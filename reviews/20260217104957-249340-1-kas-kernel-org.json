@@ -1,0 +1,130 @@
+{
+  "thread_id": "20260217104957.249340-1-kas@kernel.org",
+  "subject": "[PATCHv2 0/2] efi: Fix alignenment issues in unaccepted memory code",
+  "url": "https://lore.kernel.org/all/20260217104957.249340-1-kas@kernel.org/",
+  "dates": {
+    "2026-02-17": {
+      "report_file": "2026-02-17_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl (Meta) (author)",
+          "summary": "The reviewer, Kiryl (Meta), pointed out issues in the patch related to unaligned physical addresses and sizes when handling EFI unaccepted memory. They specifically mentioned that the reserve_unaccepted() function incorrectly calculates the size of the memblock reservation for the unaccepted memory table, leading to potential kernel panics. Additionally, they noted that the accept_memory() and range_contains_unaccepted_memory() functions do not properly align the start address down and the size up to the nearest page boundary before performing unit_size alignment checks.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The reserve_unaccepted() function incorrectly calculates the size of the\nmemblock reservation for the unaccepted memory table. It aligns the\nsize of the table, but fails to account for cases where the table's\nstarting physical address (efi.unaccepted) is not page-aligned.\n\nIf the table starts at an offset within a page and its end crosses into\na subsequent page that the aligned size does not cover, the end of the\ntable will not be reserved. This can lead to the table being overwritten\nor inaccessible, causing a kernel panic in accept_memory().\n\nThis issue was observed when starting Intel TDX VMs with specific memory\nsizes (e.g., > 64GB).\n\nFix this by calculating the end address first (including the unaligned\nstart) and then aligning it up, ensuring the entire range is covered\nby the reservation.\n\nFixes: 8dbe33956d96 (\"efi/unaccepted: Make sure unaccepted table is mapped\")\nReported-by: Moritz Sanft <ms@edgeless.systems>\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n drivers/firmware/efi/efi.c | 8 ++++----\n 1 file changed, 4 insertions(+), 4 deletions(-)\n\ndiff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c\nindex 111e87a618e5..56e9d73412fa 100644\n--- a/drivers/firmware/efi/efi.c\n+++ b/drivers/firmware/efi/efi.c\n@@ -692,13 +692,13 @@ static __init int match_config_table(const efi_guid_t *guid,\n \n static __init void reserve_unaccepted(struct efi_unaccepted_memory *unaccepted)\n {\n-\tphys_addr_t start, size;\n+\tphys_addr_t start, end;\n \n \tstart = PAGE_ALIGN_DOWN(efi.unaccepted);\n-\tsize = PAGE_ALIGN(sizeof(*unaccepted) + unaccepted->size);\n+\tend = PAGE_ALIGN(efi.unaccepted + sizeof(*unaccepted) + unaccepted->size);\n \n-\tmemblock_add(start, size);\n-\tmemblock_reserve(start, size);\n+\tmemblock_add(start, end - start);\n+\tmemblock_reserve(start, end - start);\n }\n \n int __init efi_config_parse_tables(const efi_config_table_t *config_tables,\n-- \n2.51.2\n\n\n\n---\n\nThe accept_memory() and range_contains_unaccepted_memory() functions\nemploy a \"guard page\" logic to prevent crashes with load_unaligned_zeropad().\nThis logic extends the range to be accepted (or checked) by one unit_size\nif the end of the range is aligned to a unit_size boundary.\n\nHowever, if the caller passes a range that is not page-aligned, the\n'end' of the range might not be numerically aligned to unit_size, even\nif it covers the last page of a unit. This causes the \"if (!(end % unit_size))\"\ncheck to fail, skipping the necessary extension and leaving the next\nunit unaccepted, which can lead to a kernel panic when accessed by\nload_unaligned_zeropad().\n\nAlign the start address down and the size up to the nearest page\nboundary before performing the unit_size alignment check. This ensures\nthat the guard unit is correctly added when the range effectively ends\non a unit boundary.\n\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n 1 file changed, 8 insertions(+), 2 deletions(-)\n\ndiff --git a/drivers/firmware/efi/unaccepted_memory.c b/drivers/firmware/efi/unaccepted_memory.c\nindex c2c067eff634..4a8ec8d6a571 100644\n--- a/drivers/firmware/efi/unaccepted_memory.c\n+++ b/drivers/firmware/efi/unaccepted_memory.c\n@@ -35,14 +35,17 @@ void accept_memory(phys_addr_t start, unsigned long size)\n \tstruct efi_unaccepted_memory *unaccepted;\n \tunsigned long range_start, range_end;\n \tstruct accept_range range, *entry;\n-\tphys_addr_t end = start + size;\n \tunsigned long flags;\n+\tphys_addr_t end;\n \tu64 unit_size;\n \n \tunaccepted = efi_get_unaccepted_table();\n \tif (!unaccepted)\n \t\treturn;\n \n+\tend = PAGE_ALIGN(start + size);\n+\tstart = PAGE_ALIGN_DOWN(start);\n+\n \tunit_size = unaccepted->unit_size;\n \n \t/*\n@@ -160,15 +163,18 @@ void accept_memory(phys_addr_t start, unsigned long size)\n bool range_contains_unaccepted_memory(phys_addr_t start, unsigned long size)\n {\n \tstruct efi_unaccepted_memory *unaccepted;\n-\tphys_addr_t end = start + size;\n \tunsigned long flags;\n \tbool ret = false;\n+\tphys_addr_t end;\n \tu64 unit_size;\n \n \tunaccepted = efi_get_unaccepted_table();\n \tif (!unaccepted)\n \t\treturn false;\n \n+\tend = PAGE_ALIGN(start + size);\n+\tstart = PAGE_ALIGN_DOWN(start);\n+\n \tunit_size = unaccepted->unit_size;\n \n \t/*\n-- \n2.51.2\n\n"
+        },
+        {
+          "author": "Ard Biesheuvel",
+          "summary": "Ard Biesheuvel approved the patch without any major concerns, but mentioned that he will only queue it if other reviewers are also happy.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "approval"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "\n\nOn Tue, 17 Feb 2026, at 11:49, Kiryl Shutsemau (Meta) wrote:\n> This series addresses two issues related to unaligned physical addresses\n> and sizes when handling EFI unaccepted memory. These issues were\n> identified as potential sources of kernel panics in Intel TDX\n> environments due to incomplete memory reservation or missing \"guard page\"\n> extensions.\n>\n> The first patch fixes the reservation of the unaccepted memory table\n> itself in efi_config_parse_tables(). It ensures the entire page range\n> covering the table is reserved even if the table doesn't start on a\n> page boundary.\n>\n> The second patch ensures that memory acceptance requests in\n> accept_memory() and range_contains_unaccepted_memory() are page-aligned\n> before performing the unit_size alignment check. This prevents skipping\n> the necessary \"guard page\" extension for unaligned ranges, which is\n> required to avoid crashes with load_unaligned_zeropad().\n>\n> v2:\n>  - Fix 'end' calculation in the second patch (Tom)\n>\n> Kiryl Shutsemau (Meta) (2):\n>   efi: Fix reservation of unaccepted memory table\n>   efi: Align unaccepted memory range to page boundary\n>\n>  drivers/firmware/efi/efi.c               |  8 ++++----\n>  drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n>  2 files changed, 12 insertions(+), 6 deletions(-)\n>\n\nThis looks fine to me. If other folks are happy too, I'll queue it up and get it to Linus by the end of the week.\n"
+        },
+        {
+          "author": "Mike Rapoport",
+          "summary": "Gave Acked-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": ""
+        },
+        {
+          "author": "Tom Lendacky",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": ""
+        }
+      ],
+      "analysis_source": "llm-per-reviewer"
+    },
+    "2026-02-19": {
+      "report_file": "2026-02-19_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl (Meta) (author)",
+          "summary": "The reviewer, Kiryl (Meta), pointed out alignment issues in the original patch and provided two new patches to fix these issues. The first patch fixes the reservation of the unaccepted memory table by calculating its end address first and then aligning it up to ensure the entire range is covered. The second patch aligns the start address down and the size up to the nearest page boundary before performing unit_size alignment checks, ensuring that the guard unit is correctly added when the range effectively ends on a unit boundary.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The reserve_unaccepted() function incorrectly calculates the size of the\nmemblock reservation for the unaccepted memory table. It aligns the\nsize of the table, but fails to account for cases where the table's\nstarting physical address (efi.unaccepted) is not page-aligned.\n\nIf the table starts at an offset within a page and its end crosses into\na subsequent page that the aligned size does not cover, the end of the\ntable will not be reserved. This can lead to the table being overwritten\nor inaccessible, causing a kernel panic in accept_memory().\n\nThis issue was observed when starting Intel TDX VMs with specific memory\nsizes (e.g., > 64GB).\n\nFix this by calculating the end address first (including the unaligned\nstart) and then aligning it up, ensuring the entire range is covered\nby the reservation.\n\nFixes: 8dbe33956d96 (\"efi/unaccepted: Make sure unaccepted table is mapped\")\nReported-by: Moritz Sanft <ms@edgeless.systems>\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n drivers/firmware/efi/efi.c | 8 ++++----\n 1 file changed, 4 insertions(+), 4 deletions(-)\n\ndiff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c\nindex 111e87a618e5..56e9d73412fa 100644\n--- a/drivers/firmware/efi/efi.c\n+++ b/drivers/firmware/efi/efi.c\n@@ -692,13 +692,13 @@ static __init int match_config_table(const efi_guid_t *guid,\n \n static __init void reserve_unaccepted(struct efi_unaccepted_memory *unaccepted)\n {\n-\tphys_addr_t start, size;\n+\tphys_addr_t start, end;\n \n \tstart = PAGE_ALIGN_DOWN(efi.unaccepted);\n-\tsize = PAGE_ALIGN(sizeof(*unaccepted) + unaccepted->size);\n+\tend = PAGE_ALIGN(efi.unaccepted + sizeof(*unaccepted) + unaccepted->size);\n \n-\tmemblock_add(start, size);\n-\tmemblock_reserve(start, size);\n+\tmemblock_add(start, end - start);\n+\tmemblock_reserve(start, end - start);\n }\n \n int __init efi_config_parse_tables(const efi_config_table_t *config_tables,\n-- \n2.51.2\n\n\n\n---\n\nThe accept_memory() and range_contains_unaccepted_memory() functions\nemploy a \"guard page\" logic to prevent crashes with load_unaligned_zeropad().\nThis logic extends the range to be accepted (or checked) by one unit_size\nif the end of the range is aligned to a unit_size boundary.\n\nHowever, if the caller passes a range that is not page-aligned, the\n'end' of the range might not be numerically aligned to unit_size, even\nif it covers the last page of a unit. This causes the \"if (!(end % unit_size))\"\ncheck to fail, skipping the necessary extension and leaving the next\nunit unaccepted, which can lead to a kernel panic when accessed by\nload_unaligned_zeropad().\n\nAlign the start address down and the size up to the nearest page\nboundary before performing the unit_size alignment check. This ensures\nthat the guard unit is correctly added when the range effectively ends\non a unit boundary.\n\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n 1 file changed, 8 insertions(+), 2 deletions(-)\n\ndiff --git a/drivers/firmware/efi/unaccepted_memory.c b/drivers/firmware/efi/unaccepted_memory.c\nindex c2c067eff634..4a8ec8d6a571 100644\n--- a/drivers/firmware/efi/unaccepted_memory.c\n+++ b/drivers/firmware/efi/unaccepted_memory.c\n@@ -35,14 +35,17 @@ void accept_memory(phys_addr_t start, unsigned long size)\n \tstruct efi_unaccepted_memory *unaccepted;\n \tunsigned long range_start, range_end;\n \tstruct accept_range range, *entry;\n-\tphys_addr_t end = start + size;\n \tunsigned long flags;\n+\tphys_addr_t end;\n \tu64 unit_size;\n \n \tunaccepted = efi_get_unaccepted_table();\n \tif (!unaccepted)\n \t\treturn;\n \n+\tend = PAGE_ALIGN(start + size);\n+\tstart = PAGE_ALIGN_DOWN(start);\n+\n \tunit_size = unaccepted->unit_size;\n \n \t/*\n@@ -160,15 +163,18 @@ void accept_memory(phys_addr_t start, unsigned long size)\n bool range_contains_unaccepted_memory(phys_addr_t start, unsigned long size)\n {\n \tstruct efi_unaccepted_memory *unaccepted;\n-\tphys_addr_t end = start + size;\n \tunsigned long flags;\n \tbool ret = false;\n+\tphys_addr_t end;\n \tu64 unit_size;\n \n \tunaccepted = efi_get_unaccepted_table();\n \tif (!unaccepted)\n \t\treturn false;\n \n+\tend = PAGE_ALIGN(start + size);\n+\tstart = PAGE_ALIGN_DOWN(start);\n+\n \tunit_size = unaccepted->unit_size;\n \n \t/*\n-- \n2.51.2\n\n",
+          "reply_to": ""
+        },
+        {
+          "author": "Ard Biesheuvel",
+          "summary": "Reviewer Ard Biesheuvel found the patches acceptable and expressed willingness to queue them for Linus, but no specific technical concerns were raised.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "no major issues mentioned"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "\n\nOn Tue, 17 Feb 2026, at 11:49, Kiryl Shutsemau (Meta) wrote:\n> This series addresses two issues related to unaligned physical addresses\n> and sizes when handling EFI unaccepted memory. These issues were\n> identified as potential sources of kernel panics in Intel TDX\n> environments due to incomplete memory reservation or missing \"guard page\"\n> extensions.\n>\n> The first patch fixes the reservation of the unaccepted memory table\n> itself in efi_config_parse_tables(). It ensures the entire page range\n> covering the table is reserved even if the table doesn't start on a\n> page boundary.\n>\n> The second patch ensures that memory acceptance requests in\n> accept_memory() and range_contains_unaccepted_memory() are page-aligned\n> before performing the unit_size alignment check. This prevents skipping\n> the necessary \"guard page\" extension for unaligned ranges, which is\n> required to avoid crashes with load_unaligned_zeropad().\n>\n> v2:\n>  - Fix 'end' calculation in the second patch (Tom)\n>\n> Kiryl Shutsemau (Meta) (2):\n>   efi: Fix reservation of unaccepted memory table\n>   efi: Align unaccepted memory range to page boundary\n>\n>  drivers/firmware/efi/efi.c               |  8 ++++----\n>  drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n>  2 files changed, 12 insertions(+), 6 deletions(-)\n>\n\nThis looks fine to me. If other folks are happy too, I'll queue it up and get it to Linus by the end of the week.\n\n\n---\n\n\n\nOn Tue, 17 Feb 2026, at 14:56, Tom Lendacky wrote:\n> On 2/17/26 04:49, Kiryl Shutsemau (Meta) wrote:\n>> This series addresses two issues related to unaligned physical addresses\n>> and sizes when handling EFI unaccepted memory. These issues were\n>> identified as potential sources of kernel panics in Intel TDX\n>> environments due to incomplete memory reservation or missing \"guard page\"\n>> extensions.\n>> \n>> The first patch fixes the reservation of the unaccepted memory table\n>> itself in efi_config_parse_tables(). It ensures the entire page range\n>> covering the table is reserved even if the table doesn't start on a\n>> page boundary.\n>> \n>> The second patch ensures that memory acceptance requests in\n>> accept_memory() and range_contains_unaccepted_memory() are page-aligned\n>> before performing the unit_size alignment check. This prevents skipping\n>> the necessary \"guard page\" extension for unaligned ranges, which is\n>> required to avoid crashes with load_unaligned_zeropad().\n>> \n>> v2:\n>>  - Fix 'end' calculation in the second patch (Tom)\n>> \n>> Kiryl Shutsemau (Meta) (2):\n>>   efi: Fix reservation of unaccepted memory table\n>>   efi: Align unaccepted memory range to page boundary\n>> \n>>  drivers/firmware/efi/efi.c               |  8 ++++----\n>>  drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n>>  2 files changed, 12 insertions(+), 6 deletions(-)\n>\n> Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>\n>\n\nThanks - I've queued this up now.\n\n",
+          "reply_to": ""
+        },
+        {
+          "author": "Mike Rapoport",
+          "summary": "Gave Acked-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Feb 17, 2026 at 10:49:55AM +0000, Kiryl Shutsemau (Meta) wrote:\n> This series addresses two issues related to unaligned physical addresses\n> and sizes when handling EFI unaccepted memory. These issues were\n> identified as potential sources of kernel panics in Intel TDX\n> environments due to incomplete memory reservation or missing \"guard page\"\n> extensions.\n> \n> The first patch fixes the reservation of the unaccepted memory table\n> itself in efi_config_parse_tables(). It ensures the entire page range\n> covering the table is reserved even if the table doesn't start on a\n> page boundary.\n> \n> The second patch ensures that memory acceptance requests in\n> accept_memory() and range_contains_unaccepted_memory() are page-aligned\n> before performing the unit_size alignment check. This prevents skipping\n> the necessary \"guard page\" extension for unaligned ranges, which is\n> required to avoid crashes with load_unaligned_zeropad().\n> \n> v2:\n>  - Fix 'end' calculation in the second patch (Tom)\n> \n> Kiryl Shutsemau (Meta) (2):\n>   efi: Fix reservation of unaccepted memory table\n>   efi: Align unaccepted memory range to page boundary\n\nAcked-by: Mike Rapoport (Microsoft) <rppt@kernel.org>\n \n>  drivers/firmware/efi/efi.c               |  8 ++++----\n>  drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n>  2 files changed, 12 insertions(+), 6 deletions(-)\n> \n> -- \n> 2.51.2\n> \n\n-- \nSincerely yours,\nMike.\n",
+          "reply_to": ""
+        },
+        {
+          "author": "Tom Lendacky",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On 2/17/26 04:49, Kiryl Shutsemau (Meta) wrote:\n> This series addresses two issues related to unaligned physical addresses\n> and sizes when handling EFI unaccepted memory. These issues were\n> identified as potential sources of kernel panics in Intel TDX\n> environments due to incomplete memory reservation or missing \"guard page\"\n> extensions.\n> \n> The first patch fixes the reservation of the unaccepted memory table\n> itself in efi_config_parse_tables(). It ensures the entire page range\n> covering the table is reserved even if the table doesn't start on a\n> page boundary.\n> \n> The second patch ensures that memory acceptance requests in\n> accept_memory() and range_contains_unaccepted_memory() are page-aligned\n> before performing the unit_size alignment check. This prevents skipping\n> the necessary \"guard page\" extension for unaligned ranges, which is\n> required to avoid crashes with load_unaligned_zeropad().\n> \n> v2:\n>  - Fix 'end' calculation in the second patch (Tom)\n> \n> Kiryl Shutsemau (Meta) (2):\n>   efi: Fix reservation of unaccepted memory table\n>   efi: Align unaccepted memory range to page boundary\n> \n>  drivers/firmware/efi/efi.c               |  8 ++++----\n>  drivers/firmware/efi/unaccepted_memory.c | 10 ++++++++--\n>  2 files changed, 12 insertions(+), 6 deletions(-)\n\nReviewed-by: Tom Lendacky <thomas.lendacky@amd.com>\n\n> \n\n",
+          "reply_to": ""
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series fixes two alignment issues in the EFI unaccepted memory code that can cause kernel panics in Intel TDX environments. The first patch ensures the entire page range covering the unaccepted memory table is reserved, and the second patch aligns memory acceptance requests to a page boundary before performing unit size alignment checks."
+    }
+  }
+}
