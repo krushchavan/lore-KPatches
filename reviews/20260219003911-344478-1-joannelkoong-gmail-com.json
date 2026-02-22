@@ -9,22 +9,22 @@
       "reviews": [
         {
           "author": "Matthew Wilcox",
-          "summary": "Matthew Wilcox expressed frustration with the complexity of the iomap code, implying that it's too complicated to explain or understand.",
-          "sentiment": "neutral",
+          "summary": "reviewer expressed frustration that the iomap code has become overly complex, making it difficult to understand and explain how to fix the issue of marking a folio uptodate when read IO has bytes pending",
+          "sentiment": "needs_work",
           "sentiment_signals": [
             "frustration",
-            "complexity"
+            "difficulty understanding"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Wed, Feb 18, 2026 at 06:45:34PM -0800, Darrick J. Wong wrote:\n> On Wed, Feb 18, 2026 at 04:39:11PM -0800, Joanne Koong wrote:\n> > If a folio has ifs metadata attached to it and the folio is partially\n> > read in through an async IO helper with the rest of it then being read\n> > in through post-EOF zeroing or as inline data, and the helper\n> > successfully finishes the read first, then post-EOF zeroing / reading\n> > inline will mark the folio as uptodate in iomap_set_range_uptodate().\n> > \n> > This is a problem because when the read completion path later calls\n> > iomap_read_end(), it will call folio_end_read(), which sets the uptodate\n> > bit using XOR semantics. Calling folio_end_read() on a folio that was\n> > already marked uptodate clears the uptodate bit.\n> \n> Aha, I wondered if that xor thing was going to come back to bite us.\n\nThis isn't \"the xor thing has come back to bite us\".  This is \"the iomap\ncode is now too complicated and I cannot figure out how to explain to\nJoanne that there's really a simple way to do this\".\n\nI'm going to have to set aside my current projects and redo the iomap\nreadahead/read_folio code myself, aren't I?\n",
+          "raw_body": "This isn't \"the xor thing has come back to bite us\".  This is \"the iomap\ncode is now too complicated and I cannot figure out how to explain to\nJoanne that there's really a simple way to do this\".\n\nI'm going to have to set aside my current projects and redo the iomap\nreadahead/read_folio code myself, aren't I?",
           "reply_to": "Darrick Wong",
           "message_date": "2026-02-19"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch prevents a folio from being marked as uptodate if there are still bytes pending in the read IO, which can lead to incorrect marking of the folio as uptodate and subsequent clearing of its uptodate flag."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug where a folio is incorrectly marked as uptodate after a read operation has bytes pending. The issue occurs when the read operation reads less data than the folio size, leaving pending bytes that are then cleared by subsequent operations. The patch prevents the folio from being marked uptodate in such cases, ensuring accurate tracking of data availability."
     },
     "2026-02-20": {
       "report_file": "2026-02-20_ollama_llama3.1-8b.html",
@@ -32,99 +32,110 @@
       "reviews": [
         {
           "author": "Joanne Koong (author)",
-          "summary": "Joanne Koong raised a concern that marking a folio uptodate when read IO has bytes pending can lead to the uptodate bit being cleared by the read completion path, and suggested not marking the folio uptodate in this case.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "concern about potential bug",
-            "request for change"
-          ],
-          "has_inline_review": true,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "If a folio has ifs metadata attached to it and the folio is partially\nread in through an async IO helper with the rest of it then being read\nin through post-EOF zeroing or as inline data, and the helper\nsuccessfully finishes the read first, then post-EOF zeroing / reading\ninline will mark the folio as uptodate in iomap_set_range_uptodate().\n\nThis is a problem because when the read completion path later calls\niomap_read_end(), it will call folio_end_read(), which sets the uptodate\nbit using XOR semantics. Calling folio_end_read() on a folio that was\nalready marked uptodate clears the uptodate bit.\n\nFix this by not marking the folio as uptodate if the read IO has bytes\npending. The folio uptodate state will be set in the read completion\npath through iomap_end_read() -> folio_end_read().\n\nReported-by: Wei Gao <wegao@suse.com>\nSuggested-by: Sasha Levin <sashal@kernel.org>\nTested-by: Wei Gao <wegao@suse.com>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\nFixes: b2f35ac4146d (\"iomap: add caller-provided callbacks for read and readahead\")\n---\n fs/iomap/buffered-io.c | 15 ++++++++++++---\n 1 file changed, 12 insertions(+), 3 deletions(-)\n\ndiff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c\nindex 58887513b894..4fc5ce963feb 100644\n--- a/fs/iomap/buffered-io.c\n+++ b/fs/iomap/buffered-io.c\n@@ -80,18 +80,27 @@ static void iomap_set_range_uptodate(struct folio *folio, size_t off,\n {\n \tstruct iomap_folio_state *ifs = folio->private;\n \tunsigned long flags;\n-\tbool uptodate = true;\n+\tbool mark_uptodate = true;\n \n \tif (folio_test_uptodate(folio))\n \t\treturn;\n \n \tif (ifs) {\n \t\tspin_lock_irqsave(&ifs->state_lock, flags);\n-\t\tuptodate = ifs_set_range_uptodate(folio, ifs, off, len);\n+\t\t/*\n+\t\t * If a read with bytes pending is in progress, we must not call\n+\t\t * folio_mark_uptodate(). The read completion path\n+\t\t * (iomap_read_end()) will call folio_end_read(), which uses XOR\n+\t\t * semantics to set the uptodate bit. If we set it here, the XOR\n+\t\t * in folio_end_read() will clear it, leaving the folio not\n+\t\t * uptodate.\n+\t\t */\n+\t\tmark_uptodate = ifs_set_range_uptodate(folio, ifs, off, len) &&\n+\t\t\t\t!ifs->read_bytes_pending;\n \t\tspin_unlock_irqrestore(&ifs->state_lock, flags);\n \t}\n \n-\tif (uptodate)\n+\tif (mark_uptodate)\n \t\tfolio_mark_uptodate(folio);\n }\n \n-- \n2.47.3\n\n",
-          "reply_to": "",
-          "message_date": ""
-        },
-        {
-          "author": "Joanne Koong (author)",
-          "summary": "Reviewer Joanne Koong raised a concern about the patch, but did not explicitly state whether she approved or objected to it. She provided a link to prior discussion and mentioned that there was no clear solution in the previous thread.",
+          "summary": "Author acknowledged that the issue of marking a folio uptodate when read IO has bytes pending is still relevant and provided a link to prior discussion, indicating no immediate plan for revision.",
           "sentiment": "neutral",
           "sentiment_signals": [
-            "raised a concern",
-            "provided additional context"
+            "acknowledged",
+            "no clear resolution signal"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "This is the link to the prior discussion\nhttps://lore.kernel.org/linux-fsdevel/20251223223018.3295372-1-sashal@kernel.org/T/#mbd61eaa5fd1e8922caa479720232628e39b8c9da\n\nThanks,\nJoanne",
+          "reply_to": "Darrick Wong",
+          "message_date": "2026-02-20"
+        },
+        {
+          "author": "Darrick Wong",
+          "summary": "Reviewer Darrick Wong noted that the current iomap read state management has multiple paths and conditionals, making it confusing to understand and maintain. He suggested consolidating the read code into a single function called by iomap when filling out part of a folio, which would simplify the logic and eliminate the need for additional conditionals.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvements"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
           "analysis_source": "llm",
-          "raw_body": "On Wed, Feb 18, 2026 at 10:11 PM Darrick J. Wong <djwong@kernel.org> wrote:\n>\n> On Thu, Feb 19, 2026 at 04:23:23AM +0000, Matthew Wilcox wrote:\n> > On Wed, Feb 18, 2026 at 06:45:34PM -0800, Darrick J. Wong wrote:\n> > > On Wed, Feb 18, 2026 at 04:39:11PM -0800, Joanne Koong wrote:\n> > > > If a folio has ifs metadata attached to it and the folio is partially\n> > > > read in through an async IO helper with the rest of it then being read\n> > > > in through post-EOF zeroing or as inline data, and the helper\n> > > > successfully finishes the read first, then post-EOF zeroing / reading\n> > > > inline will mark the folio as uptodate in iomap_set_range_uptodate().\n> > > >\n> > > > This is a problem because when the read completion path later calls\n> > > > iomap_read_end(), it will call folio_end_read(), which sets the uptodate\n> > > > bit using XOR semantics. Calling folio_end_read() on a folio that was\n> > > > already marked uptodate clears the uptodate bit.\n> > >\n> > > Aha, I wondered if that xor thing was going to come back to bite us.\n> >\n> > This isn't \"the xor thing has come back to bite us\".  This is \"the iomap\n> > code is now too complicated and I cannot figure out how to explain to\n> > Joanne that there's really a simple way to do this\".\n> >\n> > I'm going to have to set aside my current projects and redo the iomap\n> > readahead/read_folio code myself, aren't I?\n>\n> Well you could try explaining to me what that simpler way is?\n>\n> /me gets the sense he's missing a discussion somewhere...\n\nThis is the link to the prior discussion\nhttps://lore.kernel.org/linux-fsdevel/20251223223018.3295372-1-sashal@kernel.org/T/#mbd61eaa5fd1e8922caa479720232628e39b8c9da\n\nThanks,\nJoanne\n>\n> --D\n",
-          "reply_to": "Darrick Wong",
-          "message_date": ""
+          "raw_body": "<willy and I had a chat; this is a clumsy non-AI summary of it>\n\nI started looking at folio read state management in iomap, and made a\nfew observations that (I hope) match what willy's grumpy about.\n\nThere are three ways that iomap can be reading into the pagecache:\na) async ->readahead,\nb) synchronous ->read_folio (page faults), and\nc) synchronous ->read_folio_range (pagecache write).\n\n(Note that (b) can call a different ->read_folio_range than (c), though\nall implementations seem to have the same function)\n\nAll three of these IO paths share the behavior that they try to fill out\nthe folio's contents and set the corresponding folio/ifs uptodate bits\nif that succeeds.  Folio contents can come from anywhere, whether it's:\n\ni) zeroing memory,\nii) copying from an inlinedata buffer, or\niii) asynchronously fetching the contents from somewhere\n\nIn the case of (c) above, if the read fails then we fail the write, and\nif the read succeeds then we start copying to the pagecache.\n\nHowever, (a) and (b) have this additional read_bytes_pending field in\nthe ifs that implements some extra tracking.  AFAICT the purpose of this\nfield is to ensure that we don't call folio_end_read prematurely if\nthere's an async read in progress.  This can happen if iomap_iter\nreturns a negative errno on a partially processed folio, I think?\n\nread_bytes_pending is initialized to the folio_size() at the start of a\nread and subtracted from when parts of the folio are supplied, whether\nthat's synchronous zeroing or asynchronous read ioend completion.  When\nthe field reaches zero, we can then call folio_end_read().\n\nBut then there are twists, like the fact that we only call\niomap_read_init() to set read_bytes_pending if we decide to do an\nasynchronous read.  Or that iomap_read_end and iomap_finish_folio_read\nhave awfully similar code.  I think in the case of (i) and (ii) we also\ndon't touch read_pending_bytes at all, and merely set the uptodate bits?\n\nThis is confusing to me.  It would be more straightforward (I think) if\nwe just did it for all cases instead of adding more conditionals.  IOWs,\nhow hard would it be to consolidate the read code so that there's one\nfunction that iomap calls when it has filled out part of a folio.  Is\nthat possible, even though we shouldn't be calling folio_end_read during\na pagecache write?\n\nAt the end of the day, however, there's a bug in Linus' tree and we need\nto fix it, so Joanne's patch is a sufficient bandaid until we can go\nclean this up.\n\n--D",
+          "reply_to": "Matthew Wilcox",
+          "message_date": "2026-02-20"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch prevents a folio from being marked as uptodate if there are still bytes pending in the read IO, which can lead to incorrect marking of the folio as uptodate and subsequent clearing of its uptodate flag."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug where a folio is incorrectly marked as uptodate after a read operation has bytes pending. The issue occurs when the read operation reads less data than the folio size, leaving pending bytes that are then cleared by subsequent operations. The patch prevents the folio from being marked uptodate in such cases, ensuring accurate tracking of data availability."
     },
     "2026-02-18": {
       "report_file": "2026-02-19_ollama_llama3.1-8b.html",
       "developer": "Joanne Koong",
       "reviews": [
         {
-          "author": "Darrick Wong",
-          "summary": "The reviewer, Darrick Wong, expressed concern that the patch's use of XOR to clear the uptodate flag might have unintended consequences and suggested adding a link to a relevant discussion thread.",
+          "author": "Joanne Koong (author)",
+          "summary": "The author addressed a concern about marking a folio uptodate when read IO has bytes pending, explaining that this would be cleared by the subsequent call to iomap_read_end() using XOR semantics. The author agreed to fix this by not marking the folio as uptodate in such cases.",
           "sentiment": "needs_work",
           "sentiment_signals": [
-            "requested changes",
-            "potential issue"
+            "acknowledged a problem",
+            "agreed to fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "If a folio has ifs metadata attached to it and the folio is partially\nread in through an async IO helper with the rest of it then being read\nin through post-EOF zeroing or as inline data, and the helper\nsuccessfully finishes the read first, then post-EOF zeroing / reading\ninline will mark the folio as uptodate in iomap_set_range_uptodate().\n\nThis is a problem because when the read completion path later calls\niomap_read_end(), it will call folio_end_read(), which sets the uptodate\nbit using XOR semantics. Calling folio_end_read() on a folio that was\nalready marked uptodate clears the uptodate bit.\n\nFix this by not marking the folio as uptodate if the read IO has bytes\npending. The folio uptodate state will be set in the read completion\npath through iomap_end_read() -> folio_end_read().\n\nReported-by: Wei Gao <wegao@suse.com>\nSuggested-by: Sasha Levin <sashal@kernel.org>\nTested-by: Wei Gao <wegao@suse.com>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\nFixes: b2f35ac4146d (\"iomap: add caller-provided callbacks for read and readahead\")\n---\n fs/iomap/buffered-io.c | 15 ++++++++++++---\n 1 file changed, 12 insertions(+), 3 deletions(-)\n\ndiff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c\nindex 58887513b894..4fc5ce963feb 100644\n--- a/fs/iomap/buffered-io.c\n+++ b/fs/iomap/buffered-io.c\n@@ -80,18 +80,27 @@ static void iomap_set_range_uptodate(struct folio *folio, size_t off,\n {\n \tstruct iomap_folio_state *ifs = folio->private;\n \tunsigned long flags;\n-\tbool uptodate = true;\n+\tbool mark_uptodate = true;\n \n \tif (folio_test_uptodate(folio))\n \t\treturn;\n \n \tif (ifs) {\n \t\tspin_lock_irqsave(&ifs->state_lock, flags);\n-\t\tuptodate = ifs_set_range_uptodate(folio, ifs, off, len);\n+\t\t/*\n+\t\t * If a read with bytes pending is in progress, we must not call\n+\t\t * folio_mark_uptodate(). The read completion path\n+\t\t * (iomap_read_end()) will call folio_end_read(), which uses XOR\n+\t\t * semantics to set the uptodate bit. If we set it here, the XOR\n+\t\t * in folio_end_read() will clear it, leaving the folio not\n+\t\t * uptodate.\n+\t\t */\n+\t\tmark_uptodate = ifs_set_range_uptodate(folio, ifs, off, len) &&\n+\t\t\t\t!ifs->read_bytes_pending;\n \t\tspin_unlock_irqrestore(&ifs->state_lock, flags);\n \t}\n \n-\tif (uptodate)\n+\tif (mark_uptodate)\n \t\tfolio_mark_uptodate(folio);\n }\n \n-- \n2.47.3",
+          "reply_to": "",
+          "message_date": "2026-02-18"
+        },
+        {
+          "author": "Darrick Wong",
+          "summary": "Reviewer Darrick Wong suggested adding a link to a relevant discussion on linux-fsdevel mailing list and CC'ing stable@vger.kernel.org for v6.19, as the original patch is now in a released kernel.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "requested additional information",
+            "added context"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
           "analysis_source": "llm",
-          "raw_body": "On Wed, Feb 18, 2026 at 04:39:11PM -0800, Joanne Koong wrote:\n> If a folio has ifs metadata attached to it and the folio is partially\n> read in through an async IO helper with the rest of it then being read\n> in through post-EOF zeroing or as inline data, and the helper\n> successfully finishes the read first, then post-EOF zeroing / reading\n> inline will mark the folio as uptodate in iomap_set_range_uptodate().\n> \n> This is a problem because when the read completion path later calls\n> iomap_read_end(), it will call folio_end_read(), which sets the uptodate\n> bit using XOR semantics. Calling folio_end_read() on a folio that was\n> already marked uptodate clears the uptodate bit.\n\nAha, I wondered if that xor thing was going to come back to bite us.\n\n> Fix this by not marking the folio as uptodate if the read IO has bytes\n> pending. The folio uptodate state will be set in the read completion\n> path through iomap_end_read() -> folio_end_read().\n> \n> Reported-by: Wei Gao <wegao@suse.com>\n> Suggested-by: Sasha Levin <sashal@kernel.org>\n> Tested-by: Wei Gao <wegao@suse.com>\n> Signed-off-by: Joanne Koong <joannelkoong@gmail.com>\n> Fixes: b2f35ac4146d (\"iomap: add caller-provided callbacks for read and readahead\")\n\nI would add:\n\nLink: https://lore.kernel.org/linux-fsdevel/aYbmy8JdgXwsGaPP@autotest-wegao.qe.prg2.suse.org/\nCc: <stable@vger.kernel.org> # v6.19\n\nsince the recent discussion around this was sort of buried in a\ndifferent thread, and the original patch is now in a released kernel.\n\n> ---\n>  fs/iomap/buffered-io.c | 15 ++++++++++++---\n>  1 file changed, 12 insertions(+), 3 deletions(-)\n> \n> diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c\n> index 58887513b894..4fc5ce963feb 100644\n> --- a/fs/iomap/buffered-io.c\n> +++ b/fs/iomap/buffered-io.c\n> @@ -80,18 +80,27 @@ static void iomap_set_range_uptodate(struct folio *folio, size_t off,\n>  {\n>  \tstruct iomap_folio_state *ifs = folio->private;\n>  \tunsigned long flags;\n> -\tbool uptodate = true;\n> +\tbool mark_uptodate = true;\n>  \n>  \tif (folio_test_uptodate(folio))\n>  \t\treturn;\n>  \n>  \tif (ifs) {\n>  \t\tspin_lock_irqsave(&ifs->state_lock, flags);\n> -\t\tuptodate = ifs_set_range_uptodate(folio, ifs, off, len);\n> +\t\t/*\n> +\t\t * If a read with bytes pending is in progress, we must not call\n> +\t\t * folio_mark_uptodate(). The read completion path\n> +\t\t * (iomap_read_end()) will call folio_end_read(), which uses XOR\n> +\t\t * semantics to set the uptodate bit. If we set it here, the XOR\n> +\t\t * in folio_end_read() will clear it, leaving the folio not\n> +\t\t * uptodate.\n\nYeah, that makes sense.  How difficult is this to write up as an fstest?\n\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D\n\n> +\t\t */\n> +\t\tmark_uptodate = ifs_set_range_uptodate(folio, ifs, off, len) &&\n> +\t\t\t\t!ifs->read_bytes_pending;\n>  \t\tspin_unlock_irqrestore(&ifs->state_lock, flags);\n>  \t}\n>  \n> -\tif (uptodate)\n> +\tif (mark_uptodate)\n>  \t\tfolio_mark_uptodate(folio);\n>  }\n>  \n> -- \n> 2.47.3\n> \n> \n",
+          "raw_body": "I would add:\n\nLink: https://lore.kernel.org/linux-fsdevel/aYbmy8JdgXwsGaPP@autotest-wegao.qe.prg2.suse.org/\nCc: <stable@vger.kernel.org> # v6.19\n\nsince the recent discussion around this was sort of buried in a\ndifferent thread, and the original patch is now in a released kernel.",
           "reply_to": "Joanne Koong",
           "message_date": "2026-02-18"
         },
         {
           "author": "Darrick Wong",
-          "summary": "Reviewer Darrick Wong raised concerns about the complexity of folio read state management in iomap, suggesting that it would be more straightforward to consolidate the read code into one function.",
-          "sentiment": "needs_work",
+          "summary": "Reviewer Darrick Wong noted that the patch's impact is relatively easy to test and requested a corresponding fstest be written.",
+          "sentiment": "neutral",
           "sentiment_signals": [
-            "requested changes",
-            "confusion"
+            "no clear signal"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
           "analysis_source": "llm",
-          "raw_body": "On Thu, Feb 19, 2026 at 04:23:23AM +0000, Matthew Wilcox wrote:\n> On Wed, Feb 18, 2026 at 06:45:34PM -0800, Darrick J. Wong wrote:\n> > On Wed, Feb 18, 2026 at 04:39:11PM -0800, Joanne Koong wrote:\n> > > If a folio has ifs metadata attached to it and the folio is partially\n> > > read in through an async IO helper with the rest of it then being read\n> > > in through post-EOF zeroing or as inline data, and the helper\n> > > successfully finishes the read first, then post-EOF zeroing / reading\n> > > inline will mark the folio as uptodate in iomap_set_range_uptodate().\n> > > \n> > > This is a problem because when the read completion path later calls\n> > > iomap_read_end(), it will call folio_end_read(), which sets the uptodate\n> > > bit using XOR semantics. Calling folio_end_read() on a folio that was\n> > > already marked uptodate clears the uptodate bit.\n> > \n> > Aha, I wondered if that xor thing was going to come back to bite us.\n> \n> This isn't \"the xor thing has come back to bite us\".  This is \"the iomap\n> code is now too complicated and I cannot figure out how to explain to\n> Joanne that there's really a simple way to do this\".\n> \n> I'm going to have to set aside my current projects and redo the iomap\n> readahead/read_folio code myself, aren't I?\n\nWell you could try explaining to me what that simpler way is?\n\n/me gets the sense he's missing a discussion somewhere...\n\n--D\n\n\n---\n\nOn Thu, Feb 19, 2026 at 04:23:23AM +0000, Matthew Wilcox wrote:\n> On Wed, Feb 18, 2026 at 06:45:34PM -0800, Darrick J. Wong wrote:\n> > On Wed, Feb 18, 2026 at 04:39:11PM -0800, Joanne Koong wrote:\n> > > If a folio has ifs metadata attached to it and the folio is partially\n> > > read in through an async IO helper with the rest of it then being read\n> > > in through post-EOF zeroing or as inline data, and the helper\n> > > successfully finishes the read first, then post-EOF zeroing / reading\n> > > inline will mark the folio as uptodate in iomap_set_range_uptodate().\n> > > \n> > > This is a problem because when the read completion path later calls\n> > > iomap_read_end(), it will call folio_end_read(), which sets the uptodate\n> > > bit using XOR semantics. Calling folio_end_read() on a folio that was\n> > > already marked uptodate clears the uptodate bit.\n> > \n> > Aha, I wondered if that xor thing was going to come back to bite us.\n> \n> This isn't \"the xor thing has come back to bite us\".  This is \"the iomap\n> code is now too complicated and I cannot figure out how to explain to\n> Joanne that there's really a simple way to do this\".\n> \n> I'm going to have to set aside my current projects and redo the iomap\n> readahead/read_folio code myself, aren't I?\n\n<willy and I had a chat; this is a clumsy non-AI summary of it>\n\nI started looking at folio read state management in iomap, and made a\nfew observations that (I hope) match what willy's grumpy about.\n\nThere are three ways that iomap can be reading into the pagecache:\na) async ->readahead,\nb) synchronous ->read_folio (page faults), and\nc) synchronous ->read_folio_range (pagecache write).\n\n(Note that (b) can call a different ->read_folio_range than (c), though\nall implementations seem to have the same function)\n\nAll three of these IO paths share the behavior that they try to fill out\nthe folio's contents and set the corresponding folio/ifs uptodate bits\nif that succeeds.  Folio contents can come from anywhere, whether it's:\n\ni) zeroing memory,\nii) copying from an inlinedata buffer, or\niii) asynchronously fetching the contents from somewhere\n\nIn the case of (c) above, if the read fails then we fail the write, and\nif the read succeeds then we start copying to the pagecache.\n\nHowever, (a) and (b) have this additional read_bytes_pending field in\nthe ifs that implements some extra tracking.  AFAICT the purpose of this\nfield is to ensure that we don't call folio_end_read prematurely if\nthere's an async read in progress.  This can happen if iomap_iter\nreturns a negative errno on a partially processed folio, I think?\n\nread_bytes_pending is initialized to the folio_size() at the start of a\nread and subtracted from when parts of the folio are supplied, whether\nthat's synchronous zeroing or asynchronous read ioend completion.  When\nthe field reaches zero, we can then call folio_end_read().\n\nBut then there are twists, like the fact that we only call\niomap_read_init() to set read_bytes_pending if we decide to do an\nasynchronous read.  Or that iomap_read_end and iomap_finish_folio_read\nhave awfully similar code.  I think in the case of (i) and (ii) we also\ndon't touch read_pending_bytes at all, and merely set the uptodate bits?\n\nThis is confusing to me.  It would be more straightforward (I think) if\nwe just did it for all cases instead of adding more conditionals.  IOWs,\nhow hard would it be to consolidate the read code so that there's one\nfunction that iomap calls when it has filled out part of a folio.  Is\nthat possible, even though we shouldn't be calling folio_end_read during\na pagecache write?\n\nAt the end of the day, however, there's a bug in Linus' tree and we need\nto fix it, so Joanne's patch is a sufficient bandaid until we can go\nclean this up.\n\n--D\n\n",
-          "reply_to": "Matthew Wilcox",
+          "raw_body": "Yeah, that makes sense.  How difficult is this to write up as an fstest?\n\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+          "reply_to": "Joanne Koong",
           "message_date": "2026-02-18"
         },
         {
-          "author": "Christoph Hellwig",
-          "summary": "Christoph Hellwig raised concerns about the patch's title mismatch between the subject and the patch description.",
+          "author": "Darrick Wong",
+          "summary": "Reviewer Darrick Wong expressed confusion about an alternative approach mentioned in a previous discussion, indicating that he was not aware of the context and requested clarification on what this simpler way is.",
           "sentiment": "neutral",
           "sentiment_signals": [
-            "title mismatch"
+            "confusion",
+            "lack of understanding"
           ],
           "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
+          "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Wed, Feb 18, 2026 at 10:11:01PM -0800, Darrick J. Wong wrote:\n> > This isn't \"the xor thing has come back to bite us\".  This is \"the iomap\n> > code is now too complicated and I cannot figure out how to explain to\n> > Joanne that there's really a simple way to do this\".\n> > \n> > I'm going to have to set aside my current projects and redo the iomap\n> > readahead/read_folio code myself, aren't I?\n> \n> Well you could try explaining to me what that simpler way is?\n> \n> /me gets the sense he's missing a discussion somewhere...\n\nSame.\n\n",
-          "reply_to": "Darrick Wong",
+          "raw_body": "Well you could try explaining to me what that simpler way is?\n\n/me gets the sense he's missing a discussion somewhere...\n\n--D",
+          "reply_to": "Matthew Wilcox",
           "message_date": "2026-02-18"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch prevents a folio from being marked as uptodate if there are still bytes pending in the read IO, which can lead to incorrect marking of the folio as uptodate and subsequent clearing of its uptodate flag."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug where a folio is incorrectly marked as uptodate after a read operation has bytes pending. The issue occurs when the read operation reads less data than the folio size, leaving pending bytes that are then cleared by subsequent operations. The patch prevents the folio from being marked uptodate in such cases, ensuring accurate tracking of data availability."
     }
   }
 }

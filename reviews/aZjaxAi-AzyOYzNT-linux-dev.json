@@ -9,38 +9,85 @@
       "reviews": [
         {
           "author": "Johannes Weiner (author)",
-          "summary": "Johannes Weiner, the author of the patch, requested changes to streamline vmalloc memory accounting by using a vmstat counter instead of a custom atomic.",
+          "summary": "The author addressed a concern about the custom memcg counter for vmalloc memory accounting and explained that eliminating it results in a single, consolidated accounting call in vmalloc code.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Eliminates the custom memcg counter and results in a single,\nconsolidated accounting call in vmalloc code.\n\nSigned-off-by: Johannes Weiner <hannes@cmpxchg.org>\n---\n include/linux/memcontrol.h |  1 -\n mm/memcontrol.c            |  4 ++--\n mm/vmalloc.c               | 16 ++++------------\n 3 files changed, 6 insertions(+), 15 deletions(-)\n\ndiff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h\nindex 67f154de10bc..c7cc4e50e59a 100644\n--- a/include/linux/memcontrol.h\n+++ b/include/linux/memcontrol.h\n@@ -35,7 +35,6 @@ enum memcg_stat_item {\n \tMEMCG_SWAP = NR_VM_NODE_STAT_ITEMS,\n \tMEMCG_SOCK,\n \tMEMCG_PERCPU_B,\n-\tMEMCG_VMALLOC,\n \tMEMCG_KMEM,\n \tMEMCG_ZSWAP_B,\n \tMEMCG_ZSWAPPED,\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 129eed3ff5bb..fef5bdd887e0 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -317,6 +317,7 @@ static const unsigned int memcg_node_stat_items[] = {\n \tNR_SHMEM_THPS,\n \tNR_FILE_THPS,\n \tNR_ANON_THPS,\n+\tNR_VMALLOC,\n \tNR_KERNEL_STACK_KB,\n \tNR_PAGETABLE,\n \tNR_SECONDARY_PAGETABLE,\n@@ -339,7 +340,6 @@ static const unsigned int memcg_stat_items[] = {\n \tMEMCG_SWAP,\n \tMEMCG_SOCK,\n \tMEMCG_PERCPU_B,\n-\tMEMCG_VMALLOC,\n \tMEMCG_KMEM,\n \tMEMCG_ZSWAP_B,\n \tMEMCG_ZSWAPPED,\n@@ -1359,7 +1359,7 @@ static const struct memory_stat memory_stats[] = {\n \t{ \"sec_pagetables\",\t\tNR_SECONDARY_PAGETABLE\t\t},\n \t{ \"percpu\",\t\t\tMEMCG_PERCPU_B\t\t\t},\n \t{ \"sock\",\t\t\tMEMCG_SOCK\t\t\t},\n-\t{ \"vmalloc\",\t\t\tMEMCG_VMALLOC\t\t\t},\n+\t{ \"vmalloc\",\t\t\tNR_VMALLOC\t\t\t},\n \t{ \"shmem\",\t\t\tNR_SHMEM\t\t\t},\n #ifdef CONFIG_ZSWAP\n \t{ \"zswap\",\t\t\tMEMCG_ZSWAP_B\t\t\t},\ndiff --git a/mm/vmalloc.c b/mm/vmalloc.c\nindex a49a46de9c4f..8773bc0c4734 100644\n--- a/mm/vmalloc.c\n+++ b/mm/vmalloc.c\n@@ -3446,9 +3446,6 @@ void vfree(const void *addr)\n \n \tif (unlikely(vm->flags & VM_FLUSH_RESET_PERMS))\n \t\tvm_reset_perms(vm);\n-\t/* All pages of vm should be charged to same memcg, so use first one. */\n-\tif (vm->nr_pages && !(vm->flags & VM_MAP_PUT_PAGES))\n-\t\tmod_memcg_page_state(vm->pages[0], MEMCG_VMALLOC, -vm->nr_pages);\n \tfor (i = 0; i < vm->nr_pages; i++) {\n \t\tstruct page *page = vm->pages[i];\n \n@@ -3458,7 +3455,7 @@ void vfree(const void *addr)\n \t\t * can be freed as an array of order-0 allocations\n \t\t */\n \t\tif (!(vm->flags & VM_MAP_PUT_PAGES))\n-\t\t\tdec_node_page_state(page, NR_VMALLOC);\n+\t\t\tmod_lruvec_page_state(page, NR_VMALLOC, -1);\n \t\t__free_page(page);\n \t\tcond_resched();\n \t}\n@@ -3649,7 +3646,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n \t\t\tcontinue;\n \t\t}\n \n-\t\tmod_node_page_state(page, NR_VMALLOC, 1 << large_order);\n+\t\tmod_lruvec_page_state(page, NR_VMALLOC, 1 << large_order);\n \n \t\tsplit_page(page, large_order);\n \t\tfor (i = 0; i < (1U << large_order); i++)\n@@ -3696,7 +3693,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n \t\t\t\t\t\t\tpages + nr_allocated);\n \n \t\t\tfor (i = nr_allocated; i < nr_allocated + nr; i++)\n-\t\t\t\tinc_node_page_state(pages[i], NR_VMALLOC);\n+\t\t\t\tmod_lruvec_page_state(pages[i], NR_VMALLOC, 1);\n \n \t\t\tnr_allocated += nr;\n \n@@ -3722,7 +3719,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n \t\tif (unlikely(!page))\n \t\t\tbreak;\n \n-\t\tmod_node_page_state(page, NR_VMALLOC, 1 << order);\n+\t\tmod_lruvec_page_state(page, NR_VMALLOC, 1 << order);\n \n \t\t/*\n \t\t * High-order allocations must be able to be treated as\n@@ -3866,11 +3863,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,\n \t\t\tvmalloc_gfp_adjust(gfp_mask, page_order), node,\n \t\t\tpage_order, nr_small_pages, area->pages);\n \n-\t/* All pages of vm should be charged to same memcg, so use first one. */\n-\tif (gfp_mask & __GFP_ACCOUNT && area->nr_pages)\n-\t\tmod_memcg_page_state(area->pages[0], MEMCG_VMALLOC,\n-\t\t\t\t     area->nr_pages);\n-\n \t/*\n \t * If not enough pages were obtained to accomplish an\n \t * allocation request, free them via vfree() if any.\n-- \n2.53.0",
+          "reply_to": "",
+          "message_date": "2026-02-20"
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Reviewer pointed out that the new vmalloc_used counter is not properly initialized in the !CONFIG_MMU case, leading to incorrect memory accounting.",
           "sentiment": "needs_work",
           "sentiment_signals": [
-            "requested changes"
+            "missing initialization",
+            "incorrect memory accounting"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
           "analysis_source": "llm",
-          "raw_body": "Eliminates the custom memcg counter and results in a single,\nconsolidated accounting call in vmalloc code.\n\nSigned-off-by: Johannes Weiner <hannes@cmpxchg.org>\n---\n include/linux/memcontrol.h |  1 -\n mm/memcontrol.c            |  4 ++--\n mm/vmalloc.c               | 16 ++++------------\n 3 files changed, 6 insertions(+), 15 deletions(-)\n\ndiff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h\nindex 67f154de10bc..c7cc4e50e59a 100644\n--- a/include/linux/memcontrol.h\n+++ b/include/linux/memcontrol.h\n@@ -35,7 +35,6 @@ enum memcg_stat_item {\n \tMEMCG_SWAP = NR_VM_NODE_STAT_ITEMS,\n \tMEMCG_SOCK,\n \tMEMCG_PERCPU_B,\n-\tMEMCG_VMALLOC,\n \tMEMCG_KMEM,\n \tMEMCG_ZSWAP_B,\n \tMEMCG_ZSWAPPED,\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 129eed3ff5bb..fef5bdd887e0 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -317,6 +317,7 @@ static const unsigned int memcg_node_stat_items[] = {\n \tNR_SHMEM_THPS,\n \tNR_FILE_THPS,\n \tNR_ANON_THPS,\n+\tNR_VMALLOC,\n \tNR_KERNEL_STACK_KB,\n \tNR_PAGETABLE,\n \tNR_SECONDARY_PAGETABLE,\n@@ -339,7 +340,6 @@ static const unsigned int memcg_stat_items[] = {\n \tMEMCG_SWAP,\n \tMEMCG_SOCK,\n \tMEMCG_PERCPU_B,\n-\tMEMCG_VMALLOC,\n \tMEMCG_KMEM,\n \tMEMCG_ZSWAP_B,\n \tMEMCG_ZSWAPPED,\n@@ -1359,7 +1359,7 @@ static const struct memory_stat memory_stats[] = {\n \t{ \"sec_pagetables\",\t\tNR_SECONDARY_PAGETABLE\t\t},\n \t{ \"percpu\",\t\t\tMEMCG_PERCPU_B\t\t\t},\n \t{ \"sock\",\t\t\tMEMCG_SOCK\t\t\t},\n-\t{ \"vmalloc\",\t\t\tMEMCG_VMALLOC\t\t\t},\n+\t{ \"vmalloc\",\t\t\tNR_VMALLOC\t\t\t},\n \t{ \"shmem\",\t\t\tNR_SHMEM\t\t\t},\n #ifdef CONFIG_ZSWAP\n \t{ \"zswap\",\t\t\tMEMCG_ZSWAP_B\t\t\t},\ndiff --git a/mm/vmalloc.c b/mm/vmalloc.c\nindex a49a46de9c4f..8773bc0c4734 100644\n--- a/mm/vmalloc.c\n+++ b/mm/vmalloc.c\n@@ -3446,9 +3446,6 @@ void vfree(const void *addr)\n \n \tif (unlikely(vm->flags & VM_FLUSH_RESET_PERMS))\n \t\tvm_reset_perms(vm);\n-\t/* All pages of vm should be charged to same memcg, so use first one. */\n-\tif (vm->nr_pages && !(vm->flags & VM_MAP_PUT_PAGES))\n-\t\tmod_memcg_page_state(vm->pages[0], MEMCG_VMALLOC, -vm->nr_pages);\n \tfor (i = 0; i < vm->nr_pages; i++) {\n \t\tstruct page *page = vm->pages[i];\n \n@@ -3458,7 +3455,7 @@ void vfree(const void *addr)\n \t\t * can be freed as an array of order-0 allocations\n \t\t */\n \t\tif (!(vm->flags & VM_MAP_PUT_PAGES))\n-\t\t\tdec_node_page_state(page, NR_VMALLOC);\n+\t\t\tmod_lruvec_page_state(page, NR_VMALLOC, -1);\n \t\t__free_page(page);\n \t\tcond_resched();\n \t}\n@@ -3649,7 +3646,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n \t\t\tcontinue;\n \t\t}\n \n-\t\tmod_node_page_state(page, NR_VMALLOC, 1 << large_order);\n+\t\tmod_lruvec_page_state(page, NR_VMALLOC, 1 << large_order);\n \n \t\tsplit_page(page, large_order);\n \t\tfor (i = 0; i < (1U << large_order); i++)\n@@ -3696,7 +3693,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n \t\t\t\t\t\t\tpages + nr_allocated);\n \n \t\t\tfor (i = nr_allocated; i < nr_allocated + nr; i++)\n-\t\t\t\tinc_node_page_state(pages[i], NR_VMALLOC);\n+\t\t\t\tmod_lruvec_page_state(pages[i], NR_VMALLOC, 1);\n \n \t\t\tnr_allocated += nr;\n \n@@ -3722,7 +3719,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n \t\tif (unlikely(!page))\n \t\t\tbreak;\n \n-\t\tmod_node_page_state(page, NR_VMALLOC, 1 << order);\n+\t\tmod_lruvec_page_state(page, NR_VMALLOC, 1 << order);\n \n \t\t/*\n \t\t * High-order allocations must be able to be treated as\n@@ -3866,11 +3863,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,\n \t\t\tvmalloc_gfp_adjust(gfp_mask, page_order), node,\n \t\t\tpage_order, nr_small_pages, area->pages);\n \n-\t/* All pages of vm should be charged to same memcg, so use first one. */\n-\tif (gfp_mask & __GFP_ACCOUNT && area->nr_pages)\n-\t\tmod_memcg_page_state(area->pages[0], MEMCG_VMALLOC,\n-\t\t\t\t     area->nr_pages);\n-\n \t/*\n \t * If not enough pages were obtained to accomplish an\n \t * allocation request, free them via vfree() if any.\n-- \n2.53.0\n\n",
-          "reply_to": "",
-          "message_date": ""
+          "raw_body": "On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:\n[...]",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-02-20"
         },
         {
           "author": "Shakeel Butt",
-          "summary": "Shakeel Butt pointed out two issues in the patch: mod_node_page_state() function requires a 'struct pglist_data *pgdat' parameter, which should be replaced with page_pgdat(page). He also suggested adding Acked-by tags after the fixes.",
+          "summary": "Reviewer Shakeel Butt pointed out that the function mod_node_page_state() requires a struct pglist_data pointer as its first parameter, and suggested using page_pgdat(page) to obtain this pointer.",
           "sentiment": "needs_work",
           "sentiment_signals": [
-            "requested changes"
+            "requested change"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "mod_node_page_state() takes 'struct pglist_data *pgdat', you need to use\npage_pgdat(page) as first param.",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-02-20"
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Reviewer Shakeel Butt approved the patch after suggested fixes were applied.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "NEEDS_WORK",
+            "has_inline_review"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Acked-by"
           ],
           "analysis_source": "llm",
-          "raw_body": "On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:\n[...]\n>  static struct vmap_area *__find_vmap_area(unsigned long addr, struct rb_root *root)\n>  {\n>  \tstruct rb_node *n = root->rb_node;\n> @@ -3463,11 +3457,11 @@ void vfree(const void *addr)\n>  \t\t * High-order allocs for huge vmallocs are split, so\n>  \t\t * can be freed as an array of order-0 allocations\n>  \t\t */\n> +\t\tif (!(vm->flags & VM_MAP_PUT_PAGES))\n> +\t\t\tdec_node_page_state(page, NR_VMALLOC);\n>  \t\t__free_page(page);\n>  \t\tcond_resched();\n>  \t}\n> -\tif (!(vm->flags & VM_MAP_PUT_PAGES))\n> -\t\tatomic_long_sub(vm->nr_pages, &nr_vmalloc_pages);\n>  \tkvfree(vm->pages);\n>  \tkfree(vm);\n>  }\n> @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n>  \t\t\tcontinue;\n>  \t\t}\n>  \n> +\t\tmod_node_page_state(page, NR_VMALLOC, 1 << large_order);\n\nmod_node_page_state() takes 'struct pglist_data *pgdat', you need to use\npage_pgdat(page) as first param.\n\n> +\n>  \t\tsplit_page(page, large_order);\n>  \t\tfor (i = 0; i < (1U << large_order); i++)\n>  \t\t\tpages[nr_allocated + i] = page + i;\n> @@ -3675,6 +3671,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n>  \tif (!order) {\n>  \t\twhile (nr_allocated < nr_pages) {\n>  \t\t\tunsigned int nr, nr_pages_request;\n> +\t\t\tint i;\n>  \n>  \t\t\t/*\n>  \t\t\t * A maximum allowed request is hard-coded and is 100\n> @@ -3698,6 +3695,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n>  \t\t\t\t\t\t\tnr_pages_request,\n>  \t\t\t\t\t\t\tpages + nr_allocated);\n>  \n> +\t\t\tfor (i = nr_allocated; i < nr_allocated + nr; i++)\n> +\t\t\t\tinc_node_page_state(pages[i], NR_VMALLOC);\n> +\n>  \t\t\tnr_allocated += nr;\n>  \n>  \t\t\t/*\n> @@ -3722,6 +3722,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,\n>  \t\tif (unlikely(!page))\n>  \t\t\tbreak;\n>  \n> +\t\tmod_node_page_state(page, NR_VMALLOC, 1 << order);\n\nSame here.\n\nWith above fixes, you can add:\n\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\n\n---\n\nOn Fri, Feb 20, 2026 at 02:10:35PM -0500, Johannes Weiner wrote:\n> Eliminates the custom memcg counter and results in a single,\n> consolidated accounting call in vmalloc code.\n> \n> Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>\n\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\n",
+          "raw_body": "Same here.\n\nWith above fixes, you can add:\n\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-02-20"
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Gave Acked-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
           "reply_to": "Johannes Weiner",
           "message_date": "2026-02-20"
         }
       ],
-      "analysis_source": "llm"
+      "analysis_source": "llm-per-reviewer"
     }
   }
 }

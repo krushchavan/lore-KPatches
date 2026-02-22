@@ -210,18 +210,17 @@
     <h1>[PATCH 1/2] mm: vmalloc: streamline vmalloc memory accounting</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260220191035.3703800-1-hannes@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Active on: <a href="#2026-02-20">2026-02-20</a></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch streamlines memory accounting for vmalloc by replacing a custom atomic counter with a vmstat counter, which provides node-specific data and prepares for future cleanup of memcg (memory cgroup) accounting.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch streamlines memory accounting for vmalloc by replacing a custom atomic counter with a vmstat counter, which provides per-node data and prepares for cleaning up memcg (memory cgroup) accounting. The changes affect several files, including mm/vmalloc.c, include/linux/mmzone.h, and include/linux/vmalloc.h. The patch updates the code to use the new vmstat counter in place of the custom atomic counter, making it easier to track memory usage and prepare for future cleanup.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-02-20">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Johannes Weiner (author)</span>
 <a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The reviewer, Johannes Weiner, is the author of the patch and provides a follow-up patch to switch to native NR_VMALLOC vmstat counter in memcontrol code.</div>
+<div class="review-comment-text">The author addressed a concern about the custom memcg counter for vmalloc memory accounting and explained that their patch eliminates this custom counter, resulting in a single consolidated accounting call in vmalloc code.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Eliminates the custom memcg counter and results in a single,
@@ -338,11 +337,9 @@ index a49a46de9c4f..8773bc0c4734 100644
  	 * If not enough pages were obtained to accomplish an
  	 * allocation request, free them via vfree() if any.
 -- 
-2.53.0
-
-</pre>
+2.53.0</pre>
 </details>
-<div class="review-comment-signals">Signals: patch series, follow-up patch</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
 </div>
 <div class="thread-children">
 <div class="thread-node depth-1">
@@ -350,89 +347,68 @@ index a49a46de9c4f..8773bc0c4734 100644
 <div class="review-comment-header">
 <span class="review-author">Shakeel Butt</span>
 <a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
-<span class="review-tag-badge">Acked-by</span>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Shakeel Butt pointed out two missing parameters in the mod_node_page_state() calls, which needed to be fixed by using page_pgdat(page) as the first parameter.</div>
+<div class="review-comment-text">Reviewer noted that the patch does not handle the case where VMALLOC_TOTAL is zero, which can lead to incorrect results in the vmallocUsed field.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:
-[...]
-&gt;  static struct vmap_area *__find_vmap_area(unsigned long addr, struct rb_root *root)
-&gt;  {
-&gt;  	struct rb_node *n = root-&gt;rb_node;
-&gt; @@ -3463,11 +3457,11 @@ void vfree(const void *addr)
-&gt;  		 * High-order allocs for huge vmallocs are split, so
-&gt;  		 * can be freed as an array of order-0 allocations
-&gt;  		 */
-&gt; +		if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
-&gt; +			dec_node_page_state(page, NR_VMALLOC);
-&gt;  		__free_page(page);
-&gt;  		cond_resched();
-&gt;  	}
-&gt; -	if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
-&gt; -		atomic_long_sub(vm-&gt;nr_pages, &amp;nr_vmalloc_pages);
-&gt;  	kvfree(vm-&gt;pages);
-&gt;  	kfree(vm);
-&gt;  }
-&gt; @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
-&gt;  			continue;
-&gt;  		}
-&gt;  
-&gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
-
-mod_node_page_state() takes &#x27;struct pglist_data *pgdat&#x27;, you need to use
-page_pgdat(page) as first param.
-
-&gt; +
-&gt;  		split_page(page, large_order);
-&gt;  		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
-&gt;  			pages[nr_allocated + i] = page + i;
-&gt; @@ -3675,6 +3671,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
-&gt;  	if (!order) {
-&gt;  		while (nr_allocated &lt; nr_pages) {
-&gt;  			unsigned int nr, nr_pages_request;
-&gt; +			int i;
-&gt;  
-&gt;  			/*
-&gt;  			 * A maximum allowed request is hard-coded and is 100
-&gt; @@ -3698,6 +3695,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
-&gt;  							nr_pages_request,
-&gt;  							pages + nr_allocated);
-&gt;  
-&gt; +			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
-&gt; +				inc_node_page_state(pages[i], NR_VMALLOC);
-&gt; +
-&gt;  			nr_allocated += nr;
-&gt;  
-&gt;  			/*
-&gt; @@ -3722,6 +3722,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
-&gt;  		if (unlikely(!page))
-&gt;  			break;
-&gt;  
-&gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
-
-Same here.
+[...]</pre>
+</details>
+<div class="review-comment-signals">Signals: patch needs additional handling for edge case</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer pointed out that the patch incorrectly passed a page pointer to mod_node_page_state(), which expects a struct pglist_data* instead, and suggested using page_pgdat(page) as the first parameter.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">mod_node_page_state() takes &#x27;struct pglist_data *pgdat&#x27;, you need to use
+page_pgdat(page) as first param.</pre>
+</details>
+<div class="review-comment-signals">Signals: requested correction</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer requested Acked-by tag after confirming that the patch addresses their concerns and is ready for inclusion.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Same here.
 
 With above fixes, you can add:
 
-Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
-
-
----
-
-On Fri, Feb 20, 2026 at 02:10:35PM -0500, Johannes Weiner wrote:
-&gt; Eliminates the custom memcg counter and results in a single,
-&gt; consolidated accounting call in vmalloc code.
-&gt; 
-&gt; Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
-
-Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
-
-</pre>
+Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;</pre>
 </details>
-<div class="review-comment-signals">Signals: requested changes</div>
+<div class="review-comment-signals">Signals: no specific technical issue raised</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
 </div>
 </div>
 </div>
