@@ -1,0 +1,749 @@
+{
+  "date": "2026-02-22",
+  "report_file": "2026-02-22_ollama_llama3.1-8b.html",
+  "llm_backends": [
+    [
+      "ollama",
+      "llama3.1:8b"
+    ]
+  ],
+  "generation_time_seconds": 7008.848473787308,
+  "developer_reports": [
+    {
+      "name": "Alexandre Ghiti",
+      "primary_email": "alexghiti@rivosinc.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Boris Burkov",
+      "primary_email": "boris@bur.io",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Dmitry Ilvokhin",
+      "primary_email": "d@ilvokhin.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Gregory Price",
+      "primary_email": "gourry@gourry.net",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[RFC PATCH v4 27/27] cxl: add cxl_compression PCI driver",
+          "message_id": "20260222084842.1824063-28-gourry@gourry.net",
+          "url": "https://lore.kernel.org/all/20260222084842.1824063-28-gourry@gourry.net/",
+          "date": "2026-02-22T08:50:38Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "This series introduces a new NUMA node state, N_MEMORY_PRIVATE, which allows for private memory nodes that can be managed by the buddy allocator but excluded from normal allocations. The series includes patches to add support for compressed RAM and a generic CXL type-3 driver for compressed memory controllers.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Gregory Price",
+              "summary": "No comments from reviewers yet. The patch author has posted a series of patches to introduce N_MEMORY_PRIVATE and add support for compressed RAM and a generic CXL type-3 driver for compressed memory controllers.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "N_MEMORY nodes are intended to contain general System RAM. Today, some\ndevice drivers hotplug their memory (marked Specific Purpose or Reserved)\nto get access to mm/ services, but don't intend it for general consumption.\n\nCreate N_MEMORY_PRIVATE for memory nodes whose memory is not intended for\ngeneral consumption. This state is mutually exclusive with N_MEMORY.\n\nAdd the node_private infrastructure for N_MEMORY_PRIVATE nodes:\n\n  - struct node_private: Per-node container stored in NODE_DATA(nid),\n    holding driver callbacks (ops), owner, and refcount.\n\n  - struct node_private_ops: Initial structure with void *reserved\n    placeholder and flags field.  Callbacks will be added by subsequent\n    commits as each consumer is wired up.\n\n  - folio_is_private_node() / page_is_private_node(): check if a\n    folio/page resides on a private node.\n\n  - folio_node_private_ops() / node_private_flags(): retrieve the ops\n    vtable or flags for a folio's node.\n\n  - Registration API: node_private_register()/unregister() for drivers\n    to register callbacks for private nodes. Only one driver callback\n    can be registered per node - attempting to register different ops\n    returns -EBUSY.\n\n  - sysfs attribute exposing N_MEMORY_PRIVATE node state.\n\nZonelist construction changes for private nodes are deferred to a\nsubsequent commit.\n\nSigned-off-by: Gregory Price <gourry@gourry.net>\n---\n drivers/base/node.c          | 197 ++++++++++++++++++++++++++++++++\n include/linux/mmzone.h       |   4 +\n include/linux/node_private.h | 210 +++++++++++++++++++++++++++++++++++\n include/linux/nodemask.h     |   1 +\n 4 files changed, 412 insertions(+)\n create mode 100644 include/linux/node_private.h\n\ndiff --git a/drivers/base/node.c b/drivers/base/node.c\nindex 00cf4532f121..646dc48a23b5 100644\n--- a/drivers/base/node.c\n+++ b/drivers/base/node.c\n@@ -22,6 +22,7 @@\n #include <linux/swap.h>\n #include <linux/slab.h>\n #include <linux/memblock.h>\n+#include <linux/node_private.h>\n \n static const struct bus_type node_subsys = {\n \t.name = \"node\",\n@@ -861,6 +862,198 @@ void register_memory_blocks_under_node_hotplug(int nid, unsigned long start_pfn,\n \t\t\t   (void *)&nid, register_mem_block_under_node_hotplug);\n \treturn;\n }\n+\n+static DEFINE_MUTEX(node_private_lock);\n+static bool node_private_initialized;\n+\n+/**\n+ * node_private_register - Register a private node\n+ * @nid: Node identifier\n+ * @np: The node_private structure (driver-allocated, driver-owned)\n+ *\n+ * Register a driver for a private node. Only one driver can register\n+ * per node. If another driver has already registered (with different np),\n+ * -EBUSY is returned. Re-registration with the same np is allowed.\n+ *\n+ * The driver owns the node_private memory and must ensure it remains valid\n+ * until refcount reaches 0 after node_private_unregister().\n+ *\n+ * Returns 0 on success, negative errno on failure.\n+ */\n+int node_private_register(int nid, struct node_private *np)\n+{\n+\tstruct node_private *existing;\n+\tpg_data_t *pgdat;\n+\tint ret = 0;\n+\n+\tif (!np || !node_possible(nid))\n+\t\treturn -EINVAL;\n+\n+\tif (!node_private_initialized)\n+\t\treturn -ENODEV;\n+\n+\tmutex_lock(&node_private_lock);\n+\tmem_hotplug_begin();\n+\n+\t/* N_MEMORY_PRIVATE and N_MEMORY are mutually exclusive */\n+\tif (node_state(nid, N_MEMORY)) {\n+\t\tret = -EBUSY;\n+\t\tgoto out;\n+\t}\n+\n+\tpgdat = NODE_DATA(nid);\n+\texisting = rcu_dereference_protected(pgdat->node_private,\n+\t\t\t\t\t     lockdep_is_held(&node_private_lock));\n+\n+\t/* Only one source my register this node */\n+\tif (existing) {\n+\t\tif (existing != np) {\n+\t\t\tret = -EBUSY;\n+\t\t\tgoto out;\n+\t\t}\n+\t\tgoto out;\n+\t}\n+\n+\trefcount_set(&np->refcount, 1);\n+\tinit_completion(&np->released);\n+\n+\trcu_assign_pointer(pgdat->node_private, np);\n+\tpgdat->private = true;\n+\n+out:\n+\tmem_hotplug_done();\n+\tmutex_unlock(&node_private_lock);\n+\treturn ret;\n+}\n+EXPORT_SYMBOL_GPL(node_private_register);\n+\n+/**\n+ * node_private_set_ops - Set service callbacks on a registered private node\n+ * @nid: Node identifier\n+ * @ops: Service callbacks and flags (driver-owned, must outlive registration)\n+ *\n+ * Validates flag dependencies and sets the ops on the node's node_private.\n+ * The node must already be registered via node_private_register().\n+ *\n+ * Returns 0 on success, -EINVAL for invalid flag combinations,\n+ * -ENODEV if no node_private is registered on @nid.\n+ */\n+int node_private_set_ops(int nid, const struct node_private_ops *ops)\n+{\n+\tstruct node_private *np;\n+\tint ret = 0;\n+\n+\tif (!ops)\n+\t\treturn -EINVAL;\n+\n+\tif (!node_possible(nid))\n+\t\treturn -EINVAL;\n+\n+\tmutex_lock(&node_private_lock);\n+\tnp = rcu_dereference_protected(NODE_DATA(nid)->node_private,\n+\t\t\t\t       lockdep_is_held(&node_private_lock));\n+\tif (!np)\n+\t\tret = -ENODEV;\n+\telse\n+\t\tnp->ops = ops;\n+\tmutex_unlock(&node_private_lock);\n+\treturn ret;\n+}\n+EXPORT_SYMBOL_GPL(node_private_set_ops);\n+\n+/**\n+ * node_private_clear_ops - Clear service callbacks from a private node\n+ * @nid: Node identifier\n+ * @ops: Expected ops pointer (must match current ops)\n+ *\n+ * Clears the ops only if @ops matches the currently registered ops,\n+ * preventing one service from accidentally clearing another's callbacks.\n+ *\n+ * Returns 0 on success, -ENODEV if no node_private is registered,\n+ * -EINVAL if @ops does not match.\n+ */\n+int node_private_clear_ops(int nid, const struct node_private_ops *ops)\n+{\n+\tstruct node_private *np;\n+\tint ret = 0;\n+\n+\tif (!node_possible(nid))\n+\t\treturn -EINVAL;\n+\n+\tmutex_lock(&node_private_lock);\n+\tnp = rcu_dereference_protected(NODE_DATA(nid)->node_private,\n+\t\t\t\t       lockdep_is_held(&node_private_lock));\n+\tif (!np)\n+\t\tret = -ENODEV;\n+\telse if (np->ops != ops)\n+\t\tret = -EINVAL;\n+\telse\n+\t\tnp->ops = NULL;\n+\tmutex_unlock(&node_private_lock);\n+\treturn ret;\n+}\n+EXPORT_SYMBOL_GPL(node_private_clear_ops);\n+\n+/**\n+ * node_private_unregister - Unregister a private node\n+ * @nid: Node identifier\n+ *\n+ * Unregister the driver from a private node. Only succeeds if all memory\n+ * has been offlined and the node is no longer N_MEMORY_PRIVATE.\n+ * When successful, drops the refcount to 0 indicating the driver can\n+ * free its context.\n+ *\n+ * N_MEMORY_PRIVATE state is cleared by offline_pages() when the last\n+ * memory is offlined, not by this function.\n+ *\n+ * Return: 0 if unregistered, -EBUSY if N_MEMORY_PRIVATE is still set\n+ * (other memory blocks remain on this node).\n+ */\n+int node_private_unregister(int nid)\n+{\n+\tstruct node_private *np;\n+\tpg_data_t *pgdat;\n+\n+\tif (!node_possible(nid))\n+\t\treturn 0;\n+\n+\tmutex_lock(&node_private_lock);\n+\tmem_hotplug_begin();\n+\n+\tpgdat = NODE_DATA(nid);\n+\tnp = rcu_dereference_protected(pgdat->node_private,\n+\t\t\t\t       lockdep_is_held(&node_private_lock));\n+\tif (!np) {\n+\t\tmem_hotplug_done();\n+\t\tmutex_unlock(&node_private_lock);\n+\t\treturn 0;\n+\t}\n+\n+\t/*\n+\t * Only unregister if all memory is offline and N_MEMORY_PRIVATE is\n+\t * cleared. N_MEMORY_PRIVATE is cleared by offline_pages() when the\n+\t * last memory block is offlined.\n+\t */\n+\tif (node_state(nid, N_MEMORY_PRIVATE)) {\n+\t\tmem_hotplug_done();\n+\t\tmutex_unlock(&node_private_lock);\n+\t\treturn -EBUSY;\n+\t}\n+\n+\trcu_assign_pointer(pgdat->node_private, NULL);\n+\tpgdat->private = false;\n+\n+\tmem_hotplug_done();\n+\tmutex_unlock(&node_private_lock);\n+\n+\tsynchronize_rcu();\n+\n+\tif (!refcount_dec_and_test(&np->refcount))\n+\t\twait_for_completion(&np->released);\n+\treturn 0;\n+}\n+EXPORT_SYMBOL_GPL(node_private_unregister);\n+\n #endif /* CONFIG_MEMORY_HOTPLUG */\n \n /**\n@@ -959,6 +1152,7 @@ static struct node_attr node_state_attr[] = {\n \t[N_HIGH_MEMORY] = _NODE_ATTR(has_high_memory, N_HIGH_MEMORY),\n #endif\n \t[N_MEMORY] = _NODE_ATTR(has_memory, N_MEMORY),\n+\t[N_MEMORY_PRIVATE] = _NODE_ATTR(has_private_memory, N_MEMORY_PRIVATE),\n \t[N_CPU] = _NODE_ATTR(has_cpu, N_CPU),\n \t[N_GENERIC_INITIATOR] = _NODE_ATTR(has_generic_initiator,\n \t\t\t\t\t   N_GENERIC_INITIATOR),\n@@ -972,6 +1166,7 @@ static struct attribute *node_state_attrs[] = {\n \t&node_state_attr[N_HIGH_MEMORY].attr.attr,\n #endif\n \t&node_state_attr[N_MEMORY].attr.attr,\n+\t&node_state_attr[N_MEMORY_PRIVATE].attr.attr,\n \t&node_state_attr[N_CPU].attr.attr,\n \t&node_state_attr[N_GENERIC_INITIATOR].attr.attr,\n \tNULL\n@@ -1007,5 +1202,7 @@ void __init node_dev_init(void)\n \t\t\tpanic(\"%s() failed to add node: %d\\n\", __func__, ret);\n \t}\n \n+\tnode_private_initialized = true;\n+\n \tregister_memory_blocks_under_nodes();\n }\ndiff --git a/include/linux/mmzone.h b/include/linux/mmzone.h\nindex b01cb1e49896..992eb1c5a2c6 100644\n--- a/include/linux/mmzone.h\n+++ b/include/linux/mmzone.h\n@@ -25,6 +25,8 @@\n #include <linux/zswap.h>\n #include <asm/page.h>\n \n+struct node_private;\n+\n /* Free memory management - zoned buddy allocator.  */\n #ifndef CONFIG_ARCH_FORCE_MAX_ORDER\n #define MAX_PAGE_ORDER 10\n@@ -1514,6 +1516,8 @@ typedef struct pglist_data {\n \tatomic_long_t\t\tvm_stat[NR_VM_NODE_STAT_ITEMS];\n #ifdef CONFIG_NUMA\n \tstruct memory_tier __rcu *memtier;\n+\tstruct node_private __rcu *node_private;\n+\tbool private;\n #endif\n #ifdef CONFIG_MEMORY_FAILURE\n \tstruct memory_failure_stats mf_stats;\ndiff --git a/include/linux/node_private.h b/include/linux/node_private.h\nnew file mode 100644\nindex 000000000000..6a70ec39d569\n--- /dev/null\n+++ b/include/linux/node_private.h\n@@ -0,0 +1,210 @@\n+/* SPDX-License-Identifier: GPL-2.0 */\n+#ifndef _LINUX_NODE_PRIVATE_H\n+#define _LINUX_NODE_PRIVATE_H\n+\n+#include <linux/completion.h>\n+#include <linux/mm.h>\n+#include <linux/nodemask.h>\n+#include <linux/rcupdate.h>\n+#include <linux/refcount.h>\n+\n+struct page;\n+struct vm_area_struct;\n+struct vm_fault;\n+\n+/**\n+ * struct node_private_ops - Callbacks for private node services\n+ *\n+ * Services register these callbacks to intercept MM operations that affect\n+ * their private nodes.\n+ *\n+ * Flag bits control which MM subsystems may operate on folios on this node.\n+ *\n+ * The pgdat->node_private pointer is RCU-protected.  Callbacks fall into\n+ * three categories based on their calling context:\n+ *\n+ * Folio-referenced callbacks (RCU released before callback):\n+ *   The caller holds a reference to a folio on the private node, which\n+ *   pins the node's memory online and prevents node_private teardown.\n+ *\n+ * Refcounted callbacks (RCU released before callback):\n+ *   The caller has no folio on the private node (e.g., folios are on a\n+ *   source node being migrated TO this node).  A temporary refcount is\n+ *   taken on node_private under rcu_read_lock to keep the structure (and\n+ *   the service module) alive across the callback.  node_private_unregister\n+ *   waits for all temporary references to drain before returning.\n+ *\n+ * Non-folio callbacks (rcu_read_lock held during callback):\n+ *   No folio reference exists, so rcu_read_lock is held across the\n+ *   callback to prevent node_private from being freed.\n+ *   These callbacks MUST NOT sleep.\n+ *\n+ * @flags: Operation exclusion flags (NP_OPS_* constants).\n+ *\n+ */\n+struct node_private_ops {\n+\tunsigned long flags;\n+};\n+\n+/**\n+ * struct node_private - Per-node container for N_MEMORY_PRIVATE nodes\n+ *\n+ * This structure is allocated by the driver and passed to node_private_register().\n+ * The driver owns the memory and must ensure it remains valid until after\n+ * node_private_unregister() returns with the reference count dropped to 0.\n+ *\n+ * @owner: Opaque driver identifier\n+ * @refcount: Reference count (1 = registered; temporary refs for non-folio\n+ *\t\tcallbacks that may sleep; 0 = fully released)\n+ * @released: Signaled when refcount drops to 0; unregister waits on this\n+ * @ops: Service callbacks and exclusion flags (NULL until service registers)\n+ */\n+struct node_private {\n+\tvoid *owner;\n+\trefcount_t refcount;\n+\tstruct completion released;\n+\tconst struct node_private_ops *ops;\n+};\n+\n+#ifdef CONFIG_NUMA\n+\n+#include <linux/mmzone.h>\n+\n+/**\n+ * folio_is_private_node - Check if folio is on an N_MEMORY_PRIVATE node\n+ * @folio: The folio to check\n+ *\n+ * Returns true if the folio resides on a private node.\n+ */\n+static inline bool folio_is_private_node(struct folio *folio)\n+{\n+\treturn node_state(folio_nid(folio), N_MEMORY_PRIVATE);\n+}\n+\n+/**\n+ * page_is_private_node - Check if page is on an N_MEMORY_PRIVATE node\n+ * @page: The page to check\n+ *\n+ * Returns true if the page resides on a private node.\n+ */\n+static inline bool page_is_private_node(struct page *page)\n+{\n+\treturn node_state(page_to_nid(page), N_MEMORY_PRIVATE);\n+}\n+\n+static inline const struct node_private_ops *\n+folio_node_private_ops(struct folio *folio)\n+{\n+\tconst struct node_private_ops *ops;\n+\tstruct node_private *np;\n+\n+\trcu_read_lock();\n+\tnp = rcu_dereference(NODE_DATA(folio_nid(folio))->node_private);\n+\tops = np ? np->ops : NULL;\n+\trcu_read_unlock();\n+\n+\treturn ops;\n+}\n+\n+static inline unsigned long node_private_flags(int nid)\n+{\n+\tstruct node_private *np;\n+\tunsigned long flags;\n+\n+\trcu_read_lock();\n+\tnp = rcu_dereference(NODE_DATA(nid)->node_private);\n+\tflags = (np && np->ops) ? np->ops->flags : 0;\n+\trcu_read_unlock();\n+\n+\treturn flags;\n+}\n+\n+static inline bool folio_private_flags(struct folio *f, unsigned long flag)\n+{\n+\treturn node_private_flags(folio_nid(f)) & flag;\n+}\n+\n+static inline bool node_private_has_flag(int nid, unsigned long flag)\n+{\n+\treturn node_private_flags(nid) & flag;\n+}\n+\n+static inline bool zone_private_flags(struct zone *z, unsigned long flag)\n+{\n+\treturn node_private_flags(zone_to_nid(z)) & flag;\n+}\n+\n+#else /* !CONFIG_NUMA */\n+\n+static inline bool folio_is_private_node(struct folio *folio)\n+{\n+\treturn false;\n+}\n+\n+static inline bool page_is_private_node(struct page *page)\n+{\n+\treturn false;\n+}\n+\n+static inline const struct node_private_ops *\n+folio_node_private_ops(struct folio *folio)\n+{\n+\treturn NULL;\n+}\n+\n+static inline unsigned long node_private_flags(int nid)\n+{\n+\treturn 0;\n+}\n+\n+static inline bool folio_private_flags(struct folio *f, unsigned long flag)\n+{\n+\treturn false;\n+}\n+\n+static inline bool node_private_has_flag(int nid, unsigned long flag)\n+{\n+\treturn false;\n+}\n+\n+static inline bool zone_private_flags(struct zone *z, unsigned long flag)\n+{\n+\treturn false;\n+}\n+\n+#endif /* CONFIG_NUMA */\n+\n+#if defined(CONFIG_NUMA) && defined(CONFIG_MEMORY_HOTPLUG)\n+\n+int node_private_register(int nid, struct node_private *np);\n+int node_private_unregister(int nid);\n+int node_private_set_ops(int nid, const struct node_private_ops *ops);\n+int node_private_clear_ops(int nid, const struct node_private_ops *ops);\n+\n+#else /* !CONFIG_NUMA || !CONFIG_MEMORY_HOTPLUG */\n+\n+static inline int node_private_register(int nid, struct node_private *np)\n+{\n+\treturn -ENODEV;\n+}\n+\n+static inline int node_private_unregister(int nid)\n+{\n+\treturn 0;\n+}\n+\n+static inline int node_private_set_ops(int nid,\n+\t\t\t\t       const struct node_private_ops *ops)\n+{\n+\treturn -ENODEV;\n+}\n+\n+static inline int node_private_clear_ops(int nid,\n+\t\t\t\t\t const struct node_private_ops *ops)\n+{\n+\treturn -ENODEV;\n+}\n+\n+#endif /* CONFIG_NUMA && CONFIG_MEMORY_HOTPLUG */\n+\n+#endif /* _LINUX_NODE_PRIVATE_H */\ndiff --git a/include/linux/nodemask.h b/include/linux/nodemask.h\nindex bd38648c998d..c9bcfd5a9a06 100644\n--- a/include/linux/nodemask.h\n+++ b/include/linux/nodemask.h\n@@ -391,6 +391,7 @@ enum node_states {\n \tN_HIGH_MEMORY = N_NORMAL_MEMORY,\n #endif\n \tN_MEMORY,\t\t/* The node has memory(regular, high, movable) */\n+\tN_MEMORY_PRIVATE,\t/* The node's memory is private */\n \tN_CPU,\t\t/* The node has one or more cpus */\n \tN_GENERIC_INITIATOR,\t/* The node has one or more Generic Initiators */\n \tNR_NODE_STATES\n-- \n2.53.0\n\n",
+              "reply_to": "",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            }
+          ]
+        }
+      ],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Jeff Layton",
+      "primary_email": "jlayton@kernel.org",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH 0/3] sunrpc: cache infrastructure scalability improvements",
+          "message_id": "20260220-sunrpc-cache-v1-0-47d04014c245@kernel.org",
+          "url": "https://lore.kernel.org/all/20260220-sunrpc-cache-v1-0-47d04014c245@kernel.org/",
+          "date": "2026-02-20T12:26:18Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-20",
+          "patch_summary": "This patch series improves the scalability of the sunrpc cache infrastructure by converting a global spinlock and waitqueue to per-cache-detail locks and waitqueues, allowing for more efficient concurrent access. The patches also split the cache detail queue into separate lists for readers and requests, simplifying the code and enabling future netlink upcall implementation. This change is intended for Linux kernel version 7.1.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Jeff Layton (author)",
+              "summary": "The author addressed a concern about the global queue_lock serializing upcall queue operations across all cache_detail instances. They agreed to convert it to a per-cache_detail spinlock, which would prevent contention between different caches.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "agreed",
+                "convert"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "The global queue_lock serializes all upcall queue operations across\nevery cache_detail instance. Convert it to a per-cache_detail spinlock\nso that different caches (e.g. auth.unix.ip vs nfsd.fh) no longer\ncontend with each other on queue operations.\n\nSigned-off-by: Jeff Layton <jlayton@kernel.org>\n---\n include/linux/sunrpc/cache.h |  1 +\n net/sunrpc/cache.c           | 47 ++++++++++++++++++++++----------------------\n 2 files changed, 24 insertions(+), 24 deletions(-)\n\ndiff --git a/include/linux/sunrpc/cache.h b/include/linux/sunrpc/cache.h\nindex e783132e481ff2593fdc5d323f7b3a08f85d4cd8..3d32dd1f7b05d35562d2064fed69877b3950fb51 100644\n--- a/include/linux/sunrpc/cache.h\n+++ b/include/linux/sunrpc/cache.h\n@@ -113,6 +113,7 @@ struct cache_detail {\n \n \t/* fields for communication over channel */\n \tstruct list_head\tqueue;\n+\tspinlock_t\t\tqueue_lock;\n \n \tatomic_t\t\twriters;\t\t/* how many time is /channel open */\n \ttime64_t\t\tlast_close;\t\t/* if no writers, when did last close */\ndiff --git a/net/sunrpc/cache.c b/net/sunrpc/cache.c\nindex 7c73d1c39687343db02d1f1423b58213b7a35f42..6add2fe311425dc3aec63efce2c4bed06a3d3ba5 100644\n--- a/net/sunrpc/cache.c\n+++ b/net/sunrpc/cache.c\n@@ -400,6 +400,7 @@ void sunrpc_init_cache_detail(struct cache_detail *cd)\n {\n \tspin_lock_init(&cd->hash_lock);\n \tINIT_LIST_HEAD(&cd->queue);\n+\tspin_lock_init(&cd->queue_lock);\n \tspin_lock(&cache_list_lock);\n \tcd->nextcheck = 0;\n \tcd->entries = 0;\n@@ -803,8 +804,6 @@ void cache_clean_deferred(void *owner)\n  *\n  */\n \n-static DEFINE_SPINLOCK(queue_lock);\n-\n struct cache_queue {\n \tstruct list_head\tlist;\n \tint\t\t\treader;\t/* if 0, then request */\n@@ -847,7 +846,7 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \tinode_lock(inode); /* protect against multiple concurrent\n \t\t\t      * readers on this file */\n  again:\n-\tspin_lock(&queue_lock);\n+\tspin_lock(&cd->queue_lock);\n \t/* need to find next request */\n \twhile (rp->q.list.next != &cd->queue &&\n \t       list_entry(rp->q.list.next, struct cache_queue, list)\n@@ -856,7 +855,7 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \t\tlist_move(&rp->q.list, next);\n \t}\n \tif (rp->q.list.next == &cd->queue) {\n-\t\tspin_unlock(&queue_lock);\n+\t\tspin_unlock(&cd->queue_lock);\n \t\tinode_unlock(inode);\n \t\tWARN_ON_ONCE(rp->offset);\n \t\treturn 0;\n@@ -865,7 +864,7 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \tWARN_ON_ONCE(rq->q.reader);\n \tif (rp->offset == 0)\n \t\trq->readers++;\n-\tspin_unlock(&queue_lock);\n+\tspin_unlock(&cd->queue_lock);\n \n \tif (rq->len == 0) {\n \t\terr = cache_request(cd, rq);\n@@ -876,9 +875,9 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \n \tif (rp->offset == 0 && !test_bit(CACHE_PENDING, &rq->item->flags)) {\n \t\terr = -EAGAIN;\n-\t\tspin_lock(&queue_lock);\n+\t\tspin_lock(&cd->queue_lock);\n \t\tlist_move(&rp->q.list, &rq->q.list);\n-\t\tspin_unlock(&queue_lock);\n+\t\tspin_unlock(&cd->queue_lock);\n \t} else {\n \t\tif (rp->offset + count > rq->len)\n \t\t\tcount = rq->len - rp->offset;\n@@ -888,26 +887,26 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \t\trp->offset += count;\n \t\tif (rp->offset >= rq->len) {\n \t\t\trp->offset = 0;\n-\t\t\tspin_lock(&queue_lock);\n+\t\t\tspin_lock(&cd->queue_lock);\n \t\t\tlist_move(&rp->q.list, &rq->q.list);\n-\t\t\tspin_unlock(&queue_lock);\n+\t\t\tspin_unlock(&cd->queue_lock);\n \t\t}\n \t\terr = 0;\n \t}\n  out:\n \tif (rp->offset == 0) {\n \t\t/* need to release rq */\n-\t\tspin_lock(&queue_lock);\n+\t\tspin_lock(&cd->queue_lock);\n \t\trq->readers--;\n \t\tif (rq->readers == 0 &&\n \t\t    !test_bit(CACHE_PENDING, &rq->item->flags)) {\n \t\t\tlist_del(&rq->q.list);\n-\t\t\tspin_unlock(&queue_lock);\n+\t\t\tspin_unlock(&cd->queue_lock);\n \t\t\tcache_put(rq->item, cd);\n \t\t\tkfree(rq->buf);\n \t\t\tkfree(rq);\n \t\t} else\n-\t\t\tspin_unlock(&queue_lock);\n+\t\t\tspin_unlock(&cd->queue_lock);\n \t}\n \tif (err == -EAGAIN)\n \t\tgoto again;\n@@ -988,7 +987,7 @@ static __poll_t cache_poll(struct file *filp, poll_table *wait,\n \tif (!rp)\n \t\treturn mask;\n \n-\tspin_lock(&queue_lock);\n+\tspin_lock(&cd->queue_lock);\n \n \tfor (cq= &rp->q; &cq->list != &cd->queue;\n \t     cq = list_entry(cq->list.next, struct cache_queue, list))\n@@ -996,7 +995,7 @@ static __poll_t cache_poll(struct file *filp, poll_table *wait,\n \t\t\tmask |= EPOLLIN | EPOLLRDNORM;\n \t\t\tbreak;\n \t\t}\n-\tspin_unlock(&queue_lock);\n+\tspin_unlock(&cd->queue_lock);\n \treturn mask;\n }\n \n@@ -1011,7 +1010,7 @@ static int cache_ioctl(struct inode *ino, struct file *filp,\n \tif (cmd != FIONREAD || !rp)\n \t\treturn -EINVAL;\n \n-\tspin_lock(&queue_lock);\n+\tspin_lock(&cd->queue_lock);\n \n \t/* only find the length remaining in current request,\n \t * or the length of the next request\n@@ -1024,7 +1023,7 @@ static int cache_ioctl(struct inode *ino, struct file *filp,\n \t\t\tlen = cr->len - rp->offset;\n \t\t\tbreak;\n \t\t}\n-\tspin_unlock(&queue_lock);\n+\tspin_unlock(&cd->queue_lock);\n \n \treturn put_user(len, (int __user *)arg);\n }\n@@ -1046,9 +1045,9 @@ static int cache_open(struct inode *inode, struct file *filp,\n \t\trp->offset = 0;\n \t\trp->q.reader = 1;\n \n-\t\tspin_lock(&queue_lock);\n+\t\tspin_lock(&cd->queue_lock);\n \t\tlist_add(&rp->q.list, &cd->queue);\n-\t\tspin_unlock(&queue_lock);\n+\t\tspin_unlock(&cd->queue_lock);\n \t}\n \tif (filp->f_mode & FMODE_WRITE)\n \t\tatomic_inc(&cd->writers);\n@@ -1062,7 +1061,7 @@ static int cache_release(struct inode *inode, struct file *filp,\n \tstruct cache_reader *rp = filp->private_data;\n \n \tif (rp) {\n-\t\tspin_lock(&queue_lock);\n+\t\tspin_lock(&cd->queue_lock);\n \t\tif (rp->offset) {\n \t\t\tstruct cache_queue *cq;\n \t\t\tfor (cq= &rp->q; &cq->list != &cd->queue;\n@@ -1075,7 +1074,7 @@ static int cache_release(struct inode *inode, struct file *filp,\n \t\t\trp->offset = 0;\n \t\t}\n \t\tlist_del(&rp->q.list);\n-\t\tspin_unlock(&queue_lock);\n+\t\tspin_unlock(&cd->queue_lock);\n \n \t\tfilp->private_data = NULL;\n \t\tkfree(rp);\n@@ -1097,7 +1096,7 @@ static void cache_dequeue(struct cache_detail *detail, struct cache_head *ch)\n \tstruct cache_request *cr;\n \tLIST_HEAD(dequeued);\n \n-\tspin_lock(&queue_lock);\n+\tspin_lock(&detail->queue_lock);\n \tlist_for_each_entry_safe(cq, tmp, &detail->queue, list)\n \t\tif (!cq->reader) {\n \t\t\tcr = container_of(cq, struct cache_request, q);\n@@ -1110,7 +1109,7 @@ static void cache_dequeue(struct cache_detail *detail, struct cache_head *ch)\n \t\t\t\tcontinue;\n \t\t\tlist_move(&cr->q.list, &dequeued);\n \t\t}\n-\tspin_unlock(&queue_lock);\n+\tspin_unlock(&detail->queue_lock);\n \twhile (!list_empty(&dequeued)) {\n \t\tcr = list_entry(dequeued.next, struct cache_request, q.list);\n \t\tlist_del(&cr->q.list);\n@@ -1235,7 +1234,7 @@ static int cache_pipe_upcall(struct cache_detail *detail, struct cache_head *h)\n \tcrq->buf = buf;\n \tcrq->len = 0;\n \tcrq->readers = 0;\n-\tspin_lock(&queue_lock);\n+\tspin_lock(&detail->queue_lock);\n \tif (test_bit(CACHE_PENDING, &h->flags)) {\n \t\tcrq->item = cache_get(h);\n \t\tlist_add_tail(&crq->q.list, &detail->queue);\n@@ -1243,7 +1242,7 @@ static int cache_pipe_upcall(struct cache_detail *detail, struct cache_head *h)\n \t} else\n \t\t/* Lost a race, no longer PENDING, so don't enqueue */\n \t\tret = -EAGAIN;\n-\tspin_unlock(&queue_lock);\n+\tspin_unlock(&detail->queue_lock);\n \twake_up(&queue_wait);\n \tif (ret == -EAGAIN) {\n \t\tkfree(buf);\n\n-- \n2.53.0",
+              "reply_to": "",
+              "message_date": "2026-02-20",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Jeff Layton (author)",
+              "summary": "The author addressed a concern about the queue_wait waitqueue being global, which wakes pollers on all caches when one cache is woken. The author agreed to convert it to a per-cache_detail field so that only relevant pollers are woken.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "agreed",
+                "convert"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "The queue_wait waitqueue is currently a file-scoped global, so a\nwake_up for one cache_detail wakes pollers on all caches. Convert it\nto a per-cache_detail field so that only pollers on the relevant cache\nare woken.\n\nSigned-off-by: Jeff Layton <jlayton@kernel.org>\n---\n include/linux/sunrpc/cache.h | 2 ++\n net/sunrpc/cache.c           | 7 +++----\n 2 files changed, 5 insertions(+), 4 deletions(-)\n\ndiff --git a/include/linux/sunrpc/cache.h b/include/linux/sunrpc/cache.h\nindex 3d32dd1f7b05d35562d2064fed69877b3950fb51..031379efba24d40f64ce346cf1032261d4b98d05 100644\n--- a/include/linux/sunrpc/cache.h\n+++ b/include/linux/sunrpc/cache.h\n@@ -16,6 +16,7 @@\n #include <linux/atomic.h>\n #include <linux/kstrtox.h>\n #include <linux/proc_fs.h>\n+#include <linux/wait.h>\n \n /*\n  * Each cache requires:\n@@ -114,6 +115,7 @@ struct cache_detail {\n \t/* fields for communication over channel */\n \tstruct list_head\tqueue;\n \tspinlock_t\t\tqueue_lock;\n+\twait_queue_head_t\tqueue_wait;\n \n \tatomic_t\t\twriters;\t\t/* how many time is /channel open */\n \ttime64_t\t\tlast_close;\t\t/* if no writers, when did last close */\ndiff --git a/net/sunrpc/cache.c b/net/sunrpc/cache.c\nindex 6add2fe311425dc3aec63efce2c4bed06a3d3ba5..aef2607b3d7ffb61a42b9ea2ec17947465c026dc 100644\n--- a/net/sunrpc/cache.c\n+++ b/net/sunrpc/cache.c\n@@ -401,6 +401,7 @@ void sunrpc_init_cache_detail(struct cache_detail *cd)\n \tspin_lock_init(&cd->hash_lock);\n \tINIT_LIST_HEAD(&cd->queue);\n \tspin_lock_init(&cd->queue_lock);\n+\tinit_waitqueue_head(&cd->queue_wait);\n \tspin_lock(&cache_list_lock);\n \tcd->nextcheck = 0;\n \tcd->entries = 0;\n@@ -970,8 +971,6 @@ static ssize_t cache_write(struct file *filp, const char __user *buf,\n \treturn ret;\n }\n \n-static DECLARE_WAIT_QUEUE_HEAD(queue_wait);\n-\n static __poll_t cache_poll(struct file *filp, poll_table *wait,\n \t\t\t       struct cache_detail *cd)\n {\n@@ -979,7 +978,7 @@ static __poll_t cache_poll(struct file *filp, poll_table *wait,\n \tstruct cache_reader *rp = filp->private_data;\n \tstruct cache_queue *cq;\n \n-\tpoll_wait(filp, &queue_wait, wait);\n+\tpoll_wait(filp, &cd->queue_wait, wait);\n \n \t/* alway allow write */\n \tmask = EPOLLOUT | EPOLLWRNORM;\n@@ -1243,7 +1242,7 @@ static int cache_pipe_upcall(struct cache_detail *detail, struct cache_head *h)\n \t\t/* Lost a race, no longer PENDING, so don't enqueue */\n \t\tret = -EAGAIN;\n \tspin_unlock(&detail->queue_lock);\n-\twake_up(&queue_wait);\n+\twake_up(&detail->queue_wait);\n \tif (ret == -EAGAIN) {\n \t\tkfree(buf);\n \t\tkfree(crq);\n\n-- \n2.53.0",
+              "reply_to": "",
+              "message_date": "2026-02-20",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Jeff Layton (author)",
+              "summary": "The author addressed a concern about the complexity of the reader-skipping loops in cache_read/cache_poll/cache_ioctl/cache_release by replacing the single interleaved queue with two dedicated lists, simplifying the data flow and eliminating the need for the cache_queue wrapper struct. The author also removed an obsolete comment.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "acknowledged a fix is needed",
+                "agreed to restructure"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Replace the single interleaved queue (which mixed cache_request and\ncache_reader entries distinguished by a ->reader flag) with two\ndedicated lists: cd->requests for upcall requests and cd->readers\nfor open file handles.\n\nReaders now track their position via a monotonically increasing\nsequence number (next_seqno) rather than by their position in the\nshared list. Each cache_request is assigned a seqno when enqueued,\nand a new cache_next_request() helper finds the next request at or\nafter a given seqno.\n\nThis eliminates the cache_queue wrapper struct entirely, simplifies\nthe reader-skipping loops in cache_read/cache_poll/cache_ioctl/\ncache_release, and makes the data flow easier to reason about.\n\nAlso, remove an obsolete comment. CACHE_UPCALLING hasn't existed\nsince before the git era started.\n\nSigned-off-by: Jeff Layton <jlayton@kernel.org>\n---\n include/linux/sunrpc/cache.h |   4 +-\n net/sunrpc/cache.c           | 125 ++++++++++++++++++-------------------------\n 2 files changed, 56 insertions(+), 73 deletions(-)\n\ndiff --git a/include/linux/sunrpc/cache.h b/include/linux/sunrpc/cache.h\nindex 031379efba24d40f64ce346cf1032261d4b98d05..b1e595c2615bd4be4d9ad19f71a8f4d08bd74a9b 100644\n--- a/include/linux/sunrpc/cache.h\n+++ b/include/linux/sunrpc/cache.h\n@@ -113,9 +113,11 @@ struct cache_detail {\n \tint\t\t\tentries;\n \n \t/* fields for communication over channel */\n-\tstruct list_head\tqueue;\n+\tstruct list_head\trequests;\n+\tstruct list_head\treaders;\n \tspinlock_t\t\tqueue_lock;\n \twait_queue_head_t\tqueue_wait;\n+\tu64\t\t\tnext_seqno;\n \n \tatomic_t\t\twriters;\t\t/* how many time is /channel open */\n \ttime64_t\t\tlast_close;\t\t/* if no writers, when did last close */\ndiff --git a/net/sunrpc/cache.c b/net/sunrpc/cache.c\nindex aef2607b3d7ffb61a42b9ea2ec17947465c026dc..09389ce8b961fe0cb5a472bcf2d3dd0b3faa13a6 100644\n--- a/net/sunrpc/cache.c\n+++ b/net/sunrpc/cache.c\n@@ -399,9 +399,11 @@ static struct delayed_work cache_cleaner;\n void sunrpc_init_cache_detail(struct cache_detail *cd)\n {\n \tspin_lock_init(&cd->hash_lock);\n-\tINIT_LIST_HEAD(&cd->queue);\n+\tINIT_LIST_HEAD(&cd->requests);\n+\tINIT_LIST_HEAD(&cd->readers);\n \tspin_lock_init(&cd->queue_lock);\n \tinit_waitqueue_head(&cd->queue_wait);\n+\tcd->next_seqno = 0;\n \tspin_lock(&cache_list_lock);\n \tcd->nextcheck = 0;\n \tcd->entries = 0;\n@@ -796,29 +798,20 @@ void cache_clean_deferred(void *owner)\n  * On read, you get a full request, or block.\n  * On write, an update request is processed.\n  * Poll works if anything to read, and always allows write.\n- *\n- * Implemented by linked list of requests.  Each open file has\n- * a ->private that also exists in this list.  New requests are added\n- * to the end and may wakeup and preceding readers.\n- * New readers are added to the head.  If, on read, an item is found with\n- * CACHE_UPCALLING clear, we free it from the list.\n- *\n  */\n \n-struct cache_queue {\n-\tstruct list_head\tlist;\n-\tint\t\t\treader;\t/* if 0, then request */\n-};\n struct cache_request {\n-\tstruct cache_queue\tq;\n+\tstruct list_head\tlist;\n \tstruct cache_head\t*item;\n-\tchar\t\t\t* buf;\n+\tchar\t\t\t*buf;\n \tint\t\t\tlen;\n \tint\t\t\treaders;\n+\tu64\t\t\tseqno;\n };\n struct cache_reader {\n-\tstruct cache_queue\tq;\n+\tstruct list_head\tlist;\n \tint\t\t\toffset;\t/* if non-0, we have a refcnt on next request */\n+\tu64\t\t\tnext_seqno;\n };\n \n static int cache_request(struct cache_detail *detail,\n@@ -833,6 +826,17 @@ static int cache_request(struct cache_detail *detail,\n \treturn PAGE_SIZE - len;\n }\n \n+static struct cache_request *\n+cache_next_request(struct cache_detail *cd, u64 seqno)\n+{\n+\tstruct cache_request *rq;\n+\n+\tlist_for_each_entry(rq, &cd->requests, list)\n+\t\tif (rq->seqno >= seqno)\n+\t\t\treturn rq;\n+\treturn NULL;\n+}\n+\n static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \t\t\t  loff_t *ppos, struct cache_detail *cd)\n {\n@@ -849,20 +853,13 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n  again:\n \tspin_lock(&cd->queue_lock);\n \t/* need to find next request */\n-\twhile (rp->q.list.next != &cd->queue &&\n-\t       list_entry(rp->q.list.next, struct cache_queue, list)\n-\t       ->reader) {\n-\t\tstruct list_head *next = rp->q.list.next;\n-\t\tlist_move(&rp->q.list, next);\n-\t}\n-\tif (rp->q.list.next == &cd->queue) {\n+\trq = cache_next_request(cd, rp->next_seqno);\n+\tif (!rq) {\n \t\tspin_unlock(&cd->queue_lock);\n \t\tinode_unlock(inode);\n \t\tWARN_ON_ONCE(rp->offset);\n \t\treturn 0;\n \t}\n-\trq = container_of(rp->q.list.next, struct cache_request, q.list);\n-\tWARN_ON_ONCE(rq->q.reader);\n \tif (rp->offset == 0)\n \t\trq->readers++;\n \tspin_unlock(&cd->queue_lock);\n@@ -877,7 +874,7 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \tif (rp->offset == 0 && !test_bit(CACHE_PENDING, &rq->item->flags)) {\n \t\terr = -EAGAIN;\n \t\tspin_lock(&cd->queue_lock);\n-\t\tlist_move(&rp->q.list, &rq->q.list);\n+\t\trp->next_seqno = rq->seqno + 1;\n \t\tspin_unlock(&cd->queue_lock);\n \t} else {\n \t\tif (rp->offset + count > rq->len)\n@@ -889,7 +886,7 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \t\tif (rp->offset >= rq->len) {\n \t\t\trp->offset = 0;\n \t\t\tspin_lock(&cd->queue_lock);\n-\t\t\tlist_move(&rp->q.list, &rq->q.list);\n+\t\t\trp->next_seqno = rq->seqno + 1;\n \t\t\tspin_unlock(&cd->queue_lock);\n \t\t}\n \t\terr = 0;\n@@ -901,7 +898,7 @@ static ssize_t cache_read(struct file *filp, char __user *buf, size_t count,\n \t\trq->readers--;\n \t\tif (rq->readers == 0 &&\n \t\t    !test_bit(CACHE_PENDING, &rq->item->flags)) {\n-\t\t\tlist_del(&rq->q.list);\n+\t\t\tlist_del(&rq->list);\n \t\t\tspin_unlock(&cd->queue_lock);\n \t\t\tcache_put(rq->item, cd);\n \t\t\tkfree(rq->buf);\n@@ -976,7 +973,6 @@ static __poll_t cache_poll(struct file *filp, poll_table *wait,\n {\n \t__poll_t mask;\n \tstruct cache_reader *rp = filp->private_data;\n-\tstruct cache_queue *cq;\n \n \tpoll_wait(filp, &cd->queue_wait, wait);\n \n@@ -988,12 +984,8 @@ static __poll_t cache_poll(struct file *filp, poll_table *wait,\n \n \tspin_lock(&cd->queue_lock);\n \n-\tfor (cq= &rp->q; &cq->list != &cd->queue;\n-\t     cq = list_entry(cq->list.next, struct cache_queue, list))\n-\t\tif (!cq->reader) {\n-\t\t\tmask |= EPOLLIN | EPOLLRDNORM;\n-\t\t\tbreak;\n-\t\t}\n+\tif (cache_next_request(cd, rp->next_seqno))\n+\t\tmask |= EPOLLIN | EPOLLRDNORM;\n \tspin_unlock(&cd->queue_lock);\n \treturn mask;\n }\n@@ -1004,7 +996,7 @@ static int cache_ioctl(struct inode *ino, struct file *filp,\n {\n \tint len = 0;\n \tstruct cache_reader *rp = filp->private_data;\n-\tstruct cache_queue *cq;\n+\tstruct cache_request *rq;\n \n \tif (cmd != FIONREAD || !rp)\n \t\treturn -EINVAL;\n@@ -1014,14 +1006,9 @@ static int cache_ioctl(struct inode *ino, struct file *filp,\n \t/* only find the length remaining in current request,\n \t * or the length of the next request\n \t */\n-\tfor (cq= &rp->q; &cq->list != &cd->queue;\n-\t     cq = list_entry(cq->list.next, struct cache_queue, list))\n-\t\tif (!cq->reader) {\n-\t\t\tstruct cache_request *cr =\n-\t\t\t\tcontainer_of(cq, struct cache_request, q);\n-\t\t\tlen = cr->len - rp->offset;\n-\t\t\tbreak;\n-\t\t}\n+\trq = cache_next_request(cd, rp->next_seqno);\n+\tif (rq)\n+\t\tlen = rq->len - rp->offset;\n \tspin_unlock(&cd->queue_lock);\n \n \treturn put_user(len, (int __user *)arg);\n@@ -1042,10 +1029,10 @@ static int cache_open(struct inode *inode, struct file *filp,\n \t\t\treturn -ENOMEM;\n \t\t}\n \t\trp->offset = 0;\n-\t\trp->q.reader = 1;\n+\t\trp->next_seqno = 0;\n \n \t\tspin_lock(&cd->queue_lock);\n-\t\tlist_add(&rp->q.list, &cd->queue);\n+\t\tlist_add(&rp->list, &cd->readers);\n \t\tspin_unlock(&cd->queue_lock);\n \t}\n \tif (filp->f_mode & FMODE_WRITE)\n@@ -1062,17 +1049,14 @@ static int cache_release(struct inode *inode, struct file *filp,\n \tif (rp) {\n \t\tspin_lock(&cd->queue_lock);\n \t\tif (rp->offset) {\n-\t\t\tstruct cache_queue *cq;\n-\t\t\tfor (cq= &rp->q; &cq->list != &cd->queue;\n-\t\t\t     cq = list_entry(cq->list.next, struct cache_queue, list))\n-\t\t\t\tif (!cq->reader) {\n-\t\t\t\t\tcontainer_of(cq, struct cache_request, q)\n-\t\t\t\t\t\t->readers--;\n-\t\t\t\t\tbreak;\n-\t\t\t\t}\n+\t\t\tstruct cache_request *rq;\n+\n+\t\t\trq = cache_next_request(cd, rp->next_seqno);\n+\t\t\tif (rq)\n+\t\t\t\trq->readers--;\n \t\t\trp->offset = 0;\n \t\t}\n-\t\tlist_del(&rp->q.list);\n+\t\tlist_del(&rp->list);\n \t\tspin_unlock(&cd->queue_lock);\n \n \t\tfilp->private_data = NULL;\n@@ -1091,27 +1075,24 @@ static int cache_release(struct inode *inode, struct file *filp,\n \n static void cache_dequeue(struct cache_detail *detail, struct cache_head *ch)\n {\n-\tstruct cache_queue *cq, *tmp;\n-\tstruct cache_request *cr;\n+\tstruct cache_request *cr, *tmp;\n \tLIST_HEAD(dequeued);\n \n \tspin_lock(&detail->queue_lock);\n-\tlist_for_each_entry_safe(cq, tmp, &detail->queue, list)\n-\t\tif (!cq->reader) {\n-\t\t\tcr = container_of(cq, struct cache_request, q);\n-\t\t\tif (cr->item != ch)\n-\t\t\t\tcontinue;\n-\t\t\tif (test_bit(CACHE_PENDING, &ch->flags))\n-\t\t\t\t/* Lost a race and it is pending again */\n-\t\t\t\tbreak;\n-\t\t\tif (cr->readers != 0)\n-\t\t\t\tcontinue;\n-\t\t\tlist_move(&cr->q.list, &dequeued);\n-\t\t}\n+\tlist_for_each_entry_safe(cr, tmp, &detail->requests, list) {\n+\t\tif (cr->item != ch)\n+\t\t\tcontinue;\n+\t\tif (test_bit(CACHE_PENDING, &ch->flags))\n+\t\t\t/* Lost a race and it is pending again */\n+\t\t\tbreak;\n+\t\tif (cr->readers != 0)\n+\t\t\tcontinue;\n+\t\tlist_move(&cr->list, &dequeued);\n+\t}\n \tspin_unlock(&detail->queue_lock);\n \twhile (!list_empty(&dequeued)) {\n-\t\tcr = list_entry(dequeued.next, struct cache_request, q.list);\n-\t\tlist_del(&cr->q.list);\n+\t\tcr = list_entry(dequeued.next, struct cache_request, list);\n+\t\tlist_del(&cr->list);\n \t\tcache_put(cr->item, detail);\n \t\tkfree(cr->buf);\n \t\tkfree(cr);\n@@ -1229,14 +1210,14 @@ static int cache_pipe_upcall(struct cache_detail *detail, struct cache_head *h)\n \t\treturn -EAGAIN;\n \t}\n \n-\tcrq->q.reader = 0;\n \tcrq->buf = buf;\n \tcrq->len = 0;\n \tcrq->readers = 0;\n \tspin_lock(&detail->queue_lock);\n \tif (test_bit(CACHE_PENDING, &h->flags)) {\n \t\tcrq->item = cache_get(h);\n-\t\tlist_add_tail(&crq->q.list, &detail->queue);\n+\t\tcrq->seqno = detail->next_seqno++;\n+\t\tlist_add_tail(&crq->list, &detail->requests);\n \t\ttrace_cache_entry_upcall(detail, h);\n \t} else\n \t\t/* Lost a race, no longer PENDING, so don't enqueue */\n\n-- \n2.53.0",
+              "reply_to": "",
+              "message_date": "2026-02-20",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Chuck Lever",
+              "summary": "reviewer noted that the new sequence number in cache_detail may not be sufficient to handle concurrent updates from multiple readers and requested additional synchronization",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "concern about concurrency",
+                "request for additional synchronization"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "From: Chuck Lever <chuck.lever@oracle.com>\n\nOn Fri, 20 Feb 2026 07:26:02 -0500, Jeff Layton wrote:",
+              "reply_to": "Jeff Layton",
+              "message_date": "2026-02-20",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Chuck Lever",
+              "summary": "reviewer noted that the patch does not address the issue of cache_detail->lock being held while calling try_to_unmap(), which can lead to a deadlock, and requested the lock be dropped before calling try_to_unmap()",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Applied to nfsd-testing, thanks!\n\n[1/3] sunrpc: convert queue_lock from global spinlock to per-cache_detail lock\n      commit: 8da8f32e9a2702259cdf97e2f8f492ef9c79db65\n[2/3] sunrpc: convert queue_wait from global to per-cache_detail waitqueue\n      commit: 802261d8b58dd2f41a52a0c92776e0fb45619efe\n[3/3] sunrpc: split cache_detail queue into request and reader lists\n      commit: 0eb3d9dc71ada02909e4dfe9cb54e703ec717ed4\n\n--\nChuck Lever",
+              "reply_to": "Jeff Layton",
+              "message_date": "2026-02-20",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "NeilBrown",
+              "summary": "reviewer noted that the code should decrement ->readers and check if it's zero, as well as verify that CACHE_PENDING is clear, before proceeding",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "bug",
+                "requested change"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Hmm..  The other place where we decrement ->readers we then check if it\nis zero and if CACHE_PENDING is clear - and do something.\nI suspect we should do that here.\nThis bug (if I'm right and it is a bug) if there before you patch, but\nnow might be a good time to fix it?\n\nThanks.  Nice cleanups.\n\nNeilBrown",
+              "reply_to": "Jeff Layton",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            }
+          ]
+        }
+      ],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Joanne Koong",
+      "primary_email": "joannelkoong@gmail.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] io_uring/rsrc: clean up buffer cloning arg validation (for 6.18-stable tree)",
+          "message_id": "CAJnrk1YA9hk5Mv0BXFe+TcWLXsNLpWtcA-gy+k03zDt4f0z7zg@mail.gmail.com",
+          "url": "https://lore.kernel.org/all/CAJnrk1YA9hk5Mv0BXFe+TcWLXsNLpWtcA-gy+k03zDt4f0z7zg@mail.gmail.com/",
+          "date": "2026-02-20T18:20:08Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-20",
+          "patch_summary": "This patch cleans up the buffer cloning argument validation in io_uring/rsrc to fix a dependency issue for commit 5b804b8f1e0d in the 6.18-stable tree.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Jens Axboe",
+              "summary": "Approved the patch as a dependency fix for commit 5b804b8f1e0d in the 6.18-stable tree.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "approved"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On 2/20/26 11:19 AM, Joanne Koong wrote:\n> Commit id upstream: b8201b50e403815f941d1c6581a27fdbfe7d0fd4\n> (\"io_uring/rsrc: clean up buffer cloning arg validation\")\n> Link to the patch:\n> https://lore.kernel.org/io-uring/20251204215116.2642044-1-joannelkoong@gmail.com/#t\n> Kernel version to apply it to: 6.18-stable tree\n> \n> Hi stable@,\n> \n> Chris Mason recently detected that this patch is a required dependency\n> for commit 5b804b8f1e0d (\"io_uring/rsrc: fix lost entries after cloned\n> range\") in the 6.18-stable tree [1]. Without this patch, the changes\n> in commit 5b804b8f1e0d use an incorrect value for nbufs when it\n> assigns \"i = nbufs\" [2].\n> \n> Could you please apply this patch to the 6.18-stable tree as a\n> dependency fix needed for commit 5b804b8f1e0d?\t\n> \n> Thanks,\n> Joanne\n> \n> [1] https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?h=linux-6.18.y&id=5b804b8f1e0d66413774d43f7a4b78bba0ca6272\n> [2] https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/io_uring/rsrc.c?h=linux-6.18.y#n1252.\n\nFWIW, this is approved on my end. CC Greg.\n\n\n-- \nJens Axboe\n\n\n",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            }
+          ]
+        }
+      ],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Johannes Weiner",
+      "primary_email": "hannes@cmpxchg.org",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Joshua Hahn",
+      "primary_email": "joshua.hahnjy@gmail.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "JP Kobryn",
+      "primary_email": "inwardvessel@gmail.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Kiryl Shutsemau",
+      "primary_email": "kas@kernel.org",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Leo Martins",
+      "primary_email": "loemra.dev@gmail.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Mark Harmstone",
+      "primary_email": "mark@harmstone.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Nhat Pham",
+      "primary_email": "nphamcs@gmail.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Rik van Riel",
+      "primary_email": "riel@surriel.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Shakeel Butt",
+      "primary_email": "shakeel.butt@linux.dev",
+      "patches_submitted": [],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [next-20260216]NULL pointer dereference in drain_obj_stock() (RCU free path)",
+          "message_id": "aZuVgStlrvZ87duZ@linux.dev",
+          "url": "https://lore.kernel.org/all/aZuVgStlrvZ87duZ@linux.dev/",
+          "date": "2026-02-22T23:49:13Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Vlastimil Babka",
+              "summary": "Reviewer Vlastimil Babka suspects a NULL pointer dereference in drain_obj_stock() due to either a bogus objext pointer or locking issues in the rcu_free_sheaf() context, which is new for memcg and causing issues during refill/drain.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "locking issues",
+                "bogus objext pointer"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "CCing memcg and slab folks.\nWould be nice to figure out where in drain_obj_stock things got wrong. Any\nchange for e.g. ./scripts/faddr2line ?\n\nI wonder if we have either some bogus objext pointer, or maybe the\nrcu_free_sheaf() context is new (or previously rare) for memcg and we have\nsome locking issues being exposed in refill/drain.",
+              "reply_to": "Carlos Maiolino",
+              "message_date": "2026-02-18",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer Shakeel Butt requested the output of ./scripts/faddr2line to help identify potential issues in the refill/drain path, as he couldn't think of anything that might go wrong.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "request for additional information"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Yes output of ./scripts/faddr2line would be really helpful. I can't think of\nanything that might go wrong in refill/drain.",
+              "reply_to": "Vlastimil Babka",
+              "message_date": "2026-02-18",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Venkat Bagalkote (author)",
+              "summary": "The author acknowledges that the NULL pointer dereference issue in drain_obj_stock() is reproducible on mainline, but does not provide a specific plan for fixing it.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledges issue",
+                "no fix plan"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "This issue also got reproduced on mainline repo.\n\n\nTraces:\n\n\n[ 8058.036083] Kernel attempted to read user page (0) - exploit attempt? \n(uid: 0)\n[ 8058.036116] BUG: Kernel NULL pointer dereference on read at 0x00000000\n[ 8058.036127] Faulting instruction address: 0xc0000000008b018c\n[ 8058.036137] Oops: Kernel access of bad area, sig: 11 [#1]\n[ 8058.036147] LE PAGE_SIZE=64K MMU=Radix SMP NR_CPUS=8192 NUMA pSeries\n[ 8058.036159] Modules linked in: overlay dm_zero dm_thin_pool \ndm_persistent_data dm_bio_prison dm_snapshot dm_bufio dm_flakey xfs loop \ndm_mod nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_fib nft_reject_inet \nnf_reject_ipv4 nf_reject_ipv6 nft_reject nft_ct nft_chain_nat nf_nat \nnf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 ip_set bonding nf_tables tls \nrfkill sunrpc nfnetlink pseries_rng vmx_crypto dax_pmem fuse ext4 crc16 \nmbcache jbd2 nd_pmem papr_scm sd_mod libnvdimm sg ibmvscsi ibmveth \nscsi_transport_srp pseries_wdt [last unloaded: scsi_debug]\n[ 8058.036339] CPU: 19 UID: 0 PID: 115 Comm: ksoftirqd/19 Kdump: loaded \nNot tainted 6.19.0+ #1 PREEMPTLAZY\n[ 8058.036361] Hardware name: IBM,9080-HEX Power11 (architected) \n0x820200 0xf000007 of:IBM,FW1110.01 (NH1110_069) hv:phyp pSeries\n[ 8058.036379] NIP: c0000000008b018c LR: c0000000008b0180 CTR: \nc00000000036d680\n[ 8058.036395] REGS: c00000000b5976c0 TRAP: 0300 Not tainted (6.19.0+)\n[ 8058.036411] MSR: 800000000280b033 <SF,VEC,VSX,EE,FP,ME,IR,DR,RI,LE> \nCR: 84042002 XER: 20040000\n[ 8058.036482] CFAR: c000000000862cf4 DAR: 0000000000000000 DSISR: \n40000000 IRQMASK: 0\n[ 8058.036482] GPR00: c0000000008b0180 c00000000b597960 c00000000243a500 \n0000000000000001\n[ 8058.036482] GPR04: 0000000000000008 0000000000000001 c0000000008b0180 \n0000000000000001\n[ 8058.036482] GPR08: a80e000000000000 0000000000000001 0000000000000007 \na80e000000000000\n[ 8058.036482] GPR12: c00e00000120f8d5 c000000d0ddf0b00 c000000073567780 \n0000000000000006\n[ 8058.036482] GPR16: c000000007012fa0 c000000007012fa4 c000000005160980 \nc000000007012f88\n[ 8058.036482] GPR20: c00c000001c3daac c000000d0d10f008 0000000000000001 \nffffffffffffff78\n[ 8058.036482] GPR24: 0000000000000005 c000000d0d58f180 c00000000cd6f580 \nc000000d0d10f01c\n[ 8058.036482] GPR28: c000000d0d10f008 c000000d0d10f010 c00000000cd6f588 \n0000000000000000\n[ 8058.036628] NIP [c0000000008b018c] drain_obj_stock+0x620/0xa48\n[ 8058.036646] LR [c0000000008b0180] drain_obj_stock+0x614/0xa48\n[ 8058.036659] Call Trace:\n[ 8058.036665] [c00000000b597960] [c0000000008b0180] \ndrain_obj_stock+0x614/0xa48 (unreliable)\n[ 8058.036688] [c00000000b597a10] [c0000000008b2a64] \nrefill_obj_stock+0x104/0x680\n[ 8058.036715] [c00000000b597a90] [c0000000008b94b8] \n__memcg_slab_free_hook+0x238/0x3ec\n[ 8058.036738] [c00000000b597b60] [c0000000007f3c10] \n__rcu_free_sheaf_prepare+0x314/0x3e8\n[ 8058.036763] [c00000000b597c10] [c0000000007fbf70] \nrcu_free_sheaf_nobarn+0x38/0x78\n[ 8058.036788] [c00000000b597c40] [c000000000334550] \nrcu_do_batch+0x2ec/0xfa8\n[ 8058.036812] [c00000000b597d40] [c0000000003399e8] rcu_core+0x22c/0x48c\n[ 8058.036835] [c00000000b597db0] [c0000000001cfe6c] \nhandle_softirqs+0x1f4/0x74c\n[ 8058.036862] [c00000000b597ed0] [c0000000001d0458] run_ksoftirqd+0x94/0xb8\n[ 8058.036885] [c00000000b597f00] [c00000000022a130] \nsmpboot_thread_fn+0x450/0x648\n[ 8058.036912] [c00000000b597f80] [c000000000218408] kthread+0x244/0x28c\n[ 8058.036927] [c00000000b597fe0] [c00000000000ded8] \nstart_kernel_thread+0x14/0x18\n[ 8058.036943] Code: 60000000 3bda0008 7fc3f378 4bfb148d 60000000 \nebfa0008 38800008 7fe3fb78 4bfb2b51 60000000 7c0004ac 39200001 \n<7d40f8a8> 7d495050 7d40f9ad 40c2fff4\n[ 8058.037000] ---[ end trace 0000000000000000 ]---\n\n\nAnd below is the corresponding o/p from faddr2line.\n\n\ndrain_obj_stock+0x620/0xa48:\narch_atomic64_sub_return_relaxed at arch/powerpc/include/asm/atomic.h:272\n(inlined by) raw_atomic64_sub_return at \ninclude/linux/atomic/atomic-arch-fallback.h:2917\n(inlined by) raw_atomic64_sub_and_test at \ninclude/linux/atomic/atomic-arch-fallback.h:4386\n(inlined by) raw_atomic_long_sub_and_test at \ninclude/linux/atomic/atomic-long.h:1551\n(inlined by) atomic_long_sub_and_test at \ninclude/linux/atomic/atomic-instrumented.h:4522\n(inlined by) percpu_ref_put_many at include/linux/percpu-refcount.h:334\n(inlined by) percpu_ref_put at include/linux/percpu-refcount.h:351\n(inlined by) obj_cgroup_put at include/linux/memcontrol.h:794\n(inlined by) drain_obj_stock at mm/memcontrol.c:3059\ndrain_obj_stock+0x614/0xa48:\ninstrument_atomic_read_write at include/linux/instrumented.h:112\n(inlined by) atomic_long_sub_and_test at \ninclude/linux/atomic/atomic-instrumented.h:4521\n(inlined by) percpu_ref_put_many at include/linux/percpu-refcount.h:334\n(inlined by) percpu_ref_put at include/linux/percpu-refcount.h:351\n(inlined by) obj_cgroup_put at include/linux/memcontrol.h:794\n(inlined by) drain_obj_stock at mm/memcontrol.c:3059\nrefill_obj_stock+0x104/0x680:\n__preempt_count_add at include/asm-generic/preempt.h:54\n(inlined by) __rcu_read_lock at include/linux/rcupdate.h:103\n(inlined by) rcu_read_lock at include/linux/rcupdate.h:848\n(inlined by) percpu_ref_get_many at include/linux/percpu-refcount.h:202\n(inlined by) percpu_ref_get at include/linux/percpu-refcount.h:222\n(inlined by) obj_cgroup_get at include/linux/memcontrol.h:782\n(inlined by) refill_obj_stock at mm/memcontrol.c:3099\n__memcg_slab_free_hook+0x238/0x3ec:\n__preempt_count_add at include/asm-generic/preempt.h:54\n(inlined by) __rcu_read_lock at include/linux/rcupdate.h:103\n(inlined by) rcu_read_lock at include/linux/rcupdate.h:848\n(inlined by) percpu_ref_put_many at include/linux/percpu-refcount.h:330\n(inlined by) percpu_ref_put at include/linux/percpu-refcount.h:351\n(inlined by) obj_cgroup_put at include/linux/memcontrol.h:794\n(inlined by) __memcg_slab_free_hook at mm/memcontrol.c:3284\n__rcu_free_sheaf_prepare+0x314/0x3e8:\nmemcg_slab_free_hook at mm/slub.c:2486\n(inlined by) __rcu_free_sheaf_prepare at mm/slub.c:2914\nrcu_free_sheaf_nobarn+0x38/0x78:\nsheaf_flush_unused at mm/slub.c:2893\n(inlined by) rcu_free_sheaf_nobarn at mm/slub.c:2941\nrcu_do_batch+0x2ec/0xfa8:\nrcu_do_batch at kernel/rcu/tree.c:2617\nrcu_core+0x22c/0x48c:\nrcu_core at kernel/rcu/tree.c:2871\nhandle_softirqs+0x1f4/0x74c:\nhandle_softirqs at kernel/softirq.c:622\nrun_ksoftirqd+0x94/0xb8:\narch_local_irq_enable at arch/powerpc/include/asm/hw_irq.h:201\n(inlined by) ksoftirqd_run_end at kernel/softirq.c:479\n(inlined by) run_ksoftirqd at kernel/softirq.c:1064\n(inlined by) run_ksoftirqd at kernel/softirq.c:1055\nsmpboot_thread_fn+0x450/0x648:\nsmpboot_thread_fn at kernel/smpboot.c:160 (discriminator 3)\nkthread+0x244/0x28c:\nkthread at kernel/kthread.c:467\nstart_kernel_thread+0x14/0x18:\nstart_kernel_thread at arch/powerpc/kernel/interrupt_64.S:771\n\n\nRegards,\n\nVenkat.",
+              "reply_to": "Vlastimil Babka",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo noted that the NULL pointer dereference in drain_obj_stock() suggests obj_cgroup_release()->percpu_ref_exit() has already been called, implying ref->data = NULL; he questioned whether stock->objcg was ever a valid objcg and suggested mis-refcounting of objcgs as a possible cause.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "mis-refcounting",
+                "NULL pointer dereference"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "It seems it crashed while dereferencing objcg->ref->data->count.\nI think that implies that obj_cgroup_release()->percpu_ref_exit()\nis already called due to the refcount reaching zero and set\nref->data = NULL.\n\nWait, was the stock->objcg ever a valid objcg?\nI think it should be valid when refilling the obj stock, otherwise\nit should have crashed in refill_obj_stock() -> obj_cgroup_get() path\nin the first place, rather than crashing when draining.\n\nAnd that sounds like we're somehow calling obj_cgroup_put() more times\nthan obj_cgroup_get().\n\nAnyway, this is my theory that it may be due to mis-refcounting of objcgs.",
+              "reply_to": "Venkat Bagalkote",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "reviewer pointed out that the patch does not address a potential NULL pointer dereference in drain_obj_stock() due to an RCU free path issue",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "NULL pointer dereference",
+                "RCU free path"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Sun, Feb 22, 2026 at 08:47:03PM +0900, Harry Yoo wrote:\n[...]",
+              "reply_to": "Harry Yoo",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer Shakeel Butt noted that the `slab_set_stride()` function is unconditionally overwritten in the `alloc_slab_obj_exts_early()` and `alloc_slab_obj_exts()` paths, which may be an issue or unrelated to the crash but appears unusual.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "issue",
+                "unrelated"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I have not looked deeper into recent slub changes (sheafs or obj_exts savings)\nbut one thing looks weird to me:\n\nallocate_slab() // for cache with SLAB_OBJ_EXT_IN_OBJ\n\t-> alloc_slab_obj_exts_early()\n\t\t-> slab_set_stride(slab, s->size)\n\t-> account_slab()\n\t\t-> alloc_slab_obj_exts()\n\t\t\t-> slab_set_stride(slab, sizeof(struct slabobj_ext));\n\nUnconditional overwrite of stride. Not sure if it is issue or even related to\nthis crash but looks odd.",
+              "reply_to": "Harry Yoo",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer Shakeel Butt identified a NULL pointer dereference in drain_obj_stock() due to stride corruption, which occurs when the stride is set unconditionally before checking if obj_exts already exists. This causes incorrect object references and eventually leads to a crash in drain_obj_stock(). The reviewer also pointed out that there is no memory barrier between the stride store and obj_exts visibility via cmpxchg, leading to a memory ordering bug on PowerPC.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "stride corruption",
+                "memory ordering bug"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I asked AI to debug this crash report along with a nudge towards to look for\nstride corruption, it gave me the following output:\n\n\n# Stride Corruption Bug Analysis\n\n## Bug Report Context\n\n- **Crash Location**: `drain_obj_stock+0x620/0xa48` in `obj_cgroup_put(old)` at mm/memcontrol.c:3059\n- **Root Cause**: `percpu_ref.data` is NULL, meaning `obj_cgroup_release()` already ran\n- **Platform**: IBM Power11 (pSeries LPAR, Radix MMU, LE, 64K pages, kernel 6.19.0-next-20260216)\n- **Trigger**: xfstests generic/428\n\n## Identified Bug: Unconditional Stride Overwrite\n\n### Location: mm/slub.c lines 2196-2223 (alloc_slab_obj_exts)\n\n```c\nretry:\n    old_exts = READ_ONCE(slab->obj_exts);\n    handle_failed_objexts_alloc(old_exts, vec, objects);\n    slab_set_stride(slab, sizeof(struct slabobj_ext));  // BUG: UNCONDITIONALLY SET\n\n    if (new_slab) {\n        slab->obj_exts = new_exts;\n    } else if (old_exts & ~OBJEXTS_FLAGS_MASK) {\n        // obj_exts already exists, BUT stride was already modified above!\n        mark_objexts_empty(vec);\n        kfree(vec);\n        return 0;\n    } else if (cmpxchg(&slab->obj_exts, old_exts, new_exts) != old_exts) {\n        goto retry;\n    }\n```\n\n### The Problem\n\nThe stride is set to `sizeof(struct slabobj_ext)` **BEFORE** checking if `obj_exts` already\nexists. If a slab was created with `SLAB_OBJ_EXT_IN_OBJ` mode (where stride = `s->size`),\nand later `alloc_slab_obj_exts` is called for any reason, the stride gets corrupted.\n\n### Stride Modes\n\nThere are two stride modes (see alloc_slab_obj_exts_early):\n\n1. **Normal mode**: stride = `sizeof(struct slabobj_ext)` (~16 bytes)\n   - obj_exts is a separate array or in slab leftover space\n\n2. **SLAB_OBJ_EXT_IN_OBJ mode**: stride = `s->size` (object size, e.g., 64-256+ bytes)\n   - obj_ext is embedded within each object at a fixed offset\n\n### Consequences of Wrong Stride\n\nWhen `slab_obj_ext` is later called:\n```c\nobj_ext = (struct slabobj_ext *)(obj_exts + slab_get_stride(slab) * index);\n```\n\nWith corrupted stride (16 instead of 256):\n- **Expected**: `obj_exts + 256 * 5 = obj_exts + 1280` (correct obj_ext for object 5)\n- **Actual**: `obj_exts + 16 * 5 = obj_exts + 80` (WRONG obj_ext - belongs to object 0!)\n\nThis causes:\n1. Reading wrong object's objcg pointer\n2. Releasing wrong objcg reference (`obj_cgroup_put`)\n3. Reference underflow on victim objcg\n4. Early `obj_cgroup_release()` \\u2192 `percpu_ref_exit()` \\u2192 `data = NULL`\n5. Stock still caches the objcg pointer\n6. Later `drain_obj_stock()` tries to put it \\u2192 **CRASH**\n\n## Missing Safety Check\n\n`slab_obj_ext()` in mm/slab.h has **no bounds checking**:\n\n```c\nstatic inline struct slabobj_ext *slab_obj_ext(struct slab *slab,\n                                               unsigned long obj_exts,\n                                               unsigned int index)\n{\n    struct slabobj_ext *obj_ext;\n\n    VM_WARN_ON_ONCE(obj_exts != slab_obj_exts(slab));\n    // MISSING: VM_WARN_ON_ONCE(index >= slab->objects);\n\n    obj_ext = (struct slabobj_ext *)(obj_exts +\n                                     slab_get_stride(slab) * index);\n    return kasan_reset_tag(obj_ext);\n}\n```\n\n## CRITICAL: Memory Ordering Bug on PowerPC (Likely Root Cause)\n\n### The Problem\n\nIn `alloc_slab_obj_exts` (mm/slub.c lines 2199-2220), there is **NO memory barrier**\nbetween the stride store and the obj_exts visibility via cmpxchg:\n\n```c\nslab_set_stride(slab, sizeof(struct slabobj_ext));  // Store to stride (line 2199)\n                                                     // NO MEMORY BARRIER HERE!\nif (new_slab) {\n    slab->obj_exts = new_exts;                       // Store to obj_exts (line 2207)\n} else if (...) {\n} else if (cmpxchg(&slab->obj_exts, ...) != ...) {   // Atomic on obj_exts (line 2220)\n    goto retry;\n}\n```\n\n### Why This Crashes on PowerPC\n\nPowerPC has a **weakly-ordered memory model**. Stores can be reordered and may not be\nimmediately visible to other processors. The cmpxchg provides a barrier AFTER it\nexecutes, but the stride store BEFORE cmpxchg may not be visible when obj_exts becomes\nvisible.\n\n**Race Scenario:**\n1. CPU A: `slab_set_stride(slab, 16)` (store to stride, in CPU A's store buffer)\n2. CPU A: `cmpxchg(&slab->obj_exts, 0, new_exts)` succeeds, obj_exts is now visible\n3. CPU B: Sees `obj_exts` is set (from step 2)\n4. CPU B: Reads `slab->stride` \\u2192 **sees OLD value (0 or garbage)** due to reordering!\n5. CPU B: `slab_obj_ext` calculates `obj_exts + 0 * index = obj_exts` for ALL indices!\n6. **All objects appear to share the same obj_ext at offset 0**\n\n### Consequences\n\n- Object 0's objcg is correct\n- Object 1..N all read object 0's objcg (WRONG!)\n- When freeing multiple objects, we `obj_cgroup_put` the SAME objcg multiple times\n- Reference count underflows \\u2192 early `obj_cgroup_release()`\n- `percpu_ref_exit()` sets `data = NULL`\n- Later stock drain tries to put the objcg \\u2192 **CRASH in `drain_obj_stock`**\n\n### Why This Matches the Bug Report\n\n- **Platform**: IBM Power11 (PowerPC) - weakly ordered memory\n- **Trigger**: xfstests generic/428 - creates high filesystem activity with many allocations\n- **Crash location**: `drain_obj_stock` \\u2192 `obj_cgroup_put` with NULL data\n- **Pattern**: Stock has cached objcg that was prematurely released\n\n### Proposed Fix\n\nAdd a write memory barrier to ensure stride is visible before obj_exts:\n\n```c\nslab_set_stride(slab, sizeof(struct slabobj_ext));\nsmp_wmb();  // Ensure stride is visible before obj_exts\n\nif (new_slab) {\n    slab->obj_exts = new_exts;\n} else if (...) {\n} else if (cmpxchg(&slab->obj_exts, old_exts, new_exts) != old_exts) {\n    goto retry;\n}\n```\n\nAnd correspondingly, the reader side should use a read barrier:\n```c\nstatic inline unsigned short slab_get_stride(struct slab *slab)\n{\n    // Need acquire semantics when reading stride after seeing obj_exts\n    return smp_load_acquire(&slab->stride);\n}\n```\n\nOr use `smp_store_release` / `smp_load_acquire` pairs for proper ordering.\n\n### Also Applies to alloc_slab_obj_exts_early\n\nThe same issue exists in `alloc_slab_obj_exts_early` (lines 2290-2291 and 2308-2309):\n\n```c\nslab->obj_exts = obj_exts;                           // Store obj_exts\nslab_set_stride(slab, sizeof(struct slabobj_ext));   // Store stride AFTER!\n```\n\nHere the order is **reversed** - obj_exts is set BEFORE stride! This is even worse\nfor memory ordering, as other CPUs could see obj_exts before stride is set.\n\n## Original Theory: Unconditional Stride Overwrite\n\n(Kept for reference - less likely to be the root cause on this specific crash)\n\nThe stride is set to `sizeof(struct slabobj_ext)` **BEFORE** checking if `obj_exts`\nalready exists. However, analysis shows this is protected by the TOCTOU check in\ncallers (`!slab_obj_exts(slab)`).\n\n## Trigger Scenarios\n\n1. **Memory ordering on PowerPC** (MOST LIKELY): Stride not visible when obj_exts\n   becomes visible due to missing memory barriers.\n\n2. **Race between alloc_slab_obj_exts calls**: Two CPUs trying to allocate obj_exts\n   for the same slab simultaneously.\n\n3. **Interaction with RCU free path**: Objects in RCU sheaf being processed when\n   stride is stale/zero.\n\n## Confirmed Code Analysis (CONFIG_64BIT)\n\nOn 64-bit systems (including IBM Power11), the stride is stored dynamically:\n\n**mm/slab.h:562-569**:\n```c\n#ifdef CONFIG_64BIT\nstatic inline void slab_set_stride(struct slab *slab, unsigned short stride)\n{\n    slab->stride = stride;  // Plain store - NO memory ordering!\n}\nstatic inline unsigned short slab_get_stride(struct slab *slab)\n{\n    return slab->stride;    // Plain load - NO memory ordering!\n}\n```\n\n**mm/slab.h:533-548** (`slab_obj_exts`):\n```c\nstatic inline unsigned long slab_obj_exts(struct slab *slab)\n{\n    unsigned long obj_exts = READ_ONCE(slab->obj_exts);  // Only compiler barrier!\n    // ... validation ...\n    return obj_exts & ~OBJEXTS_FLAGS_MASK;\n}\n```\n\n`READ_ONCE` only provides compiler ordering, NOT CPU memory ordering. There's no\nacquire barrier to ensure the stride read happens after seeing obj_exts.\n\n## Complete Fix Using Release/Acquire Semantics\n\n### Fix 1: Reader side - slab_obj_exts (mm/slab.h)\n\nChange `READ_ONCE` to `smp_load_acquire`:\n\n```c\nstatic inline unsigned long slab_obj_exts(struct slab *slab)\n{\n    unsigned long obj_exts = smp_load_acquire(&slab->obj_exts);  // Acquire barrier\n    // ... validation ...\n    return obj_exts & ~OBJEXTS_FLAGS_MASK;\n}\n```\n\n### Fix 2: Writer side - alloc_slab_obj_exts (mm/slub.c:2196-2223)\n\nUse `smp_store_release` for obj_exts after setting stride:\n\n```c\nretry:\n    old_exts = READ_ONCE(slab->obj_exts);\n    handle_failed_objexts_alloc(old_exts, vec, objects);\n\n    if (new_slab) {\n        slab_set_stride(slab, sizeof(struct slabobj_ext));\n        smp_store_release(&slab->obj_exts, new_exts);  // Release barrier\n    } else if (old_exts & ~OBJEXTS_FLAGS_MASK) {\n        mark_objexts_empty(vec);\n        kfree(vec);\n        return 0;\n    } else {\n        slab_set_stride(slab, sizeof(struct slabobj_ext));\n        // cmpxchg already provides release semantics, but stride must be\n        // visible before cmpxchg. Need explicit barrier:\n        smp_wmb();\n        if (cmpxchg(&slab->obj_exts, old_exts, new_exts) != old_exts)\n            goto retry;\n    }\n```\n\n### Fix 3: Writer side - alloc_slab_obj_exts_early (mm/slub.c:2290-2291, 2308-2309)\n\nThe order is REVERSED here - obj_exts is set BEFORE stride! Fix by using\n`smp_store_release`:\n\n```c\n// For normal obj_exts (lines 2290-2291):\nslab_set_stride(slab, sizeof(struct slabobj_ext));  // Set stride FIRST\nsmp_store_release(&slab->obj_exts, obj_exts);       // Then release obj_exts\n\n// For SLAB_OBJ_EXT_IN_OBJ (lines 2308-2309):\nslab_set_stride(slab, s->size);                     // Set stride FIRST\nsmp_store_release(&slab->obj_exts, obj_exts);       // Then release obj_exts\n```\n\n## Why This Fixes the Crash\n\nWith proper release/acquire ordering:\n\n1. **Writer** (CPU A): Sets stride, then `smp_store_release(&obj_exts, ...)` ensures\n   stride is visible to all CPUs before obj_exts becomes visible\n\n2. **Reader** (CPU B): `smp_load_acquire(&obj_exts)` ensures that if obj_exts is\n   seen as set, the subsequent stride read will see the correct value\n\nThis prevents the race where CPU B sees obj_exts but reads stale/zero stride,\nwhich caused all objects to appear to share obj_ext at offset 0, leading to\nmultiple `obj_cgroup_put` calls on the same objcg \\u2192 reference underflow \\u2192 crash.\n\n## Additional Safety: Bounds Check in slab_obj_ext\n\nAdd bounds check to catch any remaining issues:\n```c\nVM_WARN_ON_ONCE(index >= slab->objects);\n```",
+              "reply_to": "",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo noted that stride corruption is unlikely because obj_exts allocation is skipped when already present, but also agreed that a memory ordering issue is a relevant concern.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "agreed with one analysis",
+                "expressed doubt about another"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Thanks!\n\nTLDR; I think stride corruption cannot happen because we don't try to\nallocate obj_exts if we already have it (w/ SLAB_OBJ_EXT_IN_OBJ).\n\nBut the other analysis saying it's memory ordering issue seems\nvery relevant.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo questioned the necessity of calling alloc_slab_obj_exts() after obj_exts saving during slab allocation and initialization, arguing that if it benefits from the savings, there's no corruption risk, and if not, the stride size is always sizeof(struct slabobj_ext)",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I think this part is bogus.\n\nIt's not a bug because obj_exts saving is applied only during slab\nallocation and initialization. If it benefits from the obj_exts savings,\nno need to call alloc_slab_obj_exts() later, thus no corruption.\n\nIf doesn't benefit from the obj_exts savings, the stride size is always\nsizeof(struct slabobj_ext).",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "The reviewer noted that when __GFP_ACCOUNT is set but SLAB_ACCOUNT is not specified in the cache, it's possible for objects to be allocated on different CPUs' sheaves and attempt to charge objects from the same slab, leading to a potential NULL pointer dereference.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "potential bug",
+                "concern about object allocation"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Yes, that could actually happen, especially when the cache doesn't\nspecify SLAB_ACCOUNT but allocate objects with __GFP_ACCOUNT set\n(e.g. xarray does that).\n\nWith sheaves for all, objects can be in different CPUs' sheaves and they\ncould try to allocate obj_exts and charge objects from the same slab.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "The reviewer pointed out that reading the wrong stride value can lead to mis-refcounting in drain_obj_stock(), which is a critical issue in the RCU free path.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "critical issue",
+                "mis-refcounting"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Yes, reading the wrong stride value is the path to mis-refcounting\nobjcgs :P",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo suggested that additional memory barriers are needed to ensure the visibility of stride and obj_exts fields across CPUs, specifically before the slab is accessible by other CPUs.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I would say this is an overkill. Something like this should suffice:\n\ndiff --git a/mm/slub.c b/mm/slub.c\nindex 865bc050f654..8db93a88bbbf 100644\n--- a/mm/slub.c\n+++ b/mm/slub.c\n@@ -2196,7 +2196,6 @@ int alloc_slab_obj_exts(struct slab *slab, struct kmem_cache *s,\n retry:\n \told_exts = READ_ONCE(slab->obj_exts);\n \thandle_failed_objexts_alloc(old_exts, vec, objects);\n-\tslab_set_stride(slab, sizeof(struct slabobj_ext));\n\n \tif (new_slab) {\n \t\t/*\n@@ -2272,6 +2271,12 @@ static void alloc_slab_obj_exts_early(struct kmem_cache *s, struct slab *slab)\n \tvoid *addr;\n \tunsigned long obj_exts;\n\n+\t/*\n+\t * Initialize stride unconditionally,\n+\t * but override if SLAB_OBJ_EXT_IN_OBJ is set.\n+\t */\n+\tslab_set_stride(slab, sizeof(struct slabobj_ext));\n+\n \tif (!need_slab_obj_exts(s))\n \t\treturn;\n\n@@ -2288,7 +2293,6 @@ static void alloc_slab_obj_exts_early(struct kmem_cache *s, struct slab *slab)\n \t\tobj_exts |= MEMCG_DATA_OBJEXTS;\n #endif\n \t\tslab->obj_exts = obj_exts;\n-\t\tslab_set_stride(slab, sizeof(struct slabobj_ext));\n \t} else if (s->flags & SLAB_OBJ_EXT_IN_OBJ) {\n \t\tunsigned int offset = obj_exts_offset_in_object(s);\n\nThere should be enough memory barriers to ensure the stride and obj_exts\nare visible to other CPUs before the slab is accessible by other CPUs\n(by acquiring/releasing n->list_lock)",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [next-20260216]NULL pointer dereference in drain_obj_stock() (RCU free path)",
+          "message_id": "aZuR6_Mm9uqt_6Fp@linux.dev",
+          "url": "https://lore.kernel.org/all/aZuR6_Mm9uqt_6Fp@linux.dev/",
+          "date": "2026-02-22T23:37:04Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Vlastimil Babka",
+              "summary": "Reviewer Vlastimil Babka suspects a NULL pointer dereference in drain_obj_stock() due to either a bogus objext pointer or locking issues in the rcu_free_sheaf() context, which is new for memcg and exposing existing problems",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "locking issue",
+                "rcu_free_sheaf() context"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "CCing memcg and slab folks.\nWould be nice to figure out where in drain_obj_stock things got wrong. Any\nchange for e.g. ./scripts/faddr2line ?\n\nI wonder if we have either some bogus objext pointer, or maybe the\nrcu_free_sheaf() context is new (or previously rare) for memcg and we have\nsome locking issues being exposed in refill/drain.",
+              "reply_to": "Carlos Maiolino",
+              "message_date": "2026-02-18",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer Shakeel Butt requested the output of ./scripts/faddr2line to help identify potential issues in the refill/drain path, indicating a need for further investigation and analysis.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "request_for_additional_info"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Yes output of ./scripts/faddr2line would be really helpful. I can't think of\nanything that might go wrong in refill/drain.",
+              "reply_to": "Vlastimil Babka",
+              "message_date": "2026-02-18",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Venkat Bagalkote (author)",
+              "summary": "The author is addressing a concern about the NULL pointer dereference in drain_obj_stock() (RCU free path) by providing additional information that the issue also occurs on mainline repo, and including stack traces to help identify the problem.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "additional_info",
+                "stack_traces"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "This issue also got reproduced on mainline repo.\n\n\nTraces:\n\n\n[ 8058.036083] Kernel attempted to read user page (0) - exploit attempt? \n(uid: 0)\n[ 8058.036116] BUG: Kernel NULL pointer dereference on read at 0x00000000\n[ 8058.036127] Faulting instruction address: 0xc0000000008b018c\n[ 8058.036137] Oops: Kernel access of bad area, sig: 11 [#1]\n[ 8058.036147] LE PAGE_SIZE=64K MMU=Radix SMP NR_CPUS=8192 NUMA pSeries\n[ 8058.036159] Modules linked in: overlay dm_zero dm_thin_pool \ndm_persistent_data dm_bio_prison dm_snapshot dm_bufio dm_flakey xfs loop \ndm_mod nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_fib nft_reject_inet \nnf_reject_ipv4 nf_reject_ipv6 nft_reject nft_ct nft_chain_nat nf_nat \nnf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 ip_set bonding nf_tables tls \nrfkill sunrpc nfnetlink pseries_rng vmx_crypto dax_pmem fuse ext4 crc16 \nmbcache jbd2 nd_pmem papr_scm sd_mod libnvdimm sg ibmvscsi ibmveth \nscsi_transport_srp pseries_wdt [last unloaded: scsi_debug]\n[ 8058.036339] CPU: 19 UID: 0 PID: 115 Comm: ksoftirqd/19 Kdump: loaded \nNot tainted 6.19.0+ #1 PREEMPTLAZY\n[ 8058.036361] Hardware name: IBM,9080-HEX Power11 (architected) \n0x820200 0xf000007 of:IBM,FW1110.01 (NH1110_069) hv:phyp pSeries\n[ 8058.036379] NIP: c0000000008b018c LR: c0000000008b0180 CTR: \nc00000000036d680\n[ 8058.036395] REGS: c00000000b5976c0 TRAP: 0300 Not tainted (6.19.0+)\n[ 8058.036411] MSR: 800000000280b033 <SF,VEC,VSX,EE,FP,ME,IR,DR,RI,LE> \nCR: 84042002 XER: 20040000\n[ 8058.036482] CFAR: c000000000862cf4 DAR: 0000000000000000 DSISR: \n40000000 IRQMASK: 0\n[ 8058.036482] GPR00: c0000000008b0180 c00000000b597960 c00000000243a500 \n0000000000000001\n[ 8058.036482] GPR04: 0000000000000008 0000000000000001 c0000000008b0180 \n0000000000000001\n[ 8058.036482] GPR08: a80e000000000000 0000000000000001 0000000000000007 \na80e000000000000\n[ 8058.036482] GPR12: c00e00000120f8d5 c000000d0ddf0b00 c000000073567780 \n0000000000000006\n[ 8058.036482] GPR16: c000000007012fa0 c000000007012fa4 c000000005160980 \nc000000007012f88\n[ 8058.036482] GPR20: c00c000001c3daac c000000d0d10f008 0000000000000001 \nffffffffffffff78\n[ 8058.036482] GPR24: 0000000000000005 c000000d0d58f180 c00000000cd6f580 \nc000000d0d10f01c\n[ 8058.036482] GPR28: c000000d0d10f008 c000000d0d10f010 c00000000cd6f588 \n0000000000000000\n[ 8058.036628] NIP [c0000000008b018c] drain_obj_stock+0x620/0xa48\n[ 8058.036646] LR [c0000000008b0180] drain_obj_stock+0x614/0xa48\n[ 8058.036659] Call Trace:\n[ 8058.036665] [c00000000b597960] [c0000000008b0180] \ndrain_obj_stock+0x614/0xa48 (unreliable)\n[ 8058.036688] [c00000000b597a10] [c0000000008b2a64] \nrefill_obj_stock+0x104/0x680\n[ 8058.036715] [c00000000b597a90] [c0000000008b94b8] \n__memcg_slab_free_hook+0x238/0x3ec\n[ 8058.036738] [c00000000b597b60] [c0000000007f3c10] \n__rcu_free_sheaf_prepare+0x314/0x3e8\n[ 8058.036763] [c00000000b597c10] [c0000000007fbf70] \nrcu_free_sheaf_nobarn+0x38/0x78\n[ 8058.036788] [c00000000b597c40] [c000000000334550] \nrcu_do_batch+0x2ec/0xfa8\n[ 8058.036812] [c00000000b597d40] [c0000000003399e8] rcu_core+0x22c/0x48c\n[ 8058.036835] [c00000000b597db0] [c0000000001cfe6c] \nhandle_softirqs+0x1f4/0x74c\n[ 8058.036862] [c00000000b597ed0] [c0000000001d0458] run_ksoftirqd+0x94/0xb8\n[ 8058.036885] [c00000000b597f00] [c00000000022a130] \nsmpboot_thread_fn+0x450/0x648\n[ 8058.036912] [c00000000b597f80] [c000000000218408] kthread+0x244/0x28c\n[ 8058.036927] [c00000000b597fe0] [c00000000000ded8] \nstart_kernel_thread+0x14/0x18\n[ 8058.036943] Code: 60000000 3bda0008 7fc3f378 4bfb148d 60000000 \nebfa0008 38800008 7fe3fb78 4bfb2b51 60000000 7c0004ac 39200001 \n<7d40f8a8> 7d495050 7d40f9ad 40c2fff4\n[ 8058.037000] ---[ end trace 0000000000000000 ]---\n\n\nAnd below is the corresponding o/p from faddr2line.\n\n\ndrain_obj_stock+0x620/0xa48:\narch_atomic64_sub_return_relaxed at arch/powerpc/include/asm/atomic.h:272\n(inlined by) raw_atomic64_sub_return at \ninclude/linux/atomic/atomic-arch-fallback.h:2917\n(inlined by) raw_atomic64_sub_and_test at \ninclude/linux/atomic/atomic-arch-fallback.h:4386\n(inlined by) raw_atomic_long_sub_and_test at \ninclude/linux/atomic/atomic-long.h:1551\n(inlined by) atomic_long_sub_and_test at \ninclude/linux/atomic/atomic-instrumented.h:4522\n(inlined by) percpu_ref_put_many at include/linux/percpu-refcount.h:334\n(inlined by) percpu_ref_put at include/linux/percpu-refcount.h:351\n(inlined by) obj_cgroup_put at include/linux/memcontrol.h:794\n(inlined by) drain_obj_stock at mm/memcontrol.c:3059\ndrain_obj_stock+0x614/0xa48:\ninstrument_atomic_read_write at include/linux/instrumented.h:112\n(inlined by) atomic_long_sub_and_test at \ninclude/linux/atomic/atomic-instrumented.h:4521\n(inlined by) percpu_ref_put_many at include/linux/percpu-refcount.h:334\n(inlined by) percpu_ref_put at include/linux/percpu-refcount.h:351\n(inlined by) obj_cgroup_put at include/linux/memcontrol.h:794\n(inlined by) drain_obj_stock at mm/memcontrol.c:3059\nrefill_obj_stock+0x104/0x680:\n__preempt_count_add at include/asm-generic/preempt.h:54\n(inlined by) __rcu_read_lock at include/linux/rcupdate.h:103\n(inlined by) rcu_read_lock at include/linux/rcupdate.h:848\n(inlined by) percpu_ref_get_many at include/linux/percpu-refcount.h:202\n(inlined by) percpu_ref_get at include/linux/percpu-refcount.h:222\n(inlined by) obj_cgroup_get at include/linux/memcontrol.h:782\n(inlined by) refill_obj_stock at mm/memcontrol.c:3099\n__memcg_slab_free_hook+0x238/0x3ec:\n__preempt_count_add at include/asm-generic/preempt.h:54\n(inlined by) __rcu_read_lock at include/linux/rcupdate.h:103\n(inlined by) rcu_read_lock at include/linux/rcupdate.h:848\n(inlined by) percpu_ref_put_many at include/linux/percpu-refcount.h:330\n(inlined by) percpu_ref_put at include/linux/percpu-refcount.h:351\n(inlined by) obj_cgroup_put at include/linux/memcontrol.h:794\n(inlined by) __memcg_slab_free_hook at mm/memcontrol.c:3284\n__rcu_free_sheaf_prepare+0x314/0x3e8:\nmemcg_slab_free_hook at mm/slub.c:2486\n(inlined by) __rcu_free_sheaf_prepare at mm/slub.c:2914\nrcu_free_sheaf_nobarn+0x38/0x78:\nsheaf_flush_unused at mm/slub.c:2893\n(inlined by) rcu_free_sheaf_nobarn at mm/slub.c:2941\nrcu_do_batch+0x2ec/0xfa8:\nrcu_do_batch at kernel/rcu/tree.c:2617\nrcu_core+0x22c/0x48c:\nrcu_core at kernel/rcu/tree.c:2871\nhandle_softirqs+0x1f4/0x74c:\nhandle_softirqs at kernel/softirq.c:622\nrun_ksoftirqd+0x94/0xb8:\narch_local_irq_enable at arch/powerpc/include/asm/hw_irq.h:201\n(inlined by) ksoftirqd_run_end at kernel/softirq.c:479\n(inlined by) run_ksoftirqd at kernel/softirq.c:1064\n(inlined by) run_ksoftirqd at kernel/softirq.c:1055\nsmpboot_thread_fn+0x450/0x648:\nsmpboot_thread_fn at kernel/smpboot.c:160 (discriminator 3)\nkthread+0x244/0x28c:\nkthread at kernel/kthread.c:467\nstart_kernel_thread+0x14/0x18:\nstart_kernel_thread at arch/powerpc/kernel/interrupt_64.S:771\n\n\nRegards,\n\nVenkat.",
+              "reply_to": "Vlastimil Babka",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo suspected a NULL pointer dereference in drain_obj_stock(), hypothesizing that the stock->objcg was never valid, and suggested it might be due to mis-refcounting of objcgs.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "mis-refcounting",
+                "NULL pointer dereference"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "It seems it crashed while dereferencing objcg->ref->data->count.\nI think that implies that obj_cgroup_release()->percpu_ref_exit()\nis already called due to the refcount reaching zero and set\nref->data = NULL.\n\nWait, was the stock->objcg ever a valid objcg?\nI think it should be valid when refilling the obj stock, otherwise\nit should have crashed in refill_obj_stock() -> obj_cgroup_get() path\nin the first place, rather than crashing when draining.\n\nAnd that sounds like we're somehow calling obj_cgroup_put() more times\nthan obj_cgroup_get().\n\nAnyway, this is my theory that it may be due to mis-refcounting of objcgs.",
+              "reply_to": "Venkat Bagalkote",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer noted that the NULL pointer dereference in drain_obj_stock() is caused by a missing check for RCU read-side critical section, and requested the addition of a lock annotation to indicate this.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "missing RCU read-side critical section",
+                "lock annotation"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Sun, Feb 22, 2026 at 08:47:03PM +0900, Harry Yoo wrote:\n[...]",
+              "reply_to": "Harry Yoo",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer Shakeel Butt noted that the `slab_set_stride()` function is being unconditionally overwritten, which may be an issue or unrelated to the NULL pointer dereference in `drain_obj_stock()`, and requested further investigation into recent SLUB changes.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "issue",
+                "unrelated"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I have not looked deeper into recent slub changes (sheafs or obj_exts savings)\nbut one thing looks weird to me:\n\nallocate_slab() // for cache with SLAB_OBJ_EXT_IN_OBJ\n\t-> alloc_slab_obj_exts_early()\n\t\t-> slab_set_stride(slab, s->size)\n\t-> account_slab()\n\t\t-> alloc_slab_obj_exts()\n\t\t\t-> slab_set_stride(slab, sizeof(struct slabobj_ext));\n\nUnconditional overwrite of stride. Not sure if it is issue or even related to\nthis crash but looks odd.",
+              "reply_to": "Harry Yoo",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Reviewer Shakeel Butt identified a NULL pointer dereference in drain_obj_stock() due to stride corruption caused by an unconditional stride overwrite in alloc_slab_obj_exts(). The bug is triggered when the slab was created with SLAB_OBJ_EXT_IN_OBJ mode and later alloc_slab_obj_exts() is called, corrupting the stride. This leads to incorrect obj_ext calculation in slab_obj_ext(), causing reference underflow on victim objcg, early obj_cgroup_release(), and eventually a crash in drain_obj_stock(). Shakeel also pointed out a missing safety check in slab_obj_ext() and a critical memory ordering bug on PowerPC due to lack of memory barrier between stride store and obj_exts visibility.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "NULL pointer dereference",
+                "stride corruption"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I asked AI to debug this crash report along with a nudge towards to look for\nstride corruption, it gave me the following output:\n\n\n# Stride Corruption Bug Analysis\n\n## Bug Report Context\n\n- **Crash Location**: `drain_obj_stock+0x620/0xa48` in `obj_cgroup_put(old)` at mm/memcontrol.c:3059\n- **Root Cause**: `percpu_ref.data` is NULL, meaning `obj_cgroup_release()` already ran\n- **Platform**: IBM Power11 (pSeries LPAR, Radix MMU, LE, 64K pages, kernel 6.19.0-next-20260216)\n- **Trigger**: xfstests generic/428\n\n## Identified Bug: Unconditional Stride Overwrite\n\n### Location: mm/slub.c lines 2196-2223 (alloc_slab_obj_exts)\n\n```c\nretry:\n    old_exts = READ_ONCE(slab->obj_exts);\n    handle_failed_objexts_alloc(old_exts, vec, objects);\n    slab_set_stride(slab, sizeof(struct slabobj_ext));  // BUG: UNCONDITIONALLY SET\n\n    if (new_slab) {\n        slab->obj_exts = new_exts;\n    } else if (old_exts & ~OBJEXTS_FLAGS_MASK) {\n        // obj_exts already exists, BUT stride was already modified above!\n        mark_objexts_empty(vec);\n        kfree(vec);\n        return 0;\n    } else if (cmpxchg(&slab->obj_exts, old_exts, new_exts) != old_exts) {\n        goto retry;\n    }\n```\n\n### The Problem\n\nThe stride is set to `sizeof(struct slabobj_ext)` **BEFORE** checking if `obj_exts` already\nexists. If a slab was created with `SLAB_OBJ_EXT_IN_OBJ` mode (where stride = `s->size`),\nand later `alloc_slab_obj_exts` is called for any reason, the stride gets corrupted.\n\n### Stride Modes\n\nThere are two stride modes (see alloc_slab_obj_exts_early):\n\n1. **Normal mode**: stride = `sizeof(struct slabobj_ext)` (~16 bytes)\n   - obj_exts is a separate array or in slab leftover space\n\n2. **SLAB_OBJ_EXT_IN_OBJ mode**: stride = `s->size` (object size, e.g., 64-256+ bytes)\n   - obj_ext is embedded within each object at a fixed offset\n\n### Consequences of Wrong Stride\n\nWhen `slab_obj_ext` is later called:\n```c\nobj_ext = (struct slabobj_ext *)(obj_exts + slab_get_stride(slab) * index);\n```\n\nWith corrupted stride (16 instead of 256):\n- **Expected**: `obj_exts + 256 * 5 = obj_exts + 1280` (correct obj_ext for object 5)\n- **Actual**: `obj_exts + 16 * 5 = obj_exts + 80` (WRONG obj_ext - belongs to object 0!)\n\nThis causes:\n1. Reading wrong object's objcg pointer\n2. Releasing wrong objcg reference (`obj_cgroup_put`)\n3. Reference underflow on victim objcg\n4. Early `obj_cgroup_release()` \\u2192 `percpu_ref_exit()` \\u2192 `data = NULL`\n5. Stock still caches the objcg pointer\n6. Later `drain_obj_stock()` tries to put it \\u2192 **CRASH**\n\n## Missing Safety Check\n\n`slab_obj_ext()` in mm/slab.h has **no bounds checking**:\n\n```c\nstatic inline struct slabobj_ext *slab_obj_ext(struct slab *slab,\n                                               unsigned long obj_exts,\n                                               unsigned int index)\n{\n    struct slabobj_ext *obj_ext;\n\n    VM_WARN_ON_ONCE(obj_exts != slab_obj_exts(slab));\n    // MISSING: VM_WARN_ON_ONCE(index >= slab->objects);\n\n    obj_ext = (struct slabobj_ext *)(obj_exts +\n                                     slab_get_stride(slab) * index);\n    return kasan_reset_tag(obj_ext);\n}\n```\n\n## CRITICAL: Memory Ordering Bug on PowerPC (Likely Root Cause)\n\n### The Problem\n\nIn `alloc_slab_obj_exts` (mm/slub.c lines 2199-2220), there is **NO memory barrier**\nbetween the stride store and the obj_exts visibility via cmpxchg:\n\n```c\nslab_set_stride(slab, sizeof(struct slabobj_ext));  // Store to stride (line 2199)\n                                                     // NO MEMORY BARRIER HERE!\nif (new_slab) {\n    slab->obj_exts = new_exts;                       // Store to obj_exts (line 2207)\n} else if (...) {\n} else if (cmpxchg(&slab->obj_exts, ...) != ...) {   // Atomic on obj_exts (line 2220)\n    goto retry;\n}\n```\n\n### Why This Crashes on PowerPC\n\nPowerPC has a **weakly-ordered memory model**. Stores can be reordered and may not be\nimmediately visible to other processors. The cmpxchg provides a barrier AFTER it\nexecutes, but the stride store BEFORE cmpxchg may not be visible when obj_exts becomes\nvisible.\n\n**Race Scenario:**\n1. CPU A: `slab_set_stride(slab, 16)` (store to stride, in CPU A's store buffer)\n2. CPU A: `cmpxchg(&slab->obj_exts, 0, new_exts)` succeeds, obj_exts is now visible\n3. CPU B: Sees `obj_exts` is set (from step 2)\n4. CPU B: Reads `slab->stride` \\u2192 **sees OLD value (0 or garbage)** due to reordering!\n5. CPU B: `slab_obj_ext` calculates `obj_exts + 0 * index = obj_exts` for ALL indices!\n6. **All objects appear to share the same obj_ext at offset 0**\n\n### Consequences\n\n- Object 0's objcg is correct\n- Object 1..N all read object 0's objcg (WRONG!)\n- When freeing multiple objects, we `obj_cgroup_put` the SAME objcg multiple times\n- Reference count underflows \\u2192 early `obj_cgroup_release()`\n- `percpu_ref_exit()` sets `data = NULL`\n- Later stock drain tries to put the objcg \\u2192 **CRASH in `drain_obj_stock`**\n\n### Why This Matches the Bug Report\n\n- **Platform**: IBM Power11 (PowerPC) - weakly ordered memory\n- **Trigger**: xfstests generic/428 - creates high filesystem activity with many allocations\n- **Crash location**: `drain_obj_stock` \\u2192 `obj_cgroup_put` with NULL data\n- **Pattern**: Stock has cached objcg that was prematurely released\n\n### Proposed Fix\n\nAdd a write memory barrier to ensure stride is visible before obj_exts:\n\n```c\nslab_set_stride(slab, sizeof(struct slabobj_ext));\nsmp_wmb();  // Ensure stride is visible before obj_exts\n\nif (new_slab) {\n    slab->obj_exts = new_exts;\n} else if (...) {\n} else if (cmpxchg(&slab->obj_exts, old_exts, new_exts) != old_exts) {\n    goto retry;\n}\n```\n\nAnd correspondingly, the reader side should use a read barrier:\n```c\nstatic inline unsigned short slab_get_stride(struct slab *slab)\n{\n    // Need acquire semantics when reading stride after seeing obj_exts\n    return smp_load_acquire(&slab->stride);\n}\n```\n\nOr use `smp_store_release` / `smp_load_acquire` pairs for proper ordering.\n\n### Also Applies to alloc_slab_obj_exts_early\n\nThe same issue exists in `alloc_slab_obj_exts_early` (lines 2290-2291 and 2308-2309):\n\n```c\nslab->obj_exts = obj_exts;                           // Store obj_exts\nslab_set_stride(slab, sizeof(struct slabobj_ext));   // Store stride AFTER!\n```\n\nHere the order is **reversed** - obj_exts is set BEFORE stride! This is even worse\nfor memory ordering, as other CPUs could see obj_exts before stride is set.\n\n## Original Theory: Unconditional Stride Overwrite\n\n(Kept for reference - less likely to be the root cause on this specific crash)\n\nThe stride is set to `sizeof(struct slabobj_ext)` **BEFORE** checking if `obj_exts`\nalready exists. However, analysis shows this is protected by the TOCTOU check in\ncallers (`!slab_obj_exts(slab)`).\n\n## Trigger Scenarios\n\n1. **Memory ordering on PowerPC** (MOST LIKELY): Stride not visible when obj_exts\n   becomes visible due to missing memory barriers.\n\n2. **Race between alloc_slab_obj_exts calls**: Two CPUs trying to allocate obj_exts\n   for the same slab simultaneously.\n\n3. **Interaction with RCU free path**: Objects in RCU sheaf being processed when\n   stride is stale/zero.\n\n## Confirmed Code Analysis (CONFIG_64BIT)\n\nOn 64-bit systems (including IBM Power11), the stride is stored dynamically:\n\n**mm/slab.h:562-569**:\n```c\n#ifdef CONFIG_64BIT\nstatic inline void slab_set_stride(struct slab *slab, unsigned short stride)\n{\n    slab->stride = stride;  // Plain store - NO memory ordering!\n}\nstatic inline unsigned short slab_get_stride(struct slab *slab)\n{\n    return slab->stride;    // Plain load - NO memory ordering!\n}\n```\n\n**mm/slab.h:533-548** (`slab_obj_exts`):\n```c\nstatic inline unsigned long slab_obj_exts(struct slab *slab)\n{\n    unsigned long obj_exts = READ_ONCE(slab->obj_exts);  // Only compiler barrier!\n    // ... validation ...\n    return obj_exts & ~OBJEXTS_FLAGS_MASK;\n}\n```\n\n`READ_ONCE` only provides compiler ordering, NOT CPU memory ordering. There's no\nacquire barrier to ensure the stride read happens after seeing obj_exts.\n\n## Complete Fix Using Release/Acquire Semantics\n\n### Fix 1: Reader side - slab_obj_exts (mm/slab.h)\n\nChange `READ_ONCE` to `smp_load_acquire`:\n\n```c\nstatic inline unsigned long slab_obj_exts(struct slab *slab)\n{\n    unsigned long obj_exts = smp_load_acquire(&slab->obj_exts);  // Acquire barrier\n    // ... validation ...\n    return obj_exts & ~OBJEXTS_FLAGS_MASK;\n}\n```\n\n### Fix 2: Writer side - alloc_slab_obj_exts (mm/slub.c:2196-2223)\n\nUse `smp_store_release` for obj_exts after setting stride:\n\n```c\nretry:\n    old_exts = READ_ONCE(slab->obj_exts);\n    handle_failed_objexts_alloc(old_exts, vec, objects);\n\n    if (new_slab) {\n        slab_set_stride(slab, sizeof(struct slabobj_ext));\n        smp_store_release(&slab->obj_exts, new_exts);  // Release barrier\n    } else if (old_exts & ~OBJEXTS_FLAGS_MASK) {\n        mark_objexts_empty(vec);\n        kfree(vec);\n        return 0;\n    } else {\n        slab_set_stride(slab, sizeof(struct slabobj_ext));\n        // cmpxchg already provides release semantics, but stride must be\n        // visible before cmpxchg. Need explicit barrier:\n        smp_wmb();\n        if (cmpxchg(&slab->obj_exts, old_exts, new_exts) != old_exts)\n            goto retry;\n    }\n```\n\n### Fix 3: Writer side - alloc_slab_obj_exts_early (mm/slub.c:2290-2291, 2308-2309)\n\nThe order is REVERSED here - obj_exts is set BEFORE stride! Fix by using\n`smp_store_release`:\n\n```c\n// For normal obj_exts (lines 2290-2291):\nslab_set_stride(slab, sizeof(struct slabobj_ext));  // Set stride FIRST\nsmp_store_release(&slab->obj_exts, obj_exts);       // Then release obj_exts\n\n// For SLAB_OBJ_EXT_IN_OBJ (lines 2308-2309):\nslab_set_stride(slab, s->size);                     // Set stride FIRST\nsmp_store_release(&slab->obj_exts, obj_exts);       // Then release obj_exts\n```\n\n## Why This Fixes the Crash\n\nWith proper release/acquire ordering:\n\n1. **Writer** (CPU A): Sets stride, then `smp_store_release(&obj_exts, ...)` ensures\n   stride is visible to all CPUs before obj_exts becomes visible\n\n2. **Reader** (CPU B): `smp_load_acquire(&obj_exts)` ensures that if obj_exts is\n   seen as set, the subsequent stride read will see the correct value\n\nThis prevents the race where CPU B sees obj_exts but reads stale/zero stride,\nwhich caused all objects to appear to share obj_ext at offset 0, leading to\nmultiple `obj_cgroup_put` calls on the same objcg \\u2192 reference underflow \\u2192 crash.\n\n## Additional Safety: Bounds Check in slab_obj_ext\n\nAdd bounds check to catch any remaining issues:\n```c\nVM_WARN_ON_ONCE(index >= slab->objects);\n```",
+              "reply_to": "",
+              "message_date": "2026-02-22",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo noted that stride corruption cannot occur because obj_exts is not allocated if already present, but also acknowledged a potential memory ordering issue as another valid analysis.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "acknowledged multiple perspectives",
+                "no clear disagreement"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Thanks!\n\nTLDR; I think stride corruption cannot happen because we don't try to\nallocate obj_exts if we already have it (w/ SLAB_OBJ_EXT_IN_OBJ).\n\nBut the other analysis saying it's memory ordering issue seems\nvery relevant.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo questioned the necessity of calling alloc_slab_obj_exts() after obj_exts saving is applied during slab allocation and initialization, arguing that if it benefits from obj_exts savings, there's no corruption risk.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "questioning code necessity"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I think this part is bogus.\n\nIt's not a bug because obj_exts saving is applied only during slab\nallocation and initialization. If it benefits from the obj_exts savings,\nno need to call alloc_slab_obj_exts() later, thus no corruption.\n\nIf doesn't benefit from the obj_exts savings, the stride size is always\nsizeof(struct slabobj_ext).",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo noted that when __GFP_ACCOUNT is set, objects can be allocated without specifying SLAB_ACCOUNT in the cache, leading to potential NULL pointer dereferences due to charging objects from different CPUs' sheaves.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "potential bug",
+                "requested change"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Yes, that could actually happen, especially when the cache doesn't\nspecify SLAB_ACCOUNT but allocate objects with __GFP_ACCOUNT set\n(e.g. xarray does that).\n\nWith sheaves for all, objects can be in different CPUs' sheaves and they\ncould try to allocate obj_exts and charge objects from the same slab.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "The reviewer noted that the patch does not address the root cause of the NULL pointer dereference issue and suggested that reading the wrong stride value is the path to mis-refcounting.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "mis-refcounting",
+                "root cause"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Yes, reading the wrong stride value is the path to mis-refcounting\nobjcgs :P",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            },
+            {
+              "author": "Harry Yoo",
+              "summary": "Reviewer Harry Yoo suggested that additional memory barriers are needed to ensure visibility of stride and obj_exts changes across CPUs, specifically before the slab is accessible by other CPUs.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I would say this is an overkill. Something like this should suffice:\n\ndiff --git a/mm/slub.c b/mm/slub.c\nindex 865bc050f654..8db93a88bbbf 100644\n--- a/mm/slub.c\n+++ b/mm/slub.c\n@@ -2196,7 +2196,6 @@ int alloc_slab_obj_exts(struct slab *slab, struct kmem_cache *s,\n retry:\n \told_exts = READ_ONCE(slab->obj_exts);\n \thandle_failed_objexts_alloc(old_exts, vec, objects);\n-\tslab_set_stride(slab, sizeof(struct slabobj_ext));\n\n \tif (new_slab) {\n \t\t/*\n@@ -2272,6 +2271,12 @@ static void alloc_slab_obj_exts_early(struct kmem_cache *s, struct slab *slab)\n \tvoid *addr;\n \tunsigned long obj_exts;\n\n+\t/*\n+\t * Initialize stride unconditionally,\n+\t * but override if SLAB_OBJ_EXT_IN_OBJ is set.\n+\t */\n+\tslab_set_stride(slab, sizeof(struct slabobj_ext));\n+\n \tif (!need_slab_obj_exts(s))\n \t\treturn;\n\n@@ -2288,7 +2293,6 @@ static void alloc_slab_obj_exts_early(struct kmem_cache *s, struct slab *slab)\n \t\tobj_exts |= MEMCG_DATA_OBJEXTS;\n #endif\n \t\tslab->obj_exts = obj_exts;\n-\t\tslab_set_stride(slab, sizeof(struct slabobj_ext));\n \t} else if (s->flags & SLAB_OBJ_EXT_IN_OBJ) {\n \t\tunsigned int offset = obj_exts_offset_in_object(s);\n\nThere should be enough memory barriers to ensure the stride and obj_exts\nare visible to other CPUs before the slab is accessible by other CPUs\n(by acquiring/releasing n->list_lock)",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-02-23",
+              "analysis_source": "llm"
+            }
+          ]
+        }
+      ],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Usama Arif",
+      "primary_email": "usama.arif@linux.dev",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    }
+  ]
+}
