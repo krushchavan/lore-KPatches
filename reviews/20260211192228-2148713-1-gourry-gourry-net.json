@@ -1,0 +1,67 @@
+{
+  "thread_id": "20260211192228.2148713-1-gourry@gourry.net",
+  "subject": "[PATCH v3] cxl/memdev: fix deadlock in cxl_memdev_autoremove() on attach failure",
+  "url": "https://lore.kernel.org/all/20260211192228.2148713-1-gourry@gourry.net/",
+  "dates": {
+    "2026-02-11": {
+      "report_file": "2026-02-23_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Davidlohr Bueso",
+          "summary": "Preferred the original 'if (!cxl_memdev_did_attach())' check, but still found the patch readable and acceptable.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "NEUTRAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, 11 Feb 2026, Gregory Price wrote:\n\n>cxl_memdev_autoremove() takes device_lock(&cxlmd->dev) via guard(device)\n>and then calls cxl_memdev_unregister() when the attach callback was\n>provided but cxl_mem_probe() failed to bind.\n>\n>cxl_memdev_unregister() calls\n>  cdev_device_del()\n>    device_del()\n>      bus_remove_device()\n>        device_release_driver()\n>\n>This path is reached when a driver uses the @attach parameter to\n>devm_cxl_add_memdev() and the CXL topology fails to enumerate (e.g.\n>DVSEC range registers decode outside platform-defined CXL ranges,\n>causing the endpoint port probe to fail).\n>\n>Add cxl_memdev_attach_failed() to set the scope of the check correctly.\n\nI preferred the \"if (!cxl_memdev_did_attach())\" but the below still\nreads nicely.\n\nReviewed-by: Davidlohr Bueso <dave@stgolabs.net>\n",
+          "reply_to": "",
+          "message_date": "2026-02-11"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch fixes a deadlock in the cxl_memdev_autoremove() function, which occurs when the attach callback is provided but the CXL topology fails to enumerate. The fix involves adding a new function cxl_memdev_attach_failed() to correctly set the scope of the check."
+    },
+    "2026-02-23": {
+      "report_file": "2026-02-23_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Dan Williams",
+          "summary": "Found the patch acceptable and suggested adding a 'Reported-by' tag to acknowledge the kreview tool.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "NEUTRAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": ""
+        },
+        {
+          "author": "Dave Jiang",
+          "summary": "Applied the patch to the cxl/fixes branch.",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "\n\nOn 2/11/26 12:22 PM, Gregory Price wrote:\n> cxl_memdev_autoremove() takes device_lock(&cxlmd->dev) via guard(device)\n> and then calls cxl_memdev_unregister() when the attach callback was\n> provided but cxl_mem_probe() failed to bind.\n> \n> cxl_memdev_unregister() calls\n>   cdev_device_del()\n>     device_del()\n>       bus_remove_device()\n>         device_release_driver()\n> \n> This path is reached when a driver uses the @attach parameter to\n> devm_cxl_add_memdev() and the CXL topology fails to enumerate (e.g.\n> DVSEC range registers decode outside platform-defined CXL ranges,\n> causing the endpoint port probe to fail).\n> \n> Add cxl_memdev_attach_failed() to set the scope of the check correctly.\n> \n> Fixes: 29317f8dc6ed (\"cxl/mem: Introduce cxl_memdev_attach for CXL-dependent operation\")\n> Signed-off-by: Gregory Price <gourry@gourry.net>\n\nApplied to cxl/fixes\n318c58852e68\n\n> ---\n>  drivers/cxl/core/memdev.c | 13 +++++++++----\n>  1 file changed, 9 insertions(+), 4 deletions(-)\n> \n> diff --git a/drivers/cxl/core/memdev.c b/drivers/cxl/core/memdev.c\n> index af3d0cc65138..25ca4443e4f7 100644\n> --- a/drivers/cxl/core/memdev.c\n> +++ b/drivers/cxl/core/memdev.c\n> @@ -1089,10 +1089,8 @@ static int cxlmd_add(struct cxl_memdev *cxlmd, struct cxl_dev_state *cxlds)\n>  DEFINE_FREE(put_cxlmd, struct cxl_memdev *,\n>  \t    if (!IS_ERR_OR_NULL(_T)) put_device(&_T->dev))\n>  \n> -static struct cxl_memdev *cxl_memdev_autoremove(struct cxl_memdev *cxlmd)\n> +static bool cxl_memdev_attach_failed(struct cxl_memdev *cxlmd)\n>  {\n> -\tint rc;\n> -\n>  \t/*\n>  \t * If @attach is provided fail if the driver is not attached upon\n>  \t * return. Note that failure here could be the result of a race to\n> @@ -1100,7 +1098,14 @@ static struct cxl_memdev *cxl_memdev_autoremove(struct cxl_memdev *cxlmd)\n>  \t * succeeded and then cxl_mem unbound before the lock is acquired.\n>  \t */\n>  \tguard(device)(&cxlmd->dev);\n> -\tif (cxlmd->attach && !cxlmd->dev.driver) {\n> +\treturn (cxlmd->attach && !cxlmd->dev.driver);\n> +}\n> +\n> +static struct cxl_memdev *cxl_memdev_autoremove(struct cxl_memdev *cxlmd)\n> +{\n> +\tint rc;\n> +\n> +\tif (cxl_memdev_attach_failed(cxlmd)) {\n>  \t\tcxl_memdev_unregister(cxlmd);\n>  \t\treturn ERR_PTR(-ENXIO);\n>  \t}\n\n\n",
+          "reply_to": "",
+          "message_date": "2026-02-23"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch fixes a deadlock in the cxl_memdev_autoremove() function, which occurs when the attach callback is provided but the CXL topology fails to enumerate. The fix involves adding a new function cxl_memdev_attach_failed() to correctly set the scope of the check."
+    }
+  }
+}

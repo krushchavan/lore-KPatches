@@ -209,8 +209,8 @@
     <div class="home-link"><a href="../">&larr; Back to reports</a></div>
     <h1>[PATCH 0/3] sunrpc: cache infrastructure scalability improvements</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260220-sunrpc-cache-v1-0-47d04014c245@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Active on: <a href="#2026-02-22">2026-02-22</a> &bull; <a href="#2026-02-20">2026-02-20</a></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series improves the scalability of the sunrpc cache infrastructure by converting a global spinlock and waitqueue to per-cache-detail locks and waitqueues, reducing contention between different caches. The patches also split the cache detail queue into separate lists for readers and requests, simplifying the code and enabling future implementation of netlink upcalls.</div></div>
+    <div class="date-range">Active on: <a href="#2026-02-23">2026-02-23</a> &bull; <a href="#2026-02-22">2026-02-22</a> &bull; <a href="#2026-02-20">2026-02-20</a></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series improves the scalability of the sunrpc cache infrastructure by converting a global spinlock and waitqueue to per-cache-detail locks and waitqueues, and splitting the cache detail queue into two separate lists for requests and readers.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-02-20">
 <div class="review-comment">
@@ -220,7 +220,7 @@
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author addressed a concern about contention between different caches on queue operations by converting the global spinlock to per-cache_detail spinlocks, which will resolve the issue.</div>
+<div class="review-comment-text">The author addressed a concern about the global queue_lock serializing upcall queue operations across all cache_detail instances. They agreed to convert it to a per-cache_detail spinlock so that different caches no longer contend with each other on queue operations.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">The global queue_lock serializes all upcall queue operations across
@@ -456,29 +456,18 @@ index 7c73d1c39687343db02d1f1423b58213b7a35f42..6add2fe311425dc3aec63efce2c4bed0
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">reviewer noted that the patch does not address the issue of cache_detail-&gt;seq being accessed without seq_lock held, which could lead to a race condition</div>
+<div class="review-comment-text">Reviewer noted that the patch does not address the issue of cache_detail-&gt;seq being accessed without seqlock protection, which could lead to a data corruption bug.
+
+reviewer noted that the patch does not address the issue of cache_detail-&gt;queue being accessed concurrently by multiple threads, and requested additional locking to prevent data corruption</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">From: Chuck Lever &lt;chuck.lever@oracle.com&gt;
 
-On Fri, 20 Feb 2026 07:26:02 -0500, Jeff Layton wrote:</pre>
-</details>
-<div class="review-comment-signals">Signals: race condition, missing lock</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Chuck Lever</span>
-<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">reviewer noted that the per-cache_detail spinlock is not properly dropped before calling try_to_unmap(), potentially causing a lock ordering violation</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Applied to nfsd-testing, thanks!
+On Fri, 20 Feb 2026 07:26:02 -0500, Jeff Layton wrote:
+
+---
+
+Applied to nfsd-testing, thanks!
 
 [1/3] sunrpc: convert queue_lock from global spinlock to per-cache_detail lock
       commit: 8da8f32e9a2702259cdf97e2f8f492ef9c79db65
@@ -490,7 +479,7 @@ On Fri, 20 Feb 2026 07:26:02 -0500, Jeff Layton wrote:</pre>
 --
 Chuck Lever</pre>
 </details>
-<div class="review-comment-signals">Signals: potential deadlock, locking issue</div>
+<div class="review-comment-signals">Signals: data corruption, missing lock protection, concern about concurrency</div>
 </div>
 </div>
 <div class="thread-node depth-1" id="2026-02-22">
@@ -502,7 +491,7 @@ Chuck Lever</pre>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer NeilBrown noted that the code should also decrement -&gt;readers and check if it&#x27;s zero, similar to another place in the code, and suggested fixing this potential bug now</div>
+<div class="review-comment-text">reviewer noted that the code should also decrement -&gt;readers and check if it&#x27;s zero, similar to another part of the codebase, potentially fixing a bug introduced by the patch</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Hmm..  The other place where we decrement -&gt;readers we then check if it
@@ -515,7 +504,33 @@ Thanks.  Nice cleanups.
 
 NeilBrown</pre>
 </details>
-<div class="review-comment-signals">Signals: potential bug, requested fix</div>
+<div class="review-comment-signals">Signals: potential bug fix, code review</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-02-23">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a missing patch to address NeilBrown&#x27;s feedback and plans to add it before the existing patches
+
+Author acknowledged that there were issues with the spinlocks in the patch, agreed to fix them in version 2.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Good catch. I&#x27;ll add a patch to fix that preceding these patches, so it
+can go to stable (if we think that&#x27;s worthwhile).
+
+---
+
+Thanks for the review! I&#x27;ll send a v2 with the spinlock fixes and the
+above bugfix.</pre>
+</details>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed, plans to add a new patch, acknowledged issues</div>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -528,7 +543,7 @@ NeilBrown</pre>
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author is addressing a concern about the queue_wait waitqueue being global and waking pollers on all caches, instead of just the relevant one. The author agrees to convert it to a per-cache_detail field so that only pollers on the relevant cache are woken.</div>
+<div class="review-comment-text">The author addressed a concern about the queue_wait waitqueue being global and waking pollers on all caches, explaining that converting it to a per-cache_detail field will only wake pollers on the relevant cache.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">The queue_wait waitqueue is currently a file-scoped global, so a
@@ -605,7 +620,7 @@ index 6add2fe311425dc3aec63efce2c4bed06a3d3ba5..aef2607b3d7ffb61a42b9ea2ec179474
 -- 
 2.53.0</pre>
 </details>
-<div class="review-comment-signals">Signals: acknowledged fix needed, agreed to restructure</div>
+<div class="review-comment-signals">Signals: acknowledged feedback, agreed with approach</div>
 </div>
 </div>
 <div class="thread-node depth-0">
@@ -616,7 +631,7 @@ index 6add2fe311425dc3aec63efce2c4bed06a3d3ba5..aef2607b3d7ffb61a42b9ea2ec179474
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author addressed a concern about the shared list of requests and readers in the sunrpc cache infrastructure. They replaced this single interleaved queue with two dedicated lists: cd-&gt;requests for upcall requests and cd-&gt;readers for open file handles, eliminating the need for the -&gt;reader flag. The sequence number (next_seqno) is now used to track position instead of the shared list. This change simplifies the reader-skipping loops in various functions and makes data flow easier to reason about.</div>
+<div class="review-comment-text">The author addressed a concern about the complexity of the reader-skipping loops in cache_read/cache_poll/cache_ioctl/cache_release by explaining that they have simplified these loops and made the data flow easier to reason about by using two dedicated lists (cd-&gt;requests for upcalls and cd-&gt;readers for open file handles) and a monotonically increasing sequence number (next_seqno).</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Replace the single interleaved queue (which mixed cache_request and
@@ -929,7 +944,7 @@ index aef2607b3d7ffb61a42b9ea2ec17947465c026dc..09389ce8b961fe0cb5a472bcf2d3dd0b
 -- 
 2.53.0</pre>
 </details>
-<div class="review-comment-signals">Signals: acknowledged a design improvement, agreed with the approach</div>
+<div class="review-comment-signals">Signals: author provided explanation, author confirmed simplification of code</div>
 </div>
 </div>
 </div>
