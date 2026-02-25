@@ -3,7 +3,6 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="120">
     <title>LKML Activity Report - 2026-02-24 [ollama/llama3.1:8b]</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -560,10 +559,10 @@
 <body>
     <p class="back-to-index"><a href="index.html">&#8592; Back to Index</a></p>
     <h1>LKML Activity Report <span class="llm-badge">LLM: ollama/llama3.1:8b</span></h1>
-    <h2>2026-02-24 &mdash; Generated 2026-02-25 18:22:12</h2>
+    <h2>2026-02-24 &mdash; Generated 2026-02-25 18:22:14</h2>
     <p class="analysis-mode">Analysis: LLM-enriched (ollama/llama3.1:8b)</p>
+    <p class="log-link"><a href="/logs/2026-02-24_ollama_llama3.1-8b.log">View generation log</a></p>
     
-    <div class="progress-banner"><span class="progress-spinner">&#x27F3;</span><span class="progress-count">16 / 16 developers complete</span><span class="progress-updated">Updated: 2026-02-25 23:22 UTC</span></div>
 
     
     <div class="stats-grid">
@@ -766,10 +765,1439 @@
 <p>This patch introduces thin wrappers around zone lock acquire and release operations in the Linux kernel, allowing for future instrumentation or debugging hooks to be added without modifying individual call sites. The wrappers are not yet used but prepare the code for subsequent patches. This change is intended to centralize zone lock operations behind a common interface, making it easier to add functionality in the future.</p>
 </div>
 <div class="progress-detail"><span class="progress-icon">&#9654;</span> Author will post an updated version</div>
-<div class="review-comments-compact">
-<span class="review-comments-header">1 participants</span>
-<span class="reviewer-list"> &mdash; Dmitry Ilvokhin (author), Cheatham, Benjamin (Reviewed-by, Inline Review), Shakeel Butt (Reviewed-by, Acked-by)</span>
-<div class="review-detail-link"><a href="reviews/aZ3I0ADTAdCN6UmN-shell-ilvokhin-com.html#2026-02-24">View review comments &rarr;</a></div>
+<div class="review-comments">
+<div class="review-comments-header">1 participants</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing reviewer feedback about direct zone lock acquire/release operations not being replaced with the newly introduced wrappers, and has confirmed that this change will be made in the next patch.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Replace direct zone lock acquire/release operations with the
+newly introduced wrappers.
+
+The changes are purely mechanical substitutions. No functional change
+intended. Locking semantics and ordering remain unchanged.
+
+The compaction path is left unchanged for now and will be
+handled separately in the following patch due to additional
+non-trivial modifications.
+
+Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+---
+ mm/memory_hotplug.c |  9 +++---
+ mm/mm_init.c        |  3 +-
+ mm/page_alloc.c     | 73 +++++++++++++++++++++++----------------------
+ mm/page_isolation.c | 19 ++++++------
+ mm/page_reporting.c | 13 ++++----
+ mm/show_mem.c       |  5 ++--
+ mm/vmscan.c         |  5 ++--
+ mm/vmstat.c         |  9 +++---
+ 8 files changed, 72 insertions(+), 64 deletions(-)
+
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index bc805029da51..cfc0103fa50e 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -36,6 +36,7 @@
+ #include &lt;linux/rmap.h&gt;
+ #include &lt;linux/module.h&gt;
+ #include &lt;linux/node.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &lt;asm/tlbflush.h&gt;
+ 
+@@ -1190,9 +1191,9 @@ int online_pages(unsigned long pfn, unsigned long nr_pages,
+ 	 * Fixup the number of isolated pageblocks before marking the sections
+ 	 * onlining, such that undo_isolate_page_range() works correctly.
+ 	 */
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	zone-&gt;nr_isolate_pageblock += nr_pages / pageblock_nr_pages;
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	/*
+ 	 * If this zone is not populated, then it is not in zonelist.
+@@ -2041,9 +2042,9 @@ int offline_pages(unsigned long start_pfn, unsigned long nr_pages,
+ 	 * effectively stale; nobody should be touching them. Fixup the number
+ 	 * of isolated pageblocks, memory onlining will properly revert this.
+ 	 */
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	zone-&gt;nr_isolate_pageblock -= nr_pages / pageblock_nr_pages;
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	lru_cache_enable();
+ 	zone_pcp_enable(zone);
+diff --git a/mm/mm_init.c b/mm/mm_init.c
+index 1a29a719af58..426e5a0256f9 100644
+--- a/mm/mm_init.c
++++ b/mm/mm_init.c
+@@ -32,6 +32,7 @@
+ #include &lt;linux/vmstat.h&gt;
+ #include &lt;linux/kexec_handover.h&gt;
+ #include &lt;linux/hugetlb.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &quot;internal.h&quot;
+ #include &quot;slab.h&quot;
+ #include &quot;shuffle.h&quot;
+@@ -1425,7 +1426,7 @@ static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx,
+ 	zone_set_nid(zone, nid);
+ 	zone-&gt;name = zone_names[idx];
+ 	zone-&gt;zone_pgdat = NODE_DATA(nid);
+-	spin_lock_init(&amp;zone-&gt;lock);
++	zone_lock_init(zone);
+ 	zone_seqlock_init(zone);
+ 	zone_pcp_init(zone);
+ }
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index e4104973e22f..2c9fe30da7a1 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -54,6 +54,7 @@
+ #include &lt;linux/delayacct.h&gt;
+ #include &lt;linux/cacheinfo.h&gt;
+ #include &lt;linux/pgalloc_tag.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &lt;asm/div64.h&gt;
+ #include &quot;internal.h&quot;
+ #include &quot;shuffle.h&quot;
+@@ -1494,7 +1495,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 	/* Ensure requested pindex is drained first. */
+ 	pindex = pindex - 1;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 
+ 	while (count &gt; 0) {
+ 		struct list_head *list;
+@@ -1527,7 +1528,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 		} while (count &gt; 0 &amp;&amp; !list_empty(list));
+ 	}
+ 
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ }
+ 
+ /* Split a multi-block free page into its individual pageblocks. */
+@@ -1571,12 +1572,12 @@ static void free_one_page(struct zone *zone, struct page *page,
+ 	unsigned long flags;
+ 
+ 	if (unlikely(fpi_flags &amp; FPI_TRYLOCK)) {
+-		if (!spin_trylock_irqsave(&amp;zone-&gt;lock, flags)) {
++		if (!zone_trylock_irqsave(zone, flags)) {
+ 			add_page_to_zone_llist(zone, page, order);
+ 			return;
+ 		}
+ 	} else {
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 	}
+ 
+ 	/* The lock succeeded. Process deferred pages. */
+@@ -1594,7 +1595,7 @@ static void free_one_page(struct zone *zone, struct page *page,
+ 		}
+ 	}
+ 	split_large_buddy(zone, page, pfn, order, fpi_flags);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	__count_vm_events(PGFREE, 1 &lt;&lt; order);
+ }
+@@ -2547,10 +2548,10 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 	int i;
+ 
+ 	if (unlikely(alloc_flags &amp; ALLOC_TRYLOCK)) {
+-		if (!spin_trylock_irqsave(&amp;zone-&gt;lock, flags))
++		if (!zone_trylock_irqsave(zone, flags))
+ 			return 0;
+ 	} else {
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 	}
+ 	for (i = 0; i &lt; count; ++i) {
+ 		struct page *page = __rmqueue(zone, order, migratetype,
+@@ -2570,7 +2571,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 		 */
+ 		list_add_tail(&amp;page-&gt;pcp_list, list);
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return i;
+ }
+@@ -3235,10 +3236,10 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+ 	do {
+ 		page = NULL;
+ 		if (unlikely(alloc_flags &amp; ALLOC_TRYLOCK)) {
+-			if (!spin_trylock_irqsave(&amp;zone-&gt;lock, flags))
++			if (!zone_trylock_irqsave(zone, flags))
+ 				return NULL;
+ 		} else {
+-			spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++			zone_lock_irqsave(zone, flags);
+ 		}
+ 		if (alloc_flags &amp; ALLOC_HIGHATOMIC)
+ 			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+@@ -3257,11 +3258,11 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+ 				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+ 
+ 			if (!page) {
+-				spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++				zone_unlock_irqrestore(zone, flags);
+ 				return NULL;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	} while (check_new_pages(page, order));
+ 
+ 	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 &lt;&lt; order);
+@@ -3448,7 +3449,7 @@ static void reserve_highatomic_pageblock(struct page *page, int order,
+ 	if (zone-&gt;nr_reserved_highatomic &gt;= max_managed)
+ 		return;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 
+ 	/* Recheck the nr_reserved_highatomic limit under the lock */
+ 	if (zone-&gt;nr_reserved_highatomic &gt;= max_managed)
+@@ -3470,7 +3471,7 @@ static void reserve_highatomic_pageblock(struct page *page, int order,
+ 	}
+ 
+ out_unlock:
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ }
+ 
+ /*
+@@ -3503,7 +3504,7 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
+ 					pageblock_nr_pages)
+ 			continue;
+ 
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 		for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 			struct free_area *area = &amp;(zone-&gt;free_area[order]);
+ 			unsigned long size;
+@@ -3551,11 +3552,11 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
+ 			 */
+ 			WARN_ON_ONCE(ret == -1);
+ 			if (ret &gt; 0) {
+-				spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++				zone_unlock_irqrestore(zone, flags);
+ 				return ret;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	}
+ 
+ 	return false;
+@@ -6435,7 +6436,7 @@ static void __setup_per_zone_wmarks(void)
+ 	for_each_zone(zone) {
+ 		u64 tmp;
+ 
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 		tmp = (u64)pages_min * zone_managed_pages(zone);
+ 		tmp = div64_ul(tmp, lowmem_pages);
+ 		if (is_highmem(zone) || zone_idx(zone) == ZONE_MOVABLE) {
+@@ -6476,7 +6477,7 @@ static void __setup_per_zone_wmarks(void)
+ 		zone-&gt;_watermark[WMARK_PROMO] = high_wmark_pages(zone) + tmp;
+ 		trace_mm_setup_per_zone_wmarks(zone);
+ 
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	}
+ 
+ 	/* update totalreserve_pages */
+@@ -7246,7 +7247,7 @@ struct page *alloc_contig_frozen_pages_noprof(unsigned long nr_pages,
+ 	zonelist = node_zonelist(nid, gfp_mask);
+ 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
+ 					gfp_zone(gfp_mask), nodemask) {
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 
+ 		pfn = ALIGN(zone-&gt;zone_start_pfn, nr_pages);
+ 		while (zone_spans_last_pfn(zone, pfn, nr_pages)) {
+@@ -7260,18 +7261,18 @@ struct page *alloc_contig_frozen_pages_noprof(unsigned long nr_pages,
+ 				 * allocation spinning on this lock, it may
+ 				 * win the race and cause allocation to fail.
+ 				 */
+-				spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++				zone_unlock_irqrestore(zone, flags);
+ 				ret = alloc_contig_frozen_range_noprof(pfn,
+ 							pfn + nr_pages,
+ 							ACR_FLAGS_NONE,
+ 							gfp_mask);
+ 				if (!ret)
+ 					return pfn_to_page(pfn);
+-				spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++				zone_lock_irqsave(zone, flags);
+ 			}
+ 			pfn += nr_pages;
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	}
+ 	/*
+ 	 * If we failed, retry the search, but treat regions with HugeTLB pages
+@@ -7425,7 +7426,7 @@ unsigned long __offline_isolated_pages(unsigned long start_pfn,
+ 
+ 	offline_mem_sections(pfn, end_pfn);
+ 	zone = page_zone(pfn_to_page(pfn));
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	while (pfn &lt; end_pfn) {
+ 		page = pfn_to_page(pfn);
+ 		/*
+@@ -7455,7 +7456,7 @@ unsigned long __offline_isolated_pages(unsigned long start_pfn,
+ 		del_page_from_free_list(page, zone, order, MIGRATE_ISOLATE);
+ 		pfn += (1 &lt;&lt; order);
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return end_pfn - start_pfn - already_offline;
+ }
+@@ -7531,7 +7532,7 @@ bool take_page_off_buddy(struct page *page)
+ 	unsigned int order;
+ 	bool ret = false;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 		struct page *page_head = page - (pfn &amp; ((1 &lt;&lt; order) - 1));
+ 		int page_order = buddy_order(page_head);
+@@ -7552,7 +7553,7 @@ bool take_page_off_buddy(struct page *page)
+ 		if (page_count(page_head) &gt; 0)
+ 			break;
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 	return ret;
+ }
+ 
+@@ -7565,7 +7566,7 @@ bool put_page_back_buddy(struct page *page)
+ 	unsigned long flags;
+ 	bool ret = false;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	if (put_page_testzero(page)) {
+ 		unsigned long pfn = page_to_pfn(page);
+ 		int migratetype = get_pfnblock_migratetype(page, pfn);
+@@ -7576,7 +7577,7 @@ bool put_page_back_buddy(struct page *page)
+ 			ret = true;
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return ret;
+ }
+@@ -7625,7 +7626,7 @@ static void __accept_page(struct zone *zone, unsigned long *flags,
+ 	account_freepages(zone, -MAX_ORDER_NR_PAGES, MIGRATE_MOVABLE);
+ 	__mod_zone_page_state(zone, NR_UNACCEPTED, -MAX_ORDER_NR_PAGES);
+ 	__ClearPageUnaccepted(page);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, *flags);
++	zone_unlock_irqrestore(zone, *flags);
+ 
+ 	accept_memory(page_to_phys(page), PAGE_SIZE &lt;&lt; MAX_PAGE_ORDER);
+ 
+@@ -7637,9 +7638,9 @@ void accept_page(struct page *page)
+ 	struct zone *zone = page_zone(page);
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	if (!PageUnaccepted(page)) {
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return;
+ 	}
+ 
+@@ -7652,11 +7653,11 @@ static bool try_to_accept_memory_one(struct zone *zone)
+ 	unsigned long flags;
+ 	struct page *page;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	page = list_first_entry_or_null(&amp;zone-&gt;unaccepted_pages,
+ 					struct page, lru);
+ 	if (!page) {
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return false;
+ 	}
+ 
+@@ -7713,12 +7714,12 @@ static bool __free_unaccepted(struct page *page)
+ 	if (!lazy_accept)
+ 		return false;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	list_add_tail(&amp;page-&gt;lru, &amp;zone-&gt;unaccepted_pages);
+ 	account_freepages(zone, MAX_ORDER_NR_PAGES, MIGRATE_MOVABLE);
+ 	__mod_zone_page_state(zone, NR_UNACCEPTED, MAX_ORDER_NR_PAGES);
+ 	__SetPageUnaccepted(page);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return true;
+ }
+diff --git a/mm/page_isolation.c b/mm/page_isolation.c
+index c48ff5c00244..56a272f38b66 100644
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@ -10,6 +10,7 @@
+ #include &lt;linux/hugetlb.h&gt;
+ #include &lt;linux/page_owner.h&gt;
+ #include &lt;linux/migrate.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &quot;internal.h&quot;
+ 
+ #define CREATE_TRACE_POINTS
+@@ -173,7 +174,7 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,
+ 	if (PageUnaccepted(page))
+ 		accept_page(page);
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 
+ 	/*
+ 	 * We assume the caller intended to SET migrate type to isolate.
+@@ -181,7 +182,7 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,
+ 	 * set it before us.
+ 	 */
+ 	if (is_migrate_isolate_page(page)) {
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -200,15 +201,15 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,
+ 			mode);
+ 	if (!unmovable) {
+ 		if (!pageblock_isolate_and_move_free_pages(zone, page)) {
+-			spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++			zone_unlock_irqrestore(zone, flags);
+ 			return -EBUSY;
+ 		}
+ 		zone-&gt;nr_isolate_pageblock++;
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return 0;
+ 	}
+ 
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 	if (mode == PB_ISOLATE_MODE_MEM_OFFLINE) {
+ 		/*
+ 		 * printk() with zone-&gt;lock held will likely trigger a
+@@ -229,7 +230,7 @@ static void unset_migratetype_isolate(struct page *page)
+ 	struct page *buddy;
+ 
+ 	zone = page_zone(page);
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	if (!is_migrate_isolate_page(page))
+ 		goto out;
+ 
+@@ -280,7 +281,7 @@ static void unset_migratetype_isolate(struct page *page)
+ 	}
+ 	zone-&gt;nr_isolate_pageblock--;
+ out:
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ }
+ 
+ static inline struct page *
+@@ -641,9 +642,9 @@ int test_pages_isolated(unsigned long start_pfn, unsigned long end_pfn,
+ 
+ 	/* Check all pages are free or marked as ISOLATED */
+ 	zone = page_zone(page);
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	pfn = __test_page_isolated_in_pageblock(start_pfn, end_pfn, mode);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	ret = pfn &lt; end_pfn ? -EBUSY : 0;
+ 
+diff --git a/mm/page_reporting.c b/mm/page_reporting.c
+index 8a03effda749..ac2ac8fd0487 100644
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -7,6 +7,7 @@
+ #include &lt;linux/module.h&gt;
+ #include &lt;linux/delay.h&gt;
+ #include &lt;linux/scatterlist.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &quot;page_reporting.h&quot;
+ #include &quot;internal.h&quot;
+@@ -161,7 +162,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 	if (list_empty(list))
+ 		return err;
+ 
+-	spin_lock_irq(&amp;zone-&gt;lock);
++	zone_lock_irq(zone);
+ 
+ 	/*
+ 	 * Limit how many calls we will be making to the page reporting
+@@ -219,7 +220,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 			list_rotate_to_front(&amp;page-&gt;lru, list);
+ 
+ 		/* release lock before waiting on report processing */
+-		spin_unlock_irq(&amp;zone-&gt;lock);
++		zone_unlock_irq(zone);
+ 
+ 		/* begin processing pages in local list */
+ 		err = prdev-&gt;report(prdev, sgl, PAGE_REPORTING_CAPACITY);
+@@ -231,7 +232,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 		budget--;
+ 
+ 		/* reacquire zone lock and resume processing */
+-		spin_lock_irq(&amp;zone-&gt;lock);
++		zone_lock_irq(zone);
+ 
+ 		/* flush reported pages from the sg list */
+ 		page_reporting_drain(prdev, sgl, PAGE_REPORTING_CAPACITY, !err);
+@@ -251,7 +252,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 	if (!list_entry_is_head(next, list, lru) &amp;&amp; !list_is_first(&amp;next-&gt;lru, list))
+ 		list_rotate_to_front(&amp;next-&gt;lru, list);
+ 
+-	spin_unlock_irq(&amp;zone-&gt;lock);
++	zone_unlock_irq(zone);
+ 
+ 	return err;
+ }
+@@ -296,9 +297,9 @@ page_reporting_process_zone(struct page_reporting_dev_info *prdev,
+ 		err = prdev-&gt;report(prdev, sgl, leftover);
+ 
+ 		/* flush any remaining pages out from the last report */
+-		spin_lock_irq(&amp;zone-&gt;lock);
++		zone_lock_irq(zone);
+ 		page_reporting_drain(prdev, sgl, leftover, !err);
+-		spin_unlock_irq(&amp;zone-&gt;lock);
++		zone_unlock_irq(zone);
+ 	}
+ 
+ 	return err;
+diff --git a/mm/show_mem.c b/mm/show_mem.c
+index 24078ac3e6bc..245beca127af 100644
+--- a/mm/show_mem.c
++++ b/mm/show_mem.c
+@@ -14,6 +14,7 @@
+ #include &lt;linux/mmzone.h&gt;
+ #include &lt;linux/swap.h&gt;
+ #include &lt;linux/vmstat.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &quot;internal.h&quot;
+ #include &quot;swap.h&quot;
+@@ -363,7 +364,7 @@ static void show_free_areas(unsigned int filter, nodemask_t *nodemask, int max_z
+ 		show_node(zone);
+ 		printk(KERN_CONT &quot;%s: &quot;, zone-&gt;name);
+ 
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 		for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 			struct free_area *area = &amp;zone-&gt;free_area[order];
+ 			int type;
+@@ -377,7 +378,7 @@ static void show_free_areas(unsigned int filter, nodemask_t *nodemask, int max_z
+ 					types[order] |= 1 &lt;&lt; type;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 			printk(KERN_CONT &quot;%lu*%lukB &quot;,
+ 			       nr[order], K(1UL) &lt;&lt; order);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 973ffb9813ea..9fe5c41e0e0a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -58,6 +58,7 @@
+ #include &lt;linux/random.h&gt;
+ #include &lt;linux/mmu_notifier.h&gt;
+ #include &lt;linux/parser.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &lt;asm/tlbflush.h&gt;
+ #include &lt;asm/div64.h&gt;
+@@ -7129,9 +7130,9 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+ 
+ 			/* Increments are under the zone lock */
+ 			zone = pgdat-&gt;node_zones + i;
+-			spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++			zone_lock_irqsave(zone, flags);
+ 			zone-&gt;watermark_boost -= min(zone-&gt;watermark_boost, zone_boosts[i]);
+-			spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++			zone_unlock_irqrestore(zone, flags);
+ 		}
+ 
+ 		/*
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 99270713e0c1..06b27255a626 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -28,6 +28,7 @@
+ #include &lt;linux/mm_inline.h&gt;
+ #include &lt;linux/page_owner.h&gt;
+ #include &lt;linux/sched/isolation.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &quot;internal.h&quot;
+ 
+@@ -1535,10 +1536,10 @@ static void walk_zones_in_node(struct seq_file *m, pg_data_t *pgdat,
+ 			continue;
+ 
+ 		if (!nolock)
+-			spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++			zone_lock_irqsave(zone, flags);
+ 		print(m, pgdat, zone);
+ 		if (!nolock)
+-			spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++			zone_unlock_irqrestore(zone, flags);
+ 	}
+ }
+ #endif
+@@ -1603,9 +1604,9 @@ static void pagetypeinfo_showfree_print(struct seq_file *m,
+ 				}
+ 			}
+ 			seq_printf(m, &quot;%s%6lu &quot;, overflow ? &quot;&gt;&quot; : &quot;&quot;, freecount);
+-			spin_unlock_irq(&amp;zone-&gt;lock);
++			zone_unlock_irq(zone);
+ 			cond_resched();
+-			spin_lock_irq(&amp;zone-&gt;lock);
++			zone_lock_irq(zone);
+ 		}
+ 		seq_putc(m, &#x27;\n&#x27;);
+ 	}
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged fix needed, next patch</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing concerns about the lack of visibility into zone lock contention and its impact on performance, particularly in memory-intensive workloads. They explain that existing instrumentation does not provide sufficient information to diagnose issues and propose adding dedicated tracepoint instrumentation to the zone lock, following a similar model to mmap_lock tracing. The author also mentions minor restructuring required for compaction changes.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Zone lock contention can significantly impact allocation and
+reclaim latency, as it is a central synchronization point in
+the page allocator and reclaim paths. Improved visibility into
+its behavior is therefore important for diagnosing performance
+issues in memory-intensive workloads.
+
+On some production workloads at Meta, we have observed noticeable
+zone lock contention. Deeper analysis of lock holders and waiters
+is currently difficult with existing instrumentation.
+
+While generic lock contention_begin/contention_end tracepoints
+cover the slow path, they do not provide sufficient visibility
+into lock hold times. In particular, the lack of a release-side
+event makes it difficult to identify long lock holders and
+correlate them with waiters. As a result, distinguishing between
+short bursts of contention and pathological long hold times
+requires additional instrumentation.
+
+This patch series adds dedicated tracepoint instrumentation to
+zone lock, following the existing mmap_lock tracing model.
+
+The goal is to enable detailed holder/waiter analysis and lock
+hold time measurements without affecting the fast path when
+tracing is disabled.
+
+The series is structured as follows:
+
+  1. Introduce zone lock wrappers.
+  2. Mechanically convert zone lock users to the wrappers.
+  3. Convert compaction to use the wrappers (requires minor
+     restructuring of compact_lock_irqsave()).
+  4. Add zone lock tracepoints.
+
+The tracepoints are added via lightweight inline helpers in the
+wrappers. When tracing is disabled, the fast path remains
+unchanged.
+
+The compaction changes required abstracting compact_lock_irqsave() away from
+raw spinlock_t. I chose a small tagged struct to handle both zone and LRU
+locks uniformly. If there is a preferred alternative (e.g. splitting helpers
+or using a different abstraction), I would appreciate feedback.
+
+Dmitry Ilvokhin (4):
+  mm: introduce zone lock wrappers
+  mm: convert zone lock users to wrappers
+  mm: convert compaction to zone lock wrappers
+  mm: add tracepoints for zone lock
+
+ MAINTAINERS                      |   3 +
+ include/linux/zone_lock.h        | 100 ++++++++++++++++++++++++++++
+ include/trace/events/zone_lock.h |  64 ++++++++++++++++++
+ mm/Makefile                      |   2 +-
+ mm/compaction.c                  | 108 +++++++++++++++++++++++++------
+ mm/memory_hotplug.c              |   9 +--
+ mm/mm_init.c                     |   3 +-
+ mm/page_alloc.c                  |  73 ++++++++++-----------
+ mm/page_isolation.c              |  19 +++---
+ mm/page_reporting.c              |  13 ++--
+ mm/show_mem.c                    |   5 +-
+ mm/vmscan.c                      |   5 +-
+ mm/vmstat.c                      |   9 +--
+ mm/zone_lock.c                   |  31 +++++++++
+ 14 files changed, 360 insertions(+), 84 deletions(-)
+ create mode 100644 include/linux/zone_lock.h
+ create mode 100644 include/trace/events/zone_lock.h
+ create mode 100644 mm/zone_lock.c
+
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledging technical concerns, proposing additional instrumentation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the zone lock wrappers interfering with compact_lock_irqsave() by introducing a new struct compact_lock to abstract the underlying lock type, which will allow compact_lock_irqsave() to operate correctly on both zone locks and raw spinlocks. The author confirmed that no functional change is intended.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Compaction uses compact_lock_irqsave(), which currently operates
+on a raw spinlock_t pointer so that it can be used for both
+zone-&gt;lock and lru_lock. Since zone lock operations are now wrapped,
+compact_lock_irqsave() can no longer operate directly on a spinlock_t
+when the lock belongs to a zone.
+
+Introduce struct compact_lock to abstract the underlying lock type. The
+structure carries a lock type enum and a union holding either a zone
+pointer or a raw spinlock_t pointer, and dispatches to the appropriate
+lock/unlock helper.
+
+No functional change intended.
+
+Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+---
+ mm/compaction.c | 108 +++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 89 insertions(+), 19 deletions(-)
+
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 1e8f8eca318c..1b000d2b95b2 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -24,6 +24,7 @@
+ #include &lt;linux/page_owner.h&gt;
+ #include &lt;linux/psi.h&gt;
+ #include &lt;linux/cpuset.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &quot;internal.h&quot;
+ 
+ #ifdef CONFIG_COMPACTION
+@@ -493,6 +494,65 @@ static bool test_and_set_skip(struct compact_control *cc, struct page *page)
+ }
+ #endif /* CONFIG_COMPACTION */
+ 
++enum compact_lock_type {
++	COMPACT_LOCK_ZONE,
++	COMPACT_LOCK_RAW_SPINLOCK,
++};
++
++struct compact_lock {
++	enum compact_lock_type type;
++	union {
++		struct zone *zone;
++		spinlock_t *lock; /* Reference to lru lock */
++	};
++};
++
++static bool compact_do_zone_trylock_irqsave(struct zone *zone,
++					    unsigned long *flags)
++{
++	return zone_trylock_irqsave(zone, *flags);
++}
++
++static bool compact_do_raw_trylock_irqsave(spinlock_t *lock,
++					   unsigned long *flags)
++{
++	return spin_trylock_irqsave(lock, *flags);
++}
++
++static bool compact_do_trylock_irqsave(struct compact_lock lock,
++				       unsigned long *flags)
++{
++	if (lock.type == COMPACT_LOCK_ZONE)
++		return compact_do_zone_trylock_irqsave(lock.zone, flags);
++
++	return compact_do_raw_trylock_irqsave(lock.lock, flags);
++}
++
++static void compact_do_zone_lock_irqsave(struct zone *zone,
++					 unsigned long *flags)
++__acquires(zone-&gt;lock)
++{
++	zone_lock_irqsave(zone, *flags);
++}
++
++static void compact_do_raw_lock_irqsave(spinlock_t *lock,
++					unsigned long *flags)
++__acquires(lock)
++{
++	spin_lock_irqsave(lock, *flags);
++}
++
++static void compact_do_lock_irqsave(struct compact_lock lock,
++				    unsigned long *flags)
++{
++	if (lock.type == COMPACT_LOCK_ZONE) {
++		compact_do_zone_lock_irqsave(lock.zone, flags);
++		return;
++	}
++
++	return compact_do_raw_lock_irqsave(lock.lock, flags);
++}
++
+ /*
+  * Compaction requires the taking of some coarse locks that are potentially
+  * very heavily contended. For async compaction, trylock and record if the
+@@ -502,19 +562,19 @@ static bool test_and_set_skip(struct compact_control *cc, struct page *page)
+  *
+  * Always returns true which makes it easier to track lock state in callers.
+  */
+-static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,
+-						struct compact_control *cc)
+-	__acquires(lock)
++static bool compact_lock_irqsave(struct compact_lock lock,
++				 unsigned long *flags,
++				 struct compact_control *cc)
+ {
+ 	/* Track if the lock is contended in async mode */
+ 	if (cc-&gt;mode == MIGRATE_ASYNC &amp;&amp; !cc-&gt;contended) {
+-		if (spin_trylock_irqsave(lock, *flags))
++		if (compact_do_trylock_irqsave(lock, flags))
+ 			return true;
+ 
+ 		cc-&gt;contended = true;
+ 	}
+ 
+-	spin_lock_irqsave(lock, *flags);
++	compact_do_lock_irqsave(lock, flags);
+ 	return true;
+ }
+ 
+@@ -530,11 +590,13 @@ static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,
+  * Returns true if compaction should abort due to fatal signal pending.
+  * Returns false when compaction can continue.
+  */
+-static bool compact_unlock_should_abort(spinlock_t *lock,
+-		unsigned long flags, bool *locked, struct compact_control *cc)
++static bool compact_unlock_should_abort(struct zone *zone,
++					unsigned long flags,
++					bool *locked,
++					struct compact_control *cc)
+ {
+ 	if (*locked) {
+-		spin_unlock_irqrestore(lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		*locked = false;
+ 	}
+ 
+@@ -582,9 +644,8 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 		 * contention, to give chance to IRQs. Abort if fatal signal
+ 		 * pending.
+ 		 */
+-		if (!(blockpfn % COMPACT_CLUSTER_MAX)
+-		    &amp;&amp; compact_unlock_should_abort(&amp;cc-&gt;zone-&gt;lock, flags,
+-								&amp;locked, cc))
++		if (!(blockpfn % COMPACT_CLUSTER_MAX) &amp;&amp;
++		    compact_unlock_should_abort(cc-&gt;zone, flags, &amp;locked, cc))
+ 			break;
+ 
+ 		nr_scanned++;
+@@ -613,8 +674,12 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 
+ 		/* If we already hold the lock, we can skip some rechecking. */
+ 		if (!locked) {
+-			locked = compact_lock_irqsave(&amp;cc-&gt;zone-&gt;lock,
+-								&amp;flags, cc);
++			struct compact_lock zol = {
++				.type = COMPACT_LOCK_ZONE,
++				.zone = cc-&gt;zone,
++			};
++
++			locked = compact_lock_irqsave(zol, &amp;flags, cc);
+ 
+ 			/* Recheck this is a buddy page under lock */
+ 			if (!PageBuddy(page))
+@@ -649,7 +714,7 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 	}
+ 
+ 	if (locked)
+-		spin_unlock_irqrestore(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(cc-&gt;zone, flags);
+ 
+ 	/*
+ 	 * Be careful to not go outside of the pageblock.
+@@ -1157,10 +1222,15 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 
+ 		/* If we already hold the lock, we can skip some rechecking */
+ 		if (lruvec != locked) {
++			struct compact_lock zol = {
++				.type = COMPACT_LOCK_RAW_SPINLOCK,
++				.lock = &amp;lruvec-&gt;lru_lock,
++			};
++
+ 			if (locked)
+ 				unlock_page_lruvec_irqrestore(locked, flags);
+ 
+-			compact_lock_irqsave(&amp;lruvec-&gt;lru_lock, &amp;flags, cc);
++			compact_lock_irqsave(zol, &amp;flags, cc);
+ 			locked = lruvec;
+ 
+ 			lruvec_memcg_debug(lruvec, folio);
+@@ -1555,7 +1625,7 @@ static void fast_isolate_freepages(struct compact_control *cc)
+ 		if (!area-&gt;nr_free)
+ 			continue;
+ 
+-		spin_lock_irqsave(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_lock_irqsave(cc-&gt;zone, flags);
+ 		freelist = &amp;area-&gt;free_list[MIGRATE_MOVABLE];
+ 		list_for_each_entry_reverse(freepage, freelist, buddy_list) {
+ 			unsigned long pfn;
+@@ -1614,7 +1684,7 @@ static void fast_isolate_freepages(struct compact_control *cc)
+ 			}
+ 		}
+ 
+-		spin_unlock_irqrestore(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(cc-&gt;zone, flags);
+ 
+ 		/* Skip fast search if enough freepages isolated */
+ 		if (cc-&gt;nr_freepages &gt;= cc-&gt;nr_migratepages)
+@@ -1988,7 +2058,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
+ 		if (!area-&gt;nr_free)
+ 			continue;
+ 
+-		spin_lock_irqsave(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_lock_irqsave(cc-&gt;zone, flags);
+ 		freelist = &amp;area-&gt;free_list[MIGRATE_MOVABLE];
+ 		list_for_each_entry(freepage, freelist, buddy_list) {
+ 			unsigned long free_pfn;
+@@ -2021,7 +2091,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
+ 				break;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(cc-&gt;zone, flags);
+ 	}
+ 
+ 	cc-&gt;total_migrate_scanned += nr_scanned;
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged fix needed, no functional change</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the performance impact of adding tracepoint instrumentation to the zone lock wrappers, explaining that they followed the mmap_lock pattern and ensured the fast path is unaffected when tracing is disabled.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Add tracepoint instrumentation to zone lock acquire/release operations
+via the previously introduced wrappers.
+
+The implementation follows the mmap_lock tracepoint pattern: a
+lightweight inline helper checks whether the tracepoint is enabled and
+calls into an out-of-line helper when tracing is active. When
+CONFIG_TRACING is disabled, helpers compile to empty inline stubs.
+
+The fast path is unaffected when tracing is disabled.
+
+Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+---
+ MAINTAINERS                      |  2 +
+ include/linux/zone_lock.h        | 64 +++++++++++++++++++++++++++++++-
+ include/trace/events/zone_lock.h | 64 ++++++++++++++++++++++++++++++++
+ mm/Makefile                      |  2 +-
+ mm/zone_lock.c                   | 31 ++++++++++++++++
+ 5 files changed, 161 insertions(+), 2 deletions(-)
+ create mode 100644 include/trace/events/zone_lock.h
+ create mode 100644 mm/zone_lock.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 680c9ae02d7e..711ffa15f4c3 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -16499,6 +16499,7 @@ F:	include/linux/ptdump.h
+ F:	include/linux/vmpressure.h
+ F:	include/linux/vmstat.h
+ F:	include/linux/zone_lock.h
++F:	include/trace/events/zone_lock.h
+ F:	kernel/fork.c
+ F:	mm/Kconfig
+ F:	mm/debug.c
+@@ -16518,6 +16519,7 @@ F:	mm/sparse.c
+ F:	mm/util.c
+ F:	mm/vmpressure.c
+ F:	mm/vmstat.c
++F:	mm/zone_lock.c
+ N:	include/linux/page[-_]*
+ 
+ MEMORY MANAGEMENT - EXECMEM
+diff --git a/include/linux/zone_lock.h b/include/linux/zone_lock.h
+index c531e26280e6..cea41dd56324 100644
+--- a/include/linux/zone_lock.h
++++ b/include/linux/zone_lock.h
+@@ -4,6 +4,53 @@
+ 
+ #include &lt;linux/mmzone.h&gt;
+ #include &lt;linux/spinlock.h&gt;
++#include &lt;linux/tracepoint-defs.h&gt;
++
++DECLARE_TRACEPOINT(zone_lock_start_locking);
++DECLARE_TRACEPOINT(zone_lock_acquire_returned);
++DECLARE_TRACEPOINT(zone_lock_released);
++
++#ifdef CONFIG_TRACING
++
++void __zone_lock_do_trace_start_locking(struct zone *zone);
++void __zone_lock_do_trace_acquire_returned(struct zone *zone, bool success);
++void __zone_lock_do_trace_released(struct zone *zone);
++
++static inline void __zone_lock_trace_start_locking(struct zone *zone)
++{
++	if (tracepoint_enabled(zone_lock_start_locking))
++		__zone_lock_do_trace_start_locking(zone);
++}
++
++static inline void __zone_lock_trace_acquire_returned(struct zone *zone,
++						      bool success)
++{
++	if (tracepoint_enabled(zone_lock_acquire_returned))
++		__zone_lock_do_trace_acquire_returned(zone, success);
++}
++
++static inline void __zone_lock_trace_released(struct zone *zone)
++{
++	if (tracepoint_enabled(zone_lock_released))
++		__zone_lock_do_trace_released(zone);
++}
++
++#else /* !CONFIG_TRACING */
++
++static inline void __zone_lock_trace_start_locking(struct zone *zone)
++{
++}
++
++static inline void __zone_lock_trace_acquire_returned(struct zone *zone,
++						      bool success)
++{
++}
++
++static inline void __zone_lock_trace_released(struct zone *zone)
++{
++}
++
++#endif /* CONFIG_TRACING */
+ 
+ static inline void zone_lock_init(struct zone *zone)
+ {
+@@ -12,26 +59,41 @@ static inline void zone_lock_init(struct zone *zone)
+ 
+ #define zone_lock_irqsave(zone, flags)				\
+ do {								\
++	bool success = true;					\
++								\
++	__zone_lock_trace_start_locking(zone);			\
+ 	spin_lock_irqsave(&amp;(zone)-&gt;lock, flags);		\
++	__zone_lock_trace_acquire_returned(zone, success);	\
+ } while (0)
+ 
+ #define zone_trylock_irqsave(zone, flags)			\
+ ({								\
+-	spin_trylock_irqsave(&amp;(zone)-&gt;lock, flags);		\
++	bool success;						\
++								\
++	__zone_lock_trace_start_locking(zone);			\
++	success = spin_trylock_irqsave(&amp;(zone)-&gt;lock, flags);	\
++	__zone_lock_trace_acquire_returned(zone, success);	\
++	success;						\
+ })
+ 
+ static inline void zone_unlock_irqrestore(struct zone *zone, unsigned long flags)
+ {
++	__zone_lock_trace_released(zone);
+ 	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
+ }
+ 
+ static inline void zone_lock_irq(struct zone *zone)
+ {
++	bool success = true;
++
++	__zone_lock_trace_start_locking(zone);
+ 	spin_lock_irq(&amp;zone-&gt;lock);
++	__zone_lock_trace_acquire_returned(zone, success);
+ }
+ 
+ static inline void zone_unlock_irq(struct zone *zone)
+ {
++	__zone_lock_trace_released(zone);
+ 	spin_unlock_irq(&amp;zone-&gt;lock);
+ }
+ 
+diff --git a/include/trace/events/zone_lock.h b/include/trace/events/zone_lock.h
+new file mode 100644
+index 000000000000..3df82a8c0160
+--- /dev/null
++++ b/include/trace/events/zone_lock.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM zone_lock
++
++#if !defined(_TRACE_ZONE_LOCK_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_ZONE_LOCK_H
++
++#include &lt;linux/tracepoint.h&gt;
++#include &lt;linux/types.h&gt;
++
++struct zone;
++
++DECLARE_EVENT_CLASS(zone_lock,
++
++	TP_PROTO(struct zone *zone),
++
++	TP_ARGS(zone),
++
++	TP_STRUCT__entry(
++		__field(struct zone *, zone)
++	),
++
++	TP_fast_assign(
++		__entry-&gt;zone = zone;
++	),
++
++	TP_printk(&quot;zone=%p&quot;, __entry-&gt;zone)
++);
++
++#define DEFINE_ZONE_LOCK_EVENT(name)			\
++	DEFINE_EVENT(zone_lock, name,			\
++		TP_PROTO(struct zone *zone),		\
++		TP_ARGS(zone))
++
++DEFINE_ZONE_LOCK_EVENT(zone_lock_start_locking);
++DEFINE_ZONE_LOCK_EVENT(zone_lock_released);
++
++TRACE_EVENT(zone_lock_acquire_returned,
++
++	TP_PROTO(struct zone *zone, bool success),
++
++	TP_ARGS(zone, success),
++
++	TP_STRUCT__entry(
++		__field(struct zone *, zone)
++		__field(bool, success)
++	),
++
++	TP_fast_assign(
++		__entry-&gt;zone = zone;
++		__entry-&gt;success = success;
++	),
++
++	TP_printk(
++		&quot;zone=%p success=%s&quot;,
++		__entry-&gt;zone,
++		__entry-&gt;success ? &quot;true&quot; : &quot;false&quot;
++	)
++);
++
++#endif /* _TRACE_ZONE_LOCK_H */
++
++/* This part must be outside protection */
++#include &lt;trace/define_trace.h&gt;
+diff --git a/mm/Makefile b/mm/Makefile
+index 0d85b10dbdde..fd891710c696 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -55,7 +55,7 @@ obj-y			:= filemap.o mempool.o oom_kill.o fadvise.o \
+ 			   mm_init.o percpu.o slab_common.o \
+ 			   compaction.o show_mem.o \
+ 			   interval_tree.o list_lru.o workingset.o \
+-			   debug.o gup.o mmap_lock.o vma_init.o $(mmu-y)
++			   debug.o gup.o mmap_lock.o zone_lock.o vma_init.o $(mmu-y)
+ 
+ # Give &#x27;page_alloc&#x27; its own module-parameter namespace
+ page-alloc-y := page_alloc.o
+diff --git a/mm/zone_lock.c b/mm/zone_lock.c
+new file mode 100644
+index 000000000000..f647fd2aca48
+--- /dev/null
++++ b/mm/zone_lock.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++#define CREATE_TRACE_POINTS
++#include &lt;trace/events/zone_lock.h&gt;
++
++#include &lt;linux/zone_lock.h&gt;
++
++EXPORT_TRACEPOINT_SYMBOL(zone_lock_start_locking);
++EXPORT_TRACEPOINT_SYMBOL(zone_lock_acquire_returned);
++EXPORT_TRACEPOINT_SYMBOL(zone_lock_released);
++
++#ifdef CONFIG_TRACING
++
++void __zone_lock_do_trace_start_locking(struct zone *zone)
++{
++	trace_zone_lock_start_locking(zone);
++}
++EXPORT_SYMBOL(__zone_lock_do_trace_start_locking);
++
++void __zone_lock_do_trace_acquire_returned(struct zone *zone, bool success)
++{
++	trace_zone_lock_acquire_returned(zone, success);
++}
++EXPORT_SYMBOL(__zone_lock_do_trace_acquire_returned);
++
++void __zone_lock_do_trace_released(struct zone *zone)
++{
++	trace_zone_lock_released(zone);
++}
++EXPORT_SYMBOL(__zone_lock_do_trace_released);
++
++#endif /* CONFIG_TRACING */
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Cheatham, Benjamin</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer suggested reordering the series to introduce zone lock wrappers and tracepoints together, before mechanically converting users to the wrappers, to improve understanding of the changes.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think you can improve the flow of this series if reorder as follows:
+	1. Introduce zone lock wrappers
+	4. Add zone lock tracepoints
+	2. Mechanically convert zone lock users to the wrappers
+	3. Convert compaction to use the wrappers...
+
+and possibly squash 1 &amp; 4 (though that might be too big of a patch). It&#x27;s better to introduce the
+wrappers and their tracepoints together before the reviewer (i.e. me) forgets what was added in
+patch 1 by the time they get to patch 4.
+
+Thanks,
+Ben</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Cheatham, Benjamin</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer suggested removing the zone lock wrappers and making direct calls to spinlock functions, citing parity with compact helpers as a reason
+
+reviewer pointed out that the zone_lock_irqsave() macro should not return a value and suggested replacing it with an if-else statement
+
+Reviewer Cheatham suggested moving zone lock wrapper changes, which are not yet used, to a later patch where they fit better with other similar changes.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Nit: You could remove the helpers above and just do the calls directly in this function, though
+it would remove the parity with the compact helpers. compact_do_lock_irqsave() helpers can stay
+since they have the __acquires() annotations.
+
+---
+
+You don&#x27;t need the return statement here (and you shouldn&#x27;t be returning a value at all).
+
+It may be cleaner to just do an if-else statement here instead.
+
+---
+
+I would move this (and other wrapper changes below that don&#x27;t use compact_*) to the last patch. I understand you
+didn&#x27;t change it due to location but I would argue it isn&#x27;t really relevant to what&#x27;s being added in this patch
+and fits better in the last.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: requested changes, requested_reorder</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<span class="reply-to-label">↳ replying to Cheatham, Benjamin</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Shakeel Butt expressed disagreement with the suggestion to introduce zone lock wrappers, stating it&#x27;s &#x27;just different taste&#x27; and suggesting squashing patches (1) and (2) together instead.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I don&#x27;t think this suggestion will make anything better. This just seems like a
+different taste. If I make a suggestion, I would request to squash (1) and (2)
+i.e. patch containing wrappers and their use together but that is just my taste
+and would be a nit. The series ordering is good as is.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: disagreement, nit</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="reply-to-label">↳ replying to Cheatham, Benjamin</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a suggestion from reviewer Cheatham about reordering patches in the series, explained that they intentionally structured the series to keep refactoring and instrumentation changes separate, and stated their preference for maintaining the current order.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Ben,
+
+Thanks for the suggestion.
+
+I structured the series intentionally to keep all behavior-preserving
+refactoring separate from the actual instrumentation change.
+
+In particular, I had to split the conversion into two patches to
+separate the purely mechanical changes from the compaction
+restructuring. With the current order, tracepoints addition remains a
+single, atomic functional change on top of a fully converted tree. This
+keeps the instrumentation isolated from the refactoring and with an
+intention to make bisection and review of the behavioral change easier.
+
+Reordering as suggested would mix instrumentation with intermediate
+refactoring states, which I&#x27;d prefer to avoid.
+
+I hope this reasoning makes sense, but I&#x27;m happy to discuss if there are
+strong objections.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged suggestion, explained reasoning</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Cheatham, Benjamin</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch&#x27;s priority should be reassessed in favor of improving the reading order of the series, but ultimately accepted the current implementation.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">No that&#x27;s fine, I figured as much. I just wasn&#x27;t sure that was more important
+to you than what (I thought) was a better reading order for the series.
+
+Thanks,
+Ben</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK, POSITIVE</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="reply-to-label">↳ replying to Shakeel Butt</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed Shakeel Butt&#x27;s concern about using macros for zone lock wrappers, explaining that it&#x27;s necessary to modify the flags variable passed by the caller and maintain consistency with existing locking patterns.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The reason for using macros in those two cases is that they need to
+modify the flags variable passed by the caller, just like
+spin_lock_irqsave() and spin_trylock_irqsave() do. I followed the same
+convention here.
+
+If we used normal inline functions instead, we would need to pass a
+pointer to flags, which would change the call sites and diverge from the
+existing *_irqsave() locking pattern.
+
+There is also a difference between zone_lock_irqsave() and
+zone_trylock_irqsave() implementations: the former is implemented as a
+do { } while (0) macro since it does not return a value, while the
+latter uses a GCC extension in order to return the trylock result. This
+matches spin_lock_* convention as well.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: explained reasoning, acknowledged feedback</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="reply-to-label">↳ replying to Cheatham, Benjamin</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the zone lock wrappers are not valuable and agreed to remove them.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, I agree, there is no much value in this wrappers, will remove them,
+thanks!</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: agreed, will remove</div>
+</div>
 </div>
 </div>
 <div class="activity-item">
@@ -781,10 +2209,1613 @@
 <p>This patch introduces thin wrappers around zone lock acquire and release operations in the Linux kernel, allowing for future instrumentation or debugging hooks to be added without modifying individual call sites. The wrappers are not yet used but prepare the code for subsequent patches. This change is intended to centralize zone lock operations behind a common interface, making it easier to add functionality in the future.</p>
 </div>
 <div class="progress-detail"><span class="progress-icon">&#9654;</span> Author will post an updated version</div>
-<div class="review-comments-compact">
-<span class="review-comments-header">2 participants</span>
-<span class="reviewer-list"> &mdash; Dmitry Ilvokhin (author), Cheatham, Benjamin (Reviewed-by, Inline Review), Shakeel Butt (Reviewed-by, Acked-by)</span>
-<div class="review-detail-link"><a href="reviews/aZ3BLKzhIIZvkbwL-shell-ilvokhin-com.html#2026-02-24">View review comments &rarr;</a></div>
+<div class="review-comments">
+<div class="review-comments-header">2 participants</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing reviewer feedback about direct zone lock acquire/release operations not being replaced with the newly introduced wrappers, and has confirmed that this change will be made in the next patch.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Replace direct zone lock acquire/release operations with the
+newly introduced wrappers.
+
+The changes are purely mechanical substitutions. No functional change
+intended. Locking semantics and ordering remain unchanged.
+
+The compaction path is left unchanged for now and will be
+handled separately in the following patch due to additional
+non-trivial modifications.
+
+Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+---
+ mm/memory_hotplug.c |  9 +++---
+ mm/mm_init.c        |  3 +-
+ mm/page_alloc.c     | 73 +++++++++++++++++++++++----------------------
+ mm/page_isolation.c | 19 ++++++------
+ mm/page_reporting.c | 13 ++++----
+ mm/show_mem.c       |  5 ++--
+ mm/vmscan.c         |  5 ++--
+ mm/vmstat.c         |  9 +++---
+ 8 files changed, 72 insertions(+), 64 deletions(-)
+
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index bc805029da51..cfc0103fa50e 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -36,6 +36,7 @@
+ #include &lt;linux/rmap.h&gt;
+ #include &lt;linux/module.h&gt;
+ #include &lt;linux/node.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &lt;asm/tlbflush.h&gt;
+ 
+@@ -1190,9 +1191,9 @@ int online_pages(unsigned long pfn, unsigned long nr_pages,
+ 	 * Fixup the number of isolated pageblocks before marking the sections
+ 	 * onlining, such that undo_isolate_page_range() works correctly.
+ 	 */
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	zone-&gt;nr_isolate_pageblock += nr_pages / pageblock_nr_pages;
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	/*
+ 	 * If this zone is not populated, then it is not in zonelist.
+@@ -2041,9 +2042,9 @@ int offline_pages(unsigned long start_pfn, unsigned long nr_pages,
+ 	 * effectively stale; nobody should be touching them. Fixup the number
+ 	 * of isolated pageblocks, memory onlining will properly revert this.
+ 	 */
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	zone-&gt;nr_isolate_pageblock -= nr_pages / pageblock_nr_pages;
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	lru_cache_enable();
+ 	zone_pcp_enable(zone);
+diff --git a/mm/mm_init.c b/mm/mm_init.c
+index 1a29a719af58..426e5a0256f9 100644
+--- a/mm/mm_init.c
++++ b/mm/mm_init.c
+@@ -32,6 +32,7 @@
+ #include &lt;linux/vmstat.h&gt;
+ #include &lt;linux/kexec_handover.h&gt;
+ #include &lt;linux/hugetlb.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &quot;internal.h&quot;
+ #include &quot;slab.h&quot;
+ #include &quot;shuffle.h&quot;
+@@ -1425,7 +1426,7 @@ static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx,
+ 	zone_set_nid(zone, nid);
+ 	zone-&gt;name = zone_names[idx];
+ 	zone-&gt;zone_pgdat = NODE_DATA(nid);
+-	spin_lock_init(&amp;zone-&gt;lock);
++	zone_lock_init(zone);
+ 	zone_seqlock_init(zone);
+ 	zone_pcp_init(zone);
+ }
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index e4104973e22f..2c9fe30da7a1 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -54,6 +54,7 @@
+ #include &lt;linux/delayacct.h&gt;
+ #include &lt;linux/cacheinfo.h&gt;
+ #include &lt;linux/pgalloc_tag.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &lt;asm/div64.h&gt;
+ #include &quot;internal.h&quot;
+ #include &quot;shuffle.h&quot;
+@@ -1494,7 +1495,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 	/* Ensure requested pindex is drained first. */
+ 	pindex = pindex - 1;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 
+ 	while (count &gt; 0) {
+ 		struct list_head *list;
+@@ -1527,7 +1528,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 		} while (count &gt; 0 &amp;&amp; !list_empty(list));
+ 	}
+ 
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ }
+ 
+ /* Split a multi-block free page into its individual pageblocks. */
+@@ -1571,12 +1572,12 @@ static void free_one_page(struct zone *zone, struct page *page,
+ 	unsigned long flags;
+ 
+ 	if (unlikely(fpi_flags &amp; FPI_TRYLOCK)) {
+-		if (!spin_trylock_irqsave(&amp;zone-&gt;lock, flags)) {
++		if (!zone_trylock_irqsave(zone, flags)) {
+ 			add_page_to_zone_llist(zone, page, order);
+ 			return;
+ 		}
+ 	} else {
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 	}
+ 
+ 	/* The lock succeeded. Process deferred pages. */
+@@ -1594,7 +1595,7 @@ static void free_one_page(struct zone *zone, struct page *page,
+ 		}
+ 	}
+ 	split_large_buddy(zone, page, pfn, order, fpi_flags);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	__count_vm_events(PGFREE, 1 &lt;&lt; order);
+ }
+@@ -2547,10 +2548,10 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 	int i;
+ 
+ 	if (unlikely(alloc_flags &amp; ALLOC_TRYLOCK)) {
+-		if (!spin_trylock_irqsave(&amp;zone-&gt;lock, flags))
++		if (!zone_trylock_irqsave(zone, flags))
+ 			return 0;
+ 	} else {
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 	}
+ 	for (i = 0; i &lt; count; ++i) {
+ 		struct page *page = __rmqueue(zone, order, migratetype,
+@@ -2570,7 +2571,7 @@ static int rmqueue_bulk(struct zone *zone, unsigned int order,
+ 		 */
+ 		list_add_tail(&amp;page-&gt;pcp_list, list);
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return i;
+ }
+@@ -3235,10 +3236,10 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+ 	do {
+ 		page = NULL;
+ 		if (unlikely(alloc_flags &amp; ALLOC_TRYLOCK)) {
+-			if (!spin_trylock_irqsave(&amp;zone-&gt;lock, flags))
++			if (!zone_trylock_irqsave(zone, flags))
+ 				return NULL;
+ 		} else {
+-			spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++			zone_lock_irqsave(zone, flags);
+ 		}
+ 		if (alloc_flags &amp; ALLOC_HIGHATOMIC)
+ 			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+@@ -3257,11 +3258,11 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+ 				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+ 
+ 			if (!page) {
+-				spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++				zone_unlock_irqrestore(zone, flags);
+ 				return NULL;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	} while (check_new_pages(page, order));
+ 
+ 	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 &lt;&lt; order);
+@@ -3448,7 +3449,7 @@ static void reserve_highatomic_pageblock(struct page *page, int order,
+ 	if (zone-&gt;nr_reserved_highatomic &gt;= max_managed)
+ 		return;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 
+ 	/* Recheck the nr_reserved_highatomic limit under the lock */
+ 	if (zone-&gt;nr_reserved_highatomic &gt;= max_managed)
+@@ -3470,7 +3471,7 @@ static void reserve_highatomic_pageblock(struct page *page, int order,
+ 	}
+ 
+ out_unlock:
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ }
+ 
+ /*
+@@ -3503,7 +3504,7 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
+ 					pageblock_nr_pages)
+ 			continue;
+ 
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 		for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 			struct free_area *area = &amp;(zone-&gt;free_area[order]);
+ 			unsigned long size;
+@@ -3551,11 +3552,11 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
+ 			 */
+ 			WARN_ON_ONCE(ret == -1);
+ 			if (ret &gt; 0) {
+-				spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++				zone_unlock_irqrestore(zone, flags);
+ 				return ret;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	}
+ 
+ 	return false;
+@@ -6435,7 +6436,7 @@ static void __setup_per_zone_wmarks(void)
+ 	for_each_zone(zone) {
+ 		u64 tmp;
+ 
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 		tmp = (u64)pages_min * zone_managed_pages(zone);
+ 		tmp = div64_ul(tmp, lowmem_pages);
+ 		if (is_highmem(zone) || zone_idx(zone) == ZONE_MOVABLE) {
+@@ -6476,7 +6477,7 @@ static void __setup_per_zone_wmarks(void)
+ 		zone-&gt;_watermark[WMARK_PROMO] = high_wmark_pages(zone) + tmp;
+ 		trace_mm_setup_per_zone_wmarks(zone);
+ 
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	}
+ 
+ 	/* update totalreserve_pages */
+@@ -7246,7 +7247,7 @@ struct page *alloc_contig_frozen_pages_noprof(unsigned long nr_pages,
+ 	zonelist = node_zonelist(nid, gfp_mask);
+ 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
+ 					gfp_zone(gfp_mask), nodemask) {
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 
+ 		pfn = ALIGN(zone-&gt;zone_start_pfn, nr_pages);
+ 		while (zone_spans_last_pfn(zone, pfn, nr_pages)) {
+@@ -7260,18 +7261,18 @@ struct page *alloc_contig_frozen_pages_noprof(unsigned long nr_pages,
+ 				 * allocation spinning on this lock, it may
+ 				 * win the race and cause allocation to fail.
+ 				 */
+-				spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++				zone_unlock_irqrestore(zone, flags);
+ 				ret = alloc_contig_frozen_range_noprof(pfn,
+ 							pfn + nr_pages,
+ 							ACR_FLAGS_NONE,
+ 							gfp_mask);
+ 				if (!ret)
+ 					return pfn_to_page(pfn);
+-				spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++				zone_lock_irqsave(zone, flags);
+ 			}
+ 			pfn += nr_pages;
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 	}
+ 	/*
+ 	 * If we failed, retry the search, but treat regions with HugeTLB pages
+@@ -7425,7 +7426,7 @@ unsigned long __offline_isolated_pages(unsigned long start_pfn,
+ 
+ 	offline_mem_sections(pfn, end_pfn);
+ 	zone = page_zone(pfn_to_page(pfn));
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	while (pfn &lt; end_pfn) {
+ 		page = pfn_to_page(pfn);
+ 		/*
+@@ -7455,7 +7456,7 @@ unsigned long __offline_isolated_pages(unsigned long start_pfn,
+ 		del_page_from_free_list(page, zone, order, MIGRATE_ISOLATE);
+ 		pfn += (1 &lt;&lt; order);
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return end_pfn - start_pfn - already_offline;
+ }
+@@ -7531,7 +7532,7 @@ bool take_page_off_buddy(struct page *page)
+ 	unsigned int order;
+ 	bool ret = false;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 		struct page *page_head = page - (pfn &amp; ((1 &lt;&lt; order) - 1));
+ 		int page_order = buddy_order(page_head);
+@@ -7552,7 +7553,7 @@ bool take_page_off_buddy(struct page *page)
+ 		if (page_count(page_head) &gt; 0)
+ 			break;
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 	return ret;
+ }
+ 
+@@ -7565,7 +7566,7 @@ bool put_page_back_buddy(struct page *page)
+ 	unsigned long flags;
+ 	bool ret = false;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	if (put_page_testzero(page)) {
+ 		unsigned long pfn = page_to_pfn(page);
+ 		int migratetype = get_pfnblock_migratetype(page, pfn);
+@@ -7576,7 +7577,7 @@ bool put_page_back_buddy(struct page *page)
+ 			ret = true;
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return ret;
+ }
+@@ -7625,7 +7626,7 @@ static void __accept_page(struct zone *zone, unsigned long *flags,
+ 	account_freepages(zone, -MAX_ORDER_NR_PAGES, MIGRATE_MOVABLE);
+ 	__mod_zone_page_state(zone, NR_UNACCEPTED, -MAX_ORDER_NR_PAGES);
+ 	__ClearPageUnaccepted(page);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, *flags);
++	zone_unlock_irqrestore(zone, *flags);
+ 
+ 	accept_memory(page_to_phys(page), PAGE_SIZE &lt;&lt; MAX_PAGE_ORDER);
+ 
+@@ -7637,9 +7638,9 @@ void accept_page(struct page *page)
+ 	struct zone *zone = page_zone(page);
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	if (!PageUnaccepted(page)) {
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return;
+ 	}
+ 
+@@ -7652,11 +7653,11 @@ static bool try_to_accept_memory_one(struct zone *zone)
+ 	unsigned long flags;
+ 	struct page *page;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	page = list_first_entry_or_null(&amp;zone-&gt;unaccepted_pages,
+ 					struct page, lru);
+ 	if (!page) {
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return false;
+ 	}
+ 
+@@ -7713,12 +7714,12 @@ static bool __free_unaccepted(struct page *page)
+ 	if (!lazy_accept)
+ 		return false;
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	list_add_tail(&amp;page-&gt;lru, &amp;zone-&gt;unaccepted_pages);
+ 	account_freepages(zone, MAX_ORDER_NR_PAGES, MIGRATE_MOVABLE);
+ 	__mod_zone_page_state(zone, NR_UNACCEPTED, MAX_ORDER_NR_PAGES);
+ 	__SetPageUnaccepted(page);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	return true;
+ }
+diff --git a/mm/page_isolation.c b/mm/page_isolation.c
+index c48ff5c00244..56a272f38b66 100644
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@ -10,6 +10,7 @@
+ #include &lt;linux/hugetlb.h&gt;
+ #include &lt;linux/page_owner.h&gt;
+ #include &lt;linux/migrate.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &quot;internal.h&quot;
+ 
+ #define CREATE_TRACE_POINTS
+@@ -173,7 +174,7 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,
+ 	if (PageUnaccepted(page))
+ 		accept_page(page);
+ 
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 
+ 	/*
+ 	 * We assume the caller intended to SET migrate type to isolate.
+@@ -181,7 +182,7 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,
+ 	 * set it before us.
+ 	 */
+ 	if (is_migrate_isolate_page(page)) {
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -200,15 +201,15 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,
+ 			mode);
+ 	if (!unmovable) {
+ 		if (!pageblock_isolate_and_move_free_pages(zone, page)) {
+-			spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++			zone_unlock_irqrestore(zone, flags);
+ 			return -EBUSY;
+ 		}
+ 		zone-&gt;nr_isolate_pageblock++;
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		return 0;
+ 	}
+ 
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 	if (mode == PB_ISOLATE_MODE_MEM_OFFLINE) {
+ 		/*
+ 		 * printk() with zone-&gt;lock held will likely trigger a
+@@ -229,7 +230,7 @@ static void unset_migratetype_isolate(struct page *page)
+ 	struct page *buddy;
+ 
+ 	zone = page_zone(page);
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	if (!is_migrate_isolate_page(page))
+ 		goto out;
+ 
+@@ -280,7 +281,7 @@ static void unset_migratetype_isolate(struct page *page)
+ 	}
+ 	zone-&gt;nr_isolate_pageblock--;
+ out:
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ }
+ 
+ static inline struct page *
+@@ -641,9 +642,9 @@ int test_pages_isolated(unsigned long start_pfn, unsigned long end_pfn,
+ 
+ 	/* Check all pages are free or marked as ISOLATED */
+ 	zone = page_zone(page);
+-	spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++	zone_lock_irqsave(zone, flags);
+ 	pfn = __test_page_isolated_in_pageblock(start_pfn, end_pfn, mode);
+-	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++	zone_unlock_irqrestore(zone, flags);
+ 
+ 	ret = pfn &lt; end_pfn ? -EBUSY : 0;
+ 
+diff --git a/mm/page_reporting.c b/mm/page_reporting.c
+index 8a03effda749..ac2ac8fd0487 100644
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -7,6 +7,7 @@
+ #include &lt;linux/module.h&gt;
+ #include &lt;linux/delay.h&gt;
+ #include &lt;linux/scatterlist.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &quot;page_reporting.h&quot;
+ #include &quot;internal.h&quot;
+@@ -161,7 +162,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 	if (list_empty(list))
+ 		return err;
+ 
+-	spin_lock_irq(&amp;zone-&gt;lock);
++	zone_lock_irq(zone);
+ 
+ 	/*
+ 	 * Limit how many calls we will be making to the page reporting
+@@ -219,7 +220,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 			list_rotate_to_front(&amp;page-&gt;lru, list);
+ 
+ 		/* release lock before waiting on report processing */
+-		spin_unlock_irq(&amp;zone-&gt;lock);
++		zone_unlock_irq(zone);
+ 
+ 		/* begin processing pages in local list */
+ 		err = prdev-&gt;report(prdev, sgl, PAGE_REPORTING_CAPACITY);
+@@ -231,7 +232,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 		budget--;
+ 
+ 		/* reacquire zone lock and resume processing */
+-		spin_lock_irq(&amp;zone-&gt;lock);
++		zone_lock_irq(zone);
+ 
+ 		/* flush reported pages from the sg list */
+ 		page_reporting_drain(prdev, sgl, PAGE_REPORTING_CAPACITY, !err);
+@@ -251,7 +252,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
+ 	if (!list_entry_is_head(next, list, lru) &amp;&amp; !list_is_first(&amp;next-&gt;lru, list))
+ 		list_rotate_to_front(&amp;next-&gt;lru, list);
+ 
+-	spin_unlock_irq(&amp;zone-&gt;lock);
++	zone_unlock_irq(zone);
+ 
+ 	return err;
+ }
+@@ -296,9 +297,9 @@ page_reporting_process_zone(struct page_reporting_dev_info *prdev,
+ 		err = prdev-&gt;report(prdev, sgl, leftover);
+ 
+ 		/* flush any remaining pages out from the last report */
+-		spin_lock_irq(&amp;zone-&gt;lock);
++		zone_lock_irq(zone);
+ 		page_reporting_drain(prdev, sgl, leftover, !err);
+-		spin_unlock_irq(&amp;zone-&gt;lock);
++		zone_unlock_irq(zone);
+ 	}
+ 
+ 	return err;
+diff --git a/mm/show_mem.c b/mm/show_mem.c
+index 24078ac3e6bc..245beca127af 100644
+--- a/mm/show_mem.c
++++ b/mm/show_mem.c
+@@ -14,6 +14,7 @@
+ #include &lt;linux/mmzone.h&gt;
+ #include &lt;linux/swap.h&gt;
+ #include &lt;linux/vmstat.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &quot;internal.h&quot;
+ #include &quot;swap.h&quot;
+@@ -363,7 +364,7 @@ static void show_free_areas(unsigned int filter, nodemask_t *nodemask, int max_z
+ 		show_node(zone);
+ 		printk(KERN_CONT &quot;%s: &quot;, zone-&gt;name);
+ 
+-		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++		zone_lock_irqsave(zone, flags);
+ 		for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 			struct free_area *area = &amp;zone-&gt;free_area[order];
+ 			int type;
+@@ -377,7 +378,7 @@ static void show_free_areas(unsigned int filter, nodemask_t *nodemask, int max_z
+ 					types[order] |= 1 &lt;&lt; type;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		for (order = 0; order &lt; NR_PAGE_ORDERS; order++) {
+ 			printk(KERN_CONT &quot;%lu*%lukB &quot;,
+ 			       nr[order], K(1UL) &lt;&lt; order);
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 973ffb9813ea..9fe5c41e0e0a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -58,6 +58,7 @@
+ #include &lt;linux/random.h&gt;
+ #include &lt;linux/mmu_notifier.h&gt;
+ #include &lt;linux/parser.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &lt;asm/tlbflush.h&gt;
+ #include &lt;asm/div64.h&gt;
+@@ -7129,9 +7130,9 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+ 
+ 			/* Increments are under the zone lock */
+ 			zone = pgdat-&gt;node_zones + i;
+-			spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++			zone_lock_irqsave(zone, flags);
+ 			zone-&gt;watermark_boost -= min(zone-&gt;watermark_boost, zone_boosts[i]);
+-			spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++			zone_unlock_irqrestore(zone, flags);
+ 		}
+ 
+ 		/*
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 99270713e0c1..06b27255a626 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -28,6 +28,7 @@
+ #include &lt;linux/mm_inline.h&gt;
+ #include &lt;linux/page_owner.h&gt;
+ #include &lt;linux/sched/isolation.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ 
+ #include &quot;internal.h&quot;
+ 
+@@ -1535,10 +1536,10 @@ static void walk_zones_in_node(struct seq_file *m, pg_data_t *pgdat,
+ 			continue;
+ 
+ 		if (!nolock)
+-			spin_lock_irqsave(&amp;zone-&gt;lock, flags);
++			zone_lock_irqsave(zone, flags);
+ 		print(m, pgdat, zone);
+ 		if (!nolock)
+-			spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
++			zone_unlock_irqrestore(zone, flags);
+ 	}
+ }
+ #endif
+@@ -1603,9 +1604,9 @@ static void pagetypeinfo_showfree_print(struct seq_file *m,
+ 				}
+ 			}
+ 			seq_printf(m, &quot;%s%6lu &quot;, overflow ? &quot;&gt;&quot; : &quot;&quot;, freecount);
+-			spin_unlock_irq(&amp;zone-&gt;lock);
++			zone_unlock_irq(zone);
+ 			cond_resched();
+-			spin_lock_irq(&amp;zone-&gt;lock);
++			zone_lock_irq(zone);
+ 		}
+ 		seq_putc(m, &#x27;\n&#x27;);
+ 	}
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged fix needed, next patch</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing concerns about the lack of visibility into zone lock contention and its impact on performance, particularly in memory-intensive workloads. They explain that existing instrumentation does not provide sufficient information to diagnose issues and propose adding dedicated tracepoint instrumentation to the zone lock, following a similar model to mmap_lock tracing. The author also mentions minor restructuring required for compaction changes.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Zone lock contention can significantly impact allocation and
+reclaim latency, as it is a central synchronization point in
+the page allocator and reclaim paths. Improved visibility into
+its behavior is therefore important for diagnosing performance
+issues in memory-intensive workloads.
+
+On some production workloads at Meta, we have observed noticeable
+zone lock contention. Deeper analysis of lock holders and waiters
+is currently difficult with existing instrumentation.
+
+While generic lock contention_begin/contention_end tracepoints
+cover the slow path, they do not provide sufficient visibility
+into lock hold times. In particular, the lack of a release-side
+event makes it difficult to identify long lock holders and
+correlate them with waiters. As a result, distinguishing between
+short bursts of contention and pathological long hold times
+requires additional instrumentation.
+
+This patch series adds dedicated tracepoint instrumentation to
+zone lock, following the existing mmap_lock tracing model.
+
+The goal is to enable detailed holder/waiter analysis and lock
+hold time measurements without affecting the fast path when
+tracing is disabled.
+
+The series is structured as follows:
+
+  1. Introduce zone lock wrappers.
+  2. Mechanically convert zone lock users to the wrappers.
+  3. Convert compaction to use the wrappers (requires minor
+     restructuring of compact_lock_irqsave()).
+  4. Add zone lock tracepoints.
+
+The tracepoints are added via lightweight inline helpers in the
+wrappers. When tracing is disabled, the fast path remains
+unchanged.
+
+The compaction changes required abstracting compact_lock_irqsave() away from
+raw spinlock_t. I chose a small tagged struct to handle both zone and LRU
+locks uniformly. If there is a preferred alternative (e.g. splitting helpers
+or using a different abstraction), I would appreciate feedback.
+
+Dmitry Ilvokhin (4):
+  mm: introduce zone lock wrappers
+  mm: convert zone lock users to wrappers
+  mm: convert compaction to zone lock wrappers
+  mm: add tracepoints for zone lock
+
+ MAINTAINERS                      |   3 +
+ include/linux/zone_lock.h        | 100 ++++++++++++++++++++++++++++
+ include/trace/events/zone_lock.h |  64 ++++++++++++++++++
+ mm/Makefile                      |   2 +-
+ mm/compaction.c                  | 108 +++++++++++++++++++++++++------
+ mm/memory_hotplug.c              |   9 +--
+ mm/mm_init.c                     |   3 +-
+ mm/page_alloc.c                  |  73 ++++++++++-----------
+ mm/page_isolation.c              |  19 +++---
+ mm/page_reporting.c              |  13 ++--
+ mm/show_mem.c                    |   5 +-
+ mm/vmscan.c                      |   5 +-
+ mm/vmstat.c                      |   9 +--
+ mm/zone_lock.c                   |  31 +++++++++
+ 14 files changed, 360 insertions(+), 84 deletions(-)
+ create mode 100644 include/linux/zone_lock.h
+ create mode 100644 include/trace/events/zone_lock.h
+ create mode 100644 mm/zone_lock.c
+
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledging technical concerns, proposing additional instrumentation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the zone lock wrappers interfering with compact_lock_irqsave() by introducing a new struct compact_lock to abstract the underlying lock type, which will allow compact_lock_irqsave() to operate correctly on both zone locks and raw spinlocks. The author confirmed that no functional change is intended.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Compaction uses compact_lock_irqsave(), which currently operates
+on a raw spinlock_t pointer so that it can be used for both
+zone-&gt;lock and lru_lock. Since zone lock operations are now wrapped,
+compact_lock_irqsave() can no longer operate directly on a spinlock_t
+when the lock belongs to a zone.
+
+Introduce struct compact_lock to abstract the underlying lock type. The
+structure carries a lock type enum and a union holding either a zone
+pointer or a raw spinlock_t pointer, and dispatches to the appropriate
+lock/unlock helper.
+
+No functional change intended.
+
+Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+---
+ mm/compaction.c | 108 +++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 89 insertions(+), 19 deletions(-)
+
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 1e8f8eca318c..1b000d2b95b2 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -24,6 +24,7 @@
+ #include &lt;linux/page_owner.h&gt;
+ #include &lt;linux/psi.h&gt;
+ #include &lt;linux/cpuset.h&gt;
++#include &lt;linux/zone_lock.h&gt;
+ #include &quot;internal.h&quot;
+ 
+ #ifdef CONFIG_COMPACTION
+@@ -493,6 +494,65 @@ static bool test_and_set_skip(struct compact_control *cc, struct page *page)
+ }
+ #endif /* CONFIG_COMPACTION */
+ 
++enum compact_lock_type {
++	COMPACT_LOCK_ZONE,
++	COMPACT_LOCK_RAW_SPINLOCK,
++};
++
++struct compact_lock {
++	enum compact_lock_type type;
++	union {
++		struct zone *zone;
++		spinlock_t *lock; /* Reference to lru lock */
++	};
++};
++
++static bool compact_do_zone_trylock_irqsave(struct zone *zone,
++					    unsigned long *flags)
++{
++	return zone_trylock_irqsave(zone, *flags);
++}
++
++static bool compact_do_raw_trylock_irqsave(spinlock_t *lock,
++					   unsigned long *flags)
++{
++	return spin_trylock_irqsave(lock, *flags);
++}
++
++static bool compact_do_trylock_irqsave(struct compact_lock lock,
++				       unsigned long *flags)
++{
++	if (lock.type == COMPACT_LOCK_ZONE)
++		return compact_do_zone_trylock_irqsave(lock.zone, flags);
++
++	return compact_do_raw_trylock_irqsave(lock.lock, flags);
++}
++
++static void compact_do_zone_lock_irqsave(struct zone *zone,
++					 unsigned long *flags)
++__acquires(zone-&gt;lock)
++{
++	zone_lock_irqsave(zone, *flags);
++}
++
++static void compact_do_raw_lock_irqsave(spinlock_t *lock,
++					unsigned long *flags)
++__acquires(lock)
++{
++	spin_lock_irqsave(lock, *flags);
++}
++
++static void compact_do_lock_irqsave(struct compact_lock lock,
++				    unsigned long *flags)
++{
++	if (lock.type == COMPACT_LOCK_ZONE) {
++		compact_do_zone_lock_irqsave(lock.zone, flags);
++		return;
++	}
++
++	return compact_do_raw_lock_irqsave(lock.lock, flags);
++}
++
+ /*
+  * Compaction requires the taking of some coarse locks that are potentially
+  * very heavily contended. For async compaction, trylock and record if the
+@@ -502,19 +562,19 @@ static bool test_and_set_skip(struct compact_control *cc, struct page *page)
+  *
+  * Always returns true which makes it easier to track lock state in callers.
+  */
+-static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,
+-						struct compact_control *cc)
+-	__acquires(lock)
++static bool compact_lock_irqsave(struct compact_lock lock,
++				 unsigned long *flags,
++				 struct compact_control *cc)
+ {
+ 	/* Track if the lock is contended in async mode */
+ 	if (cc-&gt;mode == MIGRATE_ASYNC &amp;&amp; !cc-&gt;contended) {
+-		if (spin_trylock_irqsave(lock, *flags))
++		if (compact_do_trylock_irqsave(lock, flags))
+ 			return true;
+ 
+ 		cc-&gt;contended = true;
+ 	}
+ 
+-	spin_lock_irqsave(lock, *flags);
++	compact_do_lock_irqsave(lock, flags);
+ 	return true;
+ }
+ 
+@@ -530,11 +590,13 @@ static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,
+  * Returns true if compaction should abort due to fatal signal pending.
+  * Returns false when compaction can continue.
+  */
+-static bool compact_unlock_should_abort(spinlock_t *lock,
+-		unsigned long flags, bool *locked, struct compact_control *cc)
++static bool compact_unlock_should_abort(struct zone *zone,
++					unsigned long flags,
++					bool *locked,
++					struct compact_control *cc)
+ {
+ 	if (*locked) {
+-		spin_unlock_irqrestore(lock, flags);
++		zone_unlock_irqrestore(zone, flags);
+ 		*locked = false;
+ 	}
+ 
+@@ -582,9 +644,8 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 		 * contention, to give chance to IRQs. Abort if fatal signal
+ 		 * pending.
+ 		 */
+-		if (!(blockpfn % COMPACT_CLUSTER_MAX)
+-		    &amp;&amp; compact_unlock_should_abort(&amp;cc-&gt;zone-&gt;lock, flags,
+-								&amp;locked, cc))
++		if (!(blockpfn % COMPACT_CLUSTER_MAX) &amp;&amp;
++		    compact_unlock_should_abort(cc-&gt;zone, flags, &amp;locked, cc))
+ 			break;
+ 
+ 		nr_scanned++;
+@@ -613,8 +674,12 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 
+ 		/* If we already hold the lock, we can skip some rechecking. */
+ 		if (!locked) {
+-			locked = compact_lock_irqsave(&amp;cc-&gt;zone-&gt;lock,
+-								&amp;flags, cc);
++			struct compact_lock zol = {
++				.type = COMPACT_LOCK_ZONE,
++				.zone = cc-&gt;zone,
++			};
++
++			locked = compact_lock_irqsave(zol, &amp;flags, cc);
+ 
+ 			/* Recheck this is a buddy page under lock */
+ 			if (!PageBuddy(page))
+@@ -649,7 +714,7 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 	}
+ 
+ 	if (locked)
+-		spin_unlock_irqrestore(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(cc-&gt;zone, flags);
+ 
+ 	/*
+ 	 * Be careful to not go outside of the pageblock.
+@@ -1157,10 +1222,15 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 
+ 		/* If we already hold the lock, we can skip some rechecking */
+ 		if (lruvec != locked) {
++			struct compact_lock zol = {
++				.type = COMPACT_LOCK_RAW_SPINLOCK,
++				.lock = &amp;lruvec-&gt;lru_lock,
++			};
++
+ 			if (locked)
+ 				unlock_page_lruvec_irqrestore(locked, flags);
+ 
+-			compact_lock_irqsave(&amp;lruvec-&gt;lru_lock, &amp;flags, cc);
++			compact_lock_irqsave(zol, &amp;flags, cc);
+ 			locked = lruvec;
+ 
+ 			lruvec_memcg_debug(lruvec, folio);
+@@ -1555,7 +1625,7 @@ static void fast_isolate_freepages(struct compact_control *cc)
+ 		if (!area-&gt;nr_free)
+ 			continue;
+ 
+-		spin_lock_irqsave(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_lock_irqsave(cc-&gt;zone, flags);
+ 		freelist = &amp;area-&gt;free_list[MIGRATE_MOVABLE];
+ 		list_for_each_entry_reverse(freepage, freelist, buddy_list) {
+ 			unsigned long pfn;
+@@ -1614,7 +1684,7 @@ static void fast_isolate_freepages(struct compact_control *cc)
+ 			}
+ 		}
+ 
+-		spin_unlock_irqrestore(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(cc-&gt;zone, flags);
+ 
+ 		/* Skip fast search if enough freepages isolated */
+ 		if (cc-&gt;nr_freepages &gt;= cc-&gt;nr_migratepages)
+@@ -1988,7 +2058,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
+ 		if (!area-&gt;nr_free)
+ 			continue;
+ 
+-		spin_lock_irqsave(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_lock_irqsave(cc-&gt;zone, flags);
+ 		freelist = &amp;area-&gt;free_list[MIGRATE_MOVABLE];
+ 		list_for_each_entry(freepage, freelist, buddy_list) {
+ 			unsigned long free_pfn;
+@@ -2021,7 +2091,7 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
+ 				break;
+ 			}
+ 		}
+-		spin_unlock_irqrestore(&amp;cc-&gt;zone-&gt;lock, flags);
++		zone_unlock_irqrestore(cc-&gt;zone, flags);
+ 	}
+ 
+ 	cc-&gt;total_migrate_scanned += nr_scanned;
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged fix needed, no functional change</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the performance impact of adding tracepoint instrumentation to the zone lock wrappers, explaining that they followed the mmap_lock pattern and ensured the fast path is unaffected when tracing is disabled.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Add tracepoint instrumentation to zone lock acquire/release operations
+via the previously introduced wrappers.
+
+The implementation follows the mmap_lock tracepoint pattern: a
+lightweight inline helper checks whether the tracepoint is enabled and
+calls into an out-of-line helper when tracing is active. When
+CONFIG_TRACING is disabled, helpers compile to empty inline stubs.
+
+The fast path is unaffected when tracing is disabled.
+
+Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+---
+ MAINTAINERS                      |  2 +
+ include/linux/zone_lock.h        | 64 +++++++++++++++++++++++++++++++-
+ include/trace/events/zone_lock.h | 64 ++++++++++++++++++++++++++++++++
+ mm/Makefile                      |  2 +-
+ mm/zone_lock.c                   | 31 ++++++++++++++++
+ 5 files changed, 161 insertions(+), 2 deletions(-)
+ create mode 100644 include/trace/events/zone_lock.h
+ create mode 100644 mm/zone_lock.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 680c9ae02d7e..711ffa15f4c3 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -16499,6 +16499,7 @@ F:	include/linux/ptdump.h
+ F:	include/linux/vmpressure.h
+ F:	include/linux/vmstat.h
+ F:	include/linux/zone_lock.h
++F:	include/trace/events/zone_lock.h
+ F:	kernel/fork.c
+ F:	mm/Kconfig
+ F:	mm/debug.c
+@@ -16518,6 +16519,7 @@ F:	mm/sparse.c
+ F:	mm/util.c
+ F:	mm/vmpressure.c
+ F:	mm/vmstat.c
++F:	mm/zone_lock.c
+ N:	include/linux/page[-_]*
+ 
+ MEMORY MANAGEMENT - EXECMEM
+diff --git a/include/linux/zone_lock.h b/include/linux/zone_lock.h
+index c531e26280e6..cea41dd56324 100644
+--- a/include/linux/zone_lock.h
++++ b/include/linux/zone_lock.h
+@@ -4,6 +4,53 @@
+ 
+ #include &lt;linux/mmzone.h&gt;
+ #include &lt;linux/spinlock.h&gt;
++#include &lt;linux/tracepoint-defs.h&gt;
++
++DECLARE_TRACEPOINT(zone_lock_start_locking);
++DECLARE_TRACEPOINT(zone_lock_acquire_returned);
++DECLARE_TRACEPOINT(zone_lock_released);
++
++#ifdef CONFIG_TRACING
++
++void __zone_lock_do_trace_start_locking(struct zone *zone);
++void __zone_lock_do_trace_acquire_returned(struct zone *zone, bool success);
++void __zone_lock_do_trace_released(struct zone *zone);
++
++static inline void __zone_lock_trace_start_locking(struct zone *zone)
++{
++	if (tracepoint_enabled(zone_lock_start_locking))
++		__zone_lock_do_trace_start_locking(zone);
++}
++
++static inline void __zone_lock_trace_acquire_returned(struct zone *zone,
++						      bool success)
++{
++	if (tracepoint_enabled(zone_lock_acquire_returned))
++		__zone_lock_do_trace_acquire_returned(zone, success);
++}
++
++static inline void __zone_lock_trace_released(struct zone *zone)
++{
++	if (tracepoint_enabled(zone_lock_released))
++		__zone_lock_do_trace_released(zone);
++}
++
++#else /* !CONFIG_TRACING */
++
++static inline void __zone_lock_trace_start_locking(struct zone *zone)
++{
++}
++
++static inline void __zone_lock_trace_acquire_returned(struct zone *zone,
++						      bool success)
++{
++}
++
++static inline void __zone_lock_trace_released(struct zone *zone)
++{
++}
++
++#endif /* CONFIG_TRACING */
+ 
+ static inline void zone_lock_init(struct zone *zone)
+ {
+@@ -12,26 +59,41 @@ static inline void zone_lock_init(struct zone *zone)
+ 
+ #define zone_lock_irqsave(zone, flags)				\
+ do {								\
++	bool success = true;					\
++								\
++	__zone_lock_trace_start_locking(zone);			\
+ 	spin_lock_irqsave(&amp;(zone)-&gt;lock, flags);		\
++	__zone_lock_trace_acquire_returned(zone, success);	\
+ } while (0)
+ 
+ #define zone_trylock_irqsave(zone, flags)			\
+ ({								\
+-	spin_trylock_irqsave(&amp;(zone)-&gt;lock, flags);		\
++	bool success;						\
++								\
++	__zone_lock_trace_start_locking(zone);			\
++	success = spin_trylock_irqsave(&amp;(zone)-&gt;lock, flags);	\
++	__zone_lock_trace_acquire_returned(zone, success);	\
++	success;						\
+ })
+ 
+ static inline void zone_unlock_irqrestore(struct zone *zone, unsigned long flags)
+ {
++	__zone_lock_trace_released(zone);
+ 	spin_unlock_irqrestore(&amp;zone-&gt;lock, flags);
+ }
+ 
+ static inline void zone_lock_irq(struct zone *zone)
+ {
++	bool success = true;
++
++	__zone_lock_trace_start_locking(zone);
+ 	spin_lock_irq(&amp;zone-&gt;lock);
++	__zone_lock_trace_acquire_returned(zone, success);
+ }
+ 
+ static inline void zone_unlock_irq(struct zone *zone)
+ {
++	__zone_lock_trace_released(zone);
+ 	spin_unlock_irq(&amp;zone-&gt;lock);
+ }
+ 
+diff --git a/include/trace/events/zone_lock.h b/include/trace/events/zone_lock.h
+new file mode 100644
+index 000000000000..3df82a8c0160
+--- /dev/null
++++ b/include/trace/events/zone_lock.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM zone_lock
++
++#if !defined(_TRACE_ZONE_LOCK_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_ZONE_LOCK_H
++
++#include &lt;linux/tracepoint.h&gt;
++#include &lt;linux/types.h&gt;
++
++struct zone;
++
++DECLARE_EVENT_CLASS(zone_lock,
++
++	TP_PROTO(struct zone *zone),
++
++	TP_ARGS(zone),
++
++	TP_STRUCT__entry(
++		__field(struct zone *, zone)
++	),
++
++	TP_fast_assign(
++		__entry-&gt;zone = zone;
++	),
++
++	TP_printk(&quot;zone=%p&quot;, __entry-&gt;zone)
++);
++
++#define DEFINE_ZONE_LOCK_EVENT(name)			\
++	DEFINE_EVENT(zone_lock, name,			\
++		TP_PROTO(struct zone *zone),		\
++		TP_ARGS(zone))
++
++DEFINE_ZONE_LOCK_EVENT(zone_lock_start_locking);
++DEFINE_ZONE_LOCK_EVENT(zone_lock_released);
++
++TRACE_EVENT(zone_lock_acquire_returned,
++
++	TP_PROTO(struct zone *zone, bool success),
++
++	TP_ARGS(zone, success),
++
++	TP_STRUCT__entry(
++		__field(struct zone *, zone)
++		__field(bool, success)
++	),
++
++	TP_fast_assign(
++		__entry-&gt;zone = zone;
++		__entry-&gt;success = success;
++	),
++
++	TP_printk(
++		&quot;zone=%p success=%s&quot;,
++		__entry-&gt;zone,
++		__entry-&gt;success ? &quot;true&quot; : &quot;false&quot;
++	)
++);
++
++#endif /* _TRACE_ZONE_LOCK_H */
++
++/* This part must be outside protection */
++#include &lt;trace/define_trace.h&gt;
+diff --git a/mm/Makefile b/mm/Makefile
+index 0d85b10dbdde..fd891710c696 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -55,7 +55,7 @@ obj-y			:= filemap.o mempool.o oom_kill.o fadvise.o \
+ 			   mm_init.o percpu.o slab_common.o \
+ 			   compaction.o show_mem.o \
+ 			   interval_tree.o list_lru.o workingset.o \
+-			   debug.o gup.o mmap_lock.o vma_init.o $(mmu-y)
++			   debug.o gup.o mmap_lock.o zone_lock.o vma_init.o $(mmu-y)
+ 
+ # Give &#x27;page_alloc&#x27; its own module-parameter namespace
+ page-alloc-y := page_alloc.o
+diff --git a/mm/zone_lock.c b/mm/zone_lock.c
+new file mode 100644
+index 000000000000..f647fd2aca48
+--- /dev/null
++++ b/mm/zone_lock.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++#define CREATE_TRACE_POINTS
++#include &lt;trace/events/zone_lock.h&gt;
++
++#include &lt;linux/zone_lock.h&gt;
++
++EXPORT_TRACEPOINT_SYMBOL(zone_lock_start_locking);
++EXPORT_TRACEPOINT_SYMBOL(zone_lock_acquire_returned);
++EXPORT_TRACEPOINT_SYMBOL(zone_lock_released);
++
++#ifdef CONFIG_TRACING
++
++void __zone_lock_do_trace_start_locking(struct zone *zone)
++{
++	trace_zone_lock_start_locking(zone);
++}
++EXPORT_SYMBOL(__zone_lock_do_trace_start_locking);
++
++void __zone_lock_do_trace_acquire_returned(struct zone *zone, bool success)
++{
++	trace_zone_lock_acquire_returned(zone, success);
++}
++EXPORT_SYMBOL(__zone_lock_do_trace_acquire_returned);
++
++void __zone_lock_do_trace_released(struct zone *zone)
++{
++	trace_zone_lock_released(zone);
++}
++EXPORT_SYMBOL(__zone_lock_do_trace_released);
++
++#endif /* CONFIG_TRACING */
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Cheatham, Benjamin</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer suggested reordering the series to introduce zone lock wrappers and tracepoints together, before mechanically converting users to the wrappers, to improve understanding of the changes.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think you can improve the flow of this series if reorder as follows:
+	1. Introduce zone lock wrappers
+	4. Add zone lock tracepoints
+	2. Mechanically convert zone lock users to the wrappers
+	3. Convert compaction to use the wrappers...
+
+and possibly squash 1 &amp; 4 (though that might be too big of a patch). It&#x27;s better to introduce the
+wrappers and their tracepoints together before the reviewer (i.e. me) forgets what was added in
+patch 1 by the time they get to patch 4.
+
+Thanks,
+Ben</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Cheatham, Benjamin</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer suggested removing the zone lock wrappers and making direct calls to spinlock functions, citing parity with compact helpers as a reason
+
+reviewer pointed out that the zone_lock_irqsave() macro should not return a value and suggested replacing it with an if-else statement
+
+Reviewer Cheatham suggested moving zone lock wrapper changes, which are not yet used, to a later patch where they fit better with other similar changes.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Nit: You could remove the helpers above and just do the calls directly in this function, though
+it would remove the parity with the compact helpers. compact_do_lock_irqsave() helpers can stay
+since they have the __acquires() annotations.
+
+---
+
+You don&#x27;t need the return statement here (and you shouldn&#x27;t be returning a value at all).
+
+It may be cleaner to just do an if-else statement here instead.
+
+---
+
+I would move this (and other wrapper changes below that don&#x27;t use compact_*) to the last patch. I understand you
+didn&#x27;t change it due to location but I would argue it isn&#x27;t really relevant to what&#x27;s being added in this patch
+and fits better in the last.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: requested changes, requested_reorder</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<span class="reply-to-label">↳ replying to Cheatham, Benjamin</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Shakeel Butt expressed disagreement with the suggestion to introduce zone lock wrappers, stating it&#x27;s &#x27;just different taste&#x27; and suggesting squashing patches (1) and (2) together instead.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I don&#x27;t think this suggestion will make anything better. This just seems like a
+different taste. If I make a suggestion, I would request to squash (1) and (2)
+i.e. patch containing wrappers and their use together but that is just my taste
+and would be a nit. The series ordering is good as is.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: disagreement, nit</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="reply-to-label">↳ replying to Cheatham, Benjamin</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a suggestion from reviewer Cheatham about reordering patches in the series, explained that they intentionally structured the series to keep refactoring and instrumentation changes separate, and stated their preference for maintaining the current order.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Ben,
+
+Thanks for the suggestion.
+
+I structured the series intentionally to keep all behavior-preserving
+refactoring separate from the actual instrumentation change.
+
+In particular, I had to split the conversion into two patches to
+separate the purely mechanical changes from the compaction
+restructuring. With the current order, tracepoints addition remains a
+single, atomic functional change on top of a fully converted tree. This
+keeps the instrumentation isolated from the refactoring and with an
+intention to make bisection and review of the behavioral change easier.
+
+Reordering as suggested would mix instrumentation with intermediate
+refactoring states, which I&#x27;d prefer to avoid.
+
+I hope this reasoning makes sense, but I&#x27;m happy to discuss if there are
+strong objections.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged suggestion, explained reasoning</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Cheatham, Benjamin</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch&#x27;s priority should be reassessed in favor of improving the reading order of the series, but ultimately accepted the current implementation.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">No that&#x27;s fine, I figured as much. I just wasn&#x27;t sure that was more important
+to you than what (I thought) was a better reading order for the series.
+
+Thanks,
+Ben</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK, POSITIVE</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Feb 24, 2026 at 03:18:04PM +0000, Dmitry Ilvokhin wrote:
+&gt; On Mon, Feb 23, 2026 at 02:36:01PM -0800, Shakeel Butt wrote:
+&gt; &gt; On Wed, Feb 11, 2026 at 03:22:13PM +0000, Dmitry Ilvokhin wrote:
+&gt; &gt; &gt; Add thin wrappers around zone lock acquire/release operations. This
+&gt; &gt; &gt; prepares the code for future tracepoint instrumentation without
+&gt; &gt; &gt; modifying individual call sites.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Centralizing zone lock operations behind wrappers allows future
+&gt; &gt; &gt; instrumentation or debugging hooks to be added without touching
+&gt; &gt; &gt; all users.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; No functional change intended. The wrappers are introduced in
+&gt; &gt; &gt; preparation for subsequent patches and are not yet used.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+&gt; &gt; &gt; ---
+&gt; &gt; &gt;  MAINTAINERS               |  1 +
+&gt; &gt; &gt;  include/linux/zone_lock.h | 38 ++++++++++++++++++++++++++++++++++++++
+&gt; &gt; &gt;  2 files changed, 39 insertions(+)
+&gt; &gt; &gt;  create mode 100644 include/linux/zone_lock.h
+&gt; &gt; &gt; 
+&gt; &gt; &gt; diff --git a/MAINTAINERS b/MAINTAINERS
+&gt; &gt; &gt; index b4088f7290be..680c9ae02d7e 100644
+&gt; &gt; &gt; --- a/MAINTAINERS
+&gt; &gt; &gt; +++ b/MAINTAINERS
+&gt; &gt; &gt; @@ -16498,6 +16498,7 @@ F:	include/linux/pgtable.h
+&gt; &gt; &gt;  F:	include/linux/ptdump.h
+&gt; &gt; &gt;  F:	include/linux/vmpressure.h
+&gt; &gt; &gt;  F:	include/linux/vmstat.h
+&gt; &gt; &gt; +F:	include/linux/zone_lock.h
+&gt; &gt; &gt;  F:	kernel/fork.c
+&gt; &gt; &gt;  F:	mm/Kconfig
+&gt; &gt; &gt;  F:	mm/debug.c
+&gt; &gt; &gt; diff --git a/include/linux/zone_lock.h b/include/linux/zone_lock.h
+&gt; &gt; &gt; new file mode 100644
+&gt; &gt; &gt; index 000000000000..c531e26280e6
+&gt; &gt; &gt; --- /dev/null
+&gt; &gt; &gt; +++ b/include/linux/zone_lock.h
+&gt; &gt; &gt; @@ -0,0 +1,38 @@
+&gt; &gt; &gt; +/* SPDX-License-Identifier: GPL-2.0 */
+&gt; &gt; &gt; +#ifndef _LINUX_ZONE_LOCK_H
+&gt; &gt; &gt; +#define _LINUX_ZONE_LOCK_H
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +#include &lt;linux/mmzone.h&gt;
+&gt; &gt; &gt; +#include &lt;linux/spinlock.h&gt;
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +static inline void zone_lock_init(struct zone *zone)
+&gt; &gt; &gt; +{
+&gt; &gt; &gt; +	spin_lock_init(&amp;zone-&gt;lock);
+&gt; &gt; &gt; +}
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +#define zone_lock_irqsave(zone, flags)				\
+&gt; &gt; &gt; +do {								\
+&gt; &gt; &gt; +	spin_lock_irqsave(&amp;(zone)-&gt;lock, flags);		\
+&gt; &gt; &gt; +} while (0)
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +#define zone_trylock_irqsave(zone, flags)			\
+&gt; &gt; &gt; +({								\
+&gt; &gt; &gt; +	spin_trylock_irqsave(&amp;(zone)-&gt;lock, flags);		\
+&gt; &gt; &gt; +})
+&gt; &gt; 
+&gt; &gt; Any reason you used macros for above two and inlined functions for remaining?
+&gt; &gt;
+&gt; 
+&gt; The reason for using macros in those two cases is that they need to
+&gt; modify the flags variable passed by the caller, just like
+&gt; spin_lock_irqsave() and spin_trylock_irqsave() do. I followed the same
+&gt; convention here.
+&gt; 
+&gt; If we used normal inline functions instead, we would need to pass a
+&gt; pointer to flags, which would change the call sites and diverge from the
+&gt; existing *_irqsave() locking pattern.
+&gt; 
+&gt; There is also a difference between zone_lock_irqsave() and
+&gt; zone_trylock_irqsave() implementations: the former is implemented as a
+&gt; do { } while (0) macro since it does not return a value, while the
+&gt; latter uses a GCC extension in order to return the trylock result. This
+&gt; matches spin_lock_* convention as well.
+&gt; 
+
+Cool, thanks for the explanation.
+</pre>
+</details>
+</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="reply-to-label">↳ replying to Shakeel Butt</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed Shakeel Butt&#x27;s concern about using macros for zone lock wrappers, explaining that it&#x27;s necessary to modify the flags variable passed by the caller and maintain consistency with existing locking patterns.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The reason for using macros in those two cases is that they need to
+modify the flags variable passed by the caller, just like
+spin_lock_irqsave() and spin_trylock_irqsave() do. I followed the same
+convention here.
+
+If we used normal inline functions instead, we would need to pass a
+pointer to flags, which would change the call sites and diverge from the
+existing *_irqsave() locking pattern.
+
+There is also a difference between zone_lock_irqsave() and
+zone_trylock_irqsave() implementations: the former is implemented as a
+do { } while (0) macro since it does not return a value, while the
+latter uses a GCC extension in order to return the trylock result. This
+matches spin_lock_* convention as well.</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: explained reasoning, acknowledged feedback</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<span class="reply-to-label">↳ replying to Dmitry Ilvokhin</span>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Feb 24, 2026 at 03:18:04PM +0000, Dmitry Ilvokhin wrote:
+&gt; On Mon, Feb 23, 2026 at 02:36:01PM -0800, Shakeel Butt wrote:
+&gt; &gt; On Wed, Feb 11, 2026 at 03:22:13PM +0000, Dmitry Ilvokhin wrote:
+&gt; &gt; &gt; Add thin wrappers around zone lock acquire/release operations. This
+&gt; &gt; &gt; prepares the code for future tracepoint instrumentation without
+&gt; &gt; &gt; modifying individual call sites.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Centralizing zone lock operations behind wrappers allows future
+&gt; &gt; &gt; instrumentation or debugging hooks to be added without touching
+&gt; &gt; &gt; all users.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; No functional change intended. The wrappers are introduced in
+&gt; &gt; &gt; preparation for subsequent patches and are not yet used.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+&gt; &gt; &gt; ---
+&gt; &gt; &gt;  MAINTAINERS               |  1 +
+&gt; &gt; &gt;  include/linux/zone_lock.h | 38 ++++++++++++++++++++++++++++++++++++++
+&gt; &gt; &gt;  2 files changed, 39 insertions(+)
+&gt; &gt; &gt;  create mode 100644 include/linux/zone_lock.h
+&gt; &gt; &gt; 
+&gt; &gt; &gt; diff --git a/MAINTAINERS b/MAINTAINERS
+&gt; &gt; &gt; index b4088f7290be..680c9ae02d7e 100644
+&gt; &gt; &gt; --- a/MAINTAINERS
+&gt; &gt; &gt; +++ b/MAINTAINERS
+&gt; &gt; &gt; @@ -16498,6 +16498,7 @@ F:	include/linux/pgtable.h
+&gt; &gt; &gt;  F:	include/linux/ptdump.h
+&gt; &gt; &gt;  F:	include/linux/vmpressure.h
+&gt; &gt; &gt;  F:	include/linux/vmstat.h
+&gt; &gt; &gt; +F:	include/linux/zone_lock.h
+&gt; &gt; &gt;  F:	kernel/fork.c
+&gt; &gt; &gt;  F:	mm/Kconfig
+&gt; &gt; &gt;  F:	mm/debug.c
+&gt; &gt; &gt; diff --git a/include/linux/zone_lock.h b/include/linux/zone_lock.h
+&gt; &gt; &gt; new file mode 100644
+&gt; &gt; &gt; index 000000000000..c531e26280e6
+&gt; &gt; &gt; --- /dev/null
+&gt; &gt; &gt; +++ b/include/linux/zone_lock.h
+&gt; &gt; &gt; @@ -0,0 +1,38 @@
+&gt; &gt; &gt; +/* SPDX-License-Identifier: GPL-2.0 */
+&gt; &gt; &gt; +#ifndef _LINUX_ZONE_LOCK_H
+&gt; &gt; &gt; +#define _LINUX_ZONE_LOCK_H
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +#include &lt;linux/mmzone.h&gt;
+&gt; &gt; &gt; +#include &lt;linux/spinlock.h&gt;
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +static inline void zone_lock_init(struct zone *zone)
+&gt; &gt; &gt; +{
+&gt; &gt; &gt; +	spin_lock_init(&amp;zone-&gt;lock);
+&gt; &gt; &gt; +}
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +#define zone_lock_irqsave(zone, flags)				\
+&gt; &gt; &gt; +do {								\
+&gt; &gt; &gt; +	spin_lock_irqsave(&amp;(zone)-&gt;lock, flags);		\
+&gt; &gt; &gt; +} while (0)
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +#define zone_trylock_irqsave(zone, flags)			\
+&gt; &gt; &gt; +({								\
+&gt; &gt; &gt; +	spin_trylock_irqsave(&amp;(zone)-&gt;lock, flags);		\
+&gt; &gt; &gt; +})
+&gt; &gt; 
+&gt; &gt; Any reason you used macros for above two and inlined functions for remaining?
+&gt; &gt;
+&gt; 
+&gt; The reason for using macros in those two cases is that they need to
+&gt; modify the flags variable passed by the caller, just like
+&gt; spin_lock_irqsave() and spin_trylock_irqsave() do. I followed the same
+&gt; convention here.
+&gt; 
+&gt; If we used normal inline functions instead, we would need to pass a
+&gt; pointer to flags, which would change the call sites and diverge from the
+&gt; existing *_irqsave() locking pattern.
+&gt; 
+&gt; There is also a difference between zone_lock_irqsave() and
+&gt; zone_trylock_irqsave() implementations: the former is implemented as a
+&gt; do { } while (0) macro since it does not return a value, while the
+&gt; latter uses a GCC extension in order to return the trylock result. This
+&gt; matches spin_lock_* convention as well.
+&gt; 
+
+Cool, thanks for the explanation.
+</pre>
+</details>
+</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<span class="reply-to-label">↳ replying to Cheatham, Benjamin</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the zone lock wrappers are not valuable and agreed to remove them.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, I agree, there is no much value in this wrappers, will remove them,
+thanks!</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: agreed, will remove</div>
+</div>
 </div>
 </div>
 </details>
@@ -1223,10 +4254,1543 @@
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 <span class="progress-badge" style="color:#0c5460;background:#d1ecf1">RFC</span>
 <div class="progress-detail"><span class="progress-icon">&#9654;</span> RFC under discussion (3 replies)</div>
-<div class="review-comments-compact">
-<span class="review-comments-header">3 participants</span>
-<span class="reviewer-list"> &mdash; Joshua Hahn (author), Michal Hocko (Reviewed-by), Gregory Price (Reviewed-by), Kaiyang Zhao (Reviewed-by)</span>
-<div class="review-detail-link"><a href="reviews/20260224161357-2622501-1-joshua-hahnjy-gmail-com.html#2026-02-24">View review comments &rarr;</a></div>
+<div class="review-comments">
+<div class="review-comments-header">3 participants</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about the impact of relying on per-memcg-lruvec statistics for limit checking, explaining that it can introduce increased latency and proposing an alternative solution by adding new fields to struct page_counter to track tiered memory limits and usage.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On systems with tiered memory, there is currently no tracking of memory
+at the tier-memcg granularity. While per-memcg-lruvec serves at a finer
+granularity that can be accumulated to give us the desired
+per-tier-memcg accounting, relying on these lruvec stats for limit
+checking can prove touch too many hot paths too frequently and can
+introduce increased latency for other memcg users.
+
+Instead, add a new cacheline in struct page_counter to track toptier
+memcg limits and usage, as well as cached capacity values. This
+cacheline is only used by the mem_cgroup-&gt;memory page_counter.
+
+Also, introduce helpers that use these new fields to calculate
+proportional toptier high and low values, based on the system&#x27;s
+toptier:total capacity ratio.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/page_counter.h | 22 +++++++++++++++++++++-
+ mm/page_counter.c            | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/page_counter.h b/include/linux/page_counter.h
+index d649b6bbbc87..128c1272c88c 100644
+--- a/include/linux/page_counter.h
++++ b/include/linux/page_counter.h
+@@ -5,6 +5,7 @@
+ #include &lt;linux/atomic.h&gt;
+ #include &lt;linux/cache.h&gt;
+ #include &lt;linux/limits.h&gt;
++#include &lt;linux/nodemask.h&gt;
+ #include &lt;asm/page.h&gt;
+ 
+ struct page_counter {
+@@ -31,9 +32,23 @@ struct page_counter {
+ 	/* Latest cg2 reset watermark */
+ 	unsigned long local_watermark;
+ 
+-	/* Keep all the read most fields in a separete cacheline. */
++	/* Keep all the tiered memory fields in a separate cacheline. */
+ 	CACHELINE_PADDING(_pad2_);
+ 
++	atomic_long_t toptier_usage;
++
++	/* effective toptier-proportional low protection */
++	unsigned long etoptier_low;
++	atomic_long_t toptier_low_usage;
++	atomic_long_t children_toptier_low_usage;
++
++	/* Cached toptier capacity for proportional limit calculations */
++	unsigned long toptier_capacity;
++	unsigned long total_capacity;
++
++	/* Keep all the read most fields in a separate cacheline. */
++	CACHELINE_PADDING(_pad3_);
++
+ 	bool protection_support;
+ 	bool track_failcnt;
+ 	unsigned long min;
+@@ -61,6 +76,9 @@ static inline void page_counter_init(struct page_counter *counter,
+ 	counter-&gt;parent = parent;
+ 	counter-&gt;protection_support = protection_support;
+ 	counter-&gt;track_failcnt = false;
++	counter-&gt;toptier_usage = (atomic_long_t)ATOMIC_LONG_INIT(0);
++	counter-&gt;toptier_capacity = 0;
++	counter-&gt;total_capacity = 0;
+ }
+ 
+ static inline unsigned long page_counter_read(struct page_counter *counter)
+@@ -103,6 +121,8 @@ static inline void page_counter_reset_watermark(struct page_counter *counter)
+ void page_counter_calculate_protection(struct page_counter *root,
+ 				       struct page_counter *counter,
+ 				       bool recursive_protection);
++unsigned long page_counter_toptier_high(struct page_counter *counter);
++unsigned long page_counter_toptier_low(struct page_counter *counter);
+ #else
+ static inline void page_counter_calculate_protection(struct page_counter *root,
+ 						     struct page_counter *counter,
+diff --git a/mm/page_counter.c b/mm/page_counter.c
+index 661e0f2a5127..5ec97811c418 100644
+--- a/mm/page_counter.c
++++ b/mm/page_counter.c
+@@ -462,4 +462,38 @@ void page_counter_calculate_protection(struct page_counter *root,
+ 			atomic_long_read(&amp;parent-&gt;children_low_usage),
+ 			recursive_protection));
+ }
++
++unsigned long page_counter_toptier_high(struct page_counter *counter)
++{
++	unsigned long high = READ_ONCE(counter-&gt;high);
++	unsigned long toptier_cap, total_cap;
++
++	if (high == PAGE_COUNTER_MAX)
++		return PAGE_COUNTER_MAX;
++
++	toptier_cap = counter-&gt;toptier_capacity;
++	total_cap = counter-&gt;total_capacity;
++
++	if (!total_cap)
++		return PAGE_COUNTER_MAX;
++
++	return mult_frac(high, toptier_cap, total_cap);
++}
++
++unsigned long page_counter_toptier_low(struct page_counter *counter)
++{
++	unsigned long low = READ_ONCE(counter-&gt;low);
++	unsigned long toptier_cap, total_cap;
++
++	if (!low)
++		return 0;
++
++	toptier_cap = counter-&gt;toptier_capacity;
++	total_cap = counter-&gt;total_capacity;
++
++	if (!total_cap)
++		return 0;
++
++	return mult_frac(low, toptier_cap, total_cap);
++}
+ #endif /* CONFIG_MEMCG || CONFIG_CGROUP_DMEM */
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about updating toptier statistics when charging or uncharging memory control groups (memcgs). They modified the `charge_memcg` function to update the toptier fields after try_charge_memcg succeeds, and also added new functions `memcg_charge_toptier` and `memcg_uncharge_toptier` to handle this. The author did not explicitly state that a fix is planned for v2, but the changes suggest an intention to address the issue.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Modify memcg charging and uncharging sites to also update toptier
+statistics.
+
+Unfortunately, try_charge_memcg is unaware of the physical folio being
+charged; it only deals with nr_pages. Instead of modifying
+try_charge_memcg, instead adjust the toptier fields once
+try_charge_memcg succeeds, inside charge_memcg.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/memcontrol.c | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index f3e4a6ce7181..07464f02c529 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1948,6 +1948,24 @@ static void memcg_uncharge(struct mem_cgroup *memcg, unsigned int nr_pages)
+ 		page_counter_uncharge(&amp;memcg-&gt;memsw, nr_pages);
+ }
+ 
++static void memcg_charge_toptier(struct mem_cgroup *memcg,
++				 unsigned long nr_pages)
++{
++	struct page_counter *c;
++
++	for (c = &amp;memcg-&gt;memory; c; c = c-&gt;parent)
++		atomic_long_add(nr_pages, &amp;c-&gt;toptier_usage);
++}
++
++static void memcg_uncharge_toptier(struct mem_cgroup *memcg,
++				   unsigned long nr_pages)
++{
++	struct page_counter *c;
++
++	for (c = &amp;memcg-&gt;memory; c; c = c-&gt;parent)
++		atomic_long_sub(nr_pages, &amp;c-&gt;toptier_usage);
++}
++
+ /*
+  * Returns stocks cached in percpu and reset cached information.
+  */
+@@ -4830,6 +4848,9 @@ static int charge_memcg(struct folio *folio, struct mem_cgroup *memcg,
+ 	if (ret)
+ 		goto out;
+ 
++	if (node_is_toptier(folio_nid(folio)))
++		memcg_charge_toptier(memcg, folio_nr_pages(folio));
++
+ 	css_get(&amp;memcg-&gt;css);
+ 	commit_charge(folio, memcg);
+ 	memcg1_commit_charge(folio, memcg);
+@@ -4921,6 +4942,7 @@ int mem_cgroup_swapin_charge_folio(struct folio *folio, struct mm_struct *mm,
+ struct uncharge_gather {
+ 	struct mem_cgroup *memcg;
+ 	unsigned long nr_memory;
++	unsigned long nr_toptier;
+ 	unsigned long pgpgout;
+ 	unsigned long nr_kmem;
+ 	int nid;
+@@ -4941,6 +4963,8 @@ static void uncharge_batch(const struct uncharge_gather *ug)
+ 		}
+ 		memcg1_oom_recover(ug-&gt;memcg);
+ 	}
++	if (ug-&gt;nr_toptier)
++		memcg_uncharge_toptier(ug-&gt;memcg, ug-&gt;nr_toptier);
+ 
+ 	memcg1_uncharge_batch(ug-&gt;memcg, ug-&gt;pgpgout, ug-&gt;nr_memory, ug-&gt;nid);
+ 
+@@ -4989,6 +5013,9 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
+ 
+ 	nr_pages = folio_nr_pages(folio);
+ 
++	if (node_is_toptier(folio_nid(folio)))
++		ug-&gt;nr_toptier += nr_pages;
++
+ 	if (folio_memcg_kmem(folio)) {
+ 		ug-&gt;nr_memory += nr_pages;
+ 		ug-&gt;nr_kmem += nr_pages;
+@@ -5072,6 +5099,10 @@ void mem_cgroup_replace_folio(struct folio *old, struct folio *new)
+ 			page_counter_charge(&amp;memcg-&gt;memsw, nr_pages);
+ 	}
+ 
++	/* The old folio&#x27;s toptier_usage will be decremented when it is freed */
++	if (node_is_toptier(folio_nid(new)))
++		memcg_charge_toptier(memcg, nr_pages);
++
+ 	css_get(&amp;memcg-&gt;css);
+ 	commit_charge(new, memcg);
+ 	memcg1_commit_charge(new, memcg);
+@@ -5091,6 +5122,7 @@ void mem_cgroup_replace_folio(struct folio *old, struct folio *new)
+ void mem_cgroup_migrate(struct folio *old, struct folio *new)
+ {
+ 	struct mem_cgroup *memcg;
++	int old_toptier, new_toptier;
+ 
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
+@@ -5111,6 +5143,13 @@ void mem_cgroup_migrate(struct folio *old, struct folio *new)
+ 	if (!memcg)
+ 		return;
+ 
++	old_toptier = node_is_toptier(folio_nid(old));
++	new_toptier = node_is_toptier(folio_nid(new));
++	if (old_toptier &amp;&amp; !new_toptier)
++		memcg_uncharge_toptier(memcg, folio_nr_pages(old));
++	else if (!old_toptier &amp;&amp; new_toptier)
++		memcg_charge_toptier(memcg, folio_nr_pages(old));
++
+ 	/* Transfer the charge and the css ref */
+ 	commit_charge(new, memcg);
+ 
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged a concern, made changes</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the dynamic nature of toptier nodes and how they are defined by three criteria: CPUs, online memory, and cpuset.mems. The author explained that only two of these criteria can change dynamically during runtime (online memory and cpuset.mems), and introduced functions to calculate and update toptier capacity accordingly.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">What a memcg considers to be a valid toptier node is defined by three
+criteria: (1) The node has CPUs, (2) The node has online memory,
+and (3) The node is within the cgroup&#x27;s cpuset.mems.
+
+Of the three, the second and third criteria are the only ones that can
+change dynamically during runtime, via memory hotplug events and
+cpuset.mems changes, respectively.
+
+Introduce functions to calculate and update toptier capacity, and call
+them during cpuset.mems changes and memory hotplug events.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h   |  6 ++++++
+ include/linux/memory-tiers.h | 29 +++++++++++++++++++++++++
+ include/linux/page_counter.h |  2 ++
+ kernel/cgroup/cpuset.c       |  2 +-
+ mm/memcontrol.c              | 17 +++++++++++++++
+ mm/memory-tiers.c            | 41 ++++++++++++++++++++++++++++++++++++
+ mm/page_counter.c            |  8 +++++++
+ 7 files changed, 104 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 5173a9f16721..900a36112b62 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -608,6 +608,8 @@ static inline void mem_cgroup_protection(struct mem_cgroup *root,
+ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+ 				     struct mem_cgroup *memcg);
+ 
++void update_memcg_toptier_capacity(void);
++
+ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
+ 					  struct mem_cgroup *memcg)
+ {
+@@ -1116,6 +1118,10 @@ static inline void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+ {
+ }
+ 
++static inline void update_memcg_toptier_capacity(void)
++{
++}
++
+ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
+ 					  struct mem_cgroup *memcg)
+ {
+diff --git a/include/linux/memory-tiers.h b/include/linux/memory-tiers.h
+index 85440473effb..cf616885e0db 100644
+--- a/include/linux/memory-tiers.h
++++ b/include/linux/memory-tiers.h
+@@ -53,6 +53,9 @@ int mt_perf_to_adistance(struct access_coordinate *perf, int *adist);
+ struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+ 						  struct list_head *memory_types);
+ void mt_put_memory_types(struct list_head *memory_types);
++void mt_get_toptier_nodemask(nodemask_t *mask, const nodemask_t *allowed);
++unsigned long mt_get_toptier_capacity(const nodemask_t *allowed);
++unsigned long mt_get_total_capacity(const nodemask_t *allowed);
+ #ifdef CONFIG_MIGRATION
+ int next_demotion_node(int node, const nodemask_t *allowed_mask);
+ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
+@@ -152,5 +155,31 @@ static inline struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+ static inline void mt_put_memory_types(struct list_head *memory_types)
+ {
+ }
++
++static inline void mt_get_toptier_nodemask(nodemask_t *mask,
++					   const nodemask_t *allowed)
++{
++	*mask = node_states[N_MEMORY];
++	if (allowed)
++		nodes_and(*mask, *mask, *allowed);
++}
++
++static inline unsigned long mt_get_toptier_capacity(const nodemask_t *allowed)
++{
++	int nid;
++	unsigned long capacity = 0;
++
++	for_each_node_state(nid, N_MEMORY) {
++		if (allowed &amp;&amp; !node_isset(nid, *allowed))
++			continue;
++		capacity += NODE_DATA(nid)-&gt;node_present_pages;
++	}
++	return capacity;
++}
++
++static inline unsigned long mt_get_total_capacity(const nodemask_t *allowed)
++{
++	return mt_get_toptier_capacity(allowed);
++}
+ #endif	/* CONFIG_NUMA */
+ #endif  /* _LINUX_MEMORY_TIERS_H */
+diff --git a/include/linux/page_counter.h b/include/linux/page_counter.h
+index 128c1272c88c..ada5f1dd75d4 100644
+--- a/include/linux/page_counter.h
++++ b/include/linux/page_counter.h
+@@ -121,6 +121,8 @@ static inline void page_counter_reset_watermark(struct page_counter *counter)
+ void page_counter_calculate_protection(struct page_counter *root,
+ 				       struct page_counter *counter,
+ 				       bool recursive_protection);
++void page_counter_update_toptier_capacity(struct page_counter *counter,
++					  const nodemask_t *allowed);
+ unsigned long page_counter_toptier_high(struct page_counter *counter);
+ unsigned long page_counter_toptier_low(struct page_counter *counter);
+ #else
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index 7607dfe516e6..e5641dc1af88 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -2620,7 +2620,6 @@ static void update_nodemasks_hier(struct cpuset *cs, nodemask_t *new_mems)
+ 	rcu_read_lock();
+ 	cpuset_for_each_descendant_pre(cp, pos_css, cs) {
+ 		struct cpuset *parent = parent_cs(cp);
+-
+ 		bool has_mems = nodes_and(*new_mems, cp-&gt;mems_allowed, parent-&gt;effective_mems);
+ 
+ 		/*
+@@ -2701,6 +2700,7 @@ static int update_nodemask(struct cpuset *cs, struct cpuset *trialcs,
+ 
+ 	/* use trialcs-&gt;mems_allowed as a temp variable */
+ 	update_nodemasks_hier(cs, &amp;trialcs-&gt;mems_allowed);
++	update_memcg_toptier_capacity();
+ 	return 0;
+ }
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 0be1e823d813..f3e4a6ce7181 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -54,6 +54,7 @@
+ #include &lt;linux/seq_file.h&gt;
+ #include &lt;linux/vmpressure.h&gt;
+ #include &lt;linux/memremap.h&gt;
++#include &lt;linux/memory-tiers.h&gt;
+ #include &lt;linux/mm_inline.h&gt;
+ #include &lt;linux/swap_cgroup.h&gt;
+ #include &lt;linux/cpu.h&gt;
+@@ -3906,6 +3907,7 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 
+ 		page_counter_init(&amp;memcg-&gt;memory, &amp;parent-&gt;memory, memcg_on_dfl);
+ 		page_counter_init(&amp;memcg-&gt;swap, &amp;parent-&gt;swap, false);
++		page_counter_update_toptier_capacity(&amp;memcg-&gt;memory, NULL);
+ #ifdef CONFIG_MEMCG_V1
+ 		memcg-&gt;memory.track_failcnt = !memcg_on_dfl;
+ 		WRITE_ONCE(memcg-&gt;oom_kill_disable, READ_ONCE(parent-&gt;oom_kill_disable));
+@@ -3917,6 +3919,7 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 		init_memcg_events();
+ 		page_counter_init(&amp;memcg-&gt;memory, NULL, true);
+ 		page_counter_init(&amp;memcg-&gt;swap, NULL, false);
++		page_counter_update_toptier_capacity(&amp;memcg-&gt;memory, NULL);
+ #ifdef CONFIG_MEMCG_V1
+ 		page_counter_init(&amp;memcg-&gt;kmem, NULL, false);
+ 		page_counter_init(&amp;memcg-&gt;tcpmem, NULL, false);
+@@ -4804,6 +4807,20 @@ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+ 	page_counter_calculate_protection(&amp;root-&gt;memory, &amp;memcg-&gt;memory, recursive_protection);
+ }
+ 
++void update_memcg_toptier_capacity(void)
++{
++	struct mem_cgroup *memcg;
++	nodemask_t allowed;
++
++	for_each_mem_cgroup(memcg) {
++		if (memcg == root_mem_cgroup)
++			continue;
++
++		cpuset_nodes_allowed(memcg-&gt;css.cgroup, &amp;allowed);
++		page_counter_update_toptier_capacity(&amp;memcg-&gt;memory, &amp;allowed);
++	}
++}
++
+ static int charge_memcg(struct folio *folio, struct mem_cgroup *memcg,
+ 			gfp_t gfp)
+ {
+diff --git a/mm/memory-tiers.c b/mm/memory-tiers.c
+index a88256381519..259caaf4be8f 100644
+--- a/mm/memory-tiers.c
++++ b/mm/memory-tiers.c
+@@ -889,6 +889,7 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 		mutex_lock(&amp;memory_tier_lock);
+ 		if (clear_node_memory_tier(nn-&gt;nid))
+ 			establish_demotion_targets();
++		update_memcg_toptier_capacity();
+ 		mutex_unlock(&amp;memory_tier_lock);
+ 		break;
+ 	case NODE_ADDED_FIRST_MEMORY:
+@@ -896,6 +897,7 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 		memtier = set_node_memory_tier(nn-&gt;nid);
+ 		if (!IS_ERR(memtier))
+ 			establish_demotion_targets();
++		update_memcg_toptier_capacity();
+ 		mutex_unlock(&amp;memory_tier_lock);
+ 		break;
+ 	}
+@@ -941,6 +943,45 @@ bool numa_demotion_enabled = false;
+ 
+ bool tier_aware_memcg_limits;
+ 
++void mt_get_toptier_nodemask(nodemask_t *mask, const nodemask_t *allowed)
++{
++	int nid;
++
++	*mask = NODE_MASK_NONE;
++	for_each_node_state(nid, N_MEMORY) {
++		if (node_is_toptier(nid))
++			node_set(nid, *mask);
++	}
++	if (allowed)
++		nodes_and(*mask, *mask, *allowed);
++}
++
++unsigned long mt_get_toptier_capacity(const nodemask_t *allowed)
++{
++	int nid;
++	unsigned long capacity = 0;
++	nodemask_t mask;
++
++	mt_get_toptier_nodemask(&amp;mask, allowed);
++	for_each_node_mask(nid, mask)
++		capacity += NODE_DATA(nid)-&gt;node_present_pages;
++
++	return capacity;
++}
++
++unsigned long mt_get_total_capacity(const nodemask_t *allowed)
++{
++	int nid;
++	unsigned long capacity = 0;
++
++	for_each_node_state(nid, N_MEMORY) {
++		if (allowed &amp;&amp; !node_isset(nid, *allowed))
++			continue;
++		capacity += NODE_DATA(nid)-&gt;node_present_pages;
++	}
++	return capacity;
++}
++
+ #ifdef CONFIG_MIGRATION
+ #ifdef CONFIG_SYSFS
+ static ssize_t demotion_enabled_show(struct kobject *kobj,
+diff --git a/mm/page_counter.c b/mm/page_counter.c
+index 5ec97811c418..cf21c72bfd4e 100644
+--- a/mm/page_counter.c
++++ b/mm/page_counter.c
+@@ -11,6 +11,7 @@
+ #include &lt;linux/string.h&gt;
+ #include &lt;linux/sched.h&gt;
+ #include &lt;linux/bug.h&gt;
++#include &lt;linux/memory-tiers.h&gt;
+ #include &lt;asm/page.h&gt;
+ 
+ static bool track_protection(struct page_counter *c)
+@@ -463,6 +464,13 @@ void page_counter_calculate_protection(struct page_counter *root,
+ 			recursive_protection));
+ }
+ 
++void page_counter_update_toptier_capacity(struct page_counter *counter,
++					  const nodemask_t *allowed)
++{
++	counter-&gt;toptier_capacity = mt_get_toptier_capacity(allowed);
++	counter-&gt;total_capacity = mt_get_total_capacity(allowed);
++}
++
+ unsigned long page_counter_toptier_high(struct page_counter *counter)
+ {
+ 	unsigned long high = READ_ONCE(counter-&gt;high);
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: acknowledged a need for dynamic updates, explained reasoning behind implementation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about fairness in memory distribution among workloads, explaining that current limits are based on total memory footprint rather than where the memory resides. They updated the existing memory.low protection to be tier-aware in charging, enforcement, and protection calculation, providing best-effort attempts at protecting a fair proportion of toptier memory.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On machines serving multiple workloads whose memory is isolated via
+the memory cgroup controller, it is currently impossible to enforce a
+fair distribution of toptier memory among the worloads, as the only
+enforcable limits have to do with total memory footprint, but not where
+that memory resides.
+
+This makes ensuring a consistent and baseline performance difficult, as
+each workload&#x27;s performance is heavily impacted by workload-external
+factors such as which other workloads are co-located in the same host,
+and the order at which different workloads are started.
+
+Extend the existing memory.low protection to be tier-aware in the
+charging, enforcement, and protection calculation to provide
+best-effort attempts at protecting a fair proportion of toptier memory.
+
+Updates to protection and charging are performed in the same path as
+the standard memcontrol equivalents. Enforcing tier-aware memcg limits
+however, are gated behind the sysctl tier_aware_memcg. This is so that
+runtime-enabling of tier aware limits can account for memory already
+present in the system.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h   | 15 +++++++++++----
+ include/linux/page_counter.h |  7 ++++---
+ kernel/cgroup/dmem.c         |  2 +-
+ mm/memcontrol.c              | 14 ++++++++++++--
+ mm/page_counter.c            | 35 ++++++++++++++++++++++++++++++++++-
+ mm/vmscan.c                  | 13 +++++++++----
+ 6 files changed, 71 insertions(+), 15 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 900a36112b62..a998a1e3b8b0 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -606,7 +606,9 @@ static inline void mem_cgroup_protection(struct mem_cgroup *root,
+ }
+ 
+ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+-				     struct mem_cgroup *memcg);
++				     struct mem_cgroup *memcg, bool toptier);
++
++unsigned long mem_cgroup_toptier_usage(struct mem_cgroup *memcg);
+ 
+ void update_memcg_toptier_capacity(void);
+ 
+@@ -623,11 +625,15 @@ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
+ }
+ 
+ static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
+-					struct mem_cgroup *memcg)
++					struct mem_cgroup *memcg, bool toptier)
+ {
+ 	if (mem_cgroup_unprotected(target, memcg))
+ 		return false;
+ 
++	if (toptier)
++		return READ_ONCE(memcg-&gt;memory.etoptier_low) &gt;=
++				 mem_cgroup_toptier_usage(memcg);
++
+ 	return READ_ONCE(memcg-&gt;memory.elow) &gt;=
+ 		page_counter_read(&amp;memcg-&gt;memory);
+ }
+@@ -1114,7 +1120,8 @@ static inline void mem_cgroup_protection(struct mem_cgroup *root,
+ }
+ 
+ static inline void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+-						   struct mem_cgroup *memcg)
++						   struct mem_cgroup *memcg,
++						   bool toptier)
+ {
+ }
+ 
+@@ -1128,7 +1135,7 @@ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
+ 	return true;
+ }
+ static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
+-					struct mem_cgroup *memcg)
++					struct mem_cgroup *memcg, bool toptier)
+ {
+ 	return false;
+ }
+diff --git a/include/linux/page_counter.h b/include/linux/page_counter.h
+index ada5f1dd75d4..6635ee7b9575 100644
+--- a/include/linux/page_counter.h
++++ b/include/linux/page_counter.h
+@@ -120,15 +120,16 @@ static inline void page_counter_reset_watermark(struct page_counter *counter)
+ #if IS_ENABLED(CONFIG_MEMCG) || IS_ENABLED(CONFIG_CGROUP_DMEM)
+ void page_counter_calculate_protection(struct page_counter *root,
+ 				       struct page_counter *counter,
+-				       bool recursive_protection);
++				       bool recursive_protection, bool toptier);
+ void page_counter_update_toptier_capacity(struct page_counter *counter,
+ 					  const nodemask_t *allowed);
+ unsigned long page_counter_toptier_high(struct page_counter *counter);
+ unsigned long page_counter_toptier_low(struct page_counter *counter);
+ #else
+ static inline void page_counter_calculate_protection(struct page_counter *root,
+-						     struct page_counter *counter,
+-						     bool recursive_protection) {}
++						struct page_counter *counter,
++						bool recursive_protection,
++						bool toptier) {}
+ #endif
+ 
+ #endif /* _LINUX_PAGE_COUNTER_H */
+diff --git a/kernel/cgroup/dmem.c b/kernel/cgroup/dmem.c
+index 1ea6afffa985..536d43c42de8 100644
+--- a/kernel/cgroup/dmem.c
++++ b/kernel/cgroup/dmem.c
+@@ -277,7 +277,7 @@ dmem_cgroup_calculate_protection(struct dmem_cgroup_pool_state *limit_pool,
+ 			continue;
+ 
+ 		page_counter_calculate_protection(
+-			climit, &amp;found_pool-&gt;cnt, true);
++			climit, &amp;found_pool-&gt;cnt, true, false);
+ 
+ 		if (found_pool == test_pool)
+ 			break;
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 07464f02c529..8aa7ae361a73 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4806,12 +4806,13 @@ struct cgroup_subsys memory_cgrp_subsys = {
+  * mem_cgroup_calculate_protection - check if memory consumption is in the normal range
+  * @root: the top ancestor of the sub-tree being checked
+  * @memcg: the memory cgroup to check
++ * @toptier: whether the caller is in a toptier node
+  *
+  * WARNING: This function is not stateless! It can only be used as part
+  *          of a top-down tree iteration, not for isolated queries.
+  */
+ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+-				     struct mem_cgroup *memcg)
++				     struct mem_cgroup *memcg, bool toptier)
+ {
+ 	bool recursive_protection =
+ 		cgrp_dfl_root.flags &amp; CGRP_ROOT_MEMORY_RECURSIVE_PROT;
+@@ -4822,7 +4823,16 @@ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+ 	if (!root)
+ 		root = root_mem_cgroup;
+ 
+-	page_counter_calculate_protection(&amp;root-&gt;memory, &amp;memcg-&gt;memory, recursive_protection);
++	page_counter_calculate_protection(&amp;root-&gt;memory, &amp;memcg-&gt;memory,
++					  recursive_protection, toptier);
++}
++
++unsigned long mem_cgroup_toptier_usage(struct mem_cgroup *memcg)
++{
++	if (mem_cgroup_disabled() || !memcg)
++		return 0;
++
++	return atomic_long_read(&amp;memcg-&gt;memory.toptier_usage);
+ }
+ 
+ void update_memcg_toptier_capacity(void)
+diff --git a/mm/page_counter.c b/mm/page_counter.c
+index cf21c72bfd4e..79d46a1c4c0c 100644
+--- a/mm/page_counter.c
++++ b/mm/page_counter.c
+@@ -410,12 +410,39 @@ static unsigned long effective_protection(unsigned long usage,
+ 	return ep;
+ }
+ 
++static void calculate_protection_toptier(struct page_counter *counter,
++					 bool recursive_protection)
++{
++	struct page_counter *parent = counter-&gt;parent;
++	unsigned long toptier_low;
++	unsigned long toptier_usage, parent_toptier_usage;
++	unsigned long toptier_protected, old_toptier_protected;
++	long delta;
++
++	toptier_low = page_counter_toptier_low(counter);
++	toptier_usage = atomic_long_read(&amp;counter-&gt;toptier_usage);
++	parent_toptier_usage = atomic_long_read(&amp;parent-&gt;toptier_usage);
++
++	/* Propagate toptier low usage to parent for sibling distribution */
++	toptier_protected = min(toptier_usage, toptier_low);
++	old_toptier_protected = atomic_long_xchg(&amp;counter-&gt;toptier_low_usage,
++						 toptier_protected);
++	delta = toptier_protected - old_toptier_protected;
++	atomic_long_add(delta, &amp;parent-&gt;children_toptier_low_usage);
++
++	WRITE_ONCE(counter-&gt;etoptier_low,
++		   effective_protection(toptier_usage, parent_toptier_usage,
++		   toptier_low, READ_ONCE(parent-&gt;etoptier_low),
++		   atomic_long_read(&amp;parent-&gt;children_toptier_low_usage),
++		   recursive_protection));
++}
+ 
+ /**
+  * page_counter_calculate_protection - check if memory consumption is in the normal range
+  * @root: the top ancestor of the sub-tree being checked
+  * @counter: the page_counter the counter to update
+  * @recursive_protection: Whether to use memory_recursiveprot behavior.
++ * @toptier: Whether to calculate toptier-proportional protection
+  *
+  * Calculates elow/emin thresholds for given page_counter.
+  *
+@@ -424,7 +451,7 @@ static unsigned long effective_protection(unsigned long usage,
+  */
+ void page_counter_calculate_protection(struct page_counter *root,
+ 				       struct page_counter *counter,
+-				       bool recursive_protection)
++				       bool recursive_protection, bool toptier)
+ {
+ 	unsigned long usage, parent_usage;
+ 	struct page_counter *parent = counter-&gt;parent;
+@@ -446,6 +473,9 @@ void page_counter_calculate_protection(struct page_counter *root,
+ 	if (parent == root) {
+ 		counter-&gt;emin = READ_ONCE(counter-&gt;min);
+ 		counter-&gt;elow = READ_ONCE(counter-&gt;low);
++		if (toptier)
++			WRITE_ONCE(counter-&gt;etoptier_low,
++				   page_counter_toptier_low(counter));
+ 		return;
+ 	}
+ 
+@@ -462,6 +492,9 @@ void page_counter_calculate_protection(struct page_counter *root,
+ 			READ_ONCE(parent-&gt;elow),
+ 			atomic_long_read(&amp;parent-&gt;children_low_usage),
+ 			recursive_protection));
++
++	if (toptier)
++		calculate_protection_toptier(counter, recursive_protection);
+ }
+ 
+ void page_counter_update_toptier_capacity(struct page_counter *counter,
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 6a87ac7be43c..5b4cb030a477 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4144,6 +4144,7 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+ 	struct mem_cgroup *memcg;
+ 	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
+ 	bool reclaimable = !min_ttl;
++	bool toptier = node_is_toptier(pgdat-&gt;node_id);
+ 
+ 	VM_WARN_ON_ONCE(!current_is_kswapd());
+ 
+@@ -4153,7 +4154,7 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+ 	do {
+ 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
+ 
+-		mem_cgroup_calculate_protection(NULL, memcg);
++		mem_cgroup_calculate_protection(NULL, memcg, toptier);
+ 
+ 		if (!reclaimable)
+ 			reclaimable = lruvec_is_reclaimable(lruvec, sc, min_ttl);
+@@ -4905,12 +4906,14 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+ 	unsigned long reclaimed = sc-&gt;nr_reclaimed;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
++	bool toptier = tier_aware_memcg_limits &amp;&amp;
++		       node_is_toptier(pgdat-&gt;node_id);
+ 
+ 	/* lru_gen_age_node() called mem_cgroup_calculate_protection() */
+ 	if (mem_cgroup_below_min(NULL, memcg))
+ 		return MEMCG_LRU_YOUNG;
+ 
+-	if (mem_cgroup_below_low(NULL, memcg)) {
++	if (mem_cgroup_below_low(NULL, memcg, toptier)) {
+ 		/* see the comment on MEMCG_NR_GENS */
+ 		if (READ_ONCE(lruvec-&gt;lrugen.seg) != MEMCG_LRU_TAIL)
+ 			return MEMCG_LRU_TAIL;
+@@ -5960,6 +5963,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 	};
+ 	struct mem_cgroup_reclaim_cookie *partial = &amp;reclaim;
+ 	struct mem_cgroup *memcg;
++	bool toptier = node_is_toptier(pgdat-&gt;node_id);
+ 
+ 	/*
+ 	 * In most cases, direct reclaimers can do partial walks
+@@ -5987,7 +5991,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 		 */
+ 		cond_resched();
+ 
+-		mem_cgroup_calculate_protection(target_memcg, memcg);
++		mem_cgroup_calculate_protection(target_memcg, memcg, toptier);
+ 
+ 		if (mem_cgroup_below_min(target_memcg, memcg)) {
+ 			/*
+@@ -5995,7 +5999,8 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 			 * If there is no reclaimable memory, OOM.
+ 			 */
+ 			continue;
+-		} else if (mem_cgroup_below_low(target_memcg, memcg)) {
++		} else if (mem_cgroup_below_low(target_memcg, memcg,
++					tier_aware_memcg_limits &amp;&amp; toptier)) {
+ 			/*
+ 			 * Soft protection.
+ 			 * Respect the protection only as long as
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing a concern about the fairness of memory distribution among workloads in isolated cgroups. They explained that the current limits only consider total memory footprint, not where it resides. The author proposed extending the existing memory.high protection to be tier-aware and adding a new nodemask parameter to try_to_free_mem_cgroup_pages for selective reclaim from memory at the memcg-tier intersection of a cgroup.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On machines serving multiple workloads whose memory is isolated via the
+memory cgroup controller, it is currently impossible to enforce a fair
+distribution of toptier memory among the workloads, as the only
+enforcable limits have to do with total memory footprint, but not where
+that memory resides.
+
+This makes ensuring a consistent and baseline performance difficult, as
+each workload&#x27;s performance is heavily impacted by workload-external
+factors wuch as which other workloads are co-located in the same host,
+and the order at which different workloads are started.
+
+Extend the existing memory.high protection to be tier-aware in the
+charging and enforcement to limit toptier-hogging for workloads.
+
+Also, add a new nodemask parameter to try_to_free_mem_cgroup_pages,
+which can be used to selectively reclaim from memory at the
+memcg-tier interection of a cgroup.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/swap.h |  3 +-
+ mm/memcontrol-v1.c   |  6 ++--
+ mm/memcontrol.c      | 85 +++++++++++++++++++++++++++++++++++++-------
+ mm/vmscan.c          | 11 +++---
+ 4 files changed, 84 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 0effe3cc50f5..c6037ac7bf6e 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -368,7 +368,8 @@ extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 						  unsigned long nr_pages,
+ 						  gfp_t gfp_mask,
+ 						  unsigned int reclaim_options,
+-						  int *swappiness);
++						  int *swappiness,
++						  nodemask_t *allowed);
+ extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
+ 						gfp_t gfp_mask, bool noswap,
+ 						pg_data_t *pgdat,
+diff --git a/mm/memcontrol-v1.c b/mm/memcontrol-v1.c
+index 0b39ba608109..29630c7f3567 100644
+--- a/mm/memcontrol-v1.c
++++ b/mm/memcontrol-v1.c
+@@ -1497,7 +1497,8 @@ static int mem_cgroup_resize_max(struct mem_cgroup *memcg,
+ 		}
+ 
+ 		if (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,
+-				memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP, NULL)) {
++				memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP,
++				NULL, NULL)) {
+ 			ret = -EBUSY;
+ 			break;
+ 		}
+@@ -1529,7 +1530,8 @@ static int mem_cgroup_force_empty(struct mem_cgroup *memcg)
+ 			return -EINTR;
+ 
+ 		if (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,
+-						  MEMCG_RECLAIM_MAY_SWAP, NULL))
++						  MEMCG_RECLAIM_MAY_SWAP,
++						  NULL, NULL))
+ 			nr_retries--;
+ 	}
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 8aa7ae361a73..ebd4a1b73c51 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2184,18 +2184,30 @@ static unsigned long reclaim_high(struct mem_cgroup *memcg,
+ 
+ 	do {
+ 		unsigned long pflags;
+-
+-		if (page_counter_read(&amp;memcg-&gt;memory) &lt;=
+-		    READ_ONCE(memcg-&gt;memory.high))
++		nodemask_t toptier_nodes, *reclaim_nodes;
++		bool mem_high_ok, toptier_high_ok;
++
++		mt_get_toptier_nodemask(&amp;toptier_nodes, NULL);
++		mem_high_ok = page_counter_read(&amp;memcg-&gt;memory) &lt;=
++			      READ_ONCE(memcg-&gt;memory.high);
++		toptier_high_ok = !(tier_aware_memcg_limits &amp;&amp;
++				    mem_cgroup_toptier_usage(memcg) &gt;
++				    page_counter_toptier_high(&amp;memcg-&gt;memory));
++		if (mem_high_ok &amp;&amp; toptier_high_ok)
+ 			continue;
+ 
++		if (mem_high_ok &amp;&amp; !toptier_high_ok)
++			reclaim_nodes = &amp;toptier_nodes;
++		else
++			reclaim_nodes = NULL;
++
+ 		memcg_memory_event(memcg, MEMCG_HIGH);
+ 
+ 		psi_memstall_enter(&amp;pflags);
+ 		nr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,
+ 							gfp_mask,
+ 							MEMCG_RECLAIM_MAY_SWAP,
+-							NULL);
++							NULL, reclaim_nodes);
+ 		psi_memstall_leave(&amp;pflags);
+ 	} while ((memcg = parent_mem_cgroup(memcg)) &amp;&amp;
+ 		 !mem_cgroup_is_root(memcg));
+@@ -2296,6 +2308,24 @@ static u64 mem_find_max_overage(struct mem_cgroup *memcg)
+ 	return max_overage;
+ }
+ 
++static u64 toptier_find_max_overage(struct mem_cgroup *memcg)
++{
++	u64 overage, max_overage = 0;
++
++	if (!tier_aware_memcg_limits)
++		return 0;
++
++	do {
++		unsigned long usage = mem_cgroup_toptier_usage(memcg);
++		unsigned long high = page_counter_toptier_high(&amp;memcg-&gt;memory);
++
++		overage = calculate_overage(usage, high);
++		max_overage = max(overage, max_overage);
++	} while ((memcg = parent_mem_cgroup(memcg)) &amp;&amp;
++		  !mem_cgroup_is_root(memcg));
++
++	return max_overage;
++}
+ static u64 swap_find_max_overage(struct mem_cgroup *memcg)
+ {
+ 	u64 overage, max_overage = 0;
+@@ -2401,6 +2431,14 @@ void __mem_cgroup_handle_over_high(gfp_t gfp_mask)
+ 	penalty_jiffies += calculate_high_delay(memcg, nr_pages,
+ 						swap_find_max_overage(memcg));
+ 
++	/*
++	 * Don&#x27;t double-penalize for toptier high overage if system-wide
++	 * memory.high has already been breached.
++	 */
++	if (!penalty_jiffies)
++		penalty_jiffies += calculate_high_delay(memcg, nr_pages,
++					toptier_find_max_overage(memcg));
++
+ 	/*
+ 	 * Clamp the max delay per usermode return so as to still keep the
+ 	 * application moving forwards and also permit diagnostics, albeit
+@@ -2503,7 +2541,8 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 
+ 	psi_memstall_enter(&amp;pflags);
+ 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+-						    gfp_mask, reclaim_options, NULL);
++						    gfp_mask, reclaim_options,
++						    NULL, NULL);
+ 	psi_memstall_leave(&amp;pflags);
+ 
+ 	if (mem_cgroup_margin(mem_over_limit) &gt;= nr_pages)
+@@ -2592,23 +2631,26 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	 * reclaim, the cost of mismatch is negligible.
+ 	 */
+ 	do {
+-		bool mem_high, swap_high;
++		bool mem_high, swap_high, toptier_high = false;
+ 
+ 		mem_high = page_counter_read(&amp;memcg-&gt;memory) &gt;
+ 			READ_ONCE(memcg-&gt;memory.high);
+ 		swap_high = page_counter_read(&amp;memcg-&gt;swap) &gt;
+ 			READ_ONCE(memcg-&gt;swap.high);
++		toptier_high = tier_aware_memcg_limits &amp;&amp;
++			       (mem_cgroup_toptier_usage(memcg) &gt;
++				page_counter_toptier_high(&amp;memcg-&gt;memory));
+ 
+ 		/* Don&#x27;t bother a random interrupted task */
+ 		if (!in_task()) {
+-			if (mem_high) {
++			if (mem_high || toptier_high) {
+ 				schedule_work(&amp;memcg-&gt;high_work);
+ 				break;
+ 			}
+ 			continue;
+ 		}
+ 
+-		if (mem_high || swap_high) {
++		if (mem_high || swap_high || toptier_high) {
+ 			/*
+ 			 * The allocating tasks in this cgroup will need to do
+ 			 * reclaim or be throttled to prevent further growth
+@@ -4476,7 +4518,7 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+ 	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+ 	bool drained = false;
+-	unsigned long high;
++	unsigned long high, toptier_high;
+ 	int err;
+ 
+ 	buf = strstrip(buf);
+@@ -4485,15 +4527,22 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 		return err;
+ 
+ 	page_counter_set_high(&amp;memcg-&gt;memory, high);
++	toptier_high = page_counter_toptier_high(&amp;memcg-&gt;memory);
+ 
+ 	if (of-&gt;file-&gt;f_flags &amp; O_NONBLOCK)
+ 		goto out;
+ 
+ 	for (;;) {
+ 		unsigned long nr_pages = page_counter_read(&amp;memcg-&gt;memory);
++		unsigned long toptier_pages = mem_cgroup_toptier_usage(memcg);
+ 		unsigned long reclaimed;
++		unsigned long to_free;
++		nodemask_t toptier_nodes, *reclaim_nodes;
++		bool mem_high_ok = nr_pages &lt;= high;
++		bool toptier_high_ok = !(tier_aware_memcg_limits &amp;&amp;
++					 toptier_pages &gt; toptier_high);
+ 
+-		if (nr_pages &lt;= high)
++		if (mem_high_ok &amp;&amp; toptier_high_ok)
+ 			break;
+ 
+ 		if (signal_pending(current))
+@@ -4505,8 +4554,17 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 			continue;
+ 		}
+ 
+-		reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,
+-					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL);
++		mt_get_toptier_nodemask(&amp;toptier_nodes, NULL);
++		if (mem_high_ok &amp;&amp; !toptier_high_ok) {
++			reclaim_nodes = &amp;toptier_nodes;
++			to_free = toptier_pages - toptier_high;
++		} else {
++			reclaim_nodes = NULL;
++			to_free = nr_pages - high;
++		}
++		reclaimed = try_to_free_mem_cgroup_pages(memcg, to_free,
++					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,
++					NULL, reclaim_nodes);
+ 
+ 		if (!reclaimed &amp;&amp; !nr_retries--)
+ 			break;
+@@ -4558,7 +4616,8 @@ static ssize_t memory_max_write(struct kernfs_open_file *of,
+ 
+ 		if (nr_reclaims) {
+ 			if (!try_to_free_mem_cgroup_pages(memcg, nr_pages - max,
+-					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL))
++					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,
++					NULL, NULL))
+ 				nr_reclaims--;
+ 			continue;
+ 		}
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 5b4cb030a477..94498734b4f5 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -6652,7 +6652,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 					   unsigned long nr_pages,
+ 					   gfp_t gfp_mask,
+ 					   unsigned int reclaim_options,
+-					   int *swappiness)
++					   int *swappiness, nodemask_t *allowed)
+ {
+ 	unsigned long nr_reclaimed;
+ 	unsigned int noreclaim_flag;
+@@ -6668,6 +6668,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 		.may_unmap = 1,
+ 		.may_swap = !!(reclaim_options &amp; MEMCG_RECLAIM_MAY_SWAP),
+ 		.proactive = !!(reclaim_options &amp; MEMCG_RECLAIM_PROACTIVE),
++		.nodemask = allowed,
+ 	};
+ 	/*
+ 	 * Traverse the ZONELIST_FALLBACK zonelist of the current node to put
+@@ -6693,7 +6694,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 					   unsigned long nr_pages,
+ 					   gfp_t gfp_mask,
+ 					   unsigned int reclaim_options,
+-					   int *swappiness)
++					   int *swappiness, nodemask_t *allowed)
+ {
+ 	return 0;
+ }
+@@ -7806,9 +7807,9 @@ int user_proactive_reclaim(char *buf,
+ 			reclaim_options = MEMCG_RECLAIM_MAY_SWAP |
+ 					  MEMCG_RECLAIM_PROACTIVE;
+ 			reclaimed = try_to_free_mem_cgroup_pages(memcg,
+-						 batch_size, gfp_mask,
+-						 reclaim_options,
+-						 swappiness == -1 ? NULL : &amp;swappiness);
++					batch_size, gfp_mask, reclaim_options,
++					swappiness == -1 ? NULL : &amp;swappiness,
++					NULL);
+ 		} else {
+ 			struct scan_control sc = {
+ 				.gfp_mask = current_gfp_context(gfp_mask),
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing a concern that the patch does not address the issue of tier-aware memcg limits being less effective on systems with tiered memory, where well-behaved workloads can still hurt other workloads by hogging more toptier memory than their &#x27;fair share&#x27;. The author explains that introducing tier-aware memcg limits will scale memory.low/high to reflect the ratio of toptier:total memory a cgroup has access to, and provides an example scenario where this is beneficial. The author also introduces a sysctl to toggle between enforcing and overlooking toptier memcg limit breaches.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Memory cgroups provide an interface that allow multiple workloads on a
+host to co-exist, and establish both weak and strong memory isolation
+guarantees. For large servers and small embedded systems alike, memcgs
+provide an effective way to provide a baseline quality of service for
+protected workloads.
+
+This works, because for the most part, all memory is equal (except for
+zram / zswap). Restricting a cgroup&#x27;s memory footprint restricts how
+much it can hurt other workloads competing for memory. Likewise, setting
+memory.low or memory.min limits can provide weak and strong guarantees
+to the performance of a cgroup.
+
+However, on systems with tiered memory (e.g. CXL / compressed memory),
+the quality of service guarantees that memcg limits enforced become less
+effective, as memcg has no awareness of the physical location of its
+charged memory. In other words, a workload that is well-behaved within
+its memcg limits may still be hurting the performance of other
+well-behaving workloads on the system by hogging more than its
+&quot;fair share&quot; of toptier memory.
+
+Introduce tier-aware memcg limits, which scale memory.low/high to
+reflect the ratio of toptier:total memory the cgroup has access.
+
+Take the following scenario as an example:
+On a host with 3:1 toptier:lowtier, say 150G toptier, and 50Glowtier,
+setting a cgroup&#x27;s limits to:
+	memory.min:  15G
+	memory.low:  20G
+	memory.high: 40G
+	memory.max:  50G
+
+Will be enforced at the toptier as:
+	memory.min:          15G
+	memory.toptier_low:  15G (20 * 150/200)
+	memory.toptier_high: 30G (40 * 150/200)
+	memory.max:          50G
+
+Let&#x27;s say that there are 4 such cgroups on the host. Previously, it would
+be possible for 3 hosts to completely take over all of DRAM, while one
+cgroup could only access the lowtier memory. In the perspective of a
+tier-agnostic memcg limit enforcement, the three cgroups are all
+well-behaved, consuming within their memory limits.
+
+This is not to say that the scenario above is incorrect. In fact, for
+letting the hottest cgroups run in DRAM while pushing out colder cgroups
+to lowtier memory lets the system perform the most aggregate work total.
+
+But for other scenarios, the target might not be maximizing aggregate
+work, but maximizing the minimum performance guarantee for each
+individual workload (think hosts shared across different users, such as
+VM hosting services).
+
+To reflect these two scenarios, introduce a sysctl tier_aware_memcg,
+which allows the host to toggle between enforcing and overlooking
+toptier memcg limit breaches.
+
+This work is inspired &amp; based off of Kaiyang Zhao&#x27;s work from 2024 [1],
+where he referred to this concept as &quot;memory tiering fairness&quot;.
+The biggest difference in the implementations lie in how toptier memory
+is tracked; in his implementation, an lruvec stat aggregation is done on
+each usage check, while in this implementation, a new cacheline is
+introduced in page_coutner to keep track of toptier usage (Kaiyang also
+introduces a new cachline in page_counter, but only uses it to cache
+capacity and thresholds). This implementation also extends the memory
+limit enforcement to memory.high as well.
+
+[1] https://lore.kernel.org/linux-mm/20240920221202.1734227-1-kaiyang2@cs.cmu.edu/
+
+---
+Joshua Hahn (6):
+  mm/memory-tiers: Introduce tier-aware memcg limit sysfs
+  mm/page_counter: Introduce tiered memory awareness to page_counter
+  mm/memory-tiers, memcontrol: Introduce toptier capacity updates
+  mm/memcontrol: Charge and uncharge from toptier
+  mm/memcontrol, page_counter: Make memory.low tier-aware
+  mm/memcontrol: Make memory.high tier-aware
+
+ include/linux/memcontrol.h   |  21 ++++-
+ include/linux/memory-tiers.h |  30 +++++++
+ include/linux/page_counter.h |  31 ++++++-
+ include/linux/swap.h         |   3 +-
+ kernel/cgroup/cpuset.c       |   2 +-
+ kernel/cgroup/dmem.c         |   2 +-
+ mm/memcontrol-v1.c           |   6 +-
+ mm/memcontrol.c              | 155 +++++++++++++++++++++++++++++++----
+ mm/memory-tiers.c            |  63 ++++++++++++++
+ mm/page_counter.c            |  77 ++++++++++++++++-
+ mm/vmscan.c                  |  24 ++++--
+ 11 files changed, 376 insertions(+), 38 deletions(-)
+
+-- 
+2.47.3</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<span class="reply-to-label">↳ replying to Joshua Hahn</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Michal Hocko questioned whether the patch&#x27;s assumption that active workingset sizes of all workloads don&#x27;t fit into the top tier is typical in real-life configurations, and asked if memory consumption on particular tiers should be limited even without external pressure.
+
+Reviewer Michal Hocko questioned whether focusing only on the top tier is a long-term solution, noting that similar issues may arise in other tiers and expressing concern about duplicating limits for each/top tier.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This assumes that the active workingset size of all workloads doesn&#x27;t
+fit into the top tier right? Otherwise promotions would make sure to
+that we have the most active memory in the top tier. Is this typical in
+real life configurations?
+
+Or do you intend to limit memory consumption on particular tier even
+without an external pressure?
+
+---
+
+Let&#x27;s spend some more time with the interface first. You seem to be
+focusing only on the top tier with this interface, right? Is this really the
+right way to go long term? What makes you believe that we do not really
+hit the same issue with other tiers as well? Also do we want/need to
+duplicate all the limits for each/top tier? What is the reasoning for
+the switch to be runtime sysctl rather than boot-time or cgroup mount
+option?
+
+I will likely have more questions but these are immediate ones after
+reading the cover. Please note I haven&#x27;t really looked at the
+implementation yet. I really want to understand usecases and interface
+first.
+-- 
+Michal Hocko
+SUSE Labs</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: questioning, request for clarification, requested changes</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<span class="reply-to-label">↳ replying to Michal Hocko</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author is addressing Michal&#x27;s feedback by mentioning the intention to discuss project scope and use cases in LSFMMBPF, but does not directly address or acknowledge any specific technical concerns raised by Michal.
+
+Author acknowledged a concern about the impact of a workload violating its fair share of toptier memory, explaining that it mostly hurts other workloads when the aggregate working set size exceeds toptier memory capacity.
+
+Author acknowledged that the current approach may not be suitable for all use cases and proposed a different perspective of thinking about memory allocation in a per-workload context, rather than a per-system one.
+
+Author responded to Michal Hocko&#x27;s concern about the realism of the patch examples, stating they are realistic scenarios for cloud providers and hyperscalers.
+
+Author acknowledges a concern about the interface&#x27;s behavior and proposes two alternative modes: &#x27;fixed&#x27; and &#x27;opportunistic&#x27; reclaim, asking for feedback on which one aligns better with the reviewer&#x27;s expectations.
+
+Author acknowledges that the patch series was sent out of order, and agrees it would have been better to send the LSFMMBPF topic proposal first, causing some potential confusion.
+
+Author acknowledged that the current implementation only addresses two-tiered systems and may not be suitable for future multi-tiered systems, but plans to revisit this issue in a later patchset.
+
+Author responded to a question about how tier-aware memcg limits handle cases with multiple nodes or tiers in the toptier, asking for clarification on what specific scenario is being referred to.
+
+Author addressed Michal Hocko&#x27;s concern that allowing cgroups to set their own mount options for tier-aware memcg limits could lead to inconsistent behavior and undermine the purpose of having a performance guarantee, agreeing that this approach is not desirable.
+
+Author acknowledged that the reviewer&#x27;s feedback was good and thanked them for reviewing, indicating no further action or revision planned.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hello Michal,
+
+I hope that you are doing well! Thank you for taking the time to review my
+work and leaving your thoughts.
+
+I wanted to note that I hope to bring this discussion to LSFMMBPF as well,
+to discuss what the scope of the project should be, what usecases there
+are (as I will note below), how to make this scalable and sustainable
+for the future, etc. I&#x27;ll send out a topic proposal later today. I had
+separated the series from the proposal because I imagined that this
+series would go through many versions, so it would be helpful to have
+the topic as a unified place for pre-conference discussions.
+
+---
+
+Yes, for the scenario above, a workload that is violating its fair share
+of toptier memory mostly hurts other workloads if the aggregate working
+set size of all workloads exceeds the size of toptier memory.
+
+---
+
+This is true. And for a lot of usecases, this is 100% the right thing to do.
+However, with this patch I want to encourage a different perspective,
+which is to think about things in a per-workload perspective, and not a
+per-system perspective.
+
+Having hot memory in high tiers and cold memory in low tiers is only
+logical, since we increase the system&#x27;s throughput and make the most
+optimal choices for latency. However, what about systems that care about
+objectives other than simply maximizing throughput?
+
+In the original cover letter I offered an example of VM hosting services
+that care less about maximizing host-wide throughput, but more on ensuring
+a bottomline performance guarantee for all workloads running on the system.
+For the users on these services, they don&#x27;t care that the host their VM is
+running on is maximizing throughput; rather, they care that their VM meets
+the performance guarantees that their provider promised. If there is no
+way to know or enforce which tier of memory their workload lands on, either
+the bottomline guarantee becomes very underestimated, or users must deal
+with a high variance in performance.
+
+Here&#x27;s another example: Let&#x27;s say there is a host with multiple workloads,
+each serving queries for a database. The host would like to guarantee the
+lowest maximum latency possible, while maximizing the total throughput
+of the system. Once again in this situation, without tier-aware memcg
+limits the host can maximize throughput, but can only make severely
+underestimated promises on the bottom line.
+
+---
+
+I would say so. I think that the two examples above are realistic
+scenarios that cloud providers and hyperscalers might face on tiered systems.
+
+---
+
+This is a great question, and one that I hope to discuss at LSFMMBPF
+to see how people expect an interface like this to work.
+
+Over the past few weeks, I have been discussing this idea during the
+Linux Memory Hotness and Promotion biweekly calls with Gregory Price [1].
+One of the proposals that we made there (but did not include in this
+series) is the idea of &quot;fixed&quot; vs. &quot;opportunistic&quot; reclaim.
+
+Fixed mode is what we have here -- start limiting toptier usage whenever
+a workload goes above its fair slice of toptier.
+Opportunistic mode would allow workloads to use more toptier memory than
+its fair share, but only be restricted when toptier is pressured.
+
+What do you think about these two options? For the stated goal of this
+series, which is to help maximize the bottom line for workloads, fair
+share seemed to make sense. Implementing opportunistic mode changes
+on top of this work would most likely just be another sysctl.
+
+---
+
+That sounds good with me, my goal was to bring this out as an RFC patchset
+so folks could look at the code and understand the motivation, and then send
+out the LSFMMBPF topic proposal. In retrospect I think I should have done
+it in the opposite order. I&#x27;m sorry if this caused any confusion.
+
+---
+
+Yes, that&#x27;s right. I&#x27;m not sure if this is the right way to go long-term
+(say, past the next 5 years). My thinking was that I can stick with doing
+this for toptier vs. non-toptier memory for now, and deal with having
+3+ tiers in the future, when we start to have systems with that many tiers.
+AFAICT two-tiered systems are still ~relatively new, and I don&#x27;t think
+there are a lot of genuine usecases for enforcing mid-tier memory limits
+as of now. Of course, I would be excited to learn about these usecases
+and work this patchset to support them as well if anybody has them.
+
+---
+
+Sorry, I&#x27;m not sure that I completely understood this question. Are you
+referring to the case where we have multiple nodes in the toptier?
+If so, then all of those nodes are treated the same, and don&#x27;t have
+unique limits. Or are you referring to the case where we have multiple
+tiers in the toptier? If so, I hope the answer above can answer this too.
+
+---
+
+Good point : -) I don&#x27;t think cgroup mount options are a good idea,
+since this would mean that we can have a set of cgroups self-policing
+their toptier usage, while another cgroup allocates memory unrestricted.
+This would punish the self-policing cgroup and we would lose the benefit
+of having a bottomline performance guarantee.
+
+---
+
+That sounds good to me, thank you again for reviewing this work!
+I hope you have a great day : -)
+Joshua
+
+[1] https://lore.kernel.org/linux-mm/c8bc2dce-d4ec-c16e-8df4-2624c48cfc06@google.com/</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: clarifying discussion plans, separating series from proposal, clarification</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price</span>
+<span class="reply-to-label">↳ replying to Joshua Hahn</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch does not handle the case where tier-aware memcg limits are toggled off, and requested a check to ensure that the sysfs attribute is only accessed when the feature is enabled.
+
+Reviewer Gregory Price expressed concern that the patch&#x27;s assumption about always wanting tier-aware memcg limits may reduce the usefulness of secondary memory tiers, as services will prefer not to be deployed on machines with high performance variance.
+
+Reviewer Gregory Price noted that lack of tier-awareness is a significant blocker for deploying mixed workloads on large, dense memory systems with multiple tiers (2+), and suggested using the existing knobs (max/high/low/min) to proportionally control coherent memory tiers.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Just injecting a few points here
+(disclosure: I have been in the development loop for this feature)
+
+---
+
+Yes / No.  This makes the assumption that you always want this.
+
+Barring a minimum Quality of Service mechanism (as Joshua explains)
+this reduces the usefulness of a secondary tier of memory.
+
+Services will just prefer not to be deployed to these kinds of
+machines because the performance variance is too high.
+
+---
+
+The answer is unequivocally yes.
+
+Lacking tier-awareness is actually a huge blocker for deploying mixed
+workloads on large, dense memory systems with multiple tiers (2+).
+
+Technically we&#x27;re already at 4-ish tiers: DDR, CXL, ZSWAP, SWAP.
+
+We have zswap/swap controls in cgroups already, we just lack that same
+control for coherent memory tiers.  This tries to use the existing nobs
+(max/high/low/min) to do what they already do - just proportionally.
+
+~Gregory</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: requested changes, concerns, reduces usefulness</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kaiyang Zhao</span>
+<span class="reply-to-label">↳ replying to Gregory Price</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kaiyang Zhao noted that current server memory shapes and workload stacking settings cause contention of top-tier memory, leading to significant variations in tail latency and throughput for co-colocated workloads, which this patch set aims to alleviate.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hello! I&#x27;m the author of the RFC in 2024. Just want to add that we&#x27;ve
+recently released a preprint paper on arXiv that includes case studies
+with a few of Meta&#x27;s production workloads using a prototype version of
+the patches.
+
+The results confirmed that co-colocated workloads can have working set
+sizes exceeding the limited top-tier memory capacity given today&#x27;s
+server memory shapes and workload stacking settings, causing contention
+of top-tier memory. Workloads see significant variations in tail
+latency and throughput depending on the share of top-tier tier memory
+they get, which this patch set will alleviate.
+
+Best,
+Kaiyang
+
+[1] https://arxiv.org/pdf/2602.08800</pre>
+</details>
+</div>
+<div class="review-comment-signals">Signals: NEUTRAL</div>
+</div>
 </div>
 </div>
 </details>
@@ -1618,11 +6182,11 @@
 </div>
 
     <footer>
-        Generated in 0.0s
+        Generated in 830.2s
         &bull; 16 developers tracked
         &bull; Data from lore.kernel.org
         &bull; LLM: ollama/llama3.1:8b
-        
+        &bull; <a href="/logs/2026-02-24_ollama_llama3.1-8b.log">Log</a>
     </footer>
 </body>
 </html>
