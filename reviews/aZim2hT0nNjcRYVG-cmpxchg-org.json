@@ -1,6 +1,6 @@
 {
   "thread_id": "aZim2hT0nNjcRYVG@cmpxchg.org",
-  "subject": "Re: [LSF/MM/BPF TOPIC] Improving MGLRU",
+  "subject": "[LSF/MM/BPF TOPIC] Improving MGLRU",
   "url": "https://lore.kernel.org/all/aZim2hT0nNjcRYVG@cmpxchg.org/",
   "dates": {
     "2026-02-20": {
@@ -45,34 +45,20 @@
       "developer": "Johannes Weiner",
       "reviews": [
         {
-          "author": "Kairui Song (author)",
-          "summary": "Author acknowledged that MGLRU performs worse in some workloads without swap, specifically citing MongoDB as an example. They attributed this issue to the PID protection mechanism being too passive and the force protection in sort_folio being too aggressive. The author agreed that this is a fixable issue using their proposed approach, which they claim outperforms Active/Inactive LRU in all known cases.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "A bit more than that. When there is no swap, MGLRU still performs\nworse in some workloads like MongoDB. From what I've noticed that's\nbecause the PID protection is a bit too passive, and there is a force\nprotection in sort_folio which sometimes seems too aggressive.\nActive/Inactive LRU will just move a folio to head if it's accessed\ntwice while in RAM, but MGLRU won't do so, as result hotter file\nfolios are evicted equally as the colder one until the PID gets\ntriggered, or still gets protected even if it hasn't been used for a\nwhile. And by the time PID finally gets triggered, the workload might\nhas changed. This is fixable using the approach I mentioned though,\nand it seems to be better than the Active/Inactive in all our known\ncases after that, whether that is a good fix worth discussion.\n\nI also notice Ridong has a series to apply a \"heat\" based reclaim,\nwhich also looks interesting.",
-          "reply_to": "Johannes Weiner",
-          "message_date": "2026-02-21"
-        },
-        {
-          "author": "Kairui Song (author)",
-          "summary": "Author acknowledged a concern about MGLRU ignoring shadow distance for re-activation, but noted that it's not considered a problem by users and performance looks good. They proposed alternative approaches to restore the old behavior or further optimize it.",
+          "author": "Kairui Song",
+          "summary": "A bit more than that. When there is no swap, MGLRU still performs worse in some workloads like MongoDB. From what I've noticed that's because the PID protection is a bit too passive, and there is a force protection in sort_folio which sometimes seems too aggressive. Active/Inactive LRU will just move a folio to head if it's accessed twice while in RAM, but MGLRU won't do so, as result hotter file folios are evicted equally as the colder one until the PID gets triggered, or still gets protected even if it hasn't been used for a while. And by the time PID finally gets triggered, the workload might has changed.",
           "sentiment": "neutral",
-          "sentiment_signals": [
-            "acknowledged a concern",
-            "proposed alternative approaches"
-          ],
-          "has_inline_review": false,
+          "sentiment_signals": [],
+          "has_inline_review": true,
           "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "Sorry I didn't make it clear. For MGLRU currently it already ignored\nthe shadow distance for re-activation. And yeah, basically all anons\nare activated on fault, which turns out to be quite nice? None MGLRU\nusers considered that as a problem and in fact the performance looks\ngood.\n\nOf course we can restore the old behavior to test the folio\nagainst some distance (gen distance or eviction distance), or push it\nfurther to only keep the reference bit (not completely ignore the\nshadow, just only keep the reference bits, if the LFU + PID still\nworks well without the distance), and gain more performance and bits\nto use.\n\nBTW I tried to restore the refault distance behavior for both anon and\nfile folios sometime ago:\nhttps://lwn.net/Articles/945266/\n\nFor file folios it indeed looked better, anon folios seems unchanged.\nBut later tests showed that it doesn't apply to all cases, and I think\nsomething better can be used as suggested in this topic.",
-          "reply_to": "Johannes Weiner",
-          "message_date": "2026-02-21"
+          "analysis_source": "heuristic",
+          "raw_body": "On Sat, Feb 21, 2026 at 2:24 AM Johannes Weiner <hannes@cmpxchg.org> wrote:\n>\n> On Fri, Feb 20, 2026 at 01:25:33AM +0800, Kairui Song wrote:\n> > Hi All,\n> >\n> > Apologies I forgot to add the proper tag in the previous email so\n> > resending this.\n> >\n> > MGLRU has been introduced in the mainline for years, but we still have two LRUs\n> > today. There are many reasons MGLRU is still not the only LRU implementation in\n> > the kernel.\n> >\n> > And I've been looking at a few major issues here:\n> >\n> > 1. Page flag usage: MGLRU uses many more flags (3+ more) than Active/Inactive\n> > LRU.\n> > 2. Regressions: MGLRU might cause regression, even though in many workloads it\n> > outperforms Active/Inactive by a lot.\n> > 3. Metrics: MGLRU makes some metrics work differently, for example: PSI,\n> > /proc/meminfo.\n> > 4. Some reclaim behavior is less controllable.\n>\n> I would be very interested in discussing this topic as well.\n\nThanks, glad to hear that!\n\n>\n> > 2. Regressions: Currently regression is a more major problem for us.\n> >    From our perspective, almost all regressions are caused by an under- or\n> >    overprotected file cache. MGLRU's PID protection either gets too aggressive\n> >    or too passive or just have a too long latency. To fix that, I'd propose a\n> >    LFU-like design and relax the PID's aggressiveness to make it much more\n> >    proactive and effective for file folios. The idea is always use 3 bits in\n> >    the page flags to count the referenced time (which would also replace\n> >    PG_workingset and PG_referenced). Initial tests showed a 30% reduction of\n> >    refaults, and many regressions are gone. A flow chart of how the MGLRU idea\n> >    might work:\n>\n> Are you referring to refaults on the page cache side, or swapins?\n>\n> Last time we evaluated MGLRU on Meta workloads, we noticed that it\n> tends to do better with zswap, but worse with disk swap. It seemed to\n> just prefer reclaiming anon, period.\n>\n> For the balancing between anon and file to work well in all\n> situations, it needs to have a notion of backend speed and factor in\n> the respective cost of misses on each side.\n\nA bit more than that. When there is no swap, MGLRU still performs\nworse in some workloads like MongoDB. From what I've noticed that's\nbecause the PID protection is a bit too passive, and there is a force\nprotection in sort_folio which sometimes seems too aggressive.\nActive/Inactive LRU will just move a folio to head if it's accessed\ntwice while in RAM, but MGLRU won't do so, as result hotter file\nfolios are evicted equally as the colder one until the PID gets\ntriggered, or still gets protected even if it hasn't been used for a\nwhile. And by the time PID finally gets triggered, the workload might\nhas changed. This is fixable using the approach I mentioned though,\nand it seems to be better than the Active/Inactive in all our known\ncases after that, whether that is a good fix worth discussion.\n\nI also notice Ridong has a series to apply a \"heat\" based reclaim,\nwhich also looks interesting.\n\n> >    Can we just ignore the shadow for anon folios? MGLRU basically activates\n> >    anon folios unconditionally, especially if we combined with the LFU like\n> >    idea above we might only want to track the 3 bit count, and get rid of\n> >    the extra bit usage in the shadow. The eviction performance might be even\n> >    better, and other components like swap table [3] will have more bits to use\n> >    for better performance and more features.\n>\n> On the face of it, both of these sounds problematic to me. Why are\n> anon pages special cased?\n>\n> The cost of reclaiming a page is:\n>\n>     reuse frequency * cost of a miss\n>\n> The *type* of the page is not all that meaningful for workload\n> performance. The wait time is qualitatively the same.\n>\n> If you assume every refaulting anon is hot, it'll fall apart when the\n> anon set is huge and has little locality.\n\nSorry I didn't make it clear. For MGLRU currently it already ignored\nthe shadow distance for re-activation. And yeah, basically all anons\nare activated on fault, which turns out to be quite nice? None MGLRU\nusers considered that as a problem and in fact the performance looks\ngood.\n\nOf course we can restore the old behavior to test the folio\nagainst some distance (gen distance or eviction distance), or push it\nfurther to only keep the reference bit (not completely ignore the\nshadow, just only keep the reference bits, if the LFU + PID still\nworks well without the distance), and gain more performance and bits\nto use.\n\nBTW I tried to restore the refault distance behavior for both anon and\nfile folios sometime ago:\nhttps://lwn.net/Articles/945266/\n\nFor file folios it indeed looked better, anon folios seems unchanged.\nBut later tests showed that it doesn't apply to all cases, and I think\nsomething better can be used as suggested in this topic.\n\n\n",
+          "reply_to": "",
+          "message_date": "2026-02-21",
+          "message_id": ""
         }
       ],
-      "analysis_source": "llm-per-reviewer"
+      "analysis_source": "heuristic"
     }
   }
 }

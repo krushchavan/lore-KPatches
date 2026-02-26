@@ -462,115 +462,24 @@
       "analysis_source": "llm"
     },
     "2026-02-24": {
-      "report_file": "2026-02-24_ollama_llama3.1-8b.html",
+      "report_file": "2026-02-24.html",
       "developer": "Shakeel Butt",
       "reviews": [
         {
           "author": "Kairui Song",
-          "summary": "Reviewer pointed out that there is only one entry in the ghost swapfile, which serves as a reverse mapping to the physical swap slot, allowing for O(1) time swapoff and migration.\n\nReviewer Kairui Song clarified that the patch is related to disk swap, not zswap, and explained how swapoff of a physical entry loads swap data into a virtual slot.\n\nReviewer suggested modifying the interface design of the dynamic ghost swapfile to make it flexible and changeable, proposing setting a super large value and hiding it to achieve zero overhead for existing ZRAM or plain swap users.\n\nReviewer noted that in practice, they limit their ZRAM setup to 1/4 or 1:1 of total RAM to avoid endless reclaim and OOM, implying a concern about the infinite size ZSWAP enabled by this series.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "clarification",
-            "explanation",
-            "context",
-            "interface design",
-            "flexible changes",
-            "concern",
-            "implying"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "No, only one entry in the ghost swapfile (xswap or virtual swap file,\nanyway it's just a name). The one in the physical swap is a reverse\nmapping entry, it tells which slot in the ghost swapfile is pointing\nto the physical slot, so swapoff / migration of the physical slot can\nbe done in O(1) time.\n\nSo, zero duplicate of any data.\n\n---\n\nI am talking about disk swap here, not zswap. Swapoff of a physical\nentry just loads the swap data in the virtual slot according to the\nreverse mapping entry.\n\n---\n\nIt can be dynamic (just si->max += 2M on every cluster allocation\nsince it's really just a number now). Can be hidden, and can have an\ninfinite size. That's just an interface design that can be flexibly\nchanged.\n\nFor example if we just set this to a super large value and hide it, it\nwill look identical to vss from userspace perspect, but stay optional\nand zero overhead for existing ZRAM or plain swap users.\n\n---\n\nJust as a reference: In practice we limit our ZRAM setup to 1/4 or 1:1\nof the total RAM to avoid the machine goto endless reclaim and never\ngo OOM.\n\nBut we can also have an infinite size ZSWAP now, with this series.",
-          "reply_to": "Johannes Weiner",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Kairui Song",
-          "summary": "Reviewer Kairui Song noted that the patch is already addressing the issue of storing metadata at the top layer, eliminating the need for a reverse mapping in the lower layer.\n\nThe reviewer expressed concerns that the dynamic allocator is incomplete and suggested that other parts of the series, such as unified folio allocation for swapin, could be merged separately to provide immediate benefits without requiring the virtual swap or memcg part.\n\nReviewer noted that an alternative solution exists for handling memcg reparent behavior, which involves having a ci->memcg_table and allowing each layer to have its own charge design, resulting in lower overhead than the original approach.\n\nReviewer pointed out that folio_alloc_swap occurs before unmap and realloc, which contradicts their previous statement about not doing that at all.\n\nReviewer suggested a simple modification to the swapoff logic by introducing a reverse map slot in the ghost swap layer, allowing for easy handling of swapoff operations.\n\nReviewer noted that using the same infrastructure for both ghost and virtual swap files is beneficial as it allows for reuse and unification of code, reducing overhead and complexity.\n\nThe reviewer noted that the old swapoff command should not be removed immediately, as it provides a guarantee to clear up the swap cache, which is essential for certain workloads, especially in cloud environments where minor page faults can trigger anon faults. The reviewer suggested that this functionality should be preserved.\n\nReviewer Kairui Song expressed concern that the dynamic ghost swapfile interface may not be transparent to users, suggesting an alternative approach using sysfs.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "no issues remaining",
-            "requested changes",
-            "suggested collaboration",
-            "alternative solution",
-            "lower overhead",
-            "contradiction",
-            "confusion",
-            "reusing existing infrastructure",
-            "unified codebase",
-            "preservation of old swapoff functionality"
-          ],
+          "summary": "It's an issue for this series, if we want to track the folio->swap using folio->memcg to avoid an external array to record folio->swap's memcgid. It's the same. If the memcg is dead and a swap entry's memcgid record points to the dead memcg, then whoever reads this swap entry recharges the swapin folio.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
           "has_inline_review": true,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "It's already doing that, storing metadata at the top layer, only a\nreverse mapping in the lower layer.\n\nSo none of these issues are still there. Don't worry, I do remember\nthat conversation and kept that in mind :)\n\n---\n\nI left that part undone kind of on purpose, since it's only RFC, and\nin hope that there could be collaboration.\n\nAnd the dynamic allocator is only ~200 LOC now. Other parts of this\nseries are not only for virtual swap. For example the unified folio\nalloc for swapin, which gives us 15% performance gain in real\nworkloads, can still get merged and benifit all of us without\ninvolving the virtual swap or memcg part.\n\nAnd meanwhile, with the later patches, we don't have to re-implement\nthe whole infrastructure to have a virtual table. And future plans\nlike data compaction should benifit every layer naturally (same\ninfra).\n\n---\n\nAh, now as you mention it, I see in the beginning of this series I\nadded: \"Swap table P4 is stable and good to merge if we are OK with a\nfew memcg reparent behavior (there is also a solution if we don't)\".\nThe \"other solution\" also fits your different charge idea here. Just\nhave a ci->memcg_table, then each layer can have their own charge\ndesign, and the shadow is still only used for refault check. That\ngives us 10 bytes per slot overhead though, but still lower than\nbefore and stays completely dynamic.\n\nAlso, no duplicated memcg, since the upper layer and lower layer\nshould be charged differently. If they don't, then just let\nci->memcg_table stay NULL.\n\n---\n\nAnd we are not doing that at all. folio_alloc_swap happens before\nunmap, but realloc happens after that. VSS does the same thing.\n\n---\n\nSwapoff is actually easy here... If it sees a reverse map slot, read\ninto the upper layer. Else goto the old logic. Then it's done. If\nghost swap is the layer with highest priority, then every slot is a\nreverse map slot.\n\n---\n\nIt is using the same infrastructure, which means a lot of things are\nreused and unified. Isn't that a good sign? And again we don't need to\nre-implement the whole infra.\n\nAnd if you need multiple layers then there will be more \"if\"s and\noverhead however you implement it. But with unified infra, each layer\ncan stay optional. And checking \"si->flags & GHOST / VIRTUAL\" really\nshouldn't be costly or trouble some at all, compared to a mandatory\nlayer with layers of Xarray walk.\n\nAnd we can move, maintain the virt part in a separate place.\n\n---\n\nOne thing I want to highlight here is that the old swapoff really\nshouldn't just die. That gives us no chance to clear up the swap cache\nat all (vss holding swap data in RAM is also just swap cache). Pages\nstill in swap cache means minor page faults will still trigger. If the\nworkload is opaque but we knows a high load of traffic is coming and\nwants to get rid of any performance bottleneck by reading all folios\ninto the right place, swapoff gives the guarantee that no anon fault\nwill be ever triggered, that happens a lot in multiple tenant cloud\nenvironments, and these workload are opaque so madvise doesn't apply.\n\n---\n\nUsing sysfs can also be a choice, that's really just a demonstration\ninterface. But I do think it's worse if the user has no idea what is\nactually going on.",
-          "reply_to": "Nhat Pham",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Kairui Song",
-          "summary": "Reviewer Kairui Song noted that tracking folio->swap using folio->memcg could lead to a lock ordering violation, and suggested avoiding an external array to record folio->swap's memcgid.\n\nReviewer noted that when a memory cgroup is dead and its ID is referenced in a swap entry's memcgid record, the swap entry will incorrectly recharge the swap-in folio.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "lock ordering issue",
-            "requested change",
-            "requested changes"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "It's an issue for this series, if we want to track the folio->swap\nusing folio->memcg to avoid an external array to record folio->swap's\nmemcgid.\n\n---\n\nIt's the same. If the memcg is dead and a swap entry's memcgid record\npoints to the dead memcg, then whoever reads this swap entry recharges\nthe swapin folio.",
-          "reply_to": "Shakeel Butt",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Kairui Song",
-          "summary": "Reviewer Kairui Song questioned the necessity of a specific change made in the patch, citing that it was introduced before anon shadow was implemented and may not be a significant issue, suggesting alternative approaches such as using ci->memcg_table or exploring ways to reduce memory usage with MGLRU and aging feedback.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "requested changes",
-            "alternative approach"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "Hi Johannes, thanks for pointing this out.\n\nI'm just not sure how much of a real problem this is. The refault\nchallenge change was made in commit b910718a948a which was before anon\nshadow was introduced. And shadows could get reclaimed, especially\nwhen under pressure (and we could be doing that again by reclaiming\nfull_clusters with swap tables). And MGLRU simply ignores the\ntarget_memcg here yet it performs surprisingly well with multiple\nmemcg setups. And I did find a comment in workingset.c saying the\nkernel used to activate all pages, which is also fine. And that commit\nalso mentioned the active list shrinking, but anon active list gets\nshrinked just fine without refault feedback in shrink_lruvec under\ncan_age_anon_pages.\n\nSo in this RFC I just be a bit aggressive and changed it. I can do\nsome tests with different memory size setup.\n\nIf we are not OK with it, then just use a ci->memcg_table then we are\nfine, everything is still dynamic but single slot usage could be a bit\nhigher, 8 bytes to 10 bytes: and maybe find a way later to make\nci->memcg_table NULL and shrink back to 8 bytes with, e.g. MGLRU and\nbalance the memcg with things like aging feed back maybe (the later\npart is just idea but seems doable?).",
-          "reply_to": "Johannes Weiner",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Johannes Weiner",
-          "summary": "The reviewer, Johannes Weiner, expressed concerns that the patch does not properly account for anon refault detection and cache replacement strategies when dealing with large anonymous working sets, particularly in the context of modern compression and flash swap. He emphasized that the code was driven by real production problems and requested a deeper understanding of its design before making significant changes.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "requested_changes",
-            "concerns_about_design"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "*if inactive anon is empty, as part of the second\n                     chance logic\n\nPlease try to understand *why* this code is the way it is before\nthrowing it all out. It was driven by real production problems. The\nfact that some workloads don't care is not prove that many don't hurt\nif you break this.\n\nAnon refault detection was added for that reason: Once you have swap,\nyou facilitate anon workingsets that exceed memory capacity. At that\npoint, cache replacement strategies apply. Scan resistance matters.\n\nWith fast modern compression and flash swap, the anon set alone can be\nlarger than memory capacity. Everything that\n6a3ed2123a78de22a9e2b2855068a8d89f8e14f4 says about file cache starts\napplying to anonymous pages: you don't want to throw out the hot anon\nworkingset just because somebody is doing a one-off burst scan through\na larger set of cold, swapped out pages.\n\nLike I said in the LSFMM thread, there is no difference between anon\nand file. There didn't use to be historically. The LRU lists were\nsplit mechanically because noswap systems became common (lots of RAM +\nrotational drives = sad swap) and there was no point in scanning/aging\nanonymous memory if there is no swap space.\n\nBut no reasonable argument has been put forth why anon should be aged\ncompletely differently than file when you DO have swap.\n\nThere is more explanation of Why for the cgroup behavior in the cover\nletter portion of 53138cea7f398d2cdd0fa22adeec7e16093e1ebd.",
-          "reply_to": "Kairui Song",
+          "tags_given": [],
+          "analysis_source": "heuristic",
+          "raw_body": "On Tue, Feb 24, 2026 at 1:44 PM Shakeel Butt <shakeel.butt@linux.dev> wrote:\n>\n> On Fri, Feb 20, 2026 at 07:42:07AM +0800, Kairui Song via B4 Relay wrote:\n> > From: Kairui Song <kasong@tencent.com>\n> >\n> > As a result this will always charge the swapin folio into the dead\n> > cgroup's parent cgroup, and ensure folio->swap belongs to folio_memcg.\n>\n> I directly jump to this patch and the opening statement is confusing. Please\n> make the commit message self contained.\n>\n> > This only affects some uncommon behavior if we move the process between\n> > memcg.\n> >\n> > When a process that previously swapped some memory is moved to another\n> > cgroup, and the cgroup where the swap occurred is dead, folios for\n> > swap in of old swap entries will be charged into the new cgroup.\n> > Combined with the lazy freeing of swap cache, this leads to a strange\n> > situation where the folio->swap entry belongs to a cgroup that is not\n> > folio->memcg.\n>\n> Why is this an issue (i.e. folio->swap's cgroup different from\n> folio->memcg)?\n\nIt's an issue for this series, if we want to track the folio->swap\nusing folio->memcg to avoid an external array to record folio->swap's\nmemcgid.\n\n>\n> >\n> > Swapin from dead zombie memcg might be rare in practise, cgroups are\n> > offlined only after the workload in it is gone, which requires zapping\n> > the page table first, and releases all swap entries. Shmem is\n> > a bit different, but shmem always has swap count == 1, and force\n> > releases the swap cache. So, for shmem charging into the new memcg and\n> > release entry does look more sensible.\n>\n> Is this behavior same for all types of memory backed by shmem (i.e. MAP_SHARED,\n> memfd etc)? What about cow anon memory shared between parent and child\n> processes?\n\nIt's the same. If the memcg is dead and a swap entry's memcgid record\npoints to the dead memcg, then whoever reads this swap entry recharges\nthe swapin folio.\n",
+          "reply_to": "",
           "message_date": "2026-02-24",
           "message_id": ""
         }
       ],
-      "analysis_source": "llm"
+      "analysis_source": "heuristic"
     }
   }
 }

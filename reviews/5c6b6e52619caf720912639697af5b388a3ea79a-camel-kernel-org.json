@@ -4,97 +4,37 @@
   "url": "https://lore.kernel.org/all/5c6b6e52619caf720912639697af5b388a3ea79a.camel@kernel.org/",
   "dates": {
     "2026-02-24": {
-      "report_file": "2026-02-24_ollama_llama3.1-8b.html",
+      "report_file": "2026-02-24.html",
       "developer": "Jeff Layton",
       "reviews": [
         {
-          "author": "Jeff Layton",
-          "summary": "Reviewer questioned the necessity of dynamic allocation for oversized replay cache, asking if correctness is a priority when dealing with large lockowners on NFSv4.0",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "questioning correctness",
-            "asking about priority"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "Certainly a reasonable approach if we care about full correctness when\ndealing with a large lockowner on NFSv4.0. Do we?\n-- \nJeff Layton <jlayton@kernel.org>",
-          "reply_to": "Chuck Lever",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Chuck Lever (author)",
-          "summary": "Author acknowledges that the patch may not be suitable for backporting due to its dependency on a newer fix, suggests either backporting the newer fix or squashing both patches together",
+          "author": "Chuck Lever",
+          "summary": "I don't disagree at all. My concern is handling replay compliantly. Maybe there's another approach.",
           "sentiment": "neutral",
-          "sentiment_signals": [
-            "acknowledges complexity",
-            "suggests alternative approach"
-          ],
-          "has_inline_review": false,
+          "sentiment_signals": [],
+          "has_inline_review": true,
           "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "The idea would be to either:\n\no Backport your fix and not this update, or\no Squash these two together, and backport both\n\nAdmittedly this is a narrow corner case for a minor version that is\ndestined for the scrap heap.\n\n\n-- \nChuck Lever",
-          "reply_to": "Jeff Layton",
+          "analysis_source": "heuristic",
+          "raw_body": "On 2/24/26 2:51 PM, Jeff Layton wrote:\n> On Tue, 2026-02-24 at 14:42 -0500, Chuck Lever wrote:\n>> On 2/24/26 2:39 PM, Jeff Layton wrote:\n>>> On Tue, 2026-02-24 at 14:33 -0500, Chuck Lever wrote:\n>>>> From: Chuck Lever <chuck.lever@oracle.com>\n>>>>\n>>>> Commit 1e8e9913672a (\"nfsd: fix heap overflow in NFSv4.0 LOCK\n>>>> replay cache\") capped the replay cache copy at NFSD4_REPLAY_ISIZE\n>>>> to prevent a heap overflow, but set rp_buflen to zero when the\n>>>> encoded response exceeded the inline buffer. A retransmitted LOCK\n>>>> reaching the replay path then produced only a status code with no\n>>>> operation body, resulting in a malformed XDR response.\n>>>>\n>>>> When the encoded response exceeds the 112-byte inline rp_ibuf, a\n>>>> buffer is kmalloc'd to hold it. If the allocation fails, rp_buflen\n>>>> remains zero, preserving the behavior from the capped-copy fix.\n>>>> The buffer is freed when the stateowner is released or when a\n>>>> subsequent operation's response fits in the inline buffer.\n>>>>\n>>>> Fixes: 1e8e9913672a (\"nfsd: fix heap overflow in NFSv4.0 LOCK replay cache\")\n>>>> Signed-off-by: Chuck Lever <chuck.lever@oracle.com>\n>>>> ---\n>>>>  fs/nfsd/nfs4state.c | 16 ++++++++++++++++\n>>>>  fs/nfsd/nfs4xdr.c   | 23 ++++++++++++++++-------\n>>>>  fs/nfsd/state.h     | 12 +++++++-----\n>>>>  3 files changed, 39 insertions(+), 12 deletions(-)\n>>>>\n>>>> diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c\n>>>> index ba49f49bb93b..b4d0e82b2690 100644\n>>>> --- a/fs/nfsd/nfs4state.c\n>>>> +++ b/fs/nfsd/nfs4state.c\n>>>> @@ -1496,8 +1496,24 @@ release_all_access(struct nfs4_ol_stateid *stp)\n>>>>  \t}\n>>>>  }\n>>>>  \n>>>> +/**\n>>>> + * nfs4_replay_free_cache - release dynamically allocated replay buffer\n>>>> + * @rp: replay cache to reset\n>>>> + *\n>>>> + * If @rp->rp_buf points to a kmalloc'd buffer, free it and reset\n>>>> + * rp_buf to the inline rp_ibuf. Always zeroes rp_buflen.\n>>>> + */\n>>>> +void nfs4_replay_free_cache(struct nfs4_replay *rp)\n>>>> +{\n>>>> +\tif (rp->rp_buf != rp->rp_ibuf)\n>>>> +\t\tkfree(rp->rp_buf);\n>>>> +\trp->rp_buf = rp->rp_ibuf;\n>>>> +\trp->rp_buflen = 0;\n>>>> +}\n>>>> +\n>>>>  static inline void nfs4_free_stateowner(struct nfs4_stateowner *sop)\n>>>>  {\n>>>> +\tnfs4_replay_free_cache(&sop->so_replay);\n>>>>  \tkfree(sop->so_owner.data);\n>>>>  \tsop->so_ops->so_free(sop);\n>>>>  }\n>>>> diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c\n>>>> index 690f7a3122ec..2a0946c630e1 100644\n>>>> --- a/fs/nfsd/nfs4xdr.c\n>>>> +++ b/fs/nfsd/nfs4xdr.c\n>>>> @@ -6282,14 +6282,23 @@ nfsd4_encode_operation(struct nfsd4_compoundres *resp, struct nfsd4_op *op)\n>>>>  \t\tint len = xdr->buf->len - (op_status_offset + XDR_UNIT);\n>>>>  \n>>>>  \t\tso->so_replay.rp_status = op->status;\n>>>> -\t\tif (len <= NFSD4_REPLAY_ISIZE) {\n>>>> -\t\t\tso->so_replay.rp_buflen = len;\n>>>> -\t\t\tread_bytes_from_xdr_buf(xdr->buf,\n>>>> -\t\t\t\t\t\top_status_offset + XDR_UNIT,\n>>>> -\t\t\t\t\t\tso->so_replay.rp_buf, len);\n>>>> -\t\t} else {\n>>>> -\t\t\tso->so_replay.rp_buflen = 0;\n>>>> +\t\tif (len > NFSD4_REPLAY_ISIZE) {\n>>>> +\t\t\tchar *buf = kmalloc(len, GFP_KERNEL);\n>>>> +\n>>>> +\t\t\tnfs4_replay_free_cache(&so->so_replay);\n>>>> +\t\t\tif (buf) {\n>>>> +\t\t\t\tso->so_replay.rp_buf = buf;\n>>>> +\t\t\t} else {\n>>>> +\t\t\t\t/* rp_buflen already zeroed; skip caching */\n>>>> +\t\t\t\tgoto status;\n>>>> +\t\t\t}\n>>>> +\t\t} else if (so->so_replay.rp_buf != so->so_replay.rp_ibuf) {\n>>>> +\t\t\tnfs4_replay_free_cache(&so->so_replay);\n>>>>  \t\t}\n>>>> +\t\tso->so_replay.rp_buflen = len;\n>>>> +\t\tread_bytes_from_xdr_buf(xdr->buf,\n>>>> +\t\t\t\t\top_status_offset + XDR_UNIT,\n>>>> +\t\t\t\t\tso->so_replay.rp_buf, len);\n>>>>  \t}\n>>>>  status:\n>>>>  \top->status = nfsd4_map_status(op->status,\n>>>> diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h\n>>>> index 3159c7b67f50..9b05462da4cc 100644\n>>>> --- a/fs/nfsd/state.h\n>>>> +++ b/fs/nfsd/state.h\n>>>> @@ -554,10 +554,10 @@ struct nfs4_client_reclaim {\n>>>>   *   ~32(deleg. ace) = 112 bytes\n>>>>   *\n>>>>   * Some responses can exceed this. A LOCK denial includes the conflicting\n>>>> - * lock owner, which can be up to 1024 bytes (NFS4_OPAQUE_LIMIT). Responses\n>>>> - * larger than REPLAY_ISIZE are not cached in rp_ibuf; only rp_status is\n>>>> - * saved. Enlarging this constant increases the size of every\n>>>> - * nfs4_stateowner.\n>>>> + * lock owner, which can be up to 1024 bytes (NFS4_OPAQUE_LIMIT). When a\n>>>> + * response exceeds REPLAY_ISIZE, a buffer is dynamically allocated. If\n>>>> + * that allocation fails, only rp_status is saved. Enlarging this constant\n>>>> + * increases the size of every nfs4_stateowner.\n>>>>   */\n>>>>  \n>>>>  #define NFSD4_REPLAY_ISIZE       112 \n>>>> @@ -569,12 +569,14 @@ struct nfs4_client_reclaim {\n>>>>  struct nfs4_replay {\n>>>>  \t__be32\t\t\trp_status;\n>>>>  \tunsigned int\t\trp_buflen;\n>>>> -\tchar\t\t\t*rp_buf;\n>>>> +\tchar\t\t\t*rp_buf; /* rp_ibuf or kmalloc'd */\n>>>>  \tstruct knfsd_fh\t\trp_openfh;\n>>>>  \tint\t\t\trp_locked;\n>>>>  \tchar\t\t\trp_ibuf[NFSD4_REPLAY_ISIZE];\n>>>>  };\n>>>>  \n>>>> +extern void nfs4_replay_free_cache(struct nfs4_replay *rp);\n>>>> +\n>>>>  struct nfs4_stateowner;\n>>>>  \n>>>>  struct nfs4_stateowner_operations {\n>>>\n>>>\n>>> Certainly a reasonable approach if we care about full correctness when\n>>> dealing with a large lockowner on NFSv4.0. Do we?\n>>\n>> The idea would be to either:\n>>\n>> o Backport your fix and not this update, or\n>> o Squash these two together, and backport both\n>>\n>> Admittedly this is a narrow corner case for a minor version that is\n>> destined for the scrap heap.\n>>\n> \n> Right. I ask because I looked at this approach when I was fixing this,\n> and decided it wasn't worthwhile. I certainly won't stand in your way\n> if you decide you want to handle long lockowner blobs, but I doubt any\n> legitimate user will ever care.\n\nI don't disagree at all. My concern is handling replay compliantly.\nMaybe there's another approach.\n\n\n-- \nChuck Lever\n",
+          "reply_to": "",
           "message_date": "2026-02-24",
           "message_id": ""
         },
         {
-          "author": "Jeff Layton",
-          "summary": "Reviewer Jeff Layton expressed skepticism about the dynamic allocation approach for oversized NFSv4.0 replay cache, stating that he previously considered a similar solution but decided it was not worthwhile and doubted any legitimate user would care about handling long lockowner blobs.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "skepticism",
-            "doubt"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "Right. I ask because I looked at this approach when I was fixing this,\nand decided it wasn't worthwhile. I certainly won't stand in your way\nif you decide you want to handle long lockowner blobs, but I doubt any\nlegitimate user will ever care.\n-- \nJeff Layton <jlayton@kernel.org>",
-          "reply_to": "Chuck Lever",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Chuck Lever (author)",
-          "summary": "Author acknowledges the need for a more compliant replay cache handling, but suggests an alternative approach without committing to a specific fix.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "acknowledges issue",
-            "suggests alternative"
-          ],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "I don't disagree at all. My concern is handling replay compliantly.\nMaybe there's another approach.\n\n\n-- \nChuck Lever",
-          "reply_to": "Jeff Layton",
-          "message_date": "2026-02-24",
-          "message_id": ""
-        },
-        {
-          "author": "Jeff Layton",
-          "summary": "Reviewer Jeff Layton expressed that dynamic allocation for oversized NFSv4.0 replay cache is preferable to increasing NFSD4_REPLAY_ISIZE, and has no issue with the patch itself.",
+          "author": "Jeff Layton (author)",
+          "summary": "I think that the only other way is to grow NFSD4_REPLAY_ISIZE, and doing dynamic allocation is preferable to that, IMO. To be clear: I don't have a problem with your patch. It just didn't seem worthwhile to me. If you think it's worth fixing though, then go for it.",
           "sentiment": "neutral",
-          "sentiment_signals": [
-            "NEEDS_WORK",
-            "POSITIVE"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "I think that the only other way is to grow NFSD4_REPLAY_ISIZE, and\ndoing dynamic allocation is preferable to that, IMO.\n\nTo be clear: I don't have a problem with your patch. It just didn't\nseem worthwhile to me. If you think it's worth fixing though, then go\nfor it.\n-- \nJeff Layton <jlayton@kernel.org>",
-          "reply_to": "Chuck Lever",
+          "sentiment_signals": [],
+          "has_inline_review": true,
+          "tags_given": [],
+          "analysis_source": "heuristic",
+          "raw_body": "On Tue, 2026-02-24 at 14:53 -0500, Chuck Lever wrote:\n> On 2/24/26 2:51 PM, Jeff Layton wrote:\n> > On Tue, 2026-02-24 at 14:42 -0500, Chuck Lever wrote:\n> > > On 2/24/26 2:39 PM, Jeff Layton wrote:\n> > > > On Tue, 2026-02-24 at 14:33 -0500, Chuck Lever wrote:\n> > > > > From: Chuck Lever <chuck.lever@oracle.com>\n> > > > > \n> > > > > Commit 1e8e9913672a (\"nfsd: fix heap overflow in NFSv4.0 LOCK\n> > > > > replay cache\") capped the replay cache copy at NFSD4_REPLAY_ISIZE\n> > > > > to prevent a heap overflow, but set rp_buflen to zero when the\n> > > > > encoded response exceeded the inline buffer. A retransmitted LOCK\n> > > > > reaching the replay path then produced only a status code with no\n> > > > > operation body, resulting in a malformed XDR response.\n> > > > > \n> > > > > When the encoded response exceeds the 112-byte inline rp_ibuf, a\n> > > > > buffer is kmalloc'd to hold it. If the allocation fails, rp_buflen\n> > > > > remains zero, preserving the behavior from the capped-copy fix.\n> > > > > The buffer is freed when the stateowner is released or when a\n> > > > > subsequent operation's response fits in the inline buffer.\n> > > > > \n> > > > > Fixes: 1e8e9913672a (\"nfsd: fix heap overflow in NFSv4.0 LOCK replay cache\")\n> > > > > Signed-off-by: Chuck Lever <chuck.lever@oracle.com>\n> > > > > ---\n> > > > >  fs/nfsd/nfs4state.c | 16 ++++++++++++++++\n> > > > >  fs/nfsd/nfs4xdr.c   | 23 ++++++++++++++++-------\n> > > > >  fs/nfsd/state.h     | 12 +++++++-----\n> > > > >  3 files changed, 39 insertions(+), 12 deletions(-)\n> > > > > \n> > > > > diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c\n> > > > > index ba49f49bb93b..b4d0e82b2690 100644\n> > > > > --- a/fs/nfsd/nfs4state.c\n> > > > > +++ b/fs/nfsd/nfs4state.c\n> > > > > @@ -1496,8 +1496,24 @@ release_all_access(struct nfs4_ol_stateid *stp)\n> > > > >  \t}\n> > > > >  }\n> > > > >  \n> > > > > +/**\n> > > > > + * nfs4_replay_free_cache - release dynamically allocated replay buffer\n> > > > > + * @rp: replay cache to reset\n> > > > > + *\n> > > > > + * If @rp->rp_buf points to a kmalloc'd buffer, free it and reset\n> > > > > + * rp_buf to the inline rp_ibuf. Always zeroes rp_buflen.\n> > > > > + */\n> > > > > +void nfs4_replay_free_cache(struct nfs4_replay *rp)\n> > > > > +{\n> > > > > +\tif (rp->rp_buf != rp->rp_ibuf)\n> > > > > +\t\tkfree(rp->rp_buf);\n> > > > > +\trp->rp_buf = rp->rp_ibuf;\n> > > > > +\trp->rp_buflen = 0;\n> > > > > +}\n> > > > > +\n> > > > >  static inline void nfs4_free_stateowner(struct nfs4_stateowner *sop)\n> > > > >  {\n> > > > > +\tnfs4_replay_free_cache(&sop->so_replay);\n> > > > >  \tkfree(sop->so_owner.data);\n> > > > >  \tsop->so_ops->so_free(sop);\n> > > > >  }\n> > > > > diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c\n> > > > > index 690f7a3122ec..2a0946c630e1 100644\n> > > > > --- a/fs/nfsd/nfs4xdr.c\n> > > > > +++ b/fs/nfsd/nfs4xdr.c\n> > > > > @@ -6282,14 +6282,23 @@ nfsd4_encode_operation(struct nfsd4_compoundres *resp, struct nfsd4_op *op)\n> > > > >  \t\tint len = xdr->buf->len - (op_status_offset + XDR_UNIT);\n> > > > >  \n> > > > >  \t\tso->so_replay.rp_status = op->status;\n> > > > > -\t\tif (len <= NFSD4_REPLAY_ISIZE) {\n> > > > > -\t\t\tso->so_replay.rp_buflen = len;\n> > > > > -\t\t\tread_bytes_from_xdr_buf(xdr->buf,\n> > > > > -\t\t\t\t\t\top_status_offset + XDR_UNIT,\n> > > > > -\t\t\t\t\t\tso->so_replay.rp_buf, len);\n> > > > > -\t\t} else {\n> > > > > -\t\t\tso->so_replay.rp_buflen = 0;\n> > > > > +\t\tif (len > NFSD4_REPLAY_ISIZE) {\n> > > > > +\t\t\tchar *buf = kmalloc(len, GFP_KERNEL);\n> > > > > +\n> > > > > +\t\t\tnfs4_replay_free_cache(&so->so_replay);\n> > > > > +\t\t\tif (buf) {\n> > > > > +\t\t\t\tso->so_replay.rp_buf = buf;\n> > > > > +\t\t\t} else {\n> > > > > +\t\t\t\t/* rp_buflen already zeroed; skip caching */\n> > > > > +\t\t\t\tgoto status;\n> > > > > +\t\t\t}\n> > > > > +\t\t} else if (so->so_replay.rp_buf != so->so_replay.rp_ibuf) {\n> > > > > +\t\t\tnfs4_replay_free_cache(&so->so_replay);\n> > > > >  \t\t}\n> > > > > +\t\tso->so_replay.rp_buflen = len;\n> > > > > +\t\tread_bytes_from_xdr_buf(xdr->buf,\n> > > > > +\t\t\t\t\top_status_offset + XDR_UNIT,\n> > > > > +\t\t\t\t\tso->so_replay.rp_buf, len);\n> > > > >  \t}\n> > > > >  status:\n> > > > >  \top->status = nfsd4_map_status(op->status,\n> > > > > diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h\n> > > > > index 3159c7b67f50..9b05462da4cc 100644\n> > > > > --- a/fs/nfsd/state.h\n> > > > > +++ b/fs/nfsd/state.h\n> > > > > @@ -554,10 +554,10 @@ struct nfs4_client_reclaim {\n> > > > >   *   ~32(deleg. ace) = 112 bytes\n> > > > >   *\n> > > > >   * Some responses can exceed this. A LOCK denial includes the conflicting\n> > > > > - * lock owner, which can be up to 1024 bytes (NFS4_OPAQUE_LIMIT). Responses\n> > > > > - * larger than REPLAY_ISIZE are not cached in rp_ibuf; only rp_status is\n> > > > > - * saved. Enlarging this constant increases the size of every\n> > > > > - * nfs4_stateowner.\n> > > > > + * lock owner, which can be up to 1024 bytes (NFS4_OPAQUE_LIMIT). When a\n> > > > > + * response exceeds REPLAY_ISIZE, a buffer is dynamically allocated. If\n> > > > > + * that allocation fails, only rp_status is saved. Enlarging this constant\n> > > > > + * increases the size of every nfs4_stateowner.\n> > > > >   */\n> > > > >  \n> > > > >  #define NFSD4_REPLAY_ISIZE       112 \n> > > > > @@ -569,12 +569,14 @@ struct nfs4_client_reclaim {\n> > > > >  struct nfs4_replay {\n> > > > >  \t__be32\t\t\trp_status;\n> > > > >  \tunsigned int\t\trp_buflen;\n> > > > > -\tchar\t\t\t*rp_buf;\n> > > > > +\tchar\t\t\t*rp_buf; /* rp_ibuf or kmalloc'd */\n> > > > >  \tstruct knfsd_fh\t\trp_openfh;\n> > > > >  \tint\t\t\trp_locked;\n> > > > >  \tchar\t\t\trp_ibuf[NFSD4_REPLAY_ISIZE];\n> > > > >  };\n> > > > >  \n> > > > > +extern void nfs4_replay_free_cache(struct nfs4_replay *rp);\n> > > > > +\n> > > > >  struct nfs4_stateowner;\n> > > > >  \n> > > > >  struct nfs4_stateowner_operations {\n> > > > \n> > > > \n> > > > Certainly a reasonable approach if we care about full correctness when\n> > > > dealing with a large lockowner on NFSv4.0. Do we?\n> > > \n> > > The idea would be to either:\n> > > \n> > > o Backport your fix and not this update, or\n> > > o Squash these two together, and backport both\n> > > \n> > > Admittedly this is a narrow corner case for a minor version that is\n> > > destined for the scrap heap.\n> > > \n> > \n> > Right. I ask because I looked at this approach when I was fixing this,\n> > and decided it wasn't worthwhile. I certainly won't stand in your way\n> > if you decide you want to handle long lockowner blobs, but I doubt any\n> > legitimate user will ever care.\n> \n> I don't disagree at all. My concern is handling replay compliantly.\n> Maybe there's another approach.\n> \n\nI think that the only other way is to grow NFSD4_REPLAY_ISIZE, and\ndoing dynamic allocation is preferable to that, IMO.\n\nTo be clear: I don't have a problem with your patch. It just didn't\nseem worthwhile to me. If you think it's worth fixing though, then go\nfor it.\n-- \nJeff Layton <jlayton@kernel.org>\n\n",
+          "reply_to": "",
           "message_date": "2026-02-24",
           "message_id": ""
         }
       ],
-      "analysis_source": "llm"
+      "analysis_source": "heuristic"
     }
   }
 }

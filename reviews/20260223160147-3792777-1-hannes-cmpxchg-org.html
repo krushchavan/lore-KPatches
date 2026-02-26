@@ -226,186 +226,32 @@
     <h1>[PATCH v2 1/2] mm: vmalloc: streamline vmalloc memory accounting</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260223160147.3792777-1-hannes@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Active on: <a href="#2026-02-23">2026-02-23</a></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch streamlines memory accounting for vmalloc by replacing a custom, open-coded atomic counter with a vmstat counter. This change has the added benefit of making the data available per-node and prepares for cleaning up memcg (memory cgroup) accounting. The patch updates several files, including fs/proc/meminfo.c, include/linux/mmzone.h, include/linux/vmalloc.h, and mm/vmalloc.c, to use the new vmstat counter instead of the custom atomic counter. Additionally, it adds a new node_stat_item for VMALLOC and modifies the meminfo_proc_show function to display the VmallocUsed value using the global_node_page_state function.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">Use a vmstat counter instead of a custom, open-coded atomic. This has the added benefit of making the data available per-node, and prepares for cleaning up the memcg accounting as well.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-02-23">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Johannes Weiner (author)</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing a concern about the removal of the custom memcg counter for vmalloc memory accounting. They acknowledge that this change eliminates the custom counter and results in a single, consolidated accounting call in vmalloc code.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Eliminates the custom memcg counter and results in a single,
-consolidated accounting call in vmalloc code.
-
-Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
-Reviewed-by: Uladzislau Rezki (Sony) &lt;urezki@gmail.com&gt;
-Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
----
- include/linux/memcontrol.h |  1 -
- mm/memcontrol.c            |  4 ++--
- mm/vmalloc.c               | 16 ++++------------
- 3 files changed, 6 insertions(+), 15 deletions(-)
-
-diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
-index 67f154de10bc..c7cc4e50e59a 100644
---- a/include/linux/memcontrol.h
-+++ b/include/linux/memcontrol.h
-@@ -35,7 +35,6 @@ enum memcg_stat_item {
- 	MEMCG_SWAP = NR_VM_NODE_STAT_ITEMS,
- 	MEMCG_SOCK,
- 	MEMCG_PERCPU_B,
--	MEMCG_VMALLOC,
- 	MEMCG_KMEM,
- 	MEMCG_ZSWAP_B,
- 	MEMCG_ZSWAPPED,
-diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index 129eed3ff5bb..fef5bdd887e0 100644
---- a/mm/memcontrol.c
-+++ b/mm/memcontrol.c
-@@ -317,6 +317,7 @@ static const unsigned int memcg_node_stat_items[] = {
- 	NR_SHMEM_THPS,
- 	NR_FILE_THPS,
- 	NR_ANON_THPS,
-+	NR_VMALLOC,
- 	NR_KERNEL_STACK_KB,
- 	NR_PAGETABLE,
- 	NR_SECONDARY_PAGETABLE,
-@@ -339,7 +340,6 @@ static const unsigned int memcg_stat_items[] = {
- 	MEMCG_SWAP,
- 	MEMCG_SOCK,
- 	MEMCG_PERCPU_B,
--	MEMCG_VMALLOC,
- 	MEMCG_KMEM,
- 	MEMCG_ZSWAP_B,
- 	MEMCG_ZSWAPPED,
-@@ -1359,7 +1359,7 @@ static const struct memory_stat memory_stats[] = {
- 	{ &quot;sec_pagetables&quot;,		NR_SECONDARY_PAGETABLE		},
- 	{ &quot;percpu&quot;,			MEMCG_PERCPU_B			},
- 	{ &quot;sock&quot;,			MEMCG_SOCK			},
--	{ &quot;vmalloc&quot;,			MEMCG_VMALLOC			},
-+	{ &quot;vmalloc&quot;,			NR_VMALLOC			},
- 	{ &quot;shmem&quot;,			NR_SHMEM			},
- #ifdef CONFIG_ZSWAP
- 	{ &quot;zswap&quot;,			MEMCG_ZSWAP_B			},
-diff --git a/mm/vmalloc.c b/mm/vmalloc.c
-index a5fc7795aafd..8773bc0c4734 100644
---- a/mm/vmalloc.c
-+++ b/mm/vmalloc.c
-@@ -3446,9 +3446,6 @@ void vfree(const void *addr)
- 
- 	if (unlikely(vm-&gt;flags &amp; VM_FLUSH_RESET_PERMS))
- 		vm_reset_perms(vm);
--	/* All pages of vm should be charged to same memcg, so use first one. */
--	if (vm-&gt;nr_pages &amp;&amp; !(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
--		mod_memcg_page_state(vm-&gt;pages[0], MEMCG_VMALLOC, -vm-&gt;nr_pages);
- 	for (i = 0; i &lt; vm-&gt;nr_pages; i++) {
- 		struct page *page = vm-&gt;pages[i];
- 
-@@ -3458,7 +3455,7 @@ void vfree(const void *addr)
- 		 * can be freed as an array of order-0 allocations
- 		 */
- 		if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
--			dec_node_page_state(page, NR_VMALLOC);
-+			mod_lruvec_page_state(page, NR_VMALLOC, -1);
- 		__free_page(page);
- 		cond_resched();
- 	}
-@@ -3649,7 +3646,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
- 			continue;
- 		}
- 
--		mod_node_page_state(page_pgdat(page), NR_VMALLOC, 1 &lt;&lt; large_order);
-+		mod_lruvec_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
- 
- 		split_page(page, large_order);
- 		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
-@@ -3696,7 +3693,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
- 							pages + nr_allocated);
- 
- 			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
--				inc_node_page_state(pages[i], NR_VMALLOC);
-+				mod_lruvec_page_state(pages[i], NR_VMALLOC, 1);
- 
- 			nr_allocated += nr;
- 
-@@ -3722,7 +3719,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
- 		if (unlikely(!page))
- 			break;
- 
--		mod_node_page_state(page_pgdat(page), NR_VMALLOC, 1 &lt;&lt; order);
-+		mod_lruvec_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
- 
- 		/*
- 		 * High-order allocations must be able to be treated as
-@@ -3866,11 +3863,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
- 			vmalloc_gfp_adjust(gfp_mask, page_order), node,
- 			page_order, nr_small_pages, area-&gt;pages);
- 
--	/* All pages of vm should be charged to same memcg, so use first one. */
--	if (gfp_mask &amp; __GFP_ACCOUNT &amp;&amp; area-&gt;nr_pages)
--		mod_memcg_page_state(area-&gt;pages[0], MEMCG_VMALLOC,
--				     area-&gt;nr_pages);
--
- 	/*
- 	 * If not enough pages were obtained to accomplish an
- 	 * allocation request, free them via vfree() if any.
--- 
-2.53.0</pre>
-</details>
-<div class="review-comment-signals">Signals: acknowledged a change, no clear resolution signal</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
 <span class="review-author">Vishal (Oracle)</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<a class="date-chip" href="../2026-02-23.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
 <div class="review-comment-text">Gave Reviewed-by</div>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Roman Gushchin</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
-</div>
-<div class="review-comment-text">Gave Reviewed-by</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Roman Gushchin</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">reviewer noted that the patch does not address the issue of vmalloc memory accounting being per-node, and requested that the patch be revised to handle this correctly</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Reviewed-by: Roman Gushchin &lt;roman.gushchin@linux.dev&gt;
+<pre class="raw-body-text">On Mon, Feb 23, 2026 at 11:01:06AM -0500, Johannes Weiner wrote:
+&gt; Use a vmstat counter instead of a custom, open-coded atomic. This has
+&gt; the added benefit of making the data available per-node, and prepares
+&gt; for cleaning up the memcg accounting as well.
+&gt; 
+&gt; Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
 
-Nice series!
-
-Thanks</pre>
+Reviewed-by: Vishal Moola (Oracle) &lt;vishal.moola@gmail.com&gt;
+</pre>
 </details>
-<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>

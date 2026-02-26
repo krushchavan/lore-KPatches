@@ -226,234 +226,350 @@
     <h1>[PATCH 1/2] mm: vmalloc: streamline vmalloc memory accounting</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260220191035.3703800-1-hannes@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Active on: <a href="#2026-02-24">2026-02-24</a> &bull; <a href="#2026-02-23">2026-02-23</a> &bull; <a href="#2026-02-20">2026-02-20</a></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch streamlines memory accounting for vmalloc by replacing a custom atomic counter with a vmstat counter, which provides per-node data and prepares the system for cleaning up memcg (memory cgroup) accounting. The changes affect several files, including mm/vmalloc.c, include/linux/mmzone.h, and include/linux/vmalloc.h. The patch updates the way memory usage is reported in /proc/meminfo and introduces a new node stat item to track vmalloc memory usage. This change aims to simplify and improve the accuracy of memory accounting for vmalloc allocations.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">Use a vmstat counter instead of a custom, open-coded atomic. This has the added benefit of making the data available per-node, and prepares for cleaning up the memcg accounting as well.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-02-20">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Johannes Weiner (author)</span>
-<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing a concern about the removal of the custom memcg counter for vmalloc memory accounting. They eliminated this custom counter and replaced it with a single, consolidated accounting call in the vmalloc code.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Eliminates the custom memcg counter and results in a single,
-consolidated accounting call in vmalloc code.
-
-Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
----
- include/linux/memcontrol.h |  1 -
- mm/memcontrol.c            |  4 ++--
- mm/vmalloc.c               | 16 ++++------------
- 3 files changed, 6 insertions(+), 15 deletions(-)
-
-diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
-index 67f154de10bc..c7cc4e50e59a 100644
---- a/include/linux/memcontrol.h
-+++ b/include/linux/memcontrol.h
-@@ -35,7 +35,6 @@ enum memcg_stat_item {
- 	MEMCG_SWAP = NR_VM_NODE_STAT_ITEMS,
- 	MEMCG_SOCK,
- 	MEMCG_PERCPU_B,
--	MEMCG_VMALLOC,
- 	MEMCG_KMEM,
- 	MEMCG_ZSWAP_B,
- 	MEMCG_ZSWAPPED,
-diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index 129eed3ff5bb..fef5bdd887e0 100644
---- a/mm/memcontrol.c
-+++ b/mm/memcontrol.c
-@@ -317,6 +317,7 @@ static const unsigned int memcg_node_stat_items[] = {
- 	NR_SHMEM_THPS,
- 	NR_FILE_THPS,
- 	NR_ANON_THPS,
-+	NR_VMALLOC,
- 	NR_KERNEL_STACK_KB,
- 	NR_PAGETABLE,
- 	NR_SECONDARY_PAGETABLE,
-@@ -339,7 +340,6 @@ static const unsigned int memcg_stat_items[] = {
- 	MEMCG_SWAP,
- 	MEMCG_SOCK,
- 	MEMCG_PERCPU_B,
--	MEMCG_VMALLOC,
- 	MEMCG_KMEM,
- 	MEMCG_ZSWAP_B,
- 	MEMCG_ZSWAPPED,
-@@ -1359,7 +1359,7 @@ static const struct memory_stat memory_stats[] = {
- 	{ &quot;sec_pagetables&quot;,		NR_SECONDARY_PAGETABLE		},
- 	{ &quot;percpu&quot;,			MEMCG_PERCPU_B			},
- 	{ &quot;sock&quot;,			MEMCG_SOCK			},
--	{ &quot;vmalloc&quot;,			MEMCG_VMALLOC			},
-+	{ &quot;vmalloc&quot;,			NR_VMALLOC			},
- 	{ &quot;shmem&quot;,			NR_SHMEM			},
- #ifdef CONFIG_ZSWAP
- 	{ &quot;zswap&quot;,			MEMCG_ZSWAP_B			},
-diff --git a/mm/vmalloc.c b/mm/vmalloc.c
-index a49a46de9c4f..8773bc0c4734 100644
---- a/mm/vmalloc.c
-+++ b/mm/vmalloc.c
-@@ -3446,9 +3446,6 @@ void vfree(const void *addr)
- 
- 	if (unlikely(vm-&gt;flags &amp; VM_FLUSH_RESET_PERMS))
- 		vm_reset_perms(vm);
--	/* All pages of vm should be charged to same memcg, so use first one. */
--	if (vm-&gt;nr_pages &amp;&amp; !(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
--		mod_memcg_page_state(vm-&gt;pages[0], MEMCG_VMALLOC, -vm-&gt;nr_pages);
- 	for (i = 0; i &lt; vm-&gt;nr_pages; i++) {
- 		struct page *page = vm-&gt;pages[i];
- 
-@@ -3458,7 +3455,7 @@ void vfree(const void *addr)
- 		 * can be freed as an array of order-0 allocations
- 		 */
- 		if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
--			dec_node_page_state(page, NR_VMALLOC);
-+			mod_lruvec_page_state(page, NR_VMALLOC, -1);
- 		__free_page(page);
- 		cond_resched();
- 	}
-@@ -3649,7 +3646,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
- 			continue;
- 		}
- 
--		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
-+		mod_lruvec_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
- 
- 		split_page(page, large_order);
- 		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
-@@ -3696,7 +3693,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
- 							pages + nr_allocated);
- 
- 			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
--				inc_node_page_state(pages[i], NR_VMALLOC);
-+				mod_lruvec_page_state(pages[i], NR_VMALLOC, 1);
- 
- 			nr_allocated += nr;
- 
-@@ -3722,7 +3719,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
- 		if (unlikely(!page))
- 			break;
- 
--		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
-+		mod_lruvec_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
- 
- 		/*
- 		 * High-order allocations must be able to be treated as
-@@ -3866,11 +3863,6 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
- 			vmalloc_gfp_adjust(gfp_mask, page_order), node,
- 			page_order, nr_small_pages, area-&gt;pages);
- 
--	/* All pages of vm should be charged to same memcg, so use first one. */
--	if (gfp_mask &amp; __GFP_ACCOUNT &amp;&amp; area-&gt;nr_pages)
--		mod_memcg_page_state(area-&gt;pages[0], MEMCG_VMALLOC,
--				     area-&gt;nr_pages);
--
- 	/*
- 	 * If not enough pages were obtained to accomplish an
- 	 * allocation request, free them via vfree() if any.
--- 
-2.53.0</pre>
-</details>
-<div class="review-comment-signals">Signals: clarification, explanation</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
 <span class="review-author">Shakeel Butt</span>
-<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
+<a class="date-chip" href="../2026-02-20.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
 <span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
 <span class="review-tag-badge">Acked-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
-<div class="review-comment-text">Reviewer Shakeel Butt pointed out that the patch does not handle the case where the VMALLOC_TOTAL is zero, which can occur in non-MMU configurations, and requested a check to be added to handle this scenario.
-
-Reviewer Shakeel Butt pointed out that the function mod_node_page_state() requires a struct pglist_data pointer as its first argument, but the patch is using page_pgdat(page) instead, which should be corrected to maintain proper locking and functionality.
-
-Reviewer Shakeel Butt approved the patch after additional fixes were applied and added an Acked-by tag.</div>
+<div class="review-comment-text">mod_node_page_state() takes &#x27;struct pglist_data *pgdat&#x27;, you need to use page_pgdat(page) as first param. Same here. With above fixes, you can add:</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:
 [...]
-
----
+&gt;  static struct vmap_area *__find_vmap_area(unsigned long addr, struct rb_root *root)
+&gt;  {
+&gt;  	struct rb_node *n = root-&gt;rb_node;
+&gt; @@ -3463,11 +3457,11 @@ void vfree(const void *addr)
+&gt;  		 * High-order allocs for huge vmallocs are split, so
+&gt;  		 * can be freed as an array of order-0 allocations
+&gt;  		 */
+&gt; +		if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
+&gt; +			dec_node_page_state(page, NR_VMALLOC);
+&gt;  		__free_page(page);
+&gt;  		cond_resched();
+&gt;  	}
+&gt; -	if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
+&gt; -		atomic_long_sub(vm-&gt;nr_pages, &amp;nr_vmalloc_pages);
+&gt;  	kvfree(vm-&gt;pages);
+&gt;  	kfree(vm);
+&gt;  }
+&gt; @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  			continue;
+&gt;  		}
+&gt;  
+&gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
 
 mod_node_page_state() takes &#x27;struct pglist_data *pgdat&#x27;, you need to use
 page_pgdat(page) as first param.
 
----
+&gt; +
+&gt;  		split_page(page, large_order);
+&gt;  		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
+&gt;  			pages[nr_allocated + i] = page + i;
+&gt; @@ -3675,6 +3671,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  	if (!order) {
+&gt;  		while (nr_allocated &lt; nr_pages) {
+&gt;  			unsigned int nr, nr_pages_request;
+&gt; +			int i;
+&gt;  
+&gt;  			/*
+&gt;  			 * A maximum allowed request is hard-coded and is 100
+&gt; @@ -3698,6 +3695,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  							nr_pages_request,
+&gt;  							pages + nr_allocated);
+&gt;  
+&gt; +			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
+&gt; +				inc_node_page_state(pages[i], NR_VMALLOC);
+&gt; +
+&gt;  			nr_allocated += nr;
+&gt;  
+&gt;  			/*
+&gt; @@ -3722,6 +3722,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  		if (unlikely(!page))
+&gt;  			break;
+&gt;  
+&gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
 
 Same here.
 
 With above fixes, you can add:
 
-Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;</pre>
+Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
-<div class="review-comment-signals">Signals: patch needs additional handling for non-MMU config, locking, functionality</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Johannes Weiner (author)</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author acknowledged a mistake in their patch and apologized for it, indicating no fix is planned as the issue was due to a lack of incremental compilation.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Good catch, my apologies. Serves me right for not compiling
-incrementally.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
-<div class="review-comment-signals">Signals: apology, acknowledgment of mistake</div>
 </div>
 </div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Shakeel Butt</span>
-<a class="date-chip" href="../2026-02-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-20">2026-02-20</a>
-<span class="review-tag-badge">Acked-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
-</div>
-<div class="review-comment-text">Gave Acked-by</div>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
-</div>
-</div>
-<div class="thread-node depth-1" id="2026-02-23">
+<div class="thread-node depth-0" id="2026-02-23">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Uladzislau Rezki</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<a class="date-chip" href="../2026-02-23.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
-<div class="review-comment-text">Gave Reviewed-by</div>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
+<div class="review-comment-text">Can we move *_node_page_stat() to the end of the vm_area_alloc_pages()? Or mod_node_page_state in first place should be invoked on high-order page before split(to avoid of looping over small pages afterword)? I mean it would be good to place to the one solid place. If it is possible of course.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:
+&gt; Use a vmstat counter instead of a custom, open-coded atomic. This has
+&gt; the added benefit of making the data available per-node, and prepares
+&gt; for cleaning up the memcg accounting as well.
+&gt; 
+&gt; Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+&gt; ---
+&gt;  fs/proc/meminfo.c       |  3 ++-
+&gt;  include/linux/mmzone.h  |  1 +
+&gt;  include/linux/vmalloc.h |  3 ---
+&gt;  mm/vmalloc.c            | 19 ++++++++++---------
+&gt;  mm/vmstat.c             |  1 +
+&gt;  5 files changed, 14 insertions(+), 13 deletions(-)
+&gt; 
+&gt; diff --git a/fs/proc/meminfo.c b/fs/proc/meminfo.c
+&gt; index a458f1e112fd..549793f44726 100644
+&gt; --- a/fs/proc/meminfo.c
+&gt; +++ b/fs/proc/meminfo.c
+&gt; @@ -126,7 +126,8 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
+&gt;  	show_val_kb(m, &quot;Committed_AS:   &quot;, committed);
+&gt;  	seq_printf(m, &quot;VmallocTotal:   %8lu kB\n&quot;,
+&gt;  		   (unsigned long)VMALLOC_TOTAL &gt;&gt; 10);
+&gt; -	show_val_kb(m, &quot;VmallocUsed:    &quot;, vmalloc_nr_pages());
+&gt; +	show_val_kb(m, &quot;VmallocUsed:    &quot;,
+&gt; +		    global_node_page_state(NR_VMALLOC));
+&gt;  	show_val_kb(m, &quot;VmallocChunk:   &quot;, 0ul);
+&gt;  	show_val_kb(m, &quot;Percpu:         &quot;, pcpu_nr_pages());
+&gt;  
+&gt; diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+&gt; index fc5d6c88d2f0..64df797d45c6 100644
+&gt; --- a/include/linux/mmzone.h
+&gt; +++ b/include/linux/mmzone.h
+&gt; @@ -220,6 +220,7 @@ enum node_stat_item {
+&gt;  	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
+&gt;  	NR_FOLL_PIN_ACQUIRED,	/* via: pin_user_page(), gup flag: FOLL_PIN */
+&gt;  	NR_FOLL_PIN_RELEASED,	/* pages returned via unpin_user_page() */
+&gt; +	NR_VMALLOC,
+&gt;  	NR_KERNEL_STACK_KB,	/* measured in KiB */
+&gt;  #if IS_ENABLED(CONFIG_SHADOW_CALL_STACK)
+&gt;  	NR_KERNEL_SCS_KB,	/* measured in KiB */
+&gt; diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+&gt; index e8e94f90d686..3b02c0c6b371 100644
+&gt; --- a/include/linux/vmalloc.h
+&gt; +++ b/include/linux/vmalloc.h
+&gt; @@ -286,8 +286,6 @@ int unregister_vmap_purge_notifier(struct notifier_block *nb);
+&gt;  #ifdef CONFIG_MMU
+&gt;  #define VMALLOC_TOTAL (VMALLOC_END - VMALLOC_START)
+&gt;  
+&gt; -unsigned long vmalloc_nr_pages(void);
+&gt; -
+&gt;  int vm_area_map_pages(struct vm_struct *area, unsigned long start,
+&gt;  		      unsigned long end, struct page **pages);
+&gt;  void vm_area_unmap_pages(struct vm_struct *area, unsigned long start,
+&gt; @@ -304,7 +302,6 @@ static inline void set_vm_flush_reset_perms(void *addr)
+&gt;  #else  /* !CONFIG_MMU */
+&gt;  #define VMALLOC_TOTAL 0UL
+&gt;  
+&gt; -static inline unsigned long vmalloc_nr_pages(void) { return 0; }
+&gt;  static inline void set_vm_flush_reset_perms(void *addr) {}
+&gt;  #endif /* CONFIG_MMU */
+&gt;  
+&gt; diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+&gt; index e286c2d2068c..a49a46de9c4f 100644
+&gt; --- a/mm/vmalloc.c
+&gt; +++ b/mm/vmalloc.c
+&gt; @@ -1063,14 +1063,8 @@ static BLOCKING_NOTIFIER_HEAD(vmap_notify_list);
+&gt;  static void drain_vmap_area_work(struct work_struct *work);
+&gt;  static DECLARE_WORK(drain_vmap_work, drain_vmap_area_work);
+&gt;  
+&gt; -static __cacheline_aligned_in_smp atomic_long_t nr_vmalloc_pages;
+&gt;  static __cacheline_aligned_in_smp atomic_long_t vmap_lazy_nr;
+&gt;  
+&gt; -unsigned long vmalloc_nr_pages(void)
+&gt; -{
+&gt; -	return atomic_long_read(&amp;nr_vmalloc_pages);
+&gt; -}
+&gt; -
+&gt;  static struct vmap_area *__find_vmap_area(unsigned long addr, struct rb_root *root)
+&gt;  {
+&gt;  	struct rb_node *n = root-&gt;rb_node;
+&gt; @@ -3463,11 +3457,11 @@ void vfree(const void *addr)
+&gt;  		 * High-order allocs for huge vmallocs are split, so
+&gt;  		 * can be freed as an array of order-0 allocations
+&gt;  		 */
+&gt; +		if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
+&gt; +			dec_node_page_state(page, NR_VMALLOC);
+&gt;  		__free_page(page);
+&gt;  		cond_resched();
+&gt;  	}
+&gt; -	if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
+&gt; -		atomic_long_sub(vm-&gt;nr_pages, &amp;nr_vmalloc_pages);
+&gt;  	kvfree(vm-&gt;pages);
+&gt;  	kfree(vm);
+&gt;  }
+&gt; @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  			continue;
+&gt;  		}
+&gt;  
+&gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
+&gt; +
+&gt;  		split_page(page, large_order);
+&gt;  		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
+&gt;  			pages[nr_allocated + i] = page + i;
+&gt; @@ -3675,6 +3671,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  	if (!order) {
+&gt;  		while (nr_allocated &lt; nr_pages) {
+&gt;  			unsigned int nr, nr_pages_request;
+&gt; +			int i;
+&gt;  
+&gt;  			/*
+&gt;  			 * A maximum allowed request is hard-coded and is 100
+&gt; @@ -3698,6 +3695,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  							nr_pages_request,
+&gt;  							pages + nr_allocated);
+&gt;  
+&gt; +			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
+&gt; +				inc_node_page_state(pages[i], NR_VMALLOC);
+&gt; +
+&gt;  			nr_allocated += nr;
+&gt;  
+&gt;  			/*
+&gt; @@ -3722,6 +3722,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt;  		if (unlikely(!page))
+&gt;  			break;
+&gt;  
+&gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
+&gt; +
+&gt;  		/*
+Can we move *_node_page_stat() to the end of the vm_area_alloc_pages()?
+
+Or mod_node_page_state in first place should be invoked on high-order
+page before split(to avoid of looping over small pages afterword)?
+
+I mean it would be good to place to the one solid place. If it is possible
+of course.
+
+--
+Uladzislau Rezk
+</pre>
+</details>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-2">
+</div>
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Johannes Weiner (author)</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<a class="date-chip" href="../2026-02-23.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
-<div class="review-comment-text">Author addressed a concern about vmalloc memory accounting in fallback paths, suggesting an accumulation approach to handle pages from different nodes, but is uncertain if the added complexity is worth it.</div>
+<div class="review-comment-text">Good catch, my apologies. Serves me right for not compiling incrementally.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Note that the top one in the fast path IS called before the
+<pre class="raw-body-text">On Fri, Feb 20, 2026 at 02:09:28PM -0800, Shakeel Butt wrote:
+&gt; On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:
+&gt; [...]
+&gt; &gt;  static struct vmap_area *__find_vmap_area(unsigned long addr, struct rb_root *root)
+&gt; &gt;  {
+&gt; &gt;  	struct rb_node *n = root-&gt;rb_node;
+&gt; &gt; @@ -3463,11 +3457,11 @@ void vfree(const void *addr)
+&gt; &gt;  		 * High-order allocs for huge vmallocs are split, so
+&gt; &gt;  		 * can be freed as an array of order-0 allocations
+&gt; &gt;  		 */
+&gt; &gt; +		if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
+&gt; &gt; +			dec_node_page_state(page, NR_VMALLOC);
+&gt; &gt;  		__free_page(page);
+&gt; &gt;  		cond_resched();
+&gt; &gt;  	}
+&gt; &gt; -	if (!(vm-&gt;flags &amp; VM_MAP_PUT_PAGES))
+&gt; &gt; -		atomic_long_sub(vm-&gt;nr_pages, &amp;nr_vmalloc_pages);
+&gt; &gt;  	kvfree(vm-&gt;pages);
+&gt; &gt;  	kfree(vm);
+&gt; &gt;  }
+&gt; &gt; @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt;  			continue;
+&gt; &gt;  		}
+&gt; &gt;  
+&gt; &gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
+&gt; 
+&gt; mod_node_page_state() takes &#x27;struct pglist_data *pgdat&#x27;, you need to use
+&gt; page_pgdat(page) as first param.
+
+Good catch, my apologies. Serves me right for not compiling
+incrementally.
+
+&gt; With above fixes, you can add:
+&gt; 
+&gt; Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+Thanks! I&#x27;ll send out v2.
+</pre>
+</details>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner (author)</span>
+<a class="date-chip" href="../2026-02-23.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Note that the top one in the fast path IS called before the split. We&#x27;re accounting in the same step size as the page allocator can give us. In the fallback paths (bulk allocator, and one-by-one loop), the issue is that the individual pages could be coming from different nodes, so they need to bump different counters. One possible solution would be to remember the last node and accumulate until it differs, then flush: fallback_loop() { page = alloc_pages(); nid = page_to_nid(page); if (nid != last_nid) { if (node_count) { mod_node_page_state(...); node_count = 0; } last_nid = nid; } } if (node_count) mod_node_page_state(...); But it IS the slow path, and these are fairly cheap per-cpu counters. Especially compared to the cost of calling into the allocator.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Mon, Feb 23, 2026 at 04:30:32PM +0100, Uladzislau Rezki wrote:
+&gt; On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:
+&gt; &gt; @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt;  			continue;
+&gt; &gt;  		}
+&gt; &gt;  
+&gt; &gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
+&gt; &gt; +
+&gt; &gt;  		split_page(page, large_order);
+&gt; &gt;  		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
+&gt; &gt;  			pages[nr_allocated + i] = page + i;
+&gt; &gt; @@ -3675,6 +3671,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt;  	if (!order) {
+&gt; &gt;  		while (nr_allocated &lt; nr_pages) {
+&gt; &gt;  			unsigned int nr, nr_pages_request;
+&gt; &gt; +			int i;
+&gt; &gt;  
+&gt; &gt;  			/*
+&gt; &gt;  			 * A maximum allowed request is hard-coded and is 100
+&gt; &gt; @@ -3698,6 +3695,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt;  							nr_pages_request,
+&gt; &gt;  							pages + nr_allocated);
+&gt; &gt;  
+&gt; &gt; +			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
+&gt; &gt; +				inc_node_page_state(pages[i], NR_VMALLOC);
+&gt; &gt; +
+&gt; &gt;  			nr_allocated += nr;
+&gt; &gt;  
+&gt; &gt;  			/*
+&gt; &gt; @@ -3722,6 +3722,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt;  		if (unlikely(!page))
+&gt; &gt;  			break;
+&gt; &gt;  
+&gt; &gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
+&gt; &gt; +
+&gt; &gt;  		/*
+&gt; Can we move *_node_page_stat() to the end of the vm_area_alloc_pages()?
+&gt; 
+&gt; Or mod_node_page_state in first place should be invoked on high-order
+&gt; page before split(to avoid of looping over small pages afterword)?
+&gt; 
+&gt; I mean it would be good to place to the one solid place. If it is possible
+&gt; of course.
+
+Note that the top one in the fast path IS called before the
 split. We&#x27;re accounting in the same step size as the page allocator
 can give us.
 
@@ -479,64 +595,107 @@ if (node_count)
 
 But it IS the slow path, and these are fairly cheap per-cpu
 counters. Especially compared to the cost of calling into the
-allocator. So I&#x27;m not sure it&#x27;s worth it... What do you think?</pre>
+allocator. So I&#x27;m not sure it&#x27;s worth it... What do you think?
+</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Uladzislau Rezki</div>
-<div class="review-comment-signals">Signals: uncertainty, question</div>
 </div>
 </div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Uladzislau Rezki</span>
-<a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-23">2026-02-23</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">reviewer suggested moving *_node_page_stat() calls to a single location in vm_area_alloc_pages(), and also proposed invoking mod_node_page_state on high-order pages before splitting them</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Can we move *_node_page_stat() to the end of the vm_area_alloc_pages()?
-
-Or mod_node_page_state in first place should be invoked on high-order
-page before split(to avoid of looping over small pages afterword)?
-
-I mean it would be good to place to the one solid place. If it is possible
-of course.
-
---
-Uladzislau Rezk</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
-<div class="thread-node depth-1" id="2026-02-24">
+<div class="thread-node depth-0" id="2026-02-24">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Uladzislau Rezki</span>
 <a class="date-chip" href="../2026-02-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-24">2026-02-24</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
-<div class="review-comment-text">reviewer agreed with the original solution and explicitly stated that they see no need for changes, providing a Reviewed-by tag</div>
+<div class="review-comment-text">I see. I agree it is easier to keep original solution. I see that Andrew took it, but just in case:</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">I see. I agree it is easier to keep original solution. I see that
+<pre class="raw-body-text">On Mon, Feb 23, 2026 at 03:19:20PM -0500, Johannes Weiner wrote:
+&gt; On Mon, Feb 23, 2026 at 04:30:32PM +0100, Uladzislau Rezki wrote:
+&gt; &gt; On Fri, Feb 20, 2026 at 02:10:34PM -0500, Johannes Weiner wrote:
+&gt; &gt; &gt; @@ -3655,6 +3649,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt; &gt;  			continue;
+&gt; &gt; &gt;  		}
+&gt; &gt; &gt;  
+&gt; &gt; &gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; large_order);
+&gt; &gt; &gt; +
+&gt; &gt; &gt;  		split_page(page, large_order);
+&gt; &gt; &gt;  		for (i = 0; i &lt; (1U &lt;&lt; large_order); i++)
+&gt; &gt; &gt;  			pages[nr_allocated + i] = page + i;
+&gt; &gt; &gt; @@ -3675,6 +3671,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt; &gt;  	if (!order) {
+&gt; &gt; &gt;  		while (nr_allocated &lt; nr_pages) {
+&gt; &gt; &gt;  			unsigned int nr, nr_pages_request;
+&gt; &gt; &gt; +			int i;
+&gt; &gt; &gt;  
+&gt; &gt; &gt;  			/*
+&gt; &gt; &gt;  			 * A maximum allowed request is hard-coded and is 100
+&gt; &gt; &gt; @@ -3698,6 +3695,9 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt; &gt;  							nr_pages_request,
+&gt; &gt; &gt;  							pages + nr_allocated);
+&gt; &gt; &gt;  
+&gt; &gt; &gt; +			for (i = nr_allocated; i &lt; nr_allocated + nr; i++)
+&gt; &gt; &gt; +				inc_node_page_state(pages[i], NR_VMALLOC);
+&gt; &gt; &gt; +
+&gt; &gt; &gt;  			nr_allocated += nr;
+&gt; &gt; &gt;  
+&gt; &gt; &gt;  			/*
+&gt; &gt; &gt; @@ -3722,6 +3722,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+&gt; &gt; &gt;  		if (unlikely(!page))
+&gt; &gt; &gt;  			break;
+&gt; &gt; &gt;  
+&gt; &gt; &gt; +		mod_node_page_state(page, NR_VMALLOC, 1 &lt;&lt; order);
+&gt; &gt; &gt; +
+&gt; &gt; &gt;  		/*
+&gt; &gt; Can we move *_node_page_stat() to the end of the vm_area_alloc_pages()?
+&gt; &gt; 
+&gt; &gt; Or mod_node_page_state in first place should be invoked on high-order
+&gt; &gt; page before split(to avoid of looping over small pages afterword)?
+&gt; &gt; 
+&gt; &gt; I mean it would be good to place to the one solid place. If it is possible
+&gt; &gt; of course.
+&gt; 
+&gt; Note that the top one in the fast path IS called before the
+&gt; split. We&#x27;re accounting in the same step size as the page allocator
+&gt; can give us.
+&gt; 
+&gt; In the fallback paths (bulk allocator, and one-by-one loop), the issue
+&gt; is that the individual pages could be coming from different nodes, so
+&gt; they need to bump different counters. One possible solution would be
+&gt; to remember the last node and accumulate until it differs, then flush:
+&gt; 
+&gt; fallback_loop() {
+&gt; 	page = alloc_pages();
+&gt; 	nid = page_to_nid(page);
+&gt; 	if (nid != last_nid) {
+&gt; 		if (node_count) {
+&gt; 			mod_node_page_state(...);
+&gt; 			node_count = 0;
+&gt; 		}
+&gt; 		last_nid = nid;
+&gt; 	}
+&gt; }
+&gt; 
+&gt; if (node_count)
+&gt; 	mod_node_page_state(...);
+&gt; 
+&gt; But it IS the slow path, and these are fairly cheap per-cpu
+&gt; counters. Especially compared to the cost of calling into the
+&gt; allocator. So I&#x27;m not sure it&#x27;s worth it... What do you think?
+&gt;
+I see. I agree it is easier to keep original solution. I see that
 Andrew took it, but just in case:
 
 Reviewed-by: Uladzislau Rezki (Sony) &lt;urezki@gmail.com&gt;
 
 --
-Uladzislau Rezki</pre>
+Uladzislau Rezki
+
+</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
-</div>
-</div>
 </div>
 </div>
 </div>
