@@ -2,7 +2,7 @@
   "date": "2026-02-26",
   "report_file": "2026-02-26_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-02-27 07:26 UTC",
+  "last_updated": "2026-02-27 07:29 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -2677,6 +2677,298 @@
       "primary_email": "kas@kernel.org",
       "patches_submitted": [],
       "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Leo Martins",
+      "primary_email": "loemra.dev@gmail.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 3/3] btrfs: add tracepoint for search slot restart tracking",
+          "message_id": "29af2660c8c3946d422f57910ec50916463a345b.1772097864.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/29af2660c8c3946d422f57910ec50916463a345b.1772097864.git.loemra.dev@gmail.com/",
+          "date": "2026-02-26T09:51:17Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs file system, specifically for tracking search slot restarts during btrfs_search_slot() operations. The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Filipe Manana",
+              "summary": "Provided a Reviewed-by tag, indicating they have reviewed the code and found it acceptable for inclusion in the kernel.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 2/3] btrfs: inhibit extent buffer writeback to prevent COW amplification",
+          "message_id": "9e49ee6ee946e6cabb6b691693a955dbd201055c.1772097864.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/9e49ee6ee946e6cabb6b691693a955dbd201055c.1772097864.git.loemra.dev@gmail.com/",
+          "date": "2026-02-26T09:51:16Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs file system, specifically for tracking search slot restarts during btrfs_search_slot() operations. The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Filipe Manana",
+              "summary": "Provided a Reviewed-by tag, indicating they have reviewed the code and found it acceptable for inclusion in the kernel.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Thu, Feb 26, 2026 at 9:58 AM Leo Martins <loemra.dev@gmail.com> wrote:\n>\n> Inhibit writeback on COW'd extent buffers for the lifetime of the\n> transaction handle, preventing background writeback from setting\n> BTRFS_HEADER_FLAG_WRITTEN and causing unnecessary re-COW.\n>\n> COW amplification occurs when background writeback flushes an extent\n> buffer that a transaction handle is still actively modifying. When\n> lock_extent_buffer_for_io() transitions a buffer from dirty to\n> writeback, it sets BTRFS_HEADER_FLAG_WRITTEN, marking the block as\n> having been persisted to disk at its current bytenr. Once WRITTEN is\n> set, should_cow_block() must either COW the block again or overwrite\n> it in place, both of which are unnecessary overhead when the buffer\n> is still being modified by the same handle that allocated it. By\n> inhibiting background writeback on actively-used buffers, WRITTEN is\n> never set while a transaction handle holds a reference to the buffer,\n> avoiding this overhead entirely.\n>\n> Add an atomic_t writeback_inhibitors counter to struct extent_buffer,\n> which fits in an existing 6-byte hole without increasing struct size.\n> When a buffer is COW'd in btrfs_force_cow_block(), call\n> btrfs_inhibit_eb_writeback() to store the eb in the transaction\n> handle's writeback_inhibited_ebs xarray (keyed by eb->start), take a\n> reference, and increment writeback_inhibitors. The function handles\n> dedup (same eb inhibited twice by the same handle) and replacement\n> (different eb at the same logical address). Allocation failure is\n> graceful: the buffer simply falls back to the pre-existing behavior\n> where it may be written back and re-COW'd.\n>\n> Also inhibit writeback in should_cow_block() when COW is skipped,\n> so that every transaction handle that reuses an already-COW'd buffer\n> also inhibits its writeback. Without this, if handle A COWs a block\n> and inhibits it, and handle B later reuses the same block without\n> inhibiting, handle A's uninhibit on end_transaction leaves the buffer\n> unprotected while handle B is still using it. This ensures all handles\n> that access a COW'd buffer contribute to the inhibitor count, and the\n> buffer remains protected until the last handle releases it.\n>\n> In lock_extent_buffer_for_io(), when writeback_inhibitors is non-zero\n> and the writeback mode is WB_SYNC_NONE, skip the buffer. WB_SYNC_NONE\n> is used by the VM flusher threads for background and periodic\n> writeback, which are the only paths that cause COW amplification by\n> opportunistically writing out dirty extent buffers mid-transaction.\n> Skipping these is safe because the buffers remain dirty in the page\n> cache and will be written out at transaction commit time.\n>\n> WB_SYNC_ALL must always proceed regardless of writeback_inhibitors.\n> This is required for correctness in the fsync path: btrfs_sync_log()\n> writes log tree blocks via filemap_fdatawrite_range() (WB_SYNC_ALL)\n> while the transaction handle that inhibited those same blocks is still\n> active. Without the WB_SYNC_ALL bypass, those inhibited log tree\n> blocks would be silently skipped, resulting in an incomplete log on\n> disk and corruption on replay. btrfs_write_and_wait_transaction()\n> also uses WB_SYNC_ALL via filemap_fdatawrite_range(); for that path,\n> inhibitors are already cleared beforehand, but the bypass ensures\n> correctness regardless.\n>\n> Uninhibit in __btrfs_end_transaction() before atomic_dec(num_writers)\n> to prevent a race where the committer proceeds while buffers are still\n> inhibited. Also uninhibit in btrfs_commit_transaction() before writing\n> and in cleanup_transaction() for the error path.\n>\n> Signed-off-by: Leo Martins <loemra.dev@gmail.com>\n> ---\n>  fs/btrfs/ctree.c       |  9 ++++++\n>  fs/btrfs/extent_io.c   | 63 +++++++++++++++++++++++++++++++++++++++++-\n>  fs/btrfs/extent_io.h   |  6 ++++\n>  fs/btrfs/transaction.c | 19 +++++++++++++\n>  fs/btrfs/transaction.h |  3 ++\n>  5 files changed, 99 insertions(+), 1 deletion(-)\n>\n> diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c\n> index ea7cfc3a9e89..46a715c95bc8 100644\n> --- a/fs/btrfs/ctree.c\n> +++ b/fs/btrfs/ctree.c\n> @@ -21,6 +21,7 @@\n>  #include \"fs.h\"\n>  #include \"accessors.h\"\n>  #include \"extent-tree.h\"\n> +#include \"extent_io.h\"\n>  #include \"relocation.h\"\n>  #include \"file-item.h\"\n>\n> @@ -590,6 +591,10 @@ int btrfs_force_cow_block(struct btrfs_trans_handle *trans,\n>                 btrfs_tree_unlock(buf);\n>         free_extent_buffer_stale(buf);\n>         btrfs_mark_buffer_dirty(trans, cow);\n> +\n> +       /* Inhibit writeback on the COW'd buffer for this transaction handle. */\n> +       btrfs_inhibit_eb_writeback(trans, cow);\n\nBtw, that comment is redundant. It's clear what we are doing, since\nthe function's name is clear about what it does and the eb is named\n\"cow\".\nUsually we add comments for things that are not obvious.\n\n> +\n>         *cow_ret = cow;\n>         return 0;\n>\n> @@ -617,6 +622,9 @@ int btrfs_force_cow_block(struct btrfs_trans_handle *trans,\n>   * When returning false for a WRITTEN buffer allocated in the current\n>   * transaction, re-dirties the buffer for in-place overwrite instead\n>   * of requesting a new COW.\n> + *\n> + * When returning false, inhibits background writeback on the buffer\n> + * for the lifetime of the transaction handle.\n>   */\n>  static inline bool should_cow_block(struct btrfs_trans_handle *trans,\n>                                     const struct btrfs_root *root,\n> @@ -684,6 +692,7 @@ static inline bool should_cow_block(struct btrfs_trans_handle *trans,\n>                 btrfs_mark_buffer_dirty(trans, buf);\n>         }\n>\n> +       btrfs_inhibit_eb_writeback(trans, buf);\n>         return false;\n>  }\n>\n> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c\n> index ff1fc699a6ca..e04e42a81978 100644\n> --- a/fs/btrfs/extent_io.c\n> +++ b/fs/btrfs/extent_io.c\n> @@ -1940,7 +1940,9 @@ static noinline_for_stack bool lock_extent_buffer_for_io(struct extent_buffer *e\n>          * of time.\n>          */\n>         spin_lock(&eb->refs_lock);\n> -       if (test_and_clear_bit(EXTENT_BUFFER_DIRTY, &eb->bflags)) {\n> +       if ((wbc->sync_mode == WB_SYNC_ALL ||\n> +            atomic_read(&eb->writeback_inhibitors) == 0) &&\n> +           test_and_clear_bit(EXTENT_BUFFER_DIRTY, &eb->bflags)) {\n>                 XA_STATE(xas, &fs_info->buffer_tree, eb->start >> fs_info->nodesize_bits);\n>                 unsigned long flags;\n>\n> @@ -2999,6 +3001,64 @@ static inline void btrfs_release_extent_buffer(struct extent_buffer *eb)\n>         kmem_cache_free(extent_buffer_cache, eb);\n>  }\n>\n> +/*\n> + * btrfs_inhibit_eb_writeback - Inhibit writeback on buffer during transaction.\n> + * @trans: transaction handle that will own the inhibitor\n> + * @eb: extent buffer to inhibit writeback on\n> + *\n> + * Attempts to track this extent buffer in the transaction's inhibited set.\n> + * If memory allocation fails, the buffer is simply not tracked. It may\n> + * be written back and need re-COW, which is the original behavior.\n> + * This is acceptable since inhibiting writeback is an optimization.\n> + */\n> +void btrfs_inhibit_eb_writeback(struct btrfs_trans_handle *trans,\n> +                               struct extent_buffer *eb)\n> +{\n> +       unsigned long index = eb->start >> trans->fs_info->nodesize_bits;\n> +       void *old;\n> +\n> +       /* Check if already inhibited by this handle. */\n> +       old = xa_load(&trans->writeback_inhibited_ebs, index);\n> +       if (old == eb)\n> +               return;\n> +\n> +       /* Take reference for the xarray entry. */\n> +       refcount_inc(&eb->refs);\n> +\n> +       old = xa_store(&trans->writeback_inhibited_ebs, index, eb, GFP_NOFS);\n> +       if (xa_is_err(old)) {\n> +               /* Allocation failed, just skip inhibiting this buffer. */\n> +               free_extent_buffer(eb);\n> +               return;\n> +       }\n> +\n> +       /* Handle replacement of different eb at same index. */\n> +       if (old && old != eb) {\n> +               struct extent_buffer *old_eb = old;\n> +\n> +               atomic_dec(&old_eb->writeback_inhibitors);\n> +               free_extent_buffer(old_eb);\n> +       }\n> +\n> +       atomic_inc(&eb->writeback_inhibitors);\n\nBtw, at the top of this function we should assert the eb is locked.\n\nOtherwise,\n\nReviewed-by: Filipe Manana <fdmanana@suse.com>\n\nThanks.\n\n> +}\n> +\n> +/*\n> + * btrfs_uninhibit_all_eb_writeback - Uninhibit writeback on all buffers.\n> + * @trans: transaction handle to clean up\n> + */\n> +void btrfs_uninhibit_all_eb_writeback(struct btrfs_trans_handle *trans)\n> +{\n> +       struct extent_buffer *eb;\n> +       unsigned long index;\n> +\n> +       xa_for_each(&trans->writeback_inhibited_ebs, index, eb) {\n> +               atomic_dec(&eb->writeback_inhibitors);\n> +               free_extent_buffer(eb);\n> +       }\n> +       xa_destroy(&trans->writeback_inhibited_ebs);\n> +}\n> +\n>  static struct extent_buffer *__alloc_extent_buffer(struct btrfs_fs_info *fs_info,\n>                                                    u64 start)\n>  {\n> @@ -3009,6 +3069,7 @@ static struct extent_buffer *__alloc_extent_buffer(struct btrfs_fs_info *fs_info\n>         eb->len = fs_info->nodesize;\n>         eb->fs_info = fs_info;\n>         init_rwsem(&eb->lock);\n> +       atomic_set(&eb->writeback_inhibitors, 0);\n>\n>         btrfs_leak_debug_add_eb(eb);\n>\n> diff --git a/fs/btrfs/extent_io.h b/fs/btrfs/extent_io.h\n> index 73571d5d3d5a..fb68fbd4866c 100644\n> --- a/fs/btrfs/extent_io.h\n> +++ b/fs/btrfs/extent_io.h\n> @@ -102,6 +102,8 @@ struct extent_buffer {\n>         /* >= 0 if eb belongs to a log tree, -1 otherwise */\n>         s8 log_index;\n>         u8 folio_shift;\n> +       /* Inhibits WB_SYNC_NONE writeback when > 0. */\n> +       atomic_t writeback_inhibitors;\n>         struct rcu_head rcu_head;\n>\n>         struct rw_semaphore lock;\n> @@ -381,4 +383,8 @@ void btrfs_extent_buffer_leak_debug_check(struct btrfs_fs_info *fs_info);\n>  #define btrfs_extent_buffer_leak_debug_check(fs_info)  do {} while (0)\n>  #endif\n>\n> +void btrfs_inhibit_eb_writeback(struct btrfs_trans_handle *trans,\n> +                              struct extent_buffer *eb);\n> +void btrfs_uninhibit_all_eb_writeback(struct btrfs_trans_handle *trans);\n> +\n>  #endif\n> diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c\n> index f4cc9e1a1b93..a9a22629b49d 100644\n> --- a/fs/btrfs/transaction.c\n> +++ b/fs/btrfs/transaction.c\n> @@ -15,6 +15,7 @@\n>  #include \"misc.h\"\n>  #include \"ctree.h\"\n>  #include \"disk-io.h\"\n> +#include \"extent_io.h\"\n>  #include \"transaction.h\"\n>  #include \"locking.h\"\n>  #include \"tree-log.h\"\n> @@ -688,6 +689,8 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,\n>                 goto alloc_fail;\n>         }\n>\n> +       xa_init(&h->writeback_inhibited_ebs);\n> +\n>         /*\n>          * If we are JOIN_NOLOCK we're already committing a transaction and\n>          * waiting on this guy, so we don't need to do the sb_start_intwrite\n> @@ -1083,6 +1086,13 @@ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,\n>         if (trans->type & __TRANS_FREEZABLE)\n>                 sb_end_intwrite(info->sb);\n>\n> +       /*\n> +        * Uninhibit extent buffer writeback before decrementing num_writers,\n> +        * since the decrement wakes the committing thread which needs all\n> +        * buffers uninhibited to write them to disk.\n> +        */\n> +       btrfs_uninhibit_all_eb_writeback(trans);\n> +\n>         WARN_ON(cur_trans != info->running_transaction);\n>         WARN_ON(atomic_read(&cur_trans->num_writers) < 1);\n>         atomic_dec(&cur_trans->num_writers);\n> @@ -2110,6 +2120,7 @@ static void cleanup_transaction(struct btrfs_trans_handle *trans, int err)\n>         if (!test_bit(BTRFS_FS_RELOC_RUNNING, &fs_info->flags))\n>                 btrfs_scrub_cancel(fs_info);\n>\n> +       btrfs_uninhibit_all_eb_writeback(trans);\n>         kmem_cache_free(btrfs_trans_handle_cachep, trans);\n>  }\n>\n> @@ -2556,6 +2567,14 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)\n>             fs_info->cleaner_kthread)\n>                 wake_up_process(fs_info->cleaner_kthread);\n>\n> +       /*\n> +        * Uninhibit writeback on all extent buffers inhibited during this\n> +        * transaction before writing them to disk. Inhibiting prevented\n> +        * writeback while the transaction was building, but now we need\n> +        * them written.\n> +        */\n> +       btrfs_uninhibit_all_eb_writeback(trans);\n> +\n>         ret = btrfs_write_and_wait_transaction(trans);\n>         if (unlikely(ret)) {\n>                 btrfs_err(fs_info, \"error while writing out transaction: %d\", ret);\n> diff --git a/fs/btrfs/transaction.h b/fs/btrfs/transaction.h\n> index 18ef069197e5..7d70fe486758 100644\n> --- a/fs/btrfs/transaction.h\n> +++ b/fs/btrfs/transaction.h\n> @@ -12,6 +12,7 @@\n>  #include <linux/time64.h>\n>  #include <linux/mutex.h>\n>  #include <linux/wait.h>\n> +#include <linux/xarray.h>\n>  #include \"btrfs_inode.h\"\n>  #include \"delayed-ref.h\"\n>\n> @@ -162,6 +163,8 @@ struct btrfs_trans_handle {\n>         struct btrfs_fs_info *fs_info;\n>         struct list_head new_bgs;\n>         struct btrfs_block_rsv delayed_rsv;\n> +       /* Extent buffers with writeback inhibited by this handle. */\n> +       struct xarray writeback_inhibited_ebs;\n>  };\n>\n>  /*\n> --\n> 2.47.3\n>\n>\n",
+              "reply_to": "",
+              "message_date": "2026-02-26",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 1/3] btrfs: skip COW for written extent buffers allocated in current transaction",
+          "message_id": "e8e4f5e396d821ba9ed6a4eee073ae8628d52aeb.1772097864.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/e8e4f5e396d821ba9ed6a4eee073ae8628d52aeb.1772097864.git.loemra.dev@gmail.com/",
+          "date": "2026-02-26T09:51:14Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs file system, specifically for tracking search slot restarts during btrfs_search_slot() operations. The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Filipe Manana",
+              "summary": "Provided a Reviewed-by tag, indicating they have reviewed the code and found it acceptable for inclusion in the kernel.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 0/3] btrfs: fix COW amplification under memory pressure",
+          "message_id": "cover.1772097864.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/cover.1772097864.git.loemra.dev@gmail.com/",
+          "date": "2026-02-26T09:51:12Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs file system, specifically for tracking search slot restarts during btrfs_search_slot() operations. The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Filipe Manana",
+              "summary": "Provided a Reviewed-by tag, indicating they have reviewed the code and found it acceptable for inclusion in the kernel.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v3 3/3] btrfs: add tracepoint for search slot restart tracking",
+          "message_id": "18c04d9a68f64fa5e36dde196306170d0fb437d9.1771884128.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/18c04d9a68f64fa5e36dde196306170d0fb437d9.1771884128.git.loemra.dev@gmail.com/",
+          "date": "2026-02-24T19:22:55Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-24",
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs kernel module, allowing for tracking of search slot restarts in btrfs_search_slot(). The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "David Hildenbrand",
+              "summary": "The patch looks good, but the author should consider adding a comment to explain why the per-restart-site tracepoint is necessary and how it improves over the existing counter-based approach.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "NEEDS_WORK"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v3 2/3] btrfs: inhibit extent buffer writeback to prevent COW amplification",
+          "message_id": "cc847a35e26cc4dfad18c59e3c525cea507ff440.1771884128.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/cc847a35e26cc4dfad18c59e3c525cea507ff440.1771884128.git.loemra.dev@gmail.com/",
+          "date": "2026-02-24T19:22:54Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-24",
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs kernel module, allowing for tracking of search slot restarts in btrfs_search_slot(). The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "David Hildenbrand",
+              "summary": "The patch looks good, but the author should consider adding a comment to explain why the per-restart-site tracepoint is necessary and how it improves over the existing counter-based approach.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "NEEDS_WORK"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v3 1/3] btrfs: skip COW for written extent buffers allocated in current transaction",
+          "message_id": "4ce911a475b998ddf76951629ad203e6440ab0ca.1771884128.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/4ce911a475b998ddf76951629ad203e6440ab0ca.1771884128.git.loemra.dev@gmail.com/",
+          "date": "2026-02-24T19:22:52Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-24",
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs kernel module, allowing for tracking of search slot restarts in btrfs_search_slot(). The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "David Hildenbrand",
+              "summary": "The patch looks good, but the author should consider adding a comment to explain why the per-restart-site tracepoint is necessary and how it improves over the existing counter-based approach.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "NEEDS_WORK"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v3 0/3] btrfs: fix COW amplification under memory pressure",
+          "message_id": "cover.1771884128.git.loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/cover.1771884128.git.loemra.dev@gmail.com/",
+          "date": "2026-02-24T19:22:51Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-24",
+          "patch_summary": "This patch adds a new tracepoint to the Btrfs kernel module, allowing for tracking of search slot restarts in btrfs_search_slot(). The tracepoint records the root, tree level, and reason for each restart, enabling more detailed analysis of COW amplification under memory pressure.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "David Hildenbrand",
+              "summary": "The patch looks good, but the author should consider adding a comment to explain why the per-restart-site tracepoint is necessary and how it improves over the existing counter-based approach.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "NEEDS_WORK"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm"
+            }
+          ]
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v3 2/3] btrfs: inhibit extent buffer writeback to prevent COW amplification",
+          "message_id": "20260226023050.2138594-1-loemra.dev@gmail.com",
+          "url": "https://lore.kernel.org/all/20260226023050.2138594-1-loemra.dev@gmail.com/",
+          "date": "2026-02-26T02:30:54Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_summary": "This patch addresses a potential issue in the Btrfs file system where COW (Copy On Write) amplification could occur due to incorrect handling of extent buffer writeback. The problem arises when multiple transactions modify the same extent buffer, and one transaction inhibits writeback after COWing the buffer, while another transaction reuses the buffer without re-COWing it. To fix this, the patch modifies the code to inhibit writeback not only when a buffer is COWed but also whenever a handle reuses a COWed buffer without re-COWing it.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Sun YangKai",
+              "summary": "Reviewer noted that the current implementation only inhibits writeback when an extent buffer (eb) is COW'd, but does not account for cases where a transaction handle reuses a previously COW'd eb without re-COWing it, potentially leading to COW amplification.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "potential bug",
+                "requested change"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Oh, I've just got the idea. It's inhibited per trans handle. Then it \nmakes a lot of sense.\n\nThere might be some ebs that were inhibited due to tree rebalancing or \ntree walking and are no longer used, but I don't think this is a blocker \nfor this patch.\n\nLooking forward to your next patch version :)",
+              "reply_to": "Leo Martins",
+              "message_date": "2026-02-26",
+              "message_id": "f5788abc-f4de-4f3a-9ab1-7aaa579c89c9@gmail.com",
+              "analysis_source": "llm"
+            }
+          ]
+        }
+      ],
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
