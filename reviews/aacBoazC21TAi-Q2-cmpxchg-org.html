@@ -226,174 +226,43 @@
     <h1>[PATCH 5/5] mm: memcg: separate slab stat accounting from objcg charge cache</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/aacBoazC21TAi-Q2@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Active on: <a href="#2026-03-04">2026-03-04</a> &bull; <a href="#2026-03-03">2026-03-03</a></div>
-    
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch separates slab stat accounting from object charge cache in memory cgroup (memcg) to prevent potential issues with refilling and draining stock counters.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-03-03">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Shakeel Butt</span>
-<a class="date-chip" href="../2026-03-03.html" title="First appeared in report for 2026-03-03">2026-03-03</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+<a class="date-chip" href="../2026-03-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-03">2026-03-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Yes this makes sense. We already have at least one evidence (bug Hao fixed) that these are very rare, so optimizing for such cases will just increase complexity without real benefit.</div>
+<div class="review-comment-text">Reviewer noted that the patch&#x27;s optimization for IRQ allocations and frees is unlikely to provide a significant benefit due to their rarity, and suggested that adding more code complexity to address this edge case may not be worth it.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Tue, Mar 03, 2026 at 10:43:29AM -0500, Johannes Weiner wrote:
-&gt; On Tue, Mar 03, 2026 at 05:45:18AM -0800, Shakeel Butt wrote:
-&gt; &gt; On Tue, Mar 03, 2026 at 11:42:31AM +0100, Vlastimil Babka (SUSE) wrote:
-&gt; &gt; &gt; On 3/3/26 09:54, Hao Li wrote:
-&gt; &gt; &gt; &gt; On Mon, Mar 02, 2026 at 02:50:18PM -0500, Johannes Weiner wrote:
-&gt; &gt; &gt; &gt;&gt;  
-&gt; &gt; &gt; &gt;&gt; +static void refill_obj_stock(struct obj_cgroup *objcg,
-&gt; &gt; &gt; &gt;&gt; +			     unsigned int nr_bytes,
-&gt; &gt; &gt; &gt;&gt; +			     bool allow_uncharge)
-&gt; &gt; &gt; &gt;&gt; +{
-&gt; &gt; &gt; &gt;&gt; +	struct obj_stock_pcp *stock = trylock_stock();
-&gt; &gt; &gt; &gt;&gt; +	__refill_obj_stock(objcg, stock, nr_bytes, allow_uncharge);
-&gt; &gt; &gt; &gt;&gt; +	unlock_stock(stock);
-&gt; &gt; &gt; &gt; 
-&gt; &gt; &gt; &gt; Hi Johannes,
-&gt; &gt; &gt; &gt; 
-&gt; &gt; &gt; &gt; I noticed that after this patch, obj_cgroup_uncharge_pages() is now inside
-&gt; &gt; &gt; &gt; the obj_stock.lock critical section. Since obj_cgroup_uncharge_pages() calls
-&gt; &gt; &gt; &gt; refill_stock(), which seems non-trivial, this might increase the lock hold time.
-&gt; &gt; &gt; &gt; In particular, could that lead to more failed trylocks for IRQ handlers on
-&gt; &gt; &gt; &gt; non-RT kernel (or for tasks that preempt others on RT kernel)?
-&gt; 
-&gt; Good catch. I did ponder this, but forgot by the time I wrote the
-&gt; changelog.
-&gt; 
-&gt; &gt; &gt; Yes, it also seems a bit self-defeating? (at least in theory)
-&gt; &gt; &gt; 
-&gt; &gt; &gt; refill_obj_stock()
-&gt; &gt; &gt;   trylock_stock()
-&gt; &gt; &gt;   __refill_obj_stock()
-&gt; &gt; &gt;     obj_cgroup_uncharge_pages()
-&gt; &gt; &gt;       refill_stock()
-&gt; &gt; &gt;         local_trylock() -&gt; nested, will fail
-&gt; &gt; 
-&gt; &gt; Not really as the local_locks are different i.e. memcg_stock.lock in
-&gt; &gt; refill_stock() and obj_stock.lock in refill_obj_stock().
-&gt; 
-&gt; Right, refilling the *byte* stock could produce enough excess that we
-&gt; refill the *page* stock. Which in turn could produce enough excess
-&gt; that we drain that back to the page counters (shared atomics).
-&gt; 
-&gt; &gt; However Hao&#x27;s concern is valid and I think it can be easily fixed by
-&gt; &gt; moving obj_cgroup_uncharge_pages() out of obj_stock.lock.
-&gt; 
-&gt; Note that we now have multiple callsites of __refill_obj_stock(). Do
-&gt; we care enough to move this to the caller?
-&gt; 
-&gt; There are a few other places with a similar pattern:
-&gt; 
-&gt; - drain_obj_stock(): calls memcg_uncharge() under the lock
-&gt; - drain_stock(): calls memcg_uncharge() under the lock
-&gt; - refill_stock(): still does full drain_stock()
-&gt; 
-&gt; All of these could be more intentional about only updating the per-cpu
-&gt; data under the lock and the page counters outside of it.
-&gt; 
-&gt; Given that IRQ allocations/frees are rare, nested ones even rarer, and
-&gt; the &quot;slowpath&quot; is a few extra atomics, I&#x27;m not sure it&#x27;s worth the
-&gt; code complication. At least until proven otherwise.
-&gt; 
-&gt; What do you think?
-
-Yes this makes sense. We already have at least one evidence (bug Hao fixed) that
+<pre class="raw-body-text">Yes this makes sense. We already have at least one evidence (bug Hao fixed) that
 these are very rare, so optimizing for such cases will just increase complexity
-without real benefit.
-</pre>
+without real benefit.</pre>
 </details>
+<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
+<a href="https://lore.kernel.org/r/aacLODh5BY45Zp9s@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: complexity, rarity</div>
 </div>
-</div>
-<div class="thread-node depth-0" id="2026-03-04">
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-03-04">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Hao Li</span>
 <a class="date-chip" href="../2026-03-03.html" title="First appeared in report for 2026-03-04">2026-03-04</a>
-<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
-<div class="review-comment-text">Yes, make sense to me too. Thanks for taking a look.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On Tue, Mar 03, 2026 at 08:26:31AM -0800, Shakeel Butt wrote:
-&gt; On Tue, Mar 03, 2026 at 10:43:29AM -0500, Johannes Weiner wrote:
-&gt; &gt; On Tue, Mar 03, 2026 at 05:45:18AM -0800, Shakeel Butt wrote:
-&gt; &gt; &gt; On Tue, Mar 03, 2026 at 11:42:31AM +0100, Vlastimil Babka (SUSE) wrote:
-&gt; &gt; &gt; &gt; On 3/3/26 09:54, Hao Li wrote:
-&gt; &gt; &gt; &gt; &gt; On Mon, Mar 02, 2026 at 02:50:18PM -0500, Johannes Weiner wrote:
-&gt; &gt; &gt; &gt; &gt;&gt;  
-&gt; &gt; &gt; &gt; &gt;&gt; +static void refill_obj_stock(struct obj_cgroup *objcg,
-&gt; &gt; &gt; &gt; &gt;&gt; +			     unsigned int nr_bytes,
-&gt; &gt; &gt; &gt; &gt;&gt; +			     bool allow_uncharge)
-&gt; &gt; &gt; &gt; &gt;&gt; +{
-&gt; &gt; &gt; &gt; &gt;&gt; +	struct obj_stock_pcp *stock = trylock_stock();
-&gt; &gt; &gt; &gt; &gt;&gt; +	__refill_obj_stock(objcg, stock, nr_bytes, allow_uncharge);
-&gt; &gt; &gt; &gt; &gt;&gt; +	unlock_stock(stock);
-&gt; &gt; &gt; &gt; &gt; 
-&gt; &gt; &gt; &gt; &gt; Hi Johannes,
-&gt; &gt; &gt; &gt; &gt; 
-&gt; &gt; &gt; &gt; &gt; I noticed that after this patch, obj_cgroup_uncharge_pages() is now inside
-&gt; &gt; &gt; &gt; &gt; the obj_stock.lock critical section. Since obj_cgroup_uncharge_pages() calls
-&gt; &gt; &gt; &gt; &gt; refill_stock(), which seems non-trivial, this might increase the lock hold time.
-&gt; &gt; &gt; &gt; &gt; In particular, could that lead to more failed trylocks for IRQ handlers on
-&gt; &gt; &gt; &gt; &gt; non-RT kernel (or for tasks that preempt others on RT kernel)?
-&gt; &gt; 
-&gt; &gt; Good catch. I did ponder this, but forgot by the time I wrote the
-&gt; &gt; changelog.
-&gt; &gt; 
-&gt; &gt; &gt; &gt; Yes, it also seems a bit self-defeating? (at least in theory)
-&gt; &gt; &gt; &gt; 
-&gt; &gt; &gt; &gt; refill_obj_stock()
-&gt; &gt; &gt; &gt;   trylock_stock()
-&gt; &gt; &gt; &gt;   __refill_obj_stock()
-&gt; &gt; &gt; &gt;     obj_cgroup_uncharge_pages()
-&gt; &gt; &gt; &gt;       refill_stock()
-&gt; &gt; &gt; &gt;         local_trylock() -&gt; nested, will fail
-&gt; &gt; &gt; 
-&gt; &gt; &gt; Not really as the local_locks are different i.e. memcg_stock.lock in
-&gt; &gt; &gt; refill_stock() and obj_stock.lock in refill_obj_stock().
-&gt; &gt; 
-&gt; &gt; Right, refilling the *byte* stock could produce enough excess that we
-&gt; &gt; refill the *page* stock. Which in turn could produce enough excess
-&gt; &gt; that we drain that back to the page counters (shared atomics).
-&gt; &gt; 
-&gt; &gt; &gt; However Hao&#x27;s concern is valid and I think it can be easily fixed by
-&gt; &gt; &gt; moving obj_cgroup_uncharge_pages() out of obj_stock.lock.
-&gt; &gt; 
-&gt; &gt; Note that we now have multiple callsites of __refill_obj_stock(). Do
-&gt; &gt; we care enough to move this to the caller?
-&gt; &gt; 
-&gt; &gt; There are a few other places with a similar pattern:
-&gt; &gt; 
-&gt; &gt; - drain_obj_stock(): calls memcg_uncharge() under the lock
-&gt; &gt; - drain_stock(): calls memcg_uncharge() under the lock
-&gt; &gt; - refill_stock(): still does full drain_stock()
-&gt; &gt; 
-&gt; &gt; All of these could be more intentional about only updating the per-cpu
-&gt; &gt; data under the lock and the page counters outside of it.
-&gt; &gt; 
-&gt; &gt; Given that IRQ allocations/frees are rare, nested ones even rarer, and
-&gt; &gt; the &quot;slowpath&quot; is a few extra atomics, I&#x27;m not sure it&#x27;s worth the
-&gt; &gt; code complication. At least until proven otherwise.
-&gt; &gt; 
-&gt; &gt; What do you think?
-&gt; 
-&gt; Yes this makes sense. We already have at least one evidence (bug Hao fixed) that
-&gt; these are very rare, so optimizing for such cases will just increase complexity
-&gt; without real benefit.
-
-Yes, make sense to me too. Thanks for taking a look.
-
-Reviewed-by: Hao Li &lt;hao.li@linux.dev&gt;
-</pre>
-</details>
+<div class="review-comment-text">Gave Reviewed-by</div>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/6sjgaoxzbipxpza4pjnwpm57yx4d662gpjtuuzv66bvl3fazjt@4repfcgybk5t" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
 </div>
 </div>
 </div>
