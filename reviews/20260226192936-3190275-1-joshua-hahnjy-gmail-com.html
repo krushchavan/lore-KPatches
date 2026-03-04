@@ -225,7 +225,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/8] mm/zswap, zsmalloc: Per-memcg-lruvec zswap accounting</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260226192936.3190275-1-joshua.hahnjy@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Active on: <a href="#2026-03-02">2026-03-02</a> &bull; <a href="#2026-02-27">2026-02-27</a> &bull; <a href="#2026-02-26">2026-02-26</a></div>
+    <div class="date-range">Active on: <a href="#2026-03-03">2026-03-03</a> &bull; <a href="#2026-03-02">2026-03-02</a> &bull; <a href="#2026-02-27">2026-02-27</a> &bull; <a href="#2026-02-26">2026-02-26</a></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces per-memcg-lruvec zswap accounting by adding a new array of objcg pointers to the zpdesc structure, allowing for accurate tracking of memory usage by zswap and reducing NR_ZSWAP. The changes also move memcg charges to the zsmalloc layer, which is the only user of zswap at this time.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-02-26">
@@ -238,6 +238,291 @@
 </div>
 <div class="review-comment-text">Raised concerns about the increased size of struct zpdesc and the potential impact on performance. Suggested exploring alternative solutions to achieve the desired accounting functionality without incurring significant overhead.</div>
 <div class="review-comment-signals">Signals: PERFORMANCE_CONCERN</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-03-02">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham</span>
+<a class="date-chip" href="../2026-03-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-02">2026-03-02</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">I might have missed it and this might be in one of the latter patches, but could also add some quick and dirty benchmark for zswap to ensure there&#x27;s no or minimal performance implications? IIUC there is a small amount of extra overhead in certain steps, because we have to go through zsmalloc to query objcg. Usemem or kernel build should suffice IMHO. To be clear, I don&#x27;t anticipate any observable performance change, but it&#x27;s a good sanity check :) Besides, can&#x27;t be too careful with stress testing stuff :P</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, Feb 26, 2026 at 11:29 AM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; INTRODUCTION
+&gt; ============
+&gt; The current design for zswap and zsmalloc leaves a clean divide between
+&gt; layers of the memory stack. At the higher level, we have zswap, which
+&gt; interacts directly with memory consumers, compression algorithms, and
+&gt; handles memory usage accounting via memcg limits. At the lower level,
+&gt; we have zsmalloc, which handles the page allocation and migration of
+&gt; physical pages.
+&gt;
+&gt; While this logical separation simplifies the codebase, it leaves
+&gt; problems for accounting that requires both memory cgroup awareness and
+&gt; physical memory location. To name a few:
+&gt;
+&gt;  - On tiered systems, it is impossible to understand how much toptier
+&gt;    memory a cgroup is using, since zswap has no understanding of where
+&gt;    the compressed memory is physically stored.
+&gt;    + With SeongJae Park&#x27;s work to store incompressible pages as-is in
+&gt;      zswap [1], the size of compressed memory can become non-trivial,
+&gt;      and easily consume a meaningful portion of memory.
+&gt;
+&gt;  - cgroups that restrict memory nodes have no control over which nodes
+&gt;    their zswapped objects live on. This can lead to unexpectedly high
+&gt;    fault times for workloads, who must eat the remote access latency
+&gt;    cost of retrieving the compressed object from a remote node.
+&gt;    + Nhat Pham addressed this issue via a best-effort attempt to place
+&gt;      compressed objects in the same page as the original page, but this
+&gt;      cannot guarantee complete isolation [2].
+&gt;
+&gt;  - On the flip side, zsmalloc&#x27;s ignorance of cgroup also makes its
+&gt;    shrinker memcg-unaware, which can lead to ineffective reclaim when
+&gt;    pressure is localized to a single cgroup.
+&gt;
+&gt; Until recently, zpool acted as another layer of indirection between
+&gt; zswap and zsmalloc, which made bridging memcg and physical location
+&gt; difficult. Now that zsmalloc is the only allocator backend for zswap and
+&gt; zram [3], it is possible to move memory-cgroup accounting to the
+&gt; zsmalloc layer.
+&gt;
+&gt; Introduce a new per-zpdesc array of objcg pointers to track
+&gt; per-memcg-lruvec memory usage by zswap, while leaving zram users
+&gt; unaffected.
+&gt;
+&gt; This creates one source of truth for NR_ZSWAP, and more accurate
+&gt; accounting for NR_ZSWAPPED.
+&gt;
+&gt; This brings sizeof(struct zpdesc) from 56 bytes to 64 bytes, but this
+&gt; increase in size is unseen by the rest of the system because zpdesc
+&gt; overlays struct page. Implementation details and care taken to handle
+&gt; the page-&gt;memcg_data field can be found in patch 3.
+&gt;
+&gt; In addition, move the accounting of memcg charges to the zsmalloc layer,
+&gt; whose only user is zswap at the moment.
+&gt;
+&gt; PATCH OUTLINE
+&gt; =============
+&gt; Patches 1 and 2 are small cleanups that make the codebase consistent and
+&gt; easier to digest.
+&gt;
+&gt; Patches 3, 4, and 5 allocate and populate the new zpdesc-&gt;objcgs field
+&gt; with compressed objects&#x27; obj_cgroups. zswap_entry-&gt;objcgs is removed,
+&gt; and redirected to look at the zspage for memcg information.
+&gt;
+&gt; Patch 6 moves the charging and lifetime management of obj_cgroups to
+&gt; the zsmalloc layer, which leaves zswap only as a plumbing layer to hand
+&gt; cgroup information to zsmalloc.
+&gt;
+&gt; Patches 7 and 8 introduce node counters and memcg-lruvec counters for
+&gt; zswap. Special care is taken for compressed objects that span multiple
+&gt; nodes.
+&gt;
+&gt; [1] https://lore.kernel.org/linux-mm/20250822190817.49287-1-sj@kernel.org/
+&gt; [2] https://lore.kernel.org/linux-mm/20250402204416.3435994-1-nphamcs@gmail.com/#t3
+&gt; [3] https://lore.kernel.org/linux-mm/20250829162212.208258-1-hannes@cmpxchg.org/
+&gt; [4] https://lore.kernel.org/linux-mm/c8bc2dce-d4ec-c16e-8df4-2624c48cfc06@google.com/
+&gt;
+&gt; Joshua Hahn (8):
+&gt;   mm/zsmalloc: Rename zs_object_copy to zs_obj_copy
+&gt;   mm/zsmalloc: Make all obj_idx unsigned ints
+&gt;   mm/zsmalloc: Introduce objcgs pointer in struct zpdesc
+&gt;   mm/zsmalloc: Store obj_cgroup pointer in zpdesc
+&gt;   mm/zsmalloc,zswap: Redirect zswap_entry-&gt;obcg to zpdesc
+&gt;   mm/zsmalloc, zswap: Handle objcg charging and lifetime in zsmalloc
+&gt;   mm/memcontrol: Track MEMCG_ZSWAPPED in bytes
+&gt;   mm/vmstat, memcontrol: Track ZSWAP_B, ZSWAPPED_B per-memcg-lruvec
+&gt;
+&gt;  drivers/block/zram/zram_drv.c |  17 +-
+&gt;  include/linux/memcontrol.h    |  15 +-
+&gt;  include/linux/mmzone.h        |   2 +
+&gt;  include/linux/zsmalloc.h      |   6 +-
+&gt;  mm/memcontrol.c               |  68 ++------
+&gt;  mm/vmstat.c                   |   2 +
+&gt;  mm/zpdesc.h                   |  25 ++-
+&gt;  mm/zsmalloc.c                 | 282 ++++++++++++++++++++++++++++++++--
+&gt;  mm/zswap.c                    |  67 ++++----
+&gt;  9 files changed, 345 insertions(+), 139 deletions(-)
+
+I might have missed it and this might be in one of the latter patches,
+but could also add some quick and dirty benchmark for zswap to ensure
+there&#x27;s no or minimal performance implications? IIUC there is a small
+amount of extra overhead in certain steps, because we have to go
+through zsmalloc to query objcg. Usemem or kernel build should suffice
+IMHO.
+
+To be clear, I don&#x27;t anticipate any observable performance change, but
+it&#x27;s a good sanity check :) Besides, can&#x27;t be too careful with stress
+testing stuff :P
+</pre>
+</details>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-03-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham</span>
+<a class="date-chip" href="../2026-03-03.html" title="First appeared in report for 2026-03-03">2026-03-03</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Sounds like any meagre performance difference is smaller than noise :P If it&#x27;s this negligible on these microbenchmarks, I think they&#x27;ll be infinitesimal in production workloads where these operations are a very small part. Kinda makes sense, because objcgroup access is only done in very small subsets of operations: zswap entry store and zswap entry free, which can only happen once each per zswap entry. I think we&#x27;re fine, but I&#x27;ll leave other reviewers comment on it as well.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Mar 3, 2026 at 9:51 AM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; On Mon, 2 Mar 2026 13:31:32 -0800 Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt;
+&gt; &gt; On Thu, Feb 26, 2026 at 11:29 AM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; [...snip...]
+&gt;
+&gt; &gt; &gt; Introduce a new per-zpdesc array of objcg pointers to track
+&gt; &gt; &gt; per-memcg-lruvec memory usage by zswap, while leaving zram users
+&gt; &gt; &gt; unaffected.
+&gt;
+&gt; [...snip...]
+&gt;
+&gt; Hi Nhat! I hope you are doing well : -) Thank you for taking a look!
+&gt;
+&gt; &gt; I might have missed it and this might be in one of the latter patches,
+&gt; &gt; but could also add some quick and dirty benchmark for zswap to ensure
+&gt; &gt; there&#x27;s no or minimal performance implications? IIUC there is a small
+&gt; &gt; amount of extra overhead in certain steps, because we have to go
+&gt; &gt; through zsmalloc to query objcg. Usemem or kernel build should suffice
+&gt; &gt; IMHO.
+&gt;
+&gt; Yup, this was one of my concerns too. I tried to do a somewhat comprehensive
+&gt; analysis below, hopefully this can show a good picture of what&#x27;s happening.
+&gt; Spoilers: there doesn&#x27;t seem to be any significant regressions (&lt; 1%)
+&gt; and any regressions are within a small fraction of the standard deviation.
+&gt;
+&gt; One thing that I have noticed is that there is a tangible reduction in
+&gt; standard deviation for some of these benchmarks. I can&#x27;t exactly pinpoint
+&gt; why this is happening, but I&#x27;ll take it as a win :p
+&gt;
+&gt; &gt; To be clear, I don&#x27;t anticipate any observable performance change, but
+&gt; &gt; it&#x27;s a good sanity check :) Besides, can&#x27;t be too careful with stress
+&gt; &gt; testing stuff :P
+&gt;
+&gt; For sure. I should have done these and included it in the original RFC,
+&gt; but I think I might have been too eager to get the RFC out : -)
+&gt; Will include in the second version of the series!
+&gt;
+&gt; All the experiments below are done on a 2-NUMA system. The data is quite
+&gt; compressible, which I think makes sense for measuring the overhead of accounting.
+&gt;
+&gt; Benchmark 1
+&gt; Allocating 2G memory to one node with 1G memory.high. Average across 10 trials
+&gt; +-------------------------+---------+----------+
+&gt; |                         | average |  stddev  |
+&gt; +-------------------------+---------+----------+
+&gt; | Baseline (11439c4635ed) | 8887.82 | 362.40   |
+&gt; | Baseline + Series       | 8944.16 | 356.45   |
+&gt; +-------------------------+---------+----------+
+&gt; | Delta                   | +0.634% | -1.642%  |
+&gt; +-------------------------+---------+----------+
+&gt;
+&gt; Benchmark 2
+&gt; Allocating 2G memory to one node with 1G memory.high, churn 5x through the
+&gt; memory. Average across 5 trials.
+&gt; +-------------------------+----------+----------+
+&gt; |                         | average  |  stddev  |
+&gt; +-------------------------+----------+----------+
+&gt; | Baseline (11439c4635ed) | 31152.96 | 166.23   |
+&gt; | Baseline + Series       | 31355.28 | 64.86    |
+&gt; +-------------------------+----------+----------+
+&gt; | Delta                   | +0.649%  | -60.981% |
+&gt; +-------------------------+----------+----------+
+&gt;
+&gt; Benchmark 3
+&gt; Allocating 2G memory to one node with 1G memory.high, split across 2 nodes.
+&gt; Average across 5 trials.
+&gt; +-------------------------+---------+----------+
+&gt; |            a            | average |  stddev  |
+&gt; +-------------------------+---------+----------+
+&gt; | Baseline (11439c4635ed) | 16101.6 | 174.18   |
+&gt; | Baseline + Series       | 16022.4 | 117.17   |
+&gt; +-------------------------+---------+----------+
+&gt; | Delta                   | -0.492% | -32.731% |
+&gt; +-------------------------+---------+----------+
+&gt;
+&gt; Benchmark 4
+&gt; Reading stat files 10000 times under memory pressure
+&gt;
+&gt; memory.stat
+&gt; +-------------------------+---------+----------+
+&gt; |                         | average |  stddev  |
+&gt; +-------------------------+---------+----------+
+&gt; | Baseline (11439c4635ed) | 24524.4 | 501.7    |
+&gt; | Baseline + Series       | 24807.2 | 444.53   |
+&gt; +-------------------------+---------+---------+
+&gt; | Delta                   | 1.153%  | -11.395% |
+&gt; +-------------------------+---------+----------+
+&gt;
+&gt; memory.numa_stat
+&gt; +-------------------------+---------+---------+
+&gt; |                         | average | stddev  |
+&gt; +-------------------------+---------+---------+
+&gt; | Baseline (11439c4635ed) | 24807.2 | 444.53  |
+&gt; | Baseline + Series       | 23837.6 | 521.68  |
+&gt; +-------------------------+---------+---------+
+&gt; | Delta                   | -3.905% | 17.355% |
+&gt; +-------------------------+---------+---------+
+&gt;
+&gt; proc/vmstat
+&gt; +-------------------------+---------+----------+
+&gt; |                         | average |  stddev  |
+&gt; +-------------------------+---------+----------+
+&gt; | Baseline (11439c4635ed) | 24793.6 | 285.26   |
+&gt; | Baseline + Series       | 23815.6 | 553.44   |
+&gt; +-------------------------+---------+---------+
+&gt; | Delta                   | -3.945% | +94.012% |
+&gt; +-------------------------+---------+----------+
+&gt;
+&gt; ^^^ Some big increase in standard deviation here, although there is some
+&gt; decrease in the average time. Probably the most notable change that I&#x27;ve seen
+&gt; from this patch.
+&gt;
+&gt; node0/vmstat
+&gt; +-------------------------+---------+----------+
+&gt; |            a            | average |  stddev  |
+&gt; +-------------------------+---------+----------+
+&gt; | Baseline (11439c4635ed) | 24541.4 | 281.41   |
+&gt; | Baseline + Series       | 24479   | 241.29   |
+&gt; +-------------------------+---------+---------+
+&gt; | Delta                   | -0.254% | -14.257% |
+&gt; +-------------------------+---------+----------+
+&gt;
+&gt; Lots of testing results, I think mostly negligible in terms of average, but
+&gt; some non-negligible changes in standard deviation going in both directions.
+&gt; I don&#x27;t see anything too concerning off the top of my head, but for the
+&gt; next version I&#x27;ll try to do some more testing across different machines
+&gt; as well (I don&#x27;t have any machines with &gt; 2 nodes, but maybe I can do
+&gt; some tests on QEMU just to sanity check)
+&gt;
+&gt; Thanks again, Nhat. Have a great day!
+&gt; Joshua
+
+Sounds like any meagre performance difference is smaller than noise :P
+If it&#x27;s this negligible on these microbenchmarks, I think they&#x27;ll be
+infinitesimal in production workloads where these operations are a
+very small part.
+
+Kinda makes sense, because objcgroup access is only done in very small
+subsets of operations: zswap entry store and zswap entry free, which
+can only happen once each per zswap entry.
+
+I think we&#x27;re fine, but I&#x27;ll leave other reviewers comment on it as well.
+</pre>
+</details>
 </div>
 </div>
 </div>
