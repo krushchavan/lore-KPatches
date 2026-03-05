@@ -240,130 +240,6 @@
 <div class="review-comment-signals">Signals: PERFORMANCE_CONCERN</div>
 </div>
 </div>
-<div class="thread-node depth-0" id="2026-03-02">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Nhat Pham</span>
-<a class="date-chip" href="../2026-03-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-02">2026-03-02</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
-</div>
-<div class="review-comment-text">I might have missed it and this might be in one of the latter patches, but could also add some quick and dirty benchmark for zswap to ensure there&#x27;s no or minimal performance implications? IIUC there is a small amount of extra overhead in certain steps, because we have to go through zsmalloc to query objcg. Usemem or kernel build should suffice IMHO. To be clear, I don&#x27;t anticipate any observable performance change, but it&#x27;s a good sanity check :) Besides, can&#x27;t be too careful with stress testing stuff :P</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Feb 26, 2026 at 11:29 AM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
-&gt;
-&gt; INTRODUCTION
-&gt; ============
-&gt; The current design for zswap and zsmalloc leaves a clean divide between
-&gt; layers of the memory stack. At the higher level, we have zswap, which
-&gt; interacts directly with memory consumers, compression algorithms, and
-&gt; handles memory usage accounting via memcg limits. At the lower level,
-&gt; we have zsmalloc, which handles the page allocation and migration of
-&gt; physical pages.
-&gt;
-&gt; While this logical separation simplifies the codebase, it leaves
-&gt; problems for accounting that requires both memory cgroup awareness and
-&gt; physical memory location. To name a few:
-&gt;
-&gt;  - On tiered systems, it is impossible to understand how much toptier
-&gt;    memory a cgroup is using, since zswap has no understanding of where
-&gt;    the compressed memory is physically stored.
-&gt;    + With SeongJae Park&#x27;s work to store incompressible pages as-is in
-&gt;      zswap [1], the size of compressed memory can become non-trivial,
-&gt;      and easily consume a meaningful portion of memory.
-&gt;
-&gt;  - cgroups that restrict memory nodes have no control over which nodes
-&gt;    their zswapped objects live on. This can lead to unexpectedly high
-&gt;    fault times for workloads, who must eat the remote access latency
-&gt;    cost of retrieving the compressed object from a remote node.
-&gt;    + Nhat Pham addressed this issue via a best-effort attempt to place
-&gt;      compressed objects in the same page as the original page, but this
-&gt;      cannot guarantee complete isolation [2].
-&gt;
-&gt;  - On the flip side, zsmalloc&#x27;s ignorance of cgroup also makes its
-&gt;    shrinker memcg-unaware, which can lead to ineffective reclaim when
-&gt;    pressure is localized to a single cgroup.
-&gt;
-&gt; Until recently, zpool acted as another layer of indirection between
-&gt; zswap and zsmalloc, which made bridging memcg and physical location
-&gt; difficult. Now that zsmalloc is the only allocator backend for zswap and
-&gt; zram [3], it is possible to move memory-cgroup accounting to the
-&gt; zsmalloc layer.
-&gt;
-&gt; Introduce a new per-zpdesc array of objcg pointers to track
-&gt; per-memcg-lruvec memory usage by zswap, while leaving zram users
-&gt; unaffected.
-&gt;
-&gt; This creates one source of truth for NR_ZSWAP, and more accurate
-&gt; accounting for NR_ZSWAPPED.
-&gt;
-&gt; This brings sizeof(struct zpdesc) from 56 bytes to 64 bytes, but this
-&gt; increase in size is unseen by the rest of the system because zpdesc
-&gt; overlays struct page. Implementation details and care taken to handle
-&gt; the page-&gt;memcg_data field can be found in patch 3.
-&gt;
-&gt; In addition, move the accounting of memcg charges to the zsmalloc layer,
-&gt; whose only user is zswap at the moment.
-&gt;
-&gt; PATCH OUTLINE
-&gt; =============
-&gt; Patches 1 and 2 are small cleanups that make the codebase consistent and
-&gt; easier to digest.
-&gt;
-&gt; Patches 3, 4, and 5 allocate and populate the new zpdesc-&gt;objcgs field
-&gt; with compressed objects&#x27; obj_cgroups. zswap_entry-&gt;objcgs is removed,
-&gt; and redirected to look at the zspage for memcg information.
-&gt;
-&gt; Patch 6 moves the charging and lifetime management of obj_cgroups to
-&gt; the zsmalloc layer, which leaves zswap only as a plumbing layer to hand
-&gt; cgroup information to zsmalloc.
-&gt;
-&gt; Patches 7 and 8 introduce node counters and memcg-lruvec counters for
-&gt; zswap. Special care is taken for compressed objects that span multiple
-&gt; nodes.
-&gt;
-&gt; [1] https://lore.kernel.org/linux-mm/20250822190817.49287-1-sj@kernel.org/
-&gt; [2] https://lore.kernel.org/linux-mm/20250402204416.3435994-1-nphamcs@gmail.com/#t3
-&gt; [3] https://lore.kernel.org/linux-mm/20250829162212.208258-1-hannes@cmpxchg.org/
-&gt; [4] https://lore.kernel.org/linux-mm/c8bc2dce-d4ec-c16e-8df4-2624c48cfc06@google.com/
-&gt;
-&gt; Joshua Hahn (8):
-&gt;   mm/zsmalloc: Rename zs_object_copy to zs_obj_copy
-&gt;   mm/zsmalloc: Make all obj_idx unsigned ints
-&gt;   mm/zsmalloc: Introduce objcgs pointer in struct zpdesc
-&gt;   mm/zsmalloc: Store obj_cgroup pointer in zpdesc
-&gt;   mm/zsmalloc,zswap: Redirect zswap_entry-&gt;obcg to zpdesc
-&gt;   mm/zsmalloc, zswap: Handle objcg charging and lifetime in zsmalloc
-&gt;   mm/memcontrol: Track MEMCG_ZSWAPPED in bytes
-&gt;   mm/vmstat, memcontrol: Track ZSWAP_B, ZSWAPPED_B per-memcg-lruvec
-&gt;
-&gt;  drivers/block/zram/zram_drv.c |  17 +-
-&gt;  include/linux/memcontrol.h    |  15 +-
-&gt;  include/linux/mmzone.h        |   2 +
-&gt;  include/linux/zsmalloc.h      |   6 +-
-&gt;  mm/memcontrol.c               |  68 ++------
-&gt;  mm/vmstat.c                   |   2 +
-&gt;  mm/zpdesc.h                   |  25 ++-
-&gt;  mm/zsmalloc.c                 | 282 ++++++++++++++++++++++++++++++++--
-&gt;  mm/zswap.c                    |  67 ++++----
-&gt;  9 files changed, 345 insertions(+), 139 deletions(-)
-
-I might have missed it and this might be in one of the latter patches,
-but could also add some quick and dirty benchmark for zswap to ensure
-there&#x27;s no or minimal performance implications? IIUC there is a small
-amount of extra overhead in certain steps, because we have to go
-through zsmalloc to query objcg. Usemem or kernel build should suffice
-IMHO.
-
-To be clear, I don&#x27;t anticipate any observable performance change, but
-it&#x27;s a good sanity check :) Besides, can&#x27;t be too careful with stress
-testing stuff :P
-</pre>
-</details>
-</div>
-</div>
 <div class="thread-node depth-0" id="2026-03-03">
 <div class="review-comment">
 <div class="review-comment-header">
@@ -387,7 +263,6 @@ can only happen once each per zswap entry.
 I think we&#x27;re fine, but I&#x27;ll leave other reviewers comment on it as well.</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
-<a href="https://lore.kernel.org/r/CAKEwX=NW75_ftM5ZuJJRMB2CLnB-25KPvamb4L1eP=i0XuFS_g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: no significant regressions, performance differences are within a small fraction of the standard deviation</div>
 </div>
 </div>
