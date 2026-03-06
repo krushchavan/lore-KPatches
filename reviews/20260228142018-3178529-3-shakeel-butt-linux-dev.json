@@ -1,0 +1,100 @@
+{
+  "thread_id": "20260228142018.3178529-3-shakeel.butt@linux.dev",
+  "subject": "[PATCH 2/3] cgroup: add lockless fast-path checks to cgroup_file_notify()",
+  "url": "https://lore.kernel.org/all/20260228142018.3178529-3-shakeel.butt@linux.dev/",
+  "dates": {
+    "2026-02-28": {
+      "report_file": "2026-03-03_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Chen Ridong",
+          "summary": "reviewer noted that cgroup_file_notify() may be called concurrently with timer_reduce(), causing a potential race condition due to the WRITE_ONCE(cfile->notified_at, jiffies) assignment\n\nReviewer Chen Ridong questioned whether the lockless fast-path checks in cgroup_file_notify() might cause missed notifications, specifically when a notification arrives within the rate-limit window and the timer scheduling is bypassed.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "potential race condition",
+            "concurrent access",
+            "risk of missing notifications"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Shakeel,\n\nGood series to move away from the global lock.\n\nOn 2026/2/28 22:20, Shakeel Butt wrote:\n\n---\n\nPreviously, if a notification arrived within the rate-limit window, we would\nstill call timer_reduce(&cfile->notify_timer, next) to schedule a deferred\nnotification.\n\nWith this change, returning early here bypasses that timer scheduling entirely.\nDoes this risk missing notifications that would have been delivered by the timer?",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-03-02",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2.\n\nAuthor acknowledged that the lockless check-and-return can cause missed notifications, agreed to simplify it by checking timer_pending() instead, and promised an updated version soon.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged a problem",
+            "promised a fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Hi Chen, thanks for taking a look.\n\nOn Mon, Mar 02, 2026 at 09:50:53AM +0800, Chen Ridong wrote:\n\n---\n\nYou are indeed right that this can cause missed notifications. After giving some\nthought I think the lockless check-and-return can be pretty much simplified to\ntimer_pending() check. If timer is active, just do nothing and the notification\nwill be delivered eventually.\n\nI will send the updated version soon. Any comments on the other two patches?",
+          "reply_to": "Chen Ridong",
+          "message_date": "2026-03-02",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author addressed a concern about unnecessary lock acquisition due to stale reads, explained that the timer_pending() check is added to skip when a deferred notification timer is already armed, and confirmed that this change is sufficient.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "acknowledged fix needed",
+            "confirmed resolution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "From: Shakeel Butt <shakeel.butt@linux.dev>\nDate: Sat, 28 Feb 2026 04:01:28 -0800\nSubject: [PATCH] cgroup: add lockless fast-path checks to cgroup_file_notify()\n\nAdd two lockless checks before acquiring the lock:\n\n1. READ_ONCE(cfile->kn) NULL check to skip torn-down files.\n2. timer_pending() check to skip when a deferred notification\n   timer is already armed.\n\nBoth checks have safe error directions -- a stale read can only\ncause unnecessary lock acquisition, never a missed notification.\n\nAnnotate cfile->kn write sites with WRITE_ONCE() to pair with the\nlockless reader.\n\nSigned-off-by: Shakeel Butt <shakeel.butt@linux.dev>\nReported-by: Jakub Kicinski <kuba@kernel.org>\n---\n kernel/cgroup/cgroup.c | 10 ++++++++--\n 1 file changed, 8 insertions(+), 2 deletions(-)\n\ndiff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c\nindex 2b298a2cf206..6e816d27ee25 100644\n--- a/kernel/cgroup/cgroup.c\n+++ b/kernel/cgroup/cgroup.c\n@@ -1749,7 +1749,7 @@ static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)\n \t\tstruct cgroup_file *cfile = (void *)css + cft->file_offset;\n \n \t\tspin_lock_irq(&cgroup_file_kn_lock);\n-\t\tcfile->kn = NULL;\n+\t\tWRITE_ONCE(cfile->kn, NULL);\n \t\tspin_unlock_irq(&cgroup_file_kn_lock);\n \n \t\ttimer_delete_sync(&cfile->notify_timer);\n@@ -4430,7 +4430,7 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,\n \t\ttimer_setup(&cfile->notify_timer, cgroup_file_notify_timer, 0);\n \n \t\tspin_lock_irq(&cgroup_file_kn_lock);\n-\t\tcfile->kn = kn;\n+\t\tWRITE_ONCE(cfile->kn, kn);\n \t\tspin_unlock_irq(&cgroup_file_kn_lock);\n \t}\n \n@@ -4689,6 +4689,12 @@ void cgroup_file_notify(struct cgroup_file *cfile)\n \tunsigned long flags;\n \tstruct kernfs_node *kn = NULL;\n \n+\tif (!READ_ONCE(cfile->kn))\n+\t\treturn;\n+\n+\tif (timer_pending(&cfile->notify_timer))\n+\t\treturn;\n+\n \tspin_lock_irqsave(&cgroup_file_kn_lock, flags);\n \tif (cfile->kn) {\n \t\tunsigned long last = cfile->notified_at;\n-- \n2.47.3",
+          "reply_to": "",
+          "message_date": "2026-03-02",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Chen Ridong",
+          "summary": "The reviewer noted that checking timer_pending() locklessly may lead to inconsistent states and races with other timer operations, requesting a reconsideration of this approach.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "lock ordering issue",
+            "potential race condition"
+          ],
+          "has_inline_review": true,
+          "tags_given": [],
+          "raw_body": "The added timer_pending() check seems problematic. According to the function's\ncomment, callers must ensure serialization with other timer operations. Here\nwe're checking timer_pending() locklessly, which means we might:\n\n1. See an inconsistent state if another CPU is concurrently modifying the timer\n\n2. Race with del_timer() or mod_timer() from other contexts",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-03-03",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "The author addressed a concern about outdated comments, pointing out that a recent commit has already implemented lockless checks for timers, making the current patch redundant.\n\nAuthor acknowledged that seeing stale state instead of inconsistent state is acceptable, confirming that the patch's approach to handling rate-limited notifications is correct.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "redundancy",
+            "outdated",
+            "acknowledged",
+            "confirmed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "That comment seems outdated. Check the commit 90c018942c2ba (\"timer: Use\nhlist_unhashed_lockless() in timer_pending()\").\n\n---\n\nIt will not see inconsistent state but it can see stale state which is totally\nfine. At worst we will take the lock and recheck but we will never miss the\nnotifications.",
+          "reply_to": "Chen Ridong",
+          "message_date": "2026-03-02",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch adds two lockless checks to the cgroup_file_notify() function to improve performance by reducing lock contention. The first check skips torn-down files, and the second check skips notifications within a rate-limit window (~10ms). If either condition is met, the function returns without acquiring the lock. This approach trades off potential loss of deferred notifications during bursts for improved responsiveness in primary callers like __memcg_memory_event()."
+    }
+  }
+}
