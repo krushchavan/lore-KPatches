@@ -185,6 +185,1157 @@
       ],
       "discussions_posted": [],
       "errors": []
+    },
+    {
+      "name": "Dmitry Ilvokhin",
+      "primary_email": "d@ilvokhin.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH RFC 3/3] locking: Wire up contended_release tracepoint",
+          "message_id": "8298e098d3418cb446ef396f119edac58a3414e9.1772642407.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/8298e098d3418cb446ef396f119edac58a3414e9.1772642407.git.d@ilvokhin.com/",
+          "date": "2026-03-04T16:56:46Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-03-04",
+          "patch_version": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "8298e098d3418cb446ef396f119edac58a3414e9.1772642407.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/8298e098d3418cb446ef396f119edac58a3414e9.1772642407.git.d@ilvokhin.com/",
+              "subject": "[PATCH RFC 3/3] locking: Wire up contended_release tracepoint",
+              "date": "2026-03-04T16:56:46Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Add trace_contended_release() calls to the slowpath unlock paths of sleepable locks: mutex, rtmutex, semaphore, rwsem, percpu-rwsem, and RT-specific rwbase locks. Each call site fires only when there are blocked waiters being woken, except percpu_up_write() which always wakes via __wake_up().",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Steven Rostedt",
+              "summary": "Hmm, if statements should never be used just for tracepoints without a static branch. The above should be: if (trace_contended_release_enabled() && rt_mutex_has_waiters(rtm)) trace_contended_release(rwb); The above \"trace_contened_release_enabled()\" is a static_branch where it turns the if statement into a nop when the tracepoint is not enabled, and a jmp when it is. Same here.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed,  4 Mar 2026 16:56:17 +0000\nDmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> @@ -204,6 +206,8 @@ static inline void rwbase_write_unlock(struct rwbase_rt *rwb)\n>  \tunsigned long flags;\n>  \n>  \traw_spin_lock_irqsave(&rtm->wait_lock, flags);\n> +\tif (rt_mutex_has_waiters(rtm))\n> +\t\ttrace_contended_release(rwb);\n\nHmm, if statements should never be used just for tracepoints without a\nstatic branch. The above should be:\n\n\tif (trace_contended_release_enabled() && rt_mutex_has_waiters(rtm))\n\t\ttrace_contended_release(rwb);\n\nThe above \"trace_contened_release_enabled()\" is a static_branch where it\nturns the if statement into a nop when the tracepoint is not enabled, and a\njmp when it is.\n\n\n>  \t__rwbase_write_unlock(rwb, WRITER_BIAS, flags);\n>  }\n>  \n> @@ -213,6 +217,8 @@ static inline void rwbase_write_downgrade(struct rwbase_rt *rwb)\n>  \tunsigned long flags;\n>  \n>  \traw_spin_lock_irqsave(&rtm->wait_lock, flags);\n> +\tif (rt_mutex_has_waiters(rtm))\n> +\t\ttrace_contended_release(rwb);\n\nSame here.\n\n-- Steve\n\n>  \t/* Release it and account current as reader */\n>  \t__rwbase_write_unlock(rwb, WRITER_BIAS - 1, flags);\n>  }\n> diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c\n> index 24df4d98f7d2..4e61dc0bb045 100644\n> --- a/kernel/locking/rwsem.c\n> +++ b/kernel/locking/rwsem.c\n> @@ -1360,6 +1360,7 @@ static inline void __up_read(struct rw_semaphore *sem)\n>  \tif (unlikely((tmp & (RWSEM_LOCK_MASK|RWSEM_FLAG_WAITERS)) ==\n>  \t\t      RWSEM_FLAG_WAITERS)) {\n>  \t\tclear_nonspinnable(sem);\n> +\t\ttrace_contended_release(sem);\n>  \t\trwsem_wake(sem);\n>  \t}\n>  \tpreempt_enable();\n> @@ -1383,8 +1384,10 @@ static inline void __up_write(struct rw_semaphore *sem)\n>  \tpreempt_disable();\n>  \trwsem_clear_owner(sem);\n>  \ttmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);\n> -\tif (unlikely(tmp & RWSEM_FLAG_WAITERS))\n> +\tif (unlikely(tmp & RWSEM_FLAG_WAITERS)) {\n> +\t\ttrace_contended_release(sem);\n>  \t\trwsem_wake(sem);\n> +\t}\n>  \tpreempt_enable();\n>  }\n>  \n> @@ -1407,8 +1410,10 @@ static inline void __downgrade_write(struct rw_semaphore *sem)\n>  \ttmp = atomic_long_fetch_add_release(\n>  \t\t-RWSEM_WRITER_LOCKED+RWSEM_READER_BIAS, &sem->count);\n>  \trwsem_set_reader_owned(sem);\n> -\tif (tmp & RWSEM_FLAG_WAITERS)\n> +\tif (tmp & RWSEM_FLAG_WAITERS) {\n> +\t\ttrace_contended_release(sem);\n>  \t\trwsem_downgrade_wake(sem);\n> +\t}\n>  \tpreempt_enable();\n>  }\n>  \n> diff --git a/kernel/locking/semaphore.c b/kernel/locking/semaphore.c\n> index 3ef032e22f7e..3cef5ba88f7e 100644\n> --- a/kernel/locking/semaphore.c\n> +++ b/kernel/locking/semaphore.c\n> @@ -231,8 +231,10 @@ void __sched up(struct semaphore *sem)\n>  \telse\n>  \t\t__up(sem, &wake_q);\n>  \traw_spin_unlock_irqrestore(&sem->lock, flags);\n> -\tif (!wake_q_empty(&wake_q))\n> +\tif (!wake_q_empty(&wake_q)) {\n> +\t\ttrace_contended_release(sem);\n>  \t\twake_up_q(&wake_q);\n> +\t}\n>  }\n>  EXPORT_SYMBOL(up);\n>  \n\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Peter Zijlstra",
+              "summary": "I still wish you would accept: if (trace_foo_enabled() && foo) __do_trace_foo(); The compilers can't optimize the static branches and thus you'll get it twice for no reason. I really wish they would just accept __pure, but alas.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, Mar 05, 2026 at 10:59:24AM -0500, Steven Rostedt wrote:\n> On Wed,  4 Mar 2026 16:56:17 +0000\n> Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> \n> > @@ -204,6 +206,8 @@ static inline void rwbase_write_unlock(struct rwbase_rt *rwb)\n> >  \tunsigned long flags;\n> >  \n> >  \traw_spin_lock_irqsave(&rtm->wait_lock, flags);\n> > +\tif (rt_mutex_has_waiters(rtm))\n> > +\t\ttrace_contended_release(rwb);\n> \n> Hmm, if statements should never be used just for tracepoints without a\n> static branch. The above should be:\n> \n> \tif (trace_contended_release_enabled() && rt_mutex_has_waiters(rtm))\n> \t\ttrace_contended_release(rwb);\n> \n\nI still wish you would accept:\n\n\tif (trace_foo_enabled() && foo)\n\t\t__do_trace_foo();\n\nThe compilers can't optimize the static branches and thus you'll get it\ntwice for no reason.\n\nI really wish they would just accept __pure, but alas.\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Steven Rostedt",
+              "summary": "Makes sense, and that could probably be done. It shouldn't be too hard to do. If I find some time I could look at it, or perhaps someone lurking on this thread could possibly give it a try!",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, 5 Mar 2026 18:42:23 +0100\nPeter Zijlstra <peterz@infradead.org> wrote:\n\n> I still wish you would accept:\n> \n> \tif (trace_foo_enabled() && foo)\n> \t\t__do_trace_foo();\n> \n> The compilers can't optimize the static branches and thus you'll get it\n> twice for no reason.\n> \n> I really wish they would just accept __pure, but alas.\n\nMakes sense, and that could probably be done. It shouldn't be too hard to\ndo. If I find some time I could look at it, or perhaps someone lurking on\nthis thread could possibly give it a try! (I may even Cc some people that\nwant to learn this code).\n\n-- Steve\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH RFC 1/3] locking: Add contended_release tracepoint",
+          "message_id": "f8605471fd84ebff963c011aa98f79ed17f493c7.1772642407.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/f8605471fd84ebff963c011aa98f79ed17f493c7.1772642407.git.d@ilvokhin.com/",
+          "date": "2026-03-04T16:56:45Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-03-04",
+          "patch_version": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "f8605471fd84ebff963c011aa98f79ed17f493c7.1772642407.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/f8605471fd84ebff963c011aa98f79ed17f493c7.1772642407.git.d@ilvokhin.com/",
+              "subject": "[PATCH RFC 1/3] locking: Add contended_release tracepoint",
+              "date": "2026-03-04T16:56:45Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Add the contended_release trace event. This tracepoint fires on the holder side when a contended lock is released, complementing the existing contention_begin/contention_end tracepoints which fire on the waiter side.\n\nThis enables correlating lock hold time under contention with waiter events by lock address. Subsequent patches wire this tracepoint into the individual lock implementations.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Masami (Google)",
+              "summary": "OK, but I don't recommend you to split the traceevent definition and its usage. Could you combine [1/3] and [3/3], so that we can understand why this event is introduced and where it is recorded by checking one commit?",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed,  4 Mar 2026 16:56:15 +0000\nDmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> Add the contended_release trace event. This tracepoint fires on the\n> holder side when a contended lock is released, complementing the\n> existing contention_begin/contention_end tracepoints which fire on the\n> waiter side.\n> \n> This enables correlating lock hold time under contention with waiter\n> events by lock address. Subsequent patches wire this tracepoint into\n> the individual lock implementations.\n> \n\nOK, but I don't recommend you to split the traceevent definition\nand its usage. Could you combine [1/3] and [3/3], so that we can\nunderstand why this event is introduced and where it is recorded\nby checking one commit?\n\nThank you,\n\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> ---\n>  include/trace/events/lock.h | 17 +++++++++++++++++\n>  1 file changed, 17 insertions(+)\n> \n> diff --git a/include/trace/events/lock.h b/include/trace/events/lock.h\n> index 8e89baa3775f..4f28e41977ec 100644\n> --- a/include/trace/events/lock.h\n> +++ b/include/trace/events/lock.h\n> @@ -138,6 +138,23 @@ TRACE_EVENT(contention_end,\n>  \tTP_printk(\"%p (ret=%d)\", __entry->lock_addr, __entry->ret)\n>  );\n>  \n> +TRACE_EVENT(contended_release,\n> +\n> +\tTP_PROTO(void *lock),\n> +\n> +\tTP_ARGS(lock),\n> +\n> +\tTP_STRUCT__entry(\n> +\t\t__field(void *, lock_addr)\n> +\t),\n> +\n> +\tTP_fast_assign(\n> +\t\t__entry->lock_addr = lock;\n> +\t),\n> +\n> +\tTP_printk(\"%p\", __entry->lock_addr)\n> +);\n> +\n>  #endif /* _TRACE_LOCK_H */\n>  \n>  /* This part must be outside protection */\n> -- \n> 2.47.3\n> \n\n\n-- \nMasami Hiramatsu (Google) <mhiramat@kernel.org>\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH RFC 0/3] locking: contended_release tracepoint instrumentation",
+          "message_id": "cover.1772642407.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/cover.1772642407.git.d@ilvokhin.com/",
+          "date": "2026-03-04T16:56:45Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-03-04",
+          "patch_version": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "cover.1772642407.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/cover.1772642407.git.d@ilvokhin.com/",
+              "subject": "[PATCH RFC 0/3] locking: contended_release tracepoint instrumentation",
+              "date": "2026-03-04T16:56:45Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "The existing contention_begin/contention_end tracepoints fire on the waiter side. The lock holder's identity and stack can be captured at contention_begin time (e.g. perf lock contention --lock-owner), but this reflects the holder's state when a waiter arrives, not when the lock is actually released.\n\nThis series adds a contended_release tracepoint that fires on the holder side when a lock with waiters is released. This provides:\n\n- Hold time estimation: when the holder's own acquisition was contended, its contention_end (acquisition) and contended_release can be correlated to measure how long the lock was held under contention.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Peter Zijlstra",
+              "summary": "extern for consistency with all the other declarations in this header. s/_slowpath//, the corresponding down function also doesn't have _slowpath on.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed, Mar 04, 2026 at 04:56:16PM +0000, Dmitry Ilvokhin wrote:\n> Move the percpu_up_read() slowpath out of the inline function into a new\n> __percpu_up_read_slowpath() to avoid binary size increase from adding a\n> tracepoint to an inlined function.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> ---\n>  include/linux/percpu-rwsem.h  | 15 +++------------\n>  kernel/locking/percpu-rwsem.c | 18 ++++++++++++++++++\n>  2 files changed, 21 insertions(+), 12 deletions(-)\n> \n> diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h\n> index c8cb010d655e..89506895365c 100644\n> --- a/include/linux/percpu-rwsem.h\n> +++ b/include/linux/percpu-rwsem.h\n> @@ -107,6 +107,8 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)\n>  \treturn ret;\n>  }\n>  \n> +void __percpu_up_read_slowpath(struct percpu_rw_semaphore *sem);\n> +\n\nextern for consistency with all the other declarations in this header.\n\ns/_slowpath//, the corresponding down function also doesn't have\n_slowpath on.\n\n>  static inline void percpu_up_read(struct percpu_rw_semaphore *sem)\n>  {\n>  \trwsem_release(&sem->dep_map, _RET_IP_);\n",
+              "reply_to": "",
+              "message_date": "2026-03-04",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Masami (Google)",
+              "summary": "OK, but I don't recommend you to split the traceevent definition and its usage. Could you combine [1/3] and [3/3], so that we can understand why this event is introduced and where it is recorded by checking one commit?",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed,  4 Mar 2026 16:56:15 +0000\nDmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> Add the contended_release trace event. This tracepoint fires on the\n> holder side when a contended lock is released, complementing the\n> existing contention_begin/contention_end tracepoints which fire on the\n> waiter side.\n> \n> This enables correlating lock hold time under contention with waiter\n> events by lock address. Subsequent patches wire this tracepoint into\n> the individual lock implementations.\n> \n\nOK, but I don't recommend you to split the traceevent definition\nand its usage. Could you combine [1/3] and [3/3], so that we can\nunderstand why this event is introduced and where it is recorded\nby checking one commit?\n\nThank you,\n\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> ---\n>  include/trace/events/lock.h | 17 +++++++++++++++++\n>  1 file changed, 17 insertions(+)\n> \n> diff --git a/include/trace/events/lock.h b/include/trace/events/lock.h\n> index 8e89baa3775f..4f28e41977ec 100644\n> --- a/include/trace/events/lock.h\n> +++ b/include/trace/events/lock.h\n> @@ -138,6 +138,23 @@ TRACE_EVENT(contention_end,\n>  \tTP_printk(\"%p (ret=%d)\", __entry->lock_addr, __entry->ret)\n>  );\n>  \n> +TRACE_EVENT(contended_release,\n> +\n> +\tTP_PROTO(void *lock),\n> +\n> +\tTP_ARGS(lock),\n> +\n> +\tTP_STRUCT__entry(\n> +\t\t__field(void *, lock_addr)\n> +\t),\n> +\n> +\tTP_fast_assign(\n> +\t\t__entry->lock_addr = lock;\n> +\t),\n> +\n> +\tTP_printk(\"%p\", __entry->lock_addr)\n> +);\n> +\n>  #endif /* _TRACE_LOCK_H */\n>  \n>  /* This part must be outside protection */\n> -- \n> 2.47.3\n> \n\n\n-- \nMasami Hiramatsu (Google) <mhiramat@kernel.org>\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Steven Rostedt",
+              "summary": "I wonder if a cleanup patch should be added to remove the \"extern\" from the other functions, as that tends to be the way things are going (hch just recommended it elsewhere). And since \"slowpath\" is more descriptive (and used in the rtmutex code), should that be added too?",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed, 4 Mar 2026 23:02:23 +0100\nPeter Zijlstra <peterz@infradead.org> wrote:\n\n> > diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h\n> > index c8cb010d655e..89506895365c 100644\n> > --- a/include/linux/percpu-rwsem.h\n> > +++ b/include/linux/percpu-rwsem.h\n> > @@ -107,6 +107,8 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)\n> >  \treturn ret;\n> >  }\n> >  \n> > +void __percpu_up_read_slowpath(struct percpu_rw_semaphore *sem);\n> > +  \n> \n> extern for consistency with all the other declarations in this header.\n\nI wonder if a cleanup patch should be added to remove the \"extern\" from the\nother functions, as that tends to be the way things are going (hch just\nrecommended it elsewhere).\n\n> \n> s/_slowpath//, the corresponding down function also doesn't have\n> _slowpath on.\n> \n> >  static inline void percpu_up_read(struct percpu_rw_semaphore *sem)\n> >  {\n> >  \trwsem_release(&sem->dep_map, _RET_IP_);  \n\nAnd since \"slowpath\" is more descriptive (and used in the rtmutex code),\nshould that be added too?\n\n-- Steve\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Steven Rostedt",
+              "summary": "Hmm, if statements should never be used just for tracepoints without a static branch. The above should be: if (trace_contended_release_enabled() && rt_mutex_has_waiters(rtm)) trace_contended_release(rwb); The above \"trace_contened_release_enabled()\" is a static_branch where it turns the if statement into a nop when the tracepoint is not enabled, and a jmp when it is. Same here.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed,  4 Mar 2026 16:56:17 +0000\nDmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> @@ -204,6 +206,8 @@ static inline void rwbase_write_unlock(struct rwbase_rt *rwb)\n>  \tunsigned long flags;\n>  \n>  \traw_spin_lock_irqsave(&rtm->wait_lock, flags);\n> +\tif (rt_mutex_has_waiters(rtm))\n> +\t\ttrace_contended_release(rwb);\n\nHmm, if statements should never be used just for tracepoints without a\nstatic branch. The above should be:\n\n\tif (trace_contended_release_enabled() && rt_mutex_has_waiters(rtm))\n\t\ttrace_contended_release(rwb);\n\nThe above \"trace_contened_release_enabled()\" is a static_branch where it\nturns the if statement into a nop when the tracepoint is not enabled, and a\njmp when it is.\n\n\n>  \t__rwbase_write_unlock(rwb, WRITER_BIAS, flags);\n>  }\n>  \n> @@ -213,6 +217,8 @@ static inline void rwbase_write_downgrade(struct rwbase_rt *rwb)\n>  \tunsigned long flags;\n>  \n>  \traw_spin_lock_irqsave(&rtm->wait_lock, flags);\n> +\tif (rt_mutex_has_waiters(rtm))\n> +\t\ttrace_contended_release(rwb);\n\nSame here.\n\n-- Steve\n\n>  \t/* Release it and account current as reader */\n>  \t__rwbase_write_unlock(rwb, WRITER_BIAS - 1, flags);\n>  }\n> diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c\n> index 24df4d98f7d2..4e61dc0bb045 100644\n> --- a/kernel/locking/rwsem.c\n> +++ b/kernel/locking/rwsem.c\n> @@ -1360,6 +1360,7 @@ static inline void __up_read(struct rw_semaphore *sem)\n>  \tif (unlikely((tmp & (RWSEM_LOCK_MASK|RWSEM_FLAG_WAITERS)) ==\n>  \t\t      RWSEM_FLAG_WAITERS)) {\n>  \t\tclear_nonspinnable(sem);\n> +\t\ttrace_contended_release(sem);\n>  \t\trwsem_wake(sem);\n>  \t}\n>  \tpreempt_enable();\n> @@ -1383,8 +1384,10 @@ static inline void __up_write(struct rw_semaphore *sem)\n>  \tpreempt_disable();\n>  \trwsem_clear_owner(sem);\n>  \ttmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);\n> -\tif (unlikely(tmp & RWSEM_FLAG_WAITERS))\n> +\tif (unlikely(tmp & RWSEM_FLAG_WAITERS)) {\n> +\t\ttrace_contended_release(sem);\n>  \t\trwsem_wake(sem);\n> +\t}\n>  \tpreempt_enable();\n>  }\n>  \n> @@ -1407,8 +1410,10 @@ static inline void __downgrade_write(struct rw_semaphore *sem)\n>  \ttmp = atomic_long_fetch_add_release(\n>  \t\t-RWSEM_WRITER_LOCKED+RWSEM_READER_BIAS, &sem->count);\n>  \trwsem_set_reader_owned(sem);\n> -\tif (tmp & RWSEM_FLAG_WAITERS)\n> +\tif (tmp & RWSEM_FLAG_WAITERS) {\n> +\t\ttrace_contended_release(sem);\n>  \t\trwsem_downgrade_wake(sem);\n> +\t}\n>  \tpreempt_enable();\n>  }\n>  \n> diff --git a/kernel/locking/semaphore.c b/kernel/locking/semaphore.c\n> index 3ef032e22f7e..3cef5ba88f7e 100644\n> --- a/kernel/locking/semaphore.c\n> +++ b/kernel/locking/semaphore.c\n> @@ -231,8 +231,10 @@ void __sched up(struct semaphore *sem)\n>  \telse\n>  \t\t__up(sem, &wake_q);\n>  \traw_spin_unlock_irqrestore(&sem->lock, flags);\n> -\tif (!wake_q_empty(&wake_q))\n> +\tif (!wake_q_empty(&wake_q)) {\n> +\t\ttrace_contended_release(sem);\n>  \t\twake_up_q(&wake_q);\n> +\t}\n>  }\n>  EXPORT_SYMBOL(up);\n>  \n\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Peter Zijlstra",
+              "summary": "Well, I rather like the extern. But yeah, I know hch does not agree. It already has __ prefix, no point in making the name even longer for no real benefit.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, Mar 05, 2026 at 10:47:03AM -0500, Steven Rostedt wrote:\n> On Wed, 4 Mar 2026 23:02:23 +0100\n> Peter Zijlstra <peterz@infradead.org> wrote:\n> \n> > > diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h\n> > > index c8cb010d655e..89506895365c 100644\n> > > --- a/include/linux/percpu-rwsem.h\n> > > +++ b/include/linux/percpu-rwsem.h\n> > > @@ -107,6 +107,8 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)\n> > >  \treturn ret;\n> > >  }\n> > >  \n> > > +void __percpu_up_read_slowpath(struct percpu_rw_semaphore *sem);\n> > > +  \n> > \n> > extern for consistency with all the other declarations in this header.\n> \n> I wonder if a cleanup patch should be added to remove the \"extern\" from the\n> other functions, as that tends to be the way things are going (hch just\n> recommended it elsewhere).\n\nWell, I rather like the extern. But yeah, I know hch does not agree.\n\n> > \n> > s/_slowpath//, the corresponding down function also doesn't have\n> > _slowpath on.\n> > \n> > >  static inline void percpu_up_read(struct percpu_rw_semaphore *sem)\n> > >  {\n> > >  \trwsem_release(&sem->dep_map, _RET_IP_);  \n> \n> And since \"slowpath\" is more descriptive (and used in the rtmutex code),\n> should that be added too?\n\nIt already has __ prefix, no point in making the name even longer for no\nreal benefit.\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Peter Zijlstra",
+              "summary": "I still wish you would accept: if (trace_foo_enabled() && foo) __do_trace_foo(); The compilers can't optimize the static branches and thus you'll get it twice for no reason. I really wish they would just accept __pure, but alas.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, Mar 05, 2026 at 10:59:24AM -0500, Steven Rostedt wrote:\n> On Wed,  4 Mar 2026 16:56:17 +0000\n> Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> \n> > @@ -204,6 +206,8 @@ static inline void rwbase_write_unlock(struct rwbase_rt *rwb)\n> >  \tunsigned long flags;\n> >  \n> >  \traw_spin_lock_irqsave(&rtm->wait_lock, flags);\n> > +\tif (rt_mutex_has_waiters(rtm))\n> > +\t\ttrace_contended_release(rwb);\n> \n> Hmm, if statements should never be used just for tracepoints without a\n> static branch. The above should be:\n> \n> \tif (trace_contended_release_enabled() && rt_mutex_has_waiters(rtm))\n> \t\ttrace_contended_release(rwb);\n> \n\nI still wish you would accept:\n\n\tif (trace_foo_enabled() && foo)\n\t\t__do_trace_foo();\n\nThe compilers can't optimize the static branches and thus you'll get it\ntwice for no reason.\n\nI really wish they would just accept __pure, but alas.\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Steven Rostedt",
+              "summary": "Makes sense, and that could probably be done. It shouldn't be too hard to do. If I find some time I could look at it, or perhaps someone lurking on this thread could possibly give it a try!",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, 5 Mar 2026 18:42:23 +0100\nPeter Zijlstra <peterz@infradead.org> wrote:\n\n> I still wish you would accept:\n> \n> \tif (trace_foo_enabled() && foo)\n> \t\t__do_trace_foo();\n> \n> The compilers can't optimize the static branches and thus you'll get it\n> twice for no reason.\n> \n> I really wish they would just accept __pure, but alas.\n\nMakes sense, and that could probably be done. It shouldn't be too hard to\ndo. If I find some time I could look at it, or perhaps someone lurking on\nthis thread could possibly give it a try! (I may even Cc some people that\nwant to learn this code).\n\n-- Steve\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH RFC 2/3] locking/percpu-rwsem: Extract __percpu_up_read_slowpath()",
+          "message_id": "6b1f1521ca186d5c402a65619d8f30fe83b93bf6.1772642407.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/6b1f1521ca186d5c402a65619d8f30fe83b93bf6.1772642407.git.d@ilvokhin.com/",
+          "date": "2026-03-04T16:56:45Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-03-04",
+          "patch_version": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "6b1f1521ca186d5c402a65619d8f30fe83b93bf6.1772642407.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/6b1f1521ca186d5c402a65619d8f30fe83b93bf6.1772642407.git.d@ilvokhin.com/",
+              "subject": "[PATCH RFC 2/3] locking/percpu-rwsem: Extract __percpu_up_read_slowpath()",
+              "date": "2026-03-04T16:56:45Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Move the percpu_up_read() slowpath out of the inline function into a new __percpu_up_read_slowpath() to avoid binary size increase from adding a tracepoint to an inlined function.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Peter Zijlstra",
+              "summary": "extern for consistency with all the other declarations in this header. s/_slowpath//, the corresponding down function also doesn't have _slowpath on.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed, Mar 04, 2026 at 04:56:16PM +0000, Dmitry Ilvokhin wrote:\n> Move the percpu_up_read() slowpath out of the inline function into a new\n> __percpu_up_read_slowpath() to avoid binary size increase from adding a\n> tracepoint to an inlined function.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> ---\n>  include/linux/percpu-rwsem.h  | 15 +++------------\n>  kernel/locking/percpu-rwsem.c | 18 ++++++++++++++++++\n>  2 files changed, 21 insertions(+), 12 deletions(-)\n> \n> diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h\n> index c8cb010d655e..89506895365c 100644\n> --- a/include/linux/percpu-rwsem.h\n> +++ b/include/linux/percpu-rwsem.h\n> @@ -107,6 +107,8 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)\n>  \treturn ret;\n>  }\n>  \n> +void __percpu_up_read_slowpath(struct percpu_rw_semaphore *sem);\n> +\n\nextern for consistency with all the other declarations in this header.\n\ns/_slowpath//, the corresponding down function also doesn't have\n_slowpath on.\n\n>  static inline void percpu_up_read(struct percpu_rw_semaphore *sem)\n>  {\n>  \trwsem_release(&sem->dep_map, _RET_IP_);\n",
+              "reply_to": "",
+              "message_date": "2026-03-04",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Steven Rostedt",
+              "summary": "I wonder if a cleanup patch should be added to remove the \"extern\" from the other functions, as that tends to be the way things are going (hch just recommended it elsewhere). And since \"slowpath\" is more descriptive (and used in the rtmutex code), should that be added too?",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed, 4 Mar 2026 23:02:23 +0100\nPeter Zijlstra <peterz@infradead.org> wrote:\n\n> > diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h\n> > index c8cb010d655e..89506895365c 100644\n> > --- a/include/linux/percpu-rwsem.h\n> > +++ b/include/linux/percpu-rwsem.h\n> > @@ -107,6 +107,8 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)\n> >  \treturn ret;\n> >  }\n> >  \n> > +void __percpu_up_read_slowpath(struct percpu_rw_semaphore *sem);\n> > +  \n> \n> extern for consistency with all the other declarations in this header.\n\nI wonder if a cleanup patch should be added to remove the \"extern\" from the\nother functions, as that tends to be the way things are going (hch just\nrecommended it elsewhere).\n\n> \n> s/_slowpath//, the corresponding down function also doesn't have\n> _slowpath on.\n> \n> >  static inline void percpu_up_read(struct percpu_rw_semaphore *sem)\n> >  {\n> >  \trwsem_release(&sem->dep_map, _RET_IP_);  \n\nAnd since \"slowpath\" is more descriptive (and used in the rtmutex code),\nshould that be added too?\n\n-- Steve\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Peter Zijlstra",
+              "summary": "Well, I rather like the extern. But yeah, I know hch does not agree. It already has __ prefix, no point in making the name even longer for no real benefit.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, Mar 05, 2026 at 10:47:03AM -0500, Steven Rostedt wrote:\n> On Wed, 4 Mar 2026 23:02:23 +0100\n> Peter Zijlstra <peterz@infradead.org> wrote:\n> \n> > > diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h\n> > > index c8cb010d655e..89506895365c 100644\n> > > --- a/include/linux/percpu-rwsem.h\n> > > +++ b/include/linux/percpu-rwsem.h\n> > > @@ -107,6 +107,8 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)\n> > >  \treturn ret;\n> > >  }\n> > >  \n> > > +void __percpu_up_read_slowpath(struct percpu_rw_semaphore *sem);\n> > > +  \n> > \n> > extern for consistency with all the other declarations in this header.\n> \n> I wonder if a cleanup patch should be added to remove the \"extern\" from the\n> other functions, as that tends to be the way things are going (hch just\n> recommended it elsewhere).\n\nWell, I rather like the extern. But yeah, I know hch does not agree.\n\n> > \n> > s/_slowpath//, the corresponding down function also doesn't have\n> > _slowpath on.\n> > \n> > >  static inline void percpu_up_read(struct percpu_rw_semaphore *sem)\n> > >  {\n> > >  \trwsem_release(&sem->dep_map, _RET_IP_);  \n> \n> And since \"slowpath\" is more descriptive (and used in the rtmutex code),\n> should that be added too?\n\nIt already has __ prefix, no point in making the name even longer for no\nreal benefit.\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 5/5] mm: add tracepoints for zone lock",
+          "message_id": "ae145fe890f028409f727b4921904b547346fa0b.1772206930.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/ae145fe890f028409f727b4921904b547346fa0b.1772206930.git.d@ilvokhin.com/",
+          "date": "2026-02-27T16:01:22Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-27",
+          "patch_version": 4,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "bde161acf827852ef19de51e91caf5c9f7df81bd.1772030186.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/bde161acf827852ef19de51e91caf5c9f7df81bd.1772030186.git.d@ilvokhin.com/",
+              "subject": "[PATCH v2 4/4] mm: add tracepoints for zone lock",
+              "date": "2026-02-25T14:44:17Z"
+            },
+            {
+              "version": 3,
+              "message_id": "378089dd269249d3d7981fe10eb8b49ad551d353.1772129168.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/378089dd269249d3d7981fe10eb8b49ad551d353.1772129168.git.d@ilvokhin.com/",
+              "subject": "[PATCH v3 5/5] mm: add tracepoints for zone lock",
+              "date": "2026-02-26T18:26:59Z"
+            },
+            {
+              "version": 4,
+              "message_id": "ae145fe890f028409f727b4921904b547346fa0b.1772206930.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/ae145fe890f028409f727b4921904b547346fa0b.1772206930.git.d@ilvokhin.com/",
+              "subject": "[PATCH v4 5/5] mm: add tracepoints for zone lock",
+              "date": "2026-02-27T16:01:22Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Add tracepoint instrumentation to zone lock acquire/release operations via the previously introduced wrappers.\n\nThe implementation follows the mmap_lock tracepoint pattern: a lightweight inline helper checks whether the tracepoint is enabled and calls into an out-of-line helper when tracing is active. When CONFIG_TRACING is disabled, helpers compile to empty inline stubs.\n\nThe fast path is unaffected when tracing is disabled.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Steven Rostedt",
+              "summary": "Why the \"success\" variable and not just: __zone_lock_trace_acquire_returned(zone, true); Same here.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Fri, 27 Feb 2026 16:00:27 +0000\nDmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n>  static inline void zone_lock_init(struct zone *zone)\n>  {\n> @@ -12,26 +59,41 @@ static inline void zone_lock_init(struct zone *zone)\n>  \n>  #define zone_lock_irqsave(zone, flags)\t\t\t\t\\\n>  do {\t\t\t\t\t\t\t\t\\\n> +\tbool success = true;\t\t\t\t\t\\\n> +\t\t\t\t\t\t\t\t\\\n> +\t__zone_lock_trace_start_locking(zone);\t\t\t\\\n>  \tspin_lock_irqsave(&(zone)->_lock, flags);\t\t\\\n> +\t__zone_lock_trace_acquire_returned(zone, success);\t\\\n\nWhy the \"success\" variable and not just:\n\n\t__zone_lock_trace_acquire_returned(zone, true);\n\n ?\n\n\n>  } while (0)\n>  \n>  #define zone_trylock_irqsave(zone, flags)\t\t\t\\\n>  ({\t\t\t\t\t\t\t\t\\\n> -\tspin_trylock_irqsave(&(zone)->_lock, flags);\t\t\\\n> +\tbool success;\t\t\t\t\t\t\\\n> +\t\t\t\t\t\t\t\t\\\n> +\t__zone_lock_trace_start_locking(zone);\t\t\t\\\n> +\tsuccess = spin_trylock_irqsave(&(zone)->_lock, flags);\t\\\n> +\t__zone_lock_trace_acquire_returned(zone, success);\t\\\n> +\tsuccess;\t\t\t\t\t\t\\\n>  })\n>  \n>  static inline void zone_unlock_irqrestore(struct zone *zone, unsigned long flags)\n>  {\n> +\t__zone_lock_trace_released(zone);\n>  \tspin_unlock_irqrestore(&zone->_lock, flags);\n>  }\n>  \n>  static inline void zone_lock_irq(struct zone *zone)\n>  {\n> +\tbool success = true;\n> +\n> +\t__zone_lock_trace_start_locking(zone);\n>  \tspin_lock_irq(&zone->_lock);\n> +\t__zone_lock_trace_acquire_returned(zone, success);\n\nSame here.\n\n>  }\n>  \n>  static inline void zone_unlock_irq(struct zone *zone)\n>  {\n> +\t__zone_lock_trace_released(zone);\n>  \tspin_unlock_irq(&zone->_lock);\n>  }\n>\n\n-- Steve\n\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "Agree with Steven; otherwise",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Add tracepoint instrumentation to zone lock acquire/release operations\n> via the previously introduced wrappers.\n> \n> The implementation follows the mmap_lock tracepoint pattern: a\n> lightweight inline helper checks whether the tracepoint is enabled and\n> calls into an out-of-line helper when tracing is active. When\n> CONFIG_TRACING is disabled, helpers compile to empty inline stubs.\n> \n> The fast path is unaffected when tracing is disabled.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nAgree with Steven; otherwise\n\nReviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Dmitry Ilvokhin (author)",
+              "summary": "Good point, passing true directly is cleaner. Happy to respin if needed.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Fri, Feb 27, 2026 at 02:46:49PM -0500, Steven Rostedt wrote:\n> On Fri, 27 Feb 2026 16:00:27 +0000\n> Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> \n> >  static inline void zone_lock_init(struct zone *zone)\n> >  {\n> > @@ -12,26 +59,41 @@ static inline void zone_lock_init(struct zone *zone)\n> >  \n> >  #define zone_lock_irqsave(zone, flags)\t\t\t\t\\\n> >  do {\t\t\t\t\t\t\t\t\\\n> > +\tbool success = true;\t\t\t\t\t\\\n> > +\t\t\t\t\t\t\t\t\\\n> > +\t__zone_lock_trace_start_locking(zone);\t\t\t\\\n> >  \tspin_lock_irqsave(&(zone)->_lock, flags);\t\t\\\n> > +\t__zone_lock_trace_acquire_returned(zone, success);\t\\\n> \n> Why the \"success\" variable and not just:\n> \n> \t__zone_lock_trace_acquire_returned(zone, true);\n> \n>  ?\n\nGood point, passing true directly is cleaner. Happy to respin if needed.\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 3/5] mm: convert compaction to zone lock wrappers",
+          "message_id": "3a09e46f52cf9f709b0725bc2b648cc5212843b2.1772206930.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/3a09e46f52cf9f709b0725bc2b648cc5212843b2.1772206930.git.d@ilvokhin.com/",
+          "date": "2026-02-27T16:01:21Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-27",
+          "patch_version": 4,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "9710c3448c6c984164c93d7c6c0283e06ff987bf.1772030186.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/9710c3448c6c984164c93d7c6c0283e06ff987bf.1772030186.git.d@ilvokhin.com/",
+              "subject": "[PATCH v2 3/4] mm: convert compaction to zone lock wrappers",
+              "date": "2026-02-25T14:44:16Z"
+            },
+            {
+              "version": 3,
+              "message_id": "01729baf359e4c6612aead53f1fcb644f782d1de.1772129168.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/01729baf359e4c6612aead53f1fcb644f782d1de.1772129168.git.d@ilvokhin.com/",
+              "subject": "[PATCH v3 3/5] mm: convert compaction to zone lock wrappers",
+              "date": "2026-02-26T18:26:57Z"
+            },
+            {
+              "version": 4,
+              "message_id": "3a09e46f52cf9f709b0725bc2b648cc5212843b2.1772206930.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/3a09e46f52cf9f709b0725bc2b648cc5212843b2.1772206930.git.d@ilvokhin.com/",
+              "subject": "[PATCH v4 3/5] mm: convert compaction to zone lock wrappers",
+              "date": "2026-02-27T16:01:21Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Compaction uses compact_lock_irqsave(), which currently operates on a raw spinlock_t pointer so it can be used for both zone->lock and lruvec->lru_lock. Since zone lock operations are now wrapped, compact_lock_irqsave() can no longer directly operate on a spinlock_t when the lock belongs to a zone.\n\nSplit the helper into compact_zone_lock_irqsave() and compact_lruvec_lock_irqsave(), duplicating the small amount of shared logic. As there are only two call sites and both statically know the lock type, this avoids introducing additional abstraction or runtime dispatch in the compaction path.\n\nNo functional change intended.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "David (Arm)",
+              "summary": "... two tabs :)",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Compaction uses compact_lock_irqsave(), which currently operates\n> on a raw spinlock_t pointer so it can be used for both zone->lock\n> and lruvec->lru_lock. Since zone lock operations are now wrapped,\n> compact_lock_irqsave() can no longer directly operate on a\n> spinlock_t when the lock belongs to a zone.\n> \n> Split the helper into compact_zone_lock_irqsave() and\n> compact_lruvec_lock_irqsave(), duplicating the small amount of\n> shared logic. As there are only two call sites and both statically\n> know the lock type, this avoids introducing additional abstraction\n> or runtime dispatch in the compaction path.\n> \n> No functional change intended.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n>  mm/compaction.c | 33 ++++++++++++++++++++++++---------\n>  1 file changed, 24 insertions(+), 9 deletions(-)\n> \n> diff --git a/mm/compaction.c b/mm/compaction.c\n> index fa0e332a8a92..c68fcc416fc7 100644\n> --- a/mm/compaction.c\n> +++ b/mm/compaction.c\n> @@ -503,19 +503,36 @@ static bool test_and_set_skip(struct compact_control *cc, struct page *page)\n>   *\n>   * Always returns true which makes it easier to track lock state in callers.\n>   */\n> -static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,\n> -\t\t\t\t\t\tstruct compact_control *cc)\n> -\t__acquires(lock)\n> +static bool compact_zone_lock_irqsave(struct zone *zone,\n> +\t\t\t\t      unsigned long *flags,\n> +\t\t\t\t      struct compact_control *cc)\n\n... two tabs :)\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> Compaction uses compact_lock_irqsave(), which currently operates\n> on a raw spinlock_t pointer so it can be used for both zone->lock\n> and lruvec->lru_lock. Since zone lock operations are now wrapped,\n> compact_lock_irqsave() can no longer directly operate on a\n> spinlock_t when the lock belongs to a zone.\n>\n> Split the helper into compact_zone_lock_irqsave() and\n> compact_lruvec_lock_irqsave(), duplicating the small amount of\n> shared logic. As there are only two call sites and both statically\n> know the lock type, this avoids introducing additional abstraction\n> or runtime dispatch in the compaction path.\n>\n> No functional change intended.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n>  mm/compaction.c | 33 ++++++++++++++++++++++++---------\n>  1 file changed, 24 insertions(+), 9 deletions(-)\n>\n\nAcked-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Fri, 27 Feb 2026 16:00:25 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> Compaction uses compact_lock_irqsave(), which currently operates\n> on a raw spinlock_t pointer so it can be used for both zone->lock\n> and lruvec->lru_lock. Since zone lock operations are now wrapped,\n> compact_lock_irqsave() can no longer directly operate on a\n> spinlock_t when the lock belongs to a zone.\n> \n> Split the helper into compact_zone_lock_irqsave() and\n> compact_lruvec_lock_irqsave(), duplicating the small amount of\n> shared logic. As there are only two call sites and both statically\n> know the lock type, this avoids introducing additional abstraction\n> or runtime dispatch in the compaction path.\n> \n> No functional change intended.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nReviewed-by: SeongJae Park <sj@kernel.org>\n\n\nThanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-02-28",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Compaction uses compact_lock_irqsave(), which currently operates\n> on a raw spinlock_t pointer so it can be used for both zone->lock\n> and lruvec->lru_lock. Since zone lock operations are now wrapped,\n> compact_lock_irqsave() can no longer directly operate on a\n> spinlock_t when the lock belongs to a zone.\n> \n> Split the helper into compact_zone_lock_irqsave() and\n> compact_lruvec_lock_irqsave(), duplicating the small amount of\n> shared logic. As there are only two call sites and both statically\n> know the lock type, this avoids introducing additional abstraction\n> or runtime dispatch in the compaction path.\n> \n> No functional change intended.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nReviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 4/5] mm: rename zone->lock to zone->_lock",
+          "message_id": "d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com/",
+          "date": "2026-02-27T16:01:21Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-27",
+          "patch_version": 4,
+          "version_history": [
+            {
+              "version": 3,
+              "message_id": "1221b8e7fa9f5694f3c4e411f01581b5aba9bc63.1772129168.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/1221b8e7fa9f5694f3c4e411f01581b5aba9bc63.1772129168.git.d@ilvokhin.com/",
+              "subject": "[PATCH v3 4/5] mm: rename zone->lock to zone->_lock",
+              "date": "2026-02-26T18:26:57Z"
+            },
+            {
+              "version": 4,
+              "message_id": "d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com/",
+              "subject": "[PATCH v4 4/5] mm: rename zone->lock to zone->_lock",
+              "date": "2026-02-27T16:01:21Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This intentionally breaks direct users of zone->lock at compile time so all call sites are converted to the zone lock wrappers. Without the rename, present and future out-of-tree code could continue using spin_lock(&zone->lock) and bypass the wrappers and tracing infrastructure.\n\nNo functional change intended.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "David (Arm)",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> This intentionally breaks direct users of zone->lock at compile time so\n> all call sites are converted to the zone lock wrappers. Without the\n> rename, present and future out-of-tree code could continue using\n> spin_lock(&zone->lock) and bypass the wrappers and tracing\n> infrastructure.\n> \n> No functional change intended.\n> \n> Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Acked-by: SeongJae Park <sj@kernel.org>\n> ---\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> This intentionally breaks direct users of zone->lock at compile time so\n> all call sites are converted to the zone lock wrappers. Without the\n> rename, present and future out-of-tree code could continue using\n> spin_lock(&zone->lock) and bypass the wrappers and tracing\n> infrastructure.\n>\n> No functional change intended.\n>\n> Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Acked-by: SeongJae Park <sj@kernel.org>\n> ---\n>  include/linux/mmzone.h      |  7 +++++--\n>  include/linux/mmzone_lock.h | 12 ++++++------\n>  mm/compaction.c             |  4 ++--\n>  mm/internal.h               |  2 +-\n>  mm/page_alloc.c             | 16 ++++++++--------\n>  mm/page_isolation.c         |  4 ++--\n>  mm/page_owner.c             |  2 +-\n>  7 files changed, 25 insertions(+), 22 deletions(-)\n>\nAcked-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "I see some more instances of 'zone->lock' in comments in include/linux/mmzone.h and under Documentation/ but otherwise LGTM.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> This intentionally breaks direct users of zone->lock at compile time so\n> all call sites are converted to the zone lock wrappers. Without the\n> rename, present and future out-of-tree code could continue using\n> spin_lock(&zone->lock) and bypass the wrappers and tracing\n> infrastructure.\n> \n> No functional change intended.\n> \n> Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Acked-by: SeongJae Park <sj@kernel.org>\n\nI see some more instances of 'zone->lock' in comments in\ninclude/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n\nReviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Andrew Morton",
+              "summary": "I fixed (most of) that in the previous version but my fix was lost. include/linux/mmzone.h |   10 +++++----- 1 file changed, 5 insertions(+), 5 deletions(-) --- a/include/linux/mmzone.h~mm-rename-zone-lock-to-zone-_lock-fix +++ a/include/linux/mmzone.h @@ -1037,12 +1037,12 @@ struct zone { * Locking rules: * * zone_start_pfn and spanned_pages are protected by span_seqlock. -\t * It is a seqlock because it has to be read outside of zone->lock, +\t * It is a seqlock because it has to be read outside of zone_lock, * and it is done in the main allocator path.  But, it is written * quite infrequently. * -\t * The span_seq lock is declared along with zone->lock because it is -\t * frequently read in proximity to zone->lock.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n\n> On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > This intentionally breaks direct users of zone->lock at compile time so\n> > all call sites are converted to the zone lock wrappers. Without the\n> > rename, present and future out-of-tree code could continue using\n> > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > infrastructure.\n> > \n> > No functional change intended.\n> > \n> > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > Acked-by: SeongJae Park <sj@kernel.org>\n> \n> I see some more instances of 'zone->lock' in comments in\n> include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> \n\nI fixed (most of) that in the previous version but my fix was lost.\n\n\n include/linux/mmzone.h |   10 +++++-----\n 1 file changed, 5 insertions(+), 5 deletions(-)\n\n--- a/include/linux/mmzone.h~mm-rename-zone-lock-to-zone-_lock-fix\n+++ a/include/linux/mmzone.h\n@@ -1037,12 +1037,12 @@ struct zone {\n \t * Locking rules:\n \t *\n \t * zone_start_pfn and spanned_pages are protected by span_seqlock.\n-\t * It is a seqlock because it has to be read outside of zone->lock,\n+\t * It is a seqlock because it has to be read outside of zone_lock,\n \t * and it is done in the main allocator path.  But, it is written\n \t * quite infrequently.\n \t *\n-\t * The span_seq lock is declared along with zone->lock because it is\n-\t * frequently read in proximity to zone->lock.  It's good to\n+\t * The span_seq lock is declared along with zone_lock because it is\n+\t * frequently read in proximity to zone_lock.  It's good to\n \t * give them a chance of being in the same cacheline.\n \t *\n \t * Write access to present_pages at runtime should be protected by\n@@ -1065,7 +1065,7 @@ struct zone {\n \t/*\n \t * Number of isolated pageblock. It is used to solve incorrect\n \t * freepage counting problem due to racy retrieving migratetype\n-\t * of pageblock. Protected by zone->lock.\n+\t * of pageblock. Protected by zone_lock.\n \t */\n \tunsigned long\t\tnr_isolate_pageblock;\n #endif\n@@ -1502,7 +1502,7 @@ typedef struct pglist_data {\n \t * manipulate node_size_lock without checking for CONFIG_MEMORY_HOTPLUG\n \t * or CONFIG_DEFERRED_STRUCT_PAGE_INIT.\n \t *\n-\t * Nests above zone->lock and zone->span_seqlock\n+\t * Nests above zone_lock and zone->span_seqlock\n \t */\n \tspinlock_t node_size_lock;\n #endif\n_\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Dmitry Ilvokhin (author)",
+              "summary": "I still see a few 'zone->lock' references in Documentation remain on mm-new. This patch cleans them up, as noted by Vlastimil. I'm happy to adjust this patch if anything else needs attention. From: Dmitry Ilvokhin <d@ilvokhin.com> Date: Tue, 3 Mar 2026 06:13:13 -0800 Subject: [PATCH] mm: fix remaining zone->lock references --- Documentation/mm/physical_memory.rst | 4 ++-- Documentation/trace/events-kmem.rst  | 8 ++++---- 2 files changed, 6 insertions(+), 6 deletions(-) diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst index b76183545e5b..e344f93515b6 100644 --- a/Documentation/mm/physical_memory.rst +++ b/Documentation/mm/physical_memory.rst @@ -500,11 +500,11 @@ General ``nr_isolate_pageblock`` Number of isolated pageblocks.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n> On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n> \n> > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > > This intentionally breaks direct users of zone->lock at compile time so\n> > > all call sites are converted to the zone lock wrappers. Without the\n> > > rename, present and future out-of-tree code could continue using\n> > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > > infrastructure.\n> > > \n> > > No functional change intended.\n> > > \n> > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > > Acked-by: SeongJae Park <sj@kernel.org>\n> > \n> > I see some more instances of 'zone->lock' in comments in\n> > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> > \n> \n> I fixed (most of) that in the previous version but my fix was lost.\n\nThanks for the fixups, Andrew.\n\nI still see a few 'zone->lock' references in Documentation remain on\nmm-new. This patch cleans them up, as noted by Vlastimil.\n\nI'm happy to adjust this patch if anything else needs attention.\n\n>From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\nFrom: Dmitry Ilvokhin <d@ilvokhin.com>\nDate: Tue, 3 Mar 2026 06:13:13 -0800\nSubject: [PATCH] mm: fix remaining zone->lock references\n\nSigned-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n---\n Documentation/mm/physical_memory.rst | 4 ++--\n Documentation/trace/events-kmem.rst  | 8 ++++----\n 2 files changed, 6 insertions(+), 6 deletions(-)\n\ndiff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\nindex b76183545e5b..e344f93515b6 100644\n--- a/Documentation/mm/physical_memory.rst\n+++ b/Documentation/mm/physical_memory.rst\n@@ -500,11 +500,11 @@ General\n ``nr_isolate_pageblock``\n   Number of isolated pageblocks. It is used to solve incorrect freepage counting\n   problem due to racy retrieving migratetype of pageblock. Protected by\n-  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n+  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n \n ``span_seqlock``\n   The seqlock to protect ``zone_start_pfn`` and ``spanned_pages``. It is a\n-  seqlock because it has to be read outside of ``zone->lock``, and it is done in\n+  seqlock because it has to be read outside of ``zone_lock``, and it is done in\n   the main allocator path. However, the seqlock is written quite infrequently.\n   Defined only when ``CONFIG_MEMORY_HOTPLUG`` is enabled.\n \ndiff --git a/Documentation/trace/events-kmem.rst b/Documentation/trace/events-kmem.rst\nindex 68fa75247488..3c20a972de27 100644\n--- a/Documentation/trace/events-kmem.rst\n+++ b/Documentation/trace/events-kmem.rst\n@@ -57,7 +57,7 @@ the per-CPU allocator (high performance) or the buddy allocator.\n \n If pages are allocated directly from the buddy allocator, the\n mm_page_alloc_zone_locked event is triggered. This event is important as high\n-amounts of activity imply high activity on the zone->lock. Taking this lock\n+amounts of activity imply high activity on the zone_lock. Taking this lock\n impairs performance by disabling interrupts, dirtying cache lines between\n CPUs and serialising many CPUs.\n \n@@ -79,11 +79,11 @@ contention on the lruvec->lru_lock.\n   mm_page_pcpu_drain\t\tpage=%p pfn=%lu order=%d cpu=%d migratetype=%d\n \n In front of the page allocator is a per-cpu page allocator. It exists only\n-for order-0 pages, reduces contention on the zone->lock and reduces the\n+for order-0 pages, reduces contention on the zone_lock and reduces the\n amount of writing on struct page.\n \n When a per-CPU list is empty or pages of the wrong type are allocated,\n-the zone->lock will be taken once and the per-CPU list refilled. The event\n+the zone_lock will be taken once and the per-CPU list refilled. The event\n triggered is mm_page_alloc_zone_locked for each page allocated with the\n event indicating whether it is for a percpu_refill or not.\n \n@@ -92,7 +92,7 @@ which triggers a mm_page_pcpu_drain event.\n \n The individual nature of the events is so that pages can be tracked\n between allocation and freeing. A number of drain or refill pages that occur\n-consecutively imply the zone->lock being taken once. Large amounts of per-CPU\n+consecutively imply the zone_lock being taken once. Large amounts of per-CPU\n refills and drains could imply an imbalance between CPUs where too much work\n is being concentrated in one place. It could also indicate that the per-CPU\n lists should be a larger size. Finally, large amounts of refills on one CPU\n-- \n2.47.3\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-03",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same for the rest of this patch. I was initially thinking this is just a mistake, but I also found Andrew is doing same change [2], so I'm bit confused.  Is this an intentional change? [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n> > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n> > \n> > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > > > This intentionally breaks direct users of zone->lock at compile time so\n> > > > all call sites are converted to the zone lock wrappers. Without the\n> > > > rename, present and future out-of-tree code could continue using\n> > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > > > infrastructure.\n> > > > \n> > > > No functional change intended.\n> > > > \n> > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > > > Acked-by: SeongJae Park <sj@kernel.org>\n> > > \n> > > I see some more instances of 'zone->lock' in comments in\n> > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> > > \n> > \n> > I fixed (most of) that in the previous version but my fix was lost.\n> \n> Thanks for the fixups, Andrew.\n> \n> I still see a few 'zone->lock' references in Documentation remain on\n> mm-new. This patch cleans them up, as noted by Vlastimil.\n> \n> I'm happy to adjust this patch if anything else needs attention.\n> \n> From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n> From: Dmitry Ilvokhin <d@ilvokhin.com>\n> Date: Tue, 3 Mar 2026 06:13:13 -0800\n> Subject: [PATCH] mm: fix remaining zone->lock references\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> ---\n>  Documentation/mm/physical_memory.rst | 4 ++--\n>  Documentation/trace/events-kmem.rst  | 8 ++++----\n>  2 files changed, 6 insertions(+), 6 deletions(-)\n> \n> diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n> index b76183545e5b..e344f93515b6 100644\n> --- a/Documentation/mm/physical_memory.rst\n> +++ b/Documentation/mm/physical_memory.rst\n> @@ -500,11 +500,11 @@ General\n>  ``nr_isolate_pageblock``\n>    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n>    problem due to racy retrieving migratetype of pageblock. Protected by\n> -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n\nDmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\nto my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\nfor the rest of this patch.\n\nI was initially thinking this is just a mistake, but I also found Andrew is\ndoing same change [2], so I'm bit confused.  Is this an intentional change?\n\n[1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n[2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n\n\nThanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-03-03",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Dmitry Ilvokhin (author)",
+              "summary": "Good catch, thanks for pointing this out, SJ. Originally the mechanical rename was indeed zone->lock -> zone->_lock. However, in Documentation I intentionally switched references to zone_lock instead of zone->_lock. The reasoning is that _lock is now an internal implementation detail, and direct access is discouraged. The intended interface is via the zone_lock_*() / zone_unlock_*() wrappers, so referencing zone_lock in documentation felt more appropriate than mentioning the private struct field (zone->_lock). That said, I agree this creates inconsistency with the mechanical rename, and I'm happy to adjust either way: either consistently refer to the wrapper API, or keep documentation aligned with zone->_lock.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n> On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> \n> > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n> > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n> > > \n> > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > > > > This intentionally breaks direct users of zone->lock at compile time so\n> > > > > all call sites are converted to the zone lock wrappers. Without the\n> > > > > rename, present and future out-of-tree code could continue using\n> > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > > > > infrastructure.\n> > > > > \n> > > > > No functional change intended.\n> > > > > \n> > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > > > > Acked-by: SeongJae Park <sj@kernel.org>\n> > > > \n> > > > I see some more instances of 'zone->lock' in comments in\n> > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> > > > \n> > > \n> > > I fixed (most of) that in the previous version but my fix was lost.\n> > \n> > Thanks for the fixups, Andrew.\n> > \n> > I still see a few 'zone->lock' references in Documentation remain on\n> > mm-new. This patch cleans them up, as noted by Vlastimil.\n> > \n> > I'm happy to adjust this patch if anything else needs attention.\n> > \n> > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n> > From: Dmitry Ilvokhin <d@ilvokhin.com>\n> > Date: Tue, 3 Mar 2026 06:13:13 -0800\n> > Subject: [PATCH] mm: fix remaining zone->lock references\n> > \n> > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > ---\n> >  Documentation/mm/physical_memory.rst | 4 ++--\n> >  Documentation/trace/events-kmem.rst  | 8 ++++----\n> >  2 files changed, 6 insertions(+), 6 deletions(-)\n> > \n> > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n> > index b76183545e5b..e344f93515b6 100644\n> > --- a/Documentation/mm/physical_memory.rst\n> > +++ b/Documentation/mm/physical_memory.rst\n> > @@ -500,11 +500,11 @@ General\n> >  ``nr_isolate_pageblock``\n> >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n> >    problem due to racy retrieving migratetype of pageblock. Protected by\n> > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> \n> Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n> to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n> for the rest of this patch.\n> \n> I was initially thinking this is just a mistake, but I also found Andrew is\n> doing same change [2], so I'm bit confused.  Is this an intentional change?\n> \n> [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n> [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n> \n\nGood catch, thanks for pointing this out, SJ.\n\nOriginally the mechanical rename was indeed zone->lock -> zone->_lock.\nHowever, in Documentation I intentionally switched references to\nzone_lock instead of zone->_lock. The reasoning is that _lock is now an\ninternal implementation detail, and direct access is discouraged. The\nintended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\nso referencing zone_lock in documentation felt more appropriate than\nmentioning the private struct field (zone->_lock).\n\nThat said, I agree this creates inconsistency with the mechanical\nrename, and I'm happy to adjust either way: either consistently refer\nto the wrapper API, or keep documentation aligned with zone->_lock.\n\nI slightly prefer referring to the wrapper API, but don't have a strong\npreference as long as we're consistent.\n\n> \n> Thanks,\n> SJ\n> \n> [...]\n",
+              "reply_to": "",
+              "message_date": "2026-03-04",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "zone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be better. But, I'm concerned if people like me might not aware the intention under 'zone_lock'.  If there is a well-known convention that allows people to know it is for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my humble opinion.  If there is such a convention but I'm just missing it, please ignore.  If I'm not, for eaxmaple, \"protected by ``zone->lock``\" could be re-wrote to \"protected by ``zone_[un]lock_*()`` locking helpers\" or, \"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ? I also think both approaches are good.  But for the wrapper approach, I think giving more contexts rather than just ``zone_lock`` to readers would be nice.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed, 4 Mar 2026 13:01:45 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n> > On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> > \n> > > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n> > > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n> > > > \n> > > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > > > > > This intentionally breaks direct users of zone->lock at compile time so\n> > > > > > all call sites are converted to the zone lock wrappers. Without the\n> > > > > > rename, present and future out-of-tree code could continue using\n> > > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > > > > > infrastructure.\n> > > > > > \n> > > > > > No functional change intended.\n> > > > > > \n> > > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > > > > > Acked-by: SeongJae Park <sj@kernel.org>\n> > > > > \n> > > > > I see some more instances of 'zone->lock' in comments in\n> > > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> > > > > \n> > > > \n> > > > I fixed (most of) that in the previous version but my fix was lost.\n> > > \n> > > Thanks for the fixups, Andrew.\n> > > \n> > > I still see a few 'zone->lock' references in Documentation remain on\n> > > mm-new. This patch cleans them up, as noted by Vlastimil.\n> > > \n> > > I'm happy to adjust this patch if anything else needs attention.\n> > > \n> > > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n> > > From: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > Date: Tue, 3 Mar 2026 06:13:13 -0800\n> > > Subject: [PATCH] mm: fix remaining zone->lock references\n> > > \n> > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > ---\n> > >  Documentation/mm/physical_memory.rst | 4 ++--\n> > >  Documentation/trace/events-kmem.rst  | 8 ++++----\n> > >  2 files changed, 6 insertions(+), 6 deletions(-)\n> > > \n> > > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n> > > index b76183545e5b..e344f93515b6 100644\n> > > --- a/Documentation/mm/physical_memory.rst\n> > > +++ b/Documentation/mm/physical_memory.rst\n> > > @@ -500,11 +500,11 @@ General\n> > >  ``nr_isolate_pageblock``\n> > >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n> > >    problem due to racy retrieving migratetype of pageblock. Protected by\n> > > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > \n> > Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n> > to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n> > for the rest of this patch.\n> > \n> > I was initially thinking this is just a mistake, but I also found Andrew is\n> > doing same change [2], so I'm bit confused.  Is this an intentional change?\n> > \n> > [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n> > [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n> > \n> \n> Good catch, thanks for pointing this out, SJ.\n> \n> Originally the mechanical rename was indeed zone->lock -> zone->_lock.\n> However, in Documentation I intentionally switched references to\n> zone_lock instead of zone->_lock. The reasoning is that _lock is now an\n> internal implementation detail, and direct access is discouraged. The\n> intended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\n> so referencing zone_lock in documentation felt more appropriate than\n> mentioning the private struct field (zone->_lock).\n\nThank you for this nice and kind clarification, Dmitry!  I agree mentioning\nzone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be\nbetter.\n\nBut, I'm concerned if people like me might not aware the intention under\n'zone_lock'.  If there is a well-known convention that allows people to know it\nis for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my\nhumble opinion.  If there is such a convention but I'm just missing it, please\nignore.  If I'm not, for eaxmaple,\n\n\"protected by ``zone->lock``\" could be re-wrote to\n\"protected by ``zone_[un]lock_*()`` locking helpers\" or,\n\"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ?\n\n> \n> That said, I agree this creates inconsistency with the mechanical\n> rename, and I'm happy to adjust either way: either consistently refer\n> to the wrapper API, or keep documentation aligned with zone->_lock.\n> \n> I slightly prefer referring to the wrapper API, but don't have a strong\n> preference as long as we're consistent.\n\nI also think both approaches are good.  But for the wrapper approach, I think\ngiving more contexts rather than just ``zone_lock`` to readers would be nice.\n\n\nThanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-03-04",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "Maybe too verbose and people who not used to regex might be confused. Mentioning mmzone_lock.h might be better?  E.g., protected by functions in mmzone_lock.h",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Wed,  4 Mar 2026 07:13:34 -0800 SeongJae Park <sj@kernel.org> wrote:\n\n> On Wed, 4 Mar 2026 13:01:45 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> \n> > On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n> > > On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> > > \n> > > > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n> > > > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n> > > > > \n> > > > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > > > > > > This intentionally breaks direct users of zone->lock at compile time so\n> > > > > > > all call sites are converted to the zone lock wrappers. Without the\n> > > > > > > rename, present and future out-of-tree code could continue using\n> > > > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > > > > > > infrastructure.\n> > > > > > > \n> > > > > > > No functional change intended.\n> > > > > > > \n> > > > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > > > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > > > > > > Acked-by: SeongJae Park <sj@kernel.org>\n> > > > > > \n> > > > > > I see some more instances of 'zone->lock' in comments in\n> > > > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> > > > > > \n> > > > > \n> > > > > I fixed (most of) that in the previous version but my fix was lost.\n> > > > \n> > > > Thanks for the fixups, Andrew.\n> > > > \n> > > > I still see a few 'zone->lock' references in Documentation remain on\n> > > > mm-new. This patch cleans them up, as noted by Vlastimil.\n> > > > \n> > > > I'm happy to adjust this patch if anything else needs attention.\n> > > > \n> > > > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n> > > > From: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > > Date: Tue, 3 Mar 2026 06:13:13 -0800\n> > > > Subject: [PATCH] mm: fix remaining zone->lock references\n> > > > \n> > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > > > ---\n> > > >  Documentation/mm/physical_memory.rst | 4 ++--\n> > > >  Documentation/trace/events-kmem.rst  | 8 ++++----\n> > > >  2 files changed, 6 insertions(+), 6 deletions(-)\n> > > > \n> > > > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n> > > > index b76183545e5b..e344f93515b6 100644\n> > > > --- a/Documentation/mm/physical_memory.rst\n> > > > +++ b/Documentation/mm/physical_memory.rst\n> > > > @@ -500,11 +500,11 @@ General\n> > > >  ``nr_isolate_pageblock``\n> > > >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n> > > >    problem due to racy retrieving migratetype of pageblock. Protected by\n> > > > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > > > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > > \n> > > Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n> > > to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n> > > for the rest of this patch.\n> > > \n> > > I was initially thinking this is just a mistake, but I also found Andrew is\n> > > doing same change [2], so I'm bit confused.  Is this an intentional change?\n> > > \n> > > [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n> > > [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n> > > \n> > \n> > Good catch, thanks for pointing this out, SJ.\n> > \n> > Originally the mechanical rename was indeed zone->lock -> zone->_lock.\n> > However, in Documentation I intentionally switched references to\n> > zone_lock instead of zone->_lock. The reasoning is that _lock is now an\n> > internal implementation detail, and direct access is discouraged. The\n> > intended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\n> > so referencing zone_lock in documentation felt more appropriate than\n> > mentioning the private struct field (zone->_lock).\n> \n> Thank you for this nice and kind clarification, Dmitry!  I agree mentioning\n> zone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be\n> better.\n> \n> But, I'm concerned if people like me might not aware the intention under\n> 'zone_lock'.  If there is a well-known convention that allows people to know it\n> is for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my\n> humble opinion.  If there is such a convention but I'm just missing it, please\n> ignore.  If I'm not, for eaxmaple,\n> \n> \"protected by ``zone->lock``\" could be re-wrote to\n> \"protected by ``zone_[un]lock_*()`` locking helpers\" or,\n> \"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ?\n\nMaybe too verbose and people who not used to regex might be confused.\nMentioning mmzone_lock.h might be better?  E.g.,\n\n    protected by functions in mmzone_lock.h\n\n> \n> > \n> > That said, I agree this creates inconsistency with the mechanical\n> > rename, and I'm happy to adjust either way: either consistently refer\n> > to the wrapper API, or keep documentation aligned with zone->_lock.\n> > \n> > I slightly prefer referring to the wrapper API, but don't have a strong\n> > preference as long as we're consistent.\n> \n> I also think both approaches are good.  But for the wrapper approach, I think\n> giving more contexts rather than just ``zone_lock`` to readers would be nice.\n\n\nThanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-03-04",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "Grep tells me that we also have comments mentioning simply \"zone lock\", btw. And it's also a term used often in informal conversations. Maybe we could just standardize on that in comments/documentations as it's easier to read. Discovering that the field is called _lock and that wrappers should be used, is hopefully not that difficult.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On 3/4/26 16:13, SeongJae Park wrote:\n> On Wed, 4 Mar 2026 13:01:45 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> \n>> On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n>> > On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n>> > \n>> > > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n>> > > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n>> > > > \n>> > > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n>> > > > > > This intentionally breaks direct users of zone->lock at compile time so\n>> > > > > > all call sites are converted to the zone lock wrappers. Without the\n>> > > > > > rename, present and future out-of-tree code could continue using\n>> > > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n>> > > > > > infrastructure.\n>> > > > > > \n>> > > > > > No functional change intended.\n>> > > > > > \n>> > > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n>> > > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n>> > > > > > Acked-by: SeongJae Park <sj@kernel.org>\n>> > > > > \n>> > > > > I see some more instances of 'zone->lock' in comments in\n>> > > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n>> > > > > \n>> > > > \n>> > > > I fixed (most of) that in the previous version but my fix was lost.\n>> > > \n>> > > Thanks for the fixups, Andrew.\n>> > > \n>> > > I still see a few 'zone->lock' references in Documentation remain on\n>> > > mm-new. This patch cleans them up, as noted by Vlastimil.\n>> > > \n>> > > I'm happy to adjust this patch if anything else needs attention.\n>> > > \n>> > > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n>> > > From: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > > Date: Tue, 3 Mar 2026 06:13:13 -0800\n>> > > Subject: [PATCH] mm: fix remaining zone->lock references\n>> > > \n>> > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > > ---\n>> > >  Documentation/mm/physical_memory.rst | 4 ++--\n>> > >  Documentation/trace/events-kmem.rst  | 8 ++++----\n>> > >  2 files changed, 6 insertions(+), 6 deletions(-)\n>> > > \n>> > > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n>> > > index b76183545e5b..e344f93515b6 100644\n>> > > --- a/Documentation/mm/physical_memory.rst\n>> > > +++ b/Documentation/mm/physical_memory.rst\n>> > > @@ -500,11 +500,11 @@ General\n>> > >  ``nr_isolate_pageblock``\n>> > >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n>> > >    problem due to racy retrieving migratetype of pageblock. Protected by\n>> > > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n>> > > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n>> > \n>> > Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n>> > to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n>> > for the rest of this patch.\n>> > \n>> > I was initially thinking this is just a mistake, but I also found Andrew is\n>> > doing same change [2], so I'm bit confused.  Is this an intentional change?\n>> > \n>> > [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n>> > [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n>> > \n>> \n>> Good catch, thanks for pointing this out, SJ.\n>> \n>> Originally the mechanical rename was indeed zone->lock -> zone->_lock.\n>> However, in Documentation I intentionally switched references to\n>> zone_lock instead of zone->_lock. The reasoning is that _lock is now an\n>> internal implementation detail, and direct access is discouraged. The\n>> intended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\n>> so referencing zone_lock in documentation felt more appropriate than\n>> mentioning the private struct field (zone->_lock).\n> \n> Thank you for this nice and kind clarification, Dmitry!  I agree mentioning\n> zone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be\n> better.\n> \n> But, I'm concerned if people like me might not aware the intention under\n> 'zone_lock'.  If there is a well-known convention that allows people to know it\n> is for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my\n> humble opinion.  If there is such a convention but I'm just missing it, please\n> ignore.  If I'm not, for eaxmaple,\n> \n> \"protected by ``zone->lock``\" could be re-wrote to\n> \"protected by ``zone_[un]lock_*()`` locking helpers\" or,\n> \"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ?\n> \n>> \n>> That said, I agree this creates inconsistency with the mechanical\n>> rename, and I'm happy to adjust either way: either consistently refer\n>> to the wrapper API, or keep documentation aligned with zone->_lock.\n>> \n>> I slightly prefer referring to the wrapper API, but don't have a strong\n>> preference as long as we're consistent.\n> \n> I also think both approaches are good.  But for the wrapper approach, I think\n> giving more contexts rather than just ``zone_lock`` to readers would be nice.\n\nGrep tells me that we also have comments mentioning simply \"zone lock\", btw.\nAnd it's also a term used often in informal conversations. Maybe we could\njust standardize on that in comments/documentations as it's easier to read.\nDiscovering that the field is called _lock and that wrappers should be used,\nis hopefully not that difficult.\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 2/5] mm: convert zone lock users to wrappers",
+          "message_id": "d26a43ebed2f0f1edb9cfe4fbed16dd31c7a069c.1772206930.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/d26a43ebed2f0f1edb9cfe4fbed16dd31c7a069c.1772206930.git.d@ilvokhin.com/",
+          "date": "2026-02-27T16:01:21Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-27",
+          "patch_version": 4,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "e5324d64361f86d930d940a5b49235f7996efe53.1772030186.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/e5324d64361f86d930d940a5b49235f7996efe53.1772030186.git.d@ilvokhin.com/",
+              "subject": "[PATCH v2 2/4] mm: convert zone lock users to wrappers",
+              "date": "2026-02-25T14:44:16Z"
+            },
+            {
+              "version": 3,
+              "message_id": "e5324d64361f86d930d940a5b49235f7996efe53.1772129168.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/e5324d64361f86d930d940a5b49235f7996efe53.1772129168.git.d@ilvokhin.com/",
+              "subject": "[PATCH v3 2/5] mm: convert zone lock users to wrappers",
+              "date": "2026-02-26T18:26:56Z"
+            },
+            {
+              "version": 4,
+              "message_id": "d26a43ebed2f0f1edb9cfe4fbed16dd31c7a069c.1772206930.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/d26a43ebed2f0f1edb9cfe4fbed16dd31c7a069c.1772206930.git.d@ilvokhin.com/",
+              "subject": "[PATCH v4 2/5] mm: convert zone lock users to wrappers",
+              "date": "2026-02-27T16:01:21Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Replace direct zone lock acquire/release operations with the newly introduced wrappers.\n\nThe changes are purely mechanical substitutions. No functional change intended. Locking semantics and ordering remain unchanged.\n\nThe compaction path is left unchanged for now and will be handled separately in the following patch due to additional non-trivial modifications.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "David (Arm)",
+              "summary": "We tend to use two-tabs on second parameter line; like the existing code did. Besides that",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Replace direct zone lock acquire/release operations with the\n> newly introduced wrappers.\n> \n> The changes are purely mechanical substitutions. No functional change\n> intended. Locking semantics and ordering remain unchanged.\n> \n> The compaction path is left unchanged for now and will be\n> handled separately in the following patch due to additional\n> non-trivial modifications.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Reviewed-by: SeongJae Park <sj@kernel.org>\n> ---\n\n[...]\n\n>  #ifdef CONFIG_COMPACTION\n> @@ -530,11 +531,14 @@ static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,\n>   * Returns true if compaction should abort due to fatal signal pending.\n>   * Returns false when compaction can continue.\n>   */\n> -static bool compact_unlock_should_abort(spinlock_t *lock,\n> -\t\tunsigned long flags, bool *locked, struct compact_control *cc)\n> +\n> +static bool compact_unlock_should_abort(struct zone *zone,\n> +\t\t\t\t\tunsigned long flags,\n> +\t\t\t\t\tbool *locked,\n> +\t\t\t\t\tstruct compact_control *cc)\n\nWe tend to use two-tabs on second parameter line; like the existing code\ndid.\n\n\nBesides that\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> Replace direct zone lock acquire/release operations with the\n> newly introduced wrappers.\n>\n> The changes are purely mechanical substitutions. No functional change\n> intended. Locking semantics and ordering remain unchanged.\n>\n> The compaction path is left unchanged for now and will be\n> handled separately in the following patch due to additional\n> non-trivial modifications.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Reviewed-by: SeongJae Park <sj@kernel.org>\n> ---\n>  kernel/power/snapshot.c |  5 +--\n>  mm/compaction.c         | 25 +++++++-------\n>  mm/memory_hotplug.c     |  9 ++---\n>  mm/mm_init.c            |  3 +-\n>  mm/page_alloc.c         | 73 +++++++++++++++++++++--------------------\n>  mm/page_isolation.c     | 19 ++++++-----\n>  mm/page_reporting.c     | 13 ++++----\n>  mm/show_mem.c           |  5 +--\n>  mm/shuffle.c            |  9 ++---\n>  mm/vmscan.c             |  5 +--\n>  mm/vmstat.c             |  9 ++---\n>  11 files changed, 94 insertions(+), 81 deletions(-)\n>\n\nAcked-by: Zi Yan <ziy@nvidia.com>\n\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Replace direct zone lock acquire/release operations with the\n> newly introduced wrappers.\n> \n> The changes are purely mechanical substitutions. No functional change\n> intended. Locking semantics and ordering remain unchanged.\n> \n> The compaction path is left unchanged for now and will be\n> handled separately in the following patch due to additional\n> non-trivial modifications.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Reviewed-by: SeongJae Park <sj@kernel.org>\n\nReviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 1/5] mm: introduce zone lock wrappers",
+          "message_id": "849dee9c47df1e6fba97c9933af0d5a08b8e15d3.1772206930.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/849dee9c47df1e6fba97c9933af0d5a08b8e15d3.1772206930.git.d@ilvokhin.com/",
+          "date": "2026-02-27T16:01:20Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-27",
+          "patch_version": 4,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "5bcc39cd3a227944d0fbe75ff86cdac92b38d4ca.1772030186.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/5bcc39cd3a227944d0fbe75ff86cdac92b38d4ca.1772030186.git.d@ilvokhin.com/",
+              "subject": "[PATCH v2 1/4] mm: introduce zone lock wrappers",
+              "date": "2026-02-25T14:44:15Z"
+            },
+            {
+              "version": 3,
+              "message_id": "5bcc39cd3a227944d0fbe75ff86cdac92b38d4ca.1772129168.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/5bcc39cd3a227944d0fbe75ff86cdac92b38d4ca.1772129168.git.d@ilvokhin.com/",
+              "subject": "[PATCH v3 1/5] mm: introduce zone lock wrappers",
+              "date": "2026-02-26T18:26:56Z"
+            },
+            {
+              "version": 4,
+              "message_id": "849dee9c47df1e6fba97c9933af0d5a08b8e15d3.1772206930.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/849dee9c47df1e6fba97c9933af0d5a08b8e15d3.1772206930.git.d@ilvokhin.com/",
+              "subject": "[PATCH v4 1/5] mm: introduce zone lock wrappers",
+              "date": "2026-02-27T16:01:20Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Add thin wrappers around zone lock acquire/release operations. This prepares the code for future tracepoint instrumentation without modifying individual call sites.\n\nCentralizing zone lock operations behind wrappers allows future instrumentation or debugging hooks to be added without touching all users.\n\nNo functional change intended. The wrappers are introduced in preparation for subsequent patches and are not yet used.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "David (Arm)",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n> \n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n> \n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n>\n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n>\n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n>  MAINTAINERS                 |  1 +\n>  include/linux/mmzone_lock.h | 38 +++++++++++++++++++++++++++++++++++++\n>  2 files changed, 39 insertions(+)\n>  create mode 100644 include/linux/mmzone_lock.h\n>\n\nAcked-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Fri, 27 Feb 2026 16:00:23 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n> \n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n> \n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nReviewed-by: SeongJae Park <sj@kernel.org>\n\n\nThanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-02-28",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "*checks patch 2 diffstat* I think we could do it as mm/zone_lock.h even and not pollute include/linux/ Even kernel/power/snapshot.c could include it in a somewhat ugly way. However we should also later look at moving that particular code somewhere under mm/ really...",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n> \n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n> \n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\n*checks patch 2 diffstat*\n\nI think we could do it as mm/zone_lock.h even and not pollute include/linux/\nEven kernel/power/snapshot.c could include it in a somewhat ugly way.\nHowever we should also later look at moving that particular code somewhere\nunder mm/ really...\n\nAnyway,\n\nReviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\n> ---\n>  MAINTAINERS                 |  1 +\n>  include/linux/mmzone_lock.h | 38 +++++++++++++++++++++++++++++++++++++\n>  2 files changed, 39 insertions(+)\n>  create mode 100644 include/linux/mmzone_lock.h\n> \n> diff --git a/MAINTAINERS b/MAINTAINERS\n> index 55af015174a5..947298ecb111 100644\n> --- a/MAINTAINERS\n> +++ b/MAINTAINERS\n> @@ -16672,6 +16672,7 @@ F:\tinclude/linux/memory.h\n>  F:\tinclude/linux/mm.h\n>  F:\tinclude/linux/mm_*.h\n>  F:\tinclude/linux/mmzone.h\n> +F:\tinclude/linux/mmzone_lock.h\n>  F:\tinclude/linux/mmdebug.h\n>  F:\tinclude/linux/mmu_notifier.h\n>  F:\tinclude/linux/pagewalk.h\n> diff --git a/include/linux/mmzone_lock.h b/include/linux/mmzone_lock.h\n> new file mode 100644\n> index 000000000000..a1cfba8408d6\n> --- /dev/null\n> +++ b/include/linux/mmzone_lock.h\n> @@ -0,0 +1,38 @@\n> +/* SPDX-License-Identifier: GPL-2.0 */\n> +#ifndef _LINUX_MMZONE_LOCK_H\n> +#define _LINUX_MMZONE_LOCK_H\n> +\n> +#include <linux/mmzone.h>\n> +#include <linux/spinlock.h>\n> +\n> +static inline void zone_lock_init(struct zone *zone)\n> +{\n> +\tspin_lock_init(&zone->lock);\n> +}\n> +\n> +#define zone_lock_irqsave(zone, flags)\t\t\t\t\\\n> +do {\t\t\t\t\t\t\t\t\\\n> +\tspin_lock_irqsave(&(zone)->lock, flags);\t\t\\\n> +} while (0)\n> +\n> +#define zone_trylock_irqsave(zone, flags)\t\t\t\\\n> +({\t\t\t\t\t\t\t\t\\\n> +\tspin_trylock_irqsave(&(zone)->lock, flags);\t\t\\\n> +})\n> +\n> +static inline void zone_unlock_irqrestore(struct zone *zone, unsigned long flags)\n> +{\n> +\tspin_unlock_irqrestore(&zone->lock, flags);\n> +}\n> +\n> +static inline void zone_lock_irq(struct zone *zone)\n> +{\n> +\tspin_lock_irq(&zone->lock);\n> +}\n> +\n> +static inline void zone_unlock_irq(struct zone *zone)\n> +{\n> +\tspin_unlock_irq(&zone->lock);\n> +}\n> +\n> +#endif /* _LINUX_MMZONE_LOCK_H */\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-02",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 0/5] mm: zone lock tracepoint instrumentation",
+          "message_id": "cover.1772206930.git.d@ilvokhin.com",
+          "url": "https://lore.kernel.org/all/cover.1772206930.git.d@ilvokhin.com/",
+          "date": "2026-02-27T16:01:19Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-02-27",
+          "patch_version": 4,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "cover.1772030186.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/cover.1772030186.git.d@ilvokhin.com/",
+              "subject": "[PATCH v2 0/4] mm: zone lock tracepoint instrumentation",
+              "date": "2026-02-25T14:44:15Z"
+            },
+            {
+              "version": 3,
+              "message_id": "cover.1772129168.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/cover.1772129168.git.d@ilvokhin.com/",
+              "subject": "[PATCH v3 0/5] mm: zone lock tracepoint instrumentation",
+              "date": "2026-02-26T18:26:56Z"
+            },
+            {
+              "version": 4,
+              "message_id": "cover.1772206930.git.d@ilvokhin.com",
+              "url": "https://lore.kernel.org/all/cover.1772206930.git.d@ilvokhin.com/",
+              "subject": "[PATCH v4 0/5] mm: zone lock tracepoint instrumentation",
+              "date": "2026-02-27T16:01:19Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "Zone lock contention can significantly impact allocation and reclaim latency, as it is a central synchronization point in the page allocator and reclaim paths. Improved visibility into its behavior is therefore important for diagnosing performance issues in memory-intensive workloads.\n\nOn some production workloads at Meta, we have observed noticeable zone lock contention. Deeper analysis of lock holders and waiters is currently difficult with existing instrumentation.\n\nWhile generic lock contention_begin/contention_end tracepoints cover the slow path, they do not provide sufficient visibility into lock hold times. In particular, the lack of a release-side event makes it difficult to identify long lock holders and correlate them with waiters. As a result, distinguishing between short bursts of contention and pathological long hold times requires additional instrumentation.\n\nThis patch series adds dedicated tracepoint instrumentation to zone lock, following the existing mmap_lock tracing model.\n\nThe goal is to enable detailed holder/waiter analysis and lock hold time measurements without affecting the fast path when tracing is disabled.\n\nThe series is structured as follows:\n\n1. Introduce zone lock wrappers. 2. Mechanically convert zone lock users to the wrappers. 3. Convert compaction to use the wrappers (requires minor restructuring of compact_lock_irqsave()). 4. Rename zone->lock to zone->_lock. 5. Add zone lock tracepoints.\n\nThe tracepoints are added via lightweight inline helpers in the wrappers. When tracing is disabled, the fast path remains unchanged.\n\nChanges in v4: - Fix build errors in kernel/power/snapshot.c and mm/shuffle.c files. - Remove EXPORT_SYMBOL(). - Rename header zone_lock.h to mmzone_lock.h. - Properly indent __acquires() annotation.",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Steven Rostedt",
+              "summary": "Why the \"success\" variable and not just: __zone_lock_trace_acquire_returned(zone, true); Same here.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Fri, 27 Feb 2026 16:00:27 +0000\nDmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n>  static inline void zone_lock_init(struct zone *zone)\n>  {\n> @@ -12,26 +59,41 @@ static inline void zone_lock_init(struct zone *zone)\n>  \n>  #define zone_lock_irqsave(zone, flags)\t\t\t\t\\\n>  do {\t\t\t\t\t\t\t\t\\\n> +\tbool success = true;\t\t\t\t\t\\\n> +\t\t\t\t\t\t\t\t\\\n> +\t__zone_lock_trace_start_locking(zone);\t\t\t\\\n>  \tspin_lock_irqsave(&(zone)->_lock, flags);\t\t\\\n> +\t__zone_lock_trace_acquire_returned(zone, success);\t\\\n\nWhy the \"success\" variable and not just:\n\n\t__zone_lock_trace_acquire_returned(zone, true);\n\n ?\n\n\n>  } while (0)\n>  \n>  #define zone_trylock_irqsave(zone, flags)\t\t\t\\\n>  ({\t\t\t\t\t\t\t\t\\\n> -\tspin_trylock_irqsave(&(zone)->_lock, flags);\t\t\\\n> +\tbool success;\t\t\t\t\t\t\\\n> +\t\t\t\t\t\t\t\t\\\n> +\t__zone_lock_trace_start_locking(zone);\t\t\t\\\n> +\tsuccess = spin_trylock_irqsave(&(zone)->_lock, flags);\t\\\n> +\t__zone_lock_trace_acquire_returned(zone, success);\t\\\n> +\tsuccess;\t\t\t\t\t\t\\\n>  })\n>  \n>  static inline void zone_unlock_irqrestore(struct zone *zone, unsigned long flags)\n>  {\n> +\t__zone_lock_trace_released(zone);\n>  \tspin_unlock_irqrestore(&zone->_lock, flags);\n>  }\n>  \n>  static inline void zone_lock_irq(struct zone *zone)\n>  {\n> +\tbool success = true;\n> +\n> +\t__zone_lock_trace_start_locking(zone);\n>  \tspin_lock_irq(&zone->_lock);\n> +\t__zone_lock_trace_acquire_returned(zone, success);\n\nSame here.\n\n>  }\n>  \n>  static inline void zone_unlock_irq(struct zone *zone)\n>  {\n> +\t__zone_lock_trace_released(zone);\n>  \tspin_unlock_irq(&zone->_lock);\n>  }\n>\n\n-- Steve\n\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "David (Arm)",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n> \n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n> \n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "David (Arm)",
+              "summary": "We tend to use two-tabs on second parameter line; like the existing code did. Besides that",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Replace direct zone lock acquire/release operations with the\n> newly introduced wrappers.\n> \n> The changes are purely mechanical substitutions. No functional change\n> intended. Locking semantics and ordering remain unchanged.\n> \n> The compaction path is left unchanged for now and will be\n> handled separately in the following patch due to additional\n> non-trivial modifications.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Reviewed-by: SeongJae Park <sj@kernel.org>\n> ---\n\n[...]\n\n>  #ifdef CONFIG_COMPACTION\n> @@ -530,11 +531,14 @@ static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,\n>   * Returns true if compaction should abort due to fatal signal pending.\n>   * Returns false when compaction can continue.\n>   */\n> -static bool compact_unlock_should_abort(spinlock_t *lock,\n> -\t\tunsigned long flags, bool *locked, struct compact_control *cc)\n> +\n> +static bool compact_unlock_should_abort(struct zone *zone,\n> +\t\t\t\t\tunsigned long flags,\n> +\t\t\t\t\tbool *locked,\n> +\t\t\t\t\tstruct compact_control *cc)\n\nWe tend to use two-tabs on second parameter line; like the existing code\ndid.\n\n\nBesides that\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "David (Arm)",
+              "summary": "... two tabs :)",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> Compaction uses compact_lock_irqsave(), which currently operates\n> on a raw spinlock_t pointer so it can be used for both zone->lock\n> and lruvec->lru_lock. Since zone lock operations are now wrapped,\n> compact_lock_irqsave() can no longer directly operate on a\n> spinlock_t when the lock belongs to a zone.\n> \n> Split the helper into compact_zone_lock_irqsave() and\n> compact_lruvec_lock_irqsave(), duplicating the small amount of\n> shared logic. As there are only two call sites and both statically\n> know the lock type, this avoids introducing additional abstraction\n> or runtime dispatch in the compaction path.\n> \n> No functional change intended.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n>  mm/compaction.c | 33 ++++++++++++++++++++++++---------\n>  1 file changed, 24 insertions(+), 9 deletions(-)\n> \n> diff --git a/mm/compaction.c b/mm/compaction.c\n> index fa0e332a8a92..c68fcc416fc7 100644\n> --- a/mm/compaction.c\n> +++ b/mm/compaction.c\n> @@ -503,19 +503,36 @@ static bool test_and_set_skip(struct compact_control *cc, struct page *page)\n>   *\n>   * Always returns true which makes it easier to track lock state in callers.\n>   */\n> -static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,\n> -\t\t\t\t\t\tstruct compact_control *cc)\n> -\t__acquires(lock)\n> +static bool compact_zone_lock_irqsave(struct zone *zone,\n> +\t\t\t\t      unsigned long *flags,\n> +\t\t\t\t      struct compact_control *cc)\n\n... two tabs :)\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "David (Arm)",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> This intentionally breaks direct users of zone->lock at compile time so\n> all call sites are converted to the zone lock wrappers. Without the\n> rename, present and future out-of-tree code could continue using\n> spin_lock(&zone->lock) and bypass the wrappers and tracing\n> infrastructure.\n> \n> No functional change intended.\n> \n> Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Acked-by: SeongJae Park <sj@kernel.org>\n> ---\n\nAcked-by: David Hildenbrand (Arm) <david@kernel.org>\n\n-- \nCheers,\n\nDavid\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n>\n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n>\n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n>  MAINTAINERS                 |  1 +\n>  include/linux/mmzone_lock.h | 38 +++++++++++++++++++++++++++++++++++++\n>  2 files changed, 39 insertions(+)\n>  create mode 100644 include/linux/mmzone_lock.h\n>\n\nAcked-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> Replace direct zone lock acquire/release operations with the\n> newly introduced wrappers.\n>\n> The changes are purely mechanical substitutions. No functional change\n> intended. Locking semantics and ordering remain unchanged.\n>\n> The compaction path is left unchanged for now and will be\n> handled separately in the following patch due to additional\n> non-trivial modifications.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Reviewed-by: SeongJae Park <sj@kernel.org>\n> ---\n>  kernel/power/snapshot.c |  5 +--\n>  mm/compaction.c         | 25 +++++++-------\n>  mm/memory_hotplug.c     |  9 ++---\n>  mm/mm_init.c            |  3 +-\n>  mm/page_alloc.c         | 73 +++++++++++++++++++++--------------------\n>  mm/page_isolation.c     | 19 ++++++-----\n>  mm/page_reporting.c     | 13 ++++----\n>  mm/show_mem.c           |  5 +--\n>  mm/shuffle.c            |  9 ++---\n>  mm/vmscan.c             |  5 +--\n>  mm/vmstat.c             |  9 ++---\n>  11 files changed, 94 insertions(+), 81 deletions(-)\n>\n\nAcked-by: Zi Yan <ziy@nvidia.com>\n\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> Compaction uses compact_lock_irqsave(), which currently operates\n> on a raw spinlock_t pointer so it can be used for both zone->lock\n> and lruvec->lru_lock. Since zone lock operations are now wrapped,\n> compact_lock_irqsave() can no longer directly operate on a\n> spinlock_t when the lock belongs to a zone.\n>\n> Split the helper into compact_zone_lock_irqsave() and\n> compact_lruvec_lock_irqsave(), duplicating the small amount of\n> shared logic. As there are only two call sites and both statically\n> know the lock type, this avoids introducing additional abstraction\n> or runtime dispatch in the compaction path.\n>\n> No functional change intended.\n>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> ---\n>  mm/compaction.c | 33 ++++++++++++++++++++++++---------\n>  1 file changed, 24 insertions(+), 9 deletions(-)\n>\n\nAcked-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Zi Yan",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 27 Feb 2026, at 11:00, Dmitry Ilvokhin wrote:\n\n> This intentionally breaks direct users of zone->lock at compile time so\n> all call sites are converted to the zone lock wrappers. Without the\n> rename, present and future out-of-tree code could continue using\n> spin_lock(&zone->lock) and bypass the wrappers and tracing\n> infrastructure.\n>\n> No functional change intended.\n>\n> Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> Acked-by: SeongJae Park <sj@kernel.org>\n> ---\n>  include/linux/mmzone.h      |  7 +++++--\n>  include/linux/mmzone_lock.h | 12 ++++++------\n>  mm/compaction.c             |  4 ++--\n>  mm/internal.h               |  2 +-\n>  mm/page_alloc.c             | 16 ++++++++--------\n>  mm/page_isolation.c         |  4 ++--\n>  mm/page_owner.c             |  2 +-\n>  7 files changed, 25 insertions(+), 22 deletions(-)\n>\nAcked-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi\n",
+              "reply_to": "",
+              "message_date": "2026-02-27",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Fri, 27 Feb 2026 16:00:23 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n\n> Add thin wrappers around zone lock acquire/release operations. This\n> prepares the code for future tracepoint instrumentation without\n> modifying individual call sites.\n> \n> Centralizing zone lock operations behind wrappers allows future\n> instrumentation or debugging hooks to be added without touching\n> all users.\n> \n> No functional change intended. The wrappers are introduced in\n> preparation for subsequent patches and are not yet used.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nReviewed-by: SeongJae Park <sj@kernel.org>\n\n\nThanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-02-28",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v4 4/5] mm: rename zone->lock to zone->_lock",
+          "message_id": "aanSnywUXTVPaYUj@shell.ilvokhin.com",
+          "url": "https://lore.kernel.org/all/aanSnywUXTVPaYUj@shell.ilvokhin.com/",
+          "date": "2026-03-05T18:59:46Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "SeongJae Park",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On Thu, 5 Mar 2026 18:59:43 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n[...]\n> Following the suggestion from SJ and Vlastimil, I prepared fixup to\n> standardize documentation and comments on the term \"zone lock\".\n> \n> The patch is based on top of the current mm-new.\n> \n> Andrew, please let me know if you would prefer a respin of the series\n> instead.\n> \n> From 267cda3e0e160f97b346009bc48819bfeed92e52 Mon Sep 17 00:00:00 2001\n> From: Dmitry Ilvokhin <d@ilvokhin.com>\n> Date: Thu, 5 Mar 2026 10:36:17 -0800\n> Subject: [PATCH] mm: documentation: standardize on \"zone lock\" terminology\n> \n> During review of the zone lock tracing series it was suggested to\n> standardize documentation and comments on the term \"zone lock\"\n> instead of using zone_lock or referring to the internal field\n> zone->_lock.\n> \n> Update references accordingly.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n\nAcked-by: SeongJae Park <sj@kernel.org>\n\n\nTHanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "Gave Acked-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 3/5/26 19:59, Dmitry Ilvokhin wrote:\n> On Thu, Mar 05, 2026 at 06:16:26PM +0000, Dmitry Ilvokhin wrote:\n>> On Thu, Mar 05, 2026 at 10:27:07AM +0100, Vlastimil Babka (SUSE) wrote:\n>> > On 3/4/26 16:13, SeongJae Park wrote:\n>> > > On Wed, 4 Mar 2026 13:01:45 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n>> > > \n>> > >> On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n>> > >> > On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n>> > >> > \n>> > >> > > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n>> > >> > > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n>> > >> > > > \n>> > >> > > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n>> > >> > > > > > This intentionally breaks direct users of zone->lock at compile time so\n>> > >> > > > > > all call sites are converted to the zone lock wrappers. Without the\n>> > >> > > > > > rename, present and future out-of-tree code could continue using\n>> > >> > > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n>> > >> > > > > > infrastructure.\n>> > >> > > > > > \n>> > >> > > > > > No functional change intended.\n>> > >> > > > > > \n>> > >> > > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n>> > >> > > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > >> > > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n>> > >> > > > > > Acked-by: SeongJae Park <sj@kernel.org>\n>> > >> > > > > \n>> > >> > > > > I see some more instances of 'zone->lock' in comments in\n>> > >> > > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n>> > >> > > > > \n>> > >> > > > \n>> > >> > > > I fixed (most of) that in the previous version but my fix was lost.\n>> > >> > > \n>> > >> > > Thanks for the fixups, Andrew.\n>> > >> > > \n>> > >> > > I still see a few 'zone->lock' references in Documentation remain on\n>> > >> > > mm-new. This patch cleans them up, as noted by Vlastimil.\n>> > >> > > \n>> > >> > > I'm happy to adjust this patch if anything else needs attention.\n>> > >> > > \n>> > >> > > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n>> > >> > > From: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > >> > > Date: Tue, 3 Mar 2026 06:13:13 -0800\n>> > >> > > Subject: [PATCH] mm: fix remaining zone->lock references\n>> > >> > > \n>> > >> > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > >> > > ---\n>> > >> > >  Documentation/mm/physical_memory.rst | 4 ++--\n>> > >> > >  Documentation/trace/events-kmem.rst  | 8 ++++----\n>> > >> > >  2 files changed, 6 insertions(+), 6 deletions(-)\n>> > >> > > \n>> > >> > > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n>> > >> > > index b76183545e5b..e344f93515b6 100644\n>> > >> > > --- a/Documentation/mm/physical_memory.rst\n>> > >> > > +++ b/Documentation/mm/physical_memory.rst\n>> > >> > > @@ -500,11 +500,11 @@ General\n>> > >> > >  ``nr_isolate_pageblock``\n>> > >> > >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n>> > >> > >    problem due to racy retrieving migratetype of pageblock. Protected by\n>> > >> > > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n>> > >> > > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n>> > >> > \n>> > >> > Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n>> > >> > to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n>> > >> > for the rest of this patch.\n>> > >> > \n>> > >> > I was initially thinking this is just a mistake, but I also found Andrew is\n>> > >> > doing same change [2], so I'm bit confused.  Is this an intentional change?\n>> > >> > \n>> > >> > [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n>> > >> > [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n>> > >> > \n>> > >> \n>> > >> Good catch, thanks for pointing this out, SJ.\n>> > >> \n>> > >> Originally the mechanical rename was indeed zone->lock -> zone->_lock.\n>> > >> However, in Documentation I intentionally switched references to\n>> > >> zone_lock instead of zone->_lock. The reasoning is that _lock is now an\n>> > >> internal implementation detail, and direct access is discouraged. The\n>> > >> intended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\n>> > >> so referencing zone_lock in documentation felt more appropriate than\n>> > >> mentioning the private struct field (zone->_lock).\n>> > > \n>> > > Thank you for this nice and kind clarification, Dmitry!  I agree mentioning\n>> > > zone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be\n>> > > better.\n>> > > \n>> > > But, I'm concerned if people like me might not aware the intention under\n>> > > 'zone_lock'.  If there is a well-known convention that allows people to know it\n>> > > is for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my\n>> > > humble opinion.  If there is such a convention but I'm just missing it, please\n>> > > ignore.  If I'm not, for eaxmaple,\n>> > > \n>> > > \"protected by ``zone->lock``\" could be re-wrote to\n>> > > \"protected by ``zone_[un]lock_*()`` locking helpers\" or,\n>> > > \"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ?\n>> > > \n>> > >> \n>> > >> That said, I agree this creates inconsistency with the mechanical\n>> > >> rename, and I'm happy to adjust either way: either consistently refer\n>> > >> to the wrapper API, or keep documentation aligned with zone->_lock.\n>> > >> \n>> > >> I slightly prefer referring to the wrapper API, but don't have a strong\n>> > >> preference as long as we're consistent.\n>> > > \n>> > > I also think both approaches are good.  But for the wrapper approach, I think\n>> > > giving more contexts rather than just ``zone_lock`` to readers would be nice.\n>> > \n>> > Grep tells me that we also have comments mentioning simply \"zone lock\", btw.\n>> > And it's also a term used often in informal conversations. Maybe we could\n>> > just standardize on that in comments/documentations as it's easier to read.\n>> > Discovering that the field is called _lock and that wrappers should be used,\n>> > is hopefully not that difficult.\n>> \n>> Thanks for the suggestion, Vlastimil. That sounds reasonable to me as\n>> well. I'll update the comments and documentation to consistently use\n>> \"zone lock\".\n> \n> Following the suggestion from SJ and Vlastimil, I prepared fixup to\n> standardize documentation and comments on the term \"zone lock\".\n> \n> The patch is based on top of the current mm-new.\n> \n> Andrew, please let me know if you would prefer a respin of the series\n> instead.\n> \n> From 267cda3e0e160f97b346009bc48819bfeed92e52 Mon Sep 17 00:00:00 2001\n> From: Dmitry Ilvokhin <d@ilvokhin.com>\n> Date: Thu, 5 Mar 2026 10:36:17 -0800\n> Subject: [PATCH] mm: documentation: standardize on \"zone lock\" terminology\n> \n> During review of the zone lock tracing series it was suggested to\n> standardize documentation and comments on the term \"zone lock\"\n> instead of using zone_lock or referring to the internal field\n> zone->_lock.\n> \n> Update references accordingly.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n\nAcked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\nThanks!\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-06",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v4 4/5] mm: rename zone->lock to zone->_lock",
+          "message_id": "aanIdk2i-Eo9M967@shell.ilvokhin.com",
+          "url": "https://lore.kernel.org/all/aanIdk2i-Eo9M967@shell.ilvokhin.com/",
+          "date": "2026-03-05T18:16:34Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "heuristic",
+          "review_comments": [
+            {
+              "author": "Dmitry Ilvokhin (author)",
+              "summary": "Following the suggestion from SJ and Vlastimil, I prepared fixup to standardize documentation and comments on the term \"zone lock\". The patch is based on top of the current mm-new. Andrew, please let me know if you would prefer a respin of the series instead. From: Dmitry Ilvokhin <d@ilvokhin.com> Date: Thu, 5 Mar 2026 10:36:17 -0800 Subject: [PATCH] mm: documentation: standardize on \"zone lock\" terminology During review of the zone lock tracing series it was suggested to standardize documentation and comments on the term \"zone lock\" instead of using zone_lock or referring to the internal field zone->_lock. Update references accordingly. --- Documentation/mm/physical_memory.rst |  4 ++-- Documentation/trace/events-kmem.rst  |  8 ++++---- mm/compaction.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [],
+              "raw_body": "On Thu, Mar 05, 2026 at 06:16:26PM +0000, Dmitry Ilvokhin wrote:\n> On Thu, Mar 05, 2026 at 10:27:07AM +0100, Vlastimil Babka (SUSE) wrote:\n> > On 3/4/26 16:13, SeongJae Park wrote:\n> > > On Wed, 4 Mar 2026 13:01:45 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> > > \n> > >> On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n> > >> > On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n> > >> > \n> > >> > > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n> > >> > > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n> > >> > > > \n> > >> > > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n> > >> > > > > > This intentionally breaks direct users of zone->lock at compile time so\n> > >> > > > > > all call sites are converted to the zone lock wrappers. Without the\n> > >> > > > > > rename, present and future out-of-tree code could continue using\n> > >> > > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n> > >> > > > > > infrastructure.\n> > >> > > > > > \n> > >> > > > > > No functional change intended.\n> > >> > > > > > \n> > >> > > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n> > >> > > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > >> > > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > >> > > > > > Acked-by: SeongJae Park <sj@kernel.org>\n> > >> > > > > \n> > >> > > > > I see some more instances of 'zone->lock' in comments in\n> > >> > > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n> > >> > > > > \n> > >> > > > \n> > >> > > > I fixed (most of) that in the previous version but my fix was lost.\n> > >> > > \n> > >> > > Thanks for the fixups, Andrew.\n> > >> > > \n> > >> > > I still see a few 'zone->lock' references in Documentation remain on\n> > >> > > mm-new. This patch cleans them up, as noted by Vlastimil.\n> > >> > > \n> > >> > > I'm happy to adjust this patch if anything else needs attention.\n> > >> > > \n> > >> > > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n> > >> > > From: Dmitry Ilvokhin <d@ilvokhin.com>\n> > >> > > Date: Tue, 3 Mar 2026 06:13:13 -0800\n> > >> > > Subject: [PATCH] mm: fix remaining zone->lock references\n> > >> > > \n> > >> > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n> > >> > > ---\n> > >> > >  Documentation/mm/physical_memory.rst | 4 ++--\n> > >> > >  Documentation/trace/events-kmem.rst  | 8 ++++----\n> > >> > >  2 files changed, 6 insertions(+), 6 deletions(-)\n> > >> > > \n> > >> > > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n> > >> > > index b76183545e5b..e344f93515b6 100644\n> > >> > > --- a/Documentation/mm/physical_memory.rst\n> > >> > > +++ b/Documentation/mm/physical_memory.rst\n> > >> > > @@ -500,11 +500,11 @@ General\n> > >> > >  ``nr_isolate_pageblock``\n> > >> > >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n> > >> > >    problem due to racy retrieving migratetype of pageblock. Protected by\n> > >> > > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > >> > > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n> > >> > \n> > >> > Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n> > >> > to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n> > >> > for the rest of this patch.\n> > >> > \n> > >> > I was initially thinking this is just a mistake, but I also found Andrew is\n> > >> > doing same change [2], so I'm bit confused.  Is this an intentional change?\n> > >> > \n> > >> > [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n> > >> > [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n> > >> > \n> > >> \n> > >> Good catch, thanks for pointing this out, SJ.\n> > >> \n> > >> Originally the mechanical rename was indeed zone->lock -> zone->_lock.\n> > >> However, in Documentation I intentionally switched references to\n> > >> zone_lock instead of zone->_lock. The reasoning is that _lock is now an\n> > >> internal implementation detail, and direct access is discouraged. The\n> > >> intended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\n> > >> so referencing zone_lock in documentation felt more appropriate than\n> > >> mentioning the private struct field (zone->_lock).\n> > > \n> > > Thank you for this nice and kind clarification, Dmitry!  I agree mentioning\n> > > zone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be\n> > > better.\n> > > \n> > > But, I'm concerned if people like me might not aware the intention under\n> > > 'zone_lock'.  If there is a well-known convention that allows people to know it\n> > > is for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my\n> > > humble opinion.  If there is such a convention but I'm just missing it, please\n> > > ignore.  If I'm not, for eaxmaple,\n> > > \n> > > \"protected by ``zone->lock``\" could be re-wrote to\n> > > \"protected by ``zone_[un]lock_*()`` locking helpers\" or,\n> > > \"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ?\n> > > \n> > >> \n> > >> That said, I agree this creates inconsistency with the mechanical\n> > >> rename, and I'm happy to adjust either way: either consistently refer\n> > >> to the wrapper API, or keep documentation aligned with zone->_lock.\n> > >> \n> > >> I slightly prefer referring to the wrapper API, but don't have a strong\n> > >> preference as long as we're consistent.\n> > > \n> > > I also think both approaches are good.  But for the wrapper approach, I think\n> > > giving more contexts rather than just ``zone_lock`` to readers would be nice.\n> > \n> > Grep tells me that we also have comments mentioning simply \"zone lock\", btw.\n> > And it's also a term used often in informal conversations. Maybe we could\n> > just standardize on that in comments/documentations as it's easier to read.\n> > Discovering that the field is called _lock and that wrappers should be used,\n> > is hopefully not that difficult.\n> \n> Thanks for the suggestion, Vlastimil. That sounds reasonable to me as\n> well. I'll update the comments and documentation to consistently use\n> \"zone lock\".\n\nFollowing the suggestion from SJ and Vlastimil, I prepared fixup to\nstandardize documentation and comments on the term \"zone lock\".\n\nThe patch is based on top of the current mm-new.\n\nAndrew, please let me know if you would prefer a respin of the series\ninstead.\n\n>From 267cda3e0e160f97b346009bc48819bfeed92e52 Mon Sep 17 00:00:00 2001\nFrom: Dmitry Ilvokhin <d@ilvokhin.com>\nDate: Thu, 5 Mar 2026 10:36:17 -0800\nSubject: [PATCH] mm: documentation: standardize on \"zone lock\" terminology\n\nDuring review of the zone lock tracing series it was suggested to\nstandardize documentation and comments on the term \"zone lock\"\ninstead of using zone_lock or referring to the internal field\nzone->_lock.\n\nUpdate references accordingly.\n\nSigned-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n---\n Documentation/mm/physical_memory.rst |  4 ++--\n Documentation/trace/events-kmem.rst  |  8 ++++----\n mm/compaction.c                      |  2 +-\n mm/internal.h                        |  2 +-\n mm/page_alloc.c                      | 12 ++++++------\n mm/page_isolation.c                  |  4 ++--\n mm/page_owner.c                      |  2 +-\n 7 files changed, 17 insertions(+), 17 deletions(-)\n\ndiff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\nindex e344f93515b6..2398d87ac156 100644\n--- a/Documentation/mm/physical_memory.rst\n+++ b/Documentation/mm/physical_memory.rst\n@@ -500,11 +500,11 @@ General\n ``nr_isolate_pageblock``\n   Number of isolated pageblocks. It is used to solve incorrect freepage counting\n   problem due to racy retrieving migratetype of pageblock. Protected by\n-  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n+  zone lock. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n \n ``span_seqlock``\n   The seqlock to protect ``zone_start_pfn`` and ``spanned_pages``. It is a\n-  seqlock because it has to be read outside of ``zone_lock``, and it is done in\n+  seqlock because it has to be read outside of zone lock, and it is done in\n   the main allocator path. However, the seqlock is written quite infrequently.\n   Defined only when ``CONFIG_MEMORY_HOTPLUG`` is enabled.\n \ndiff --git a/Documentation/trace/events-kmem.rst b/Documentation/trace/events-kmem.rst\nindex 3c20a972de27..42f08f3b136c 100644\n--- a/Documentation/trace/events-kmem.rst\n+++ b/Documentation/trace/events-kmem.rst\n@@ -57,7 +57,7 @@ the per-CPU allocator (high performance) or the buddy allocator.\n \n If pages are allocated directly from the buddy allocator, the\n mm_page_alloc_zone_locked event is triggered. This event is important as high\n-amounts of activity imply high activity on the zone_lock. Taking this lock\n+amounts of activity imply high activity on the zone lock. Taking this lock\n impairs performance by disabling interrupts, dirtying cache lines between\n CPUs and serialising many CPUs.\n \n@@ -79,11 +79,11 @@ contention on the lruvec->lru_lock.\n   mm_page_pcpu_drain\t\tpage=%p pfn=%lu order=%d cpu=%d migratetype=%d\n \n In front of the page allocator is a per-cpu page allocator. It exists only\n-for order-0 pages, reduces contention on the zone_lock and reduces the\n+for order-0 pages, reduces contention on the zone lock and reduces the\n amount of writing on struct page.\n \n When a per-CPU list is empty or pages of the wrong type are allocated,\n-the zone_lock will be taken once and the per-CPU list refilled. The event\n+the zone lock will be taken once and the per-CPU list refilled. The event\n triggered is mm_page_alloc_zone_locked for each page allocated with the\n event indicating whether it is for a percpu_refill or not.\n \n@@ -92,7 +92,7 @@ which triggers a mm_page_pcpu_drain event.\n \n The individual nature of the events is so that pages can be tracked\n between allocation and freeing. A number of drain or refill pages that occur\n-consecutively imply the zone_lock being taken once. Large amounts of per-CPU\n+consecutively imply the zone lock being taken once. Large amounts of per-CPU\n refills and drains could imply an imbalance between CPUs where too much work\n is being concentrated in one place. It could also indicate that the per-CPU\n lists should be a larger size. Finally, large amounts of refills on one CPU\ndiff --git a/mm/compaction.c b/mm/compaction.c\nindex 143ead2cb10a..32623894a632 100644\n--- a/mm/compaction.c\n+++ b/mm/compaction.c\n@@ -1419,7 +1419,7 @@ static bool suitable_migration_target(struct compact_control *cc,\n \t\tint order = cc->order > 0 ? cc->order : pageblock_order;\n \n \t\t/*\n-\t\t * We are checking page_order without zone->_lock taken. But\n+\t\t * We are checking page_order without zone lock taken. But\n \t\t * the only small danger is that we skip a potentially suitable\n \t\t * pageblock, so it's not worth to check order for valid range.\n \t\t */\ndiff --git a/mm/internal.h b/mm/internal.h\nindex f634ac469c87..95b583e7e4f7 100644\n--- a/mm/internal.h\n+++ b/mm/internal.h\n@@ -727,7 +727,7 @@ static inline unsigned int buddy_order(struct page *page)\n  * (d) a page and its buddy are in the same zone.\n  *\n  * For recording whether a page is in the buddy system, we set PageBuddy.\n- * Setting, clearing, and testing PageBuddy is serialized by zone->_lock.\n+ * Setting, clearing, and testing PageBuddy is serialized by zone lock.\n  *\n  * For recording page's order, we use page_private(page).\n  */\ndiff --git a/mm/page_alloc.c b/mm/page_alloc.c\nindex 4c95364b7063..75ee81445640 100644\n--- a/mm/page_alloc.c\n+++ b/mm/page_alloc.c\n@@ -2440,7 +2440,7 @@ enum rmqueue_mode {\n \n /*\n  * Do the hard work of removing an element from the buddy allocator.\n- * Call me with the zone->_lock already held.\n+ * Call me with the zone lock already held.\n  */\n static __always_inline struct page *\n __rmqueue(struct zone *zone, unsigned int order, int migratetype,\n@@ -2468,7 +2468,7 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,\n \t * fallbacks modes with increasing levels of fragmentation risk.\n \t *\n \t * The fallback logic is expensive and rmqueue_bulk() calls in\n-\t * a loop with the zone->_lock held, meaning the freelists are\n+\t * a loop with the zone lock held, meaning the freelists are\n \t * not subject to any outside changes. Remember in *mode where\n \t * we found pay dirt, to save us the search on the next call.\n \t */\n@@ -7046,7 +7046,7 @@ int alloc_contig_frozen_range_noprof(unsigned long start, unsigned long end,\n \t * pages.  Because of this, we reserve the bigger range and\n \t * once this is done free the pages we are not interested in.\n \t *\n-\t * We don't have to hold zone->_lock here because the pages are\n+\t * We don't have to hold zone lock here because the pages are\n \t * isolated thus they won't get removed from buddy.\n \t */\n \touter_start = find_large_buddy(start);\n@@ -7615,7 +7615,7 @@ void accept_page(struct page *page)\n \t\treturn;\n \t}\n \n-\t/* Unlocks zone->_lock */\n+\t/* Unlocks zone lock */\n \t__accept_page(zone, &flags, page);\n }\n \n@@ -7632,7 +7632,7 @@ static bool try_to_accept_memory_one(struct zone *zone)\n \t\treturn false;\n \t}\n \n-\t/* Unlocks zone->_lock */\n+\t/* Unlocks zone lock */\n \t__accept_page(zone, &flags, page);\n \n \treturn true;\n@@ -7773,7 +7773,7 @@ struct page *alloc_frozen_pages_nolock_noprof(gfp_t gfp_flags, int nid, unsigned\n \n \t/*\n \t * Best effort allocation from percpu free list.\n-\t * If it's empty attempt to spin_trylock zone->_lock.\n+\t * If it's empty attempt to spin_trylock zone lock.\n \t */\n \tpage = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);\n \ndiff --git a/mm/page_isolation.c b/mm/page_isolation.c\nindex cf731370e7a7..e8414e9a718a 100644\n--- a/mm/page_isolation.c\n+++ b/mm/page_isolation.c\n@@ -212,7 +212,7 @@ static int set_migratetype_isolate(struct page *page, enum pb_isolate_mode mode,\n \tzone_unlock_irqrestore(zone, flags);\n \tif (mode == PB_ISOLATE_MODE_MEM_OFFLINE) {\n \t\t/*\n-\t\t * printk() with zone->_lock held will likely trigger a\n+\t\t * printk() with zone lock held will likely trigger a\n \t\t * lockdep splat, so defer it here.\n \t\t */\n \t\tdump_page(unmovable, \"unmovable page\");\n@@ -553,7 +553,7 @@ void undo_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn)\n /*\n  * Test all pages in the range is free(means isolated) or not.\n  * all pages in [start_pfn...end_pfn) must be in the same zone.\n- * zone->_lock must be held before call this.\n+ * zone lock must be held before call this.\n  *\n  * Returns the last tested pfn.\n  */\ndiff --git a/mm/page_owner.c b/mm/page_owner.c\nindex 54a4ba63b14f..109f2f28f5b1 100644\n--- a/mm/page_owner.c\n+++ b/mm/page_owner.c\n@@ -799,7 +799,7 @@ static void init_pages_in_zone(struct zone *zone)\n \t\t\t\tcontinue;\n \n \t\t\t/*\n-\t\t\t * To avoid having to grab zone->_lock, be a little\n+\t\t\t * To avoid having to grab zone lock, be a little\n \t\t\t * careful when reading buddy page order. The only\n \t\t\t * danger is that we skip too much and potentially miss\n \t\t\t * some early allocated pages, which is better than\n-- \n2.47.3\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "SeongJae Park",
+              "summary": "Gave Acked-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On Thu, 5 Mar 2026 18:59:43 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n[...]\n> Following the suggestion from SJ and Vlastimil, I prepared fixup to\n> standardize documentation and comments on the term \"zone lock\".\n> \n> The patch is based on top of the current mm-new.\n> \n> Andrew, please let me know if you would prefer a respin of the series\n> instead.\n> \n> From 267cda3e0e160f97b346009bc48819bfeed92e52 Mon Sep 17 00:00:00 2001\n> From: Dmitry Ilvokhin <d@ilvokhin.com>\n> Date: Thu, 5 Mar 2026 10:36:17 -0800\n> Subject: [PATCH] mm: documentation: standardize on \"zone lock\" terminology\n> \n> During review of the zone lock tracing series it was suggested to\n> standardize documentation and comments on the term \"zone lock\"\n> instead of using zone_lock or referring to the internal field\n> zone->_lock.\n> \n> Update references accordingly.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n\nAcked-by: SeongJae Park <sj@kernel.org>\n\n\nTHanks,\nSJ\n\n[...]\n",
+              "reply_to": "",
+              "message_date": "2026-03-05",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            },
+            {
+              "author": "Vlastimil (SUSE)",
+              "summary": "Gave Acked-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Acked-by"
+              ],
+              "raw_body": "On 3/5/26 19:59, Dmitry Ilvokhin wrote:\n> On Thu, Mar 05, 2026 at 06:16:26PM +0000, Dmitry Ilvokhin wrote:\n>> On Thu, Mar 05, 2026 at 10:27:07AM +0100, Vlastimil Babka (SUSE) wrote:\n>> > On 3/4/26 16:13, SeongJae Park wrote:\n>> > > On Wed, 4 Mar 2026 13:01:45 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n>> > > \n>> > >> On Tue, Mar 03, 2026 at 05:50:34PM -0800, SeongJae Park wrote:\n>> > >> > On Tue, 3 Mar 2026 14:25:55 +0000 Dmitry Ilvokhin <d@ilvokhin.com> wrote:\n>> > >> > \n>> > >> > > On Mon, Mar 02, 2026 at 02:37:43PM -0800, Andrew Morton wrote:\n>> > >> > > > On Mon, 2 Mar 2026 15:10:03 +0100 \"Vlastimil Babka (SUSE)\" <vbabka@kernel.org> wrote:\n>> > >> > > > \n>> > >> > > > > On 2/27/26 17:00, Dmitry Ilvokhin wrote:\n>> > >> > > > > > This intentionally breaks direct users of zone->lock at compile time so\n>> > >> > > > > > all call sites are converted to the zone lock wrappers. Without the\n>> > >> > > > > > rename, present and future out-of-tree code could continue using\n>> > >> > > > > > spin_lock(&zone->lock) and bypass the wrappers and tracing\n>> > >> > > > > > infrastructure.\n>> > >> > > > > > \n>> > >> > > > > > No functional change intended.\n>> > >> > > > > > \n>> > >> > > > > > Suggested-by: Andrew Morton <akpm@linux-foundation.org>\n>> > >> > > > > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > >> > > > > > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n>> > >> > > > > > Acked-by: SeongJae Park <sj@kernel.org>\n>> > >> > > > > \n>> > >> > > > > I see some more instances of 'zone->lock' in comments in\n>> > >> > > > > include/linux/mmzone.h and under Documentation/ but otherwise LGTM.\n>> > >> > > > > \n>> > >> > > > \n>> > >> > > > I fixed (most of) that in the previous version but my fix was lost.\n>> > >> > > \n>> > >> > > Thanks for the fixups, Andrew.\n>> > >> > > \n>> > >> > > I still see a few 'zone->lock' references in Documentation remain on\n>> > >> > > mm-new. This patch cleans them up, as noted by Vlastimil.\n>> > >> > > \n>> > >> > > I'm happy to adjust this patch if anything else needs attention.\n>> > >> > > \n>> > >> > > From 9142d5a8b60038fa424a6033253960682e5a51f4 Mon Sep 17 00:00:00 2001\n>> > >> > > From: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > >> > > Date: Tue, 3 Mar 2026 06:13:13 -0800\n>> > >> > > Subject: [PATCH] mm: fix remaining zone->lock references\n>> > >> > > \n>> > >> > > Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n>> > >> > > ---\n>> > >> > >  Documentation/mm/physical_memory.rst | 4 ++--\n>> > >> > >  Documentation/trace/events-kmem.rst  | 8 ++++----\n>> > >> > >  2 files changed, 6 insertions(+), 6 deletions(-)\n>> > >> > > \n>> > >> > > diff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\n>> > >> > > index b76183545e5b..e344f93515b6 100644\n>> > >> > > --- a/Documentation/mm/physical_memory.rst\n>> > >> > > +++ b/Documentation/mm/physical_memory.rst\n>> > >> > > @@ -500,11 +500,11 @@ General\n>> > >> > >  ``nr_isolate_pageblock``\n>> > >> > >    Number of isolated pageblocks. It is used to solve incorrect freepage counting\n>> > >> > >    problem due to racy retrieving migratetype of pageblock. Protected by\n>> > >> > > -  ``zone->lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n>> > >> > > +  ``zone_lock``. Defined only when ``CONFIG_MEMORY_ISOLATION`` is enabled.\n>> > >> > \n>> > >> > Dmitry's original patch [1] was doing 's/zone->lock/zone->_lock/', which aligns\n>> > >> > to my expectation.  But this patch is doing 's/zone->lock/zone_lock/'.  Same\n>> > >> > for the rest of this patch.\n>> > >> > \n>> > >> > I was initially thinking this is just a mistake, but I also found Andrew is\n>> > >> > doing same change [2], so I'm bit confused.  Is this an intentional change?\n>> > >> > \n>> > >> > [1] https://lore.kernel.org/d61500c5784c64e971f4d328c57639303c475f81.1772206930.git.d@ilvokhin.com\n>> > >> > [2] https://lore.kernel.org/20260302143743.220eed4feb36d7572fe726cc@linux-foundation.org\n>> > >> > \n>> > >> \n>> > >> Good catch, thanks for pointing this out, SJ.\n>> > >> \n>> > >> Originally the mechanical rename was indeed zone->lock -> zone->_lock.\n>> > >> However, in Documentation I intentionally switched references to\n>> > >> zone_lock instead of zone->_lock. The reasoning is that _lock is now an\n>> > >> internal implementation detail, and direct access is discouraged. The\n>> > >> intended interface is via the zone_lock_*() / zone_unlock_*() wrappers,\n>> > >> so referencing zone_lock in documentation felt more appropriate than\n>> > >> mentioning the private struct field (zone->_lock).\n>> > > \n>> > > Thank you for this nice and kind clarification, Dmitry!  I agree mentioning\n>> > > zone_[un]lock_*() helpers instead of the hidden member (zone->_lock) can be\n>> > > better.\n>> > > \n>> > > But, I'm concerned if people like me might not aware the intention under\n>> > > 'zone_lock'.  If there is a well-known convention that allows people to know it\n>> > > is for 'zone_[un]lock_*()' helpers, making it more clear would be nice, in my\n>> > > humble opinion.  If there is such a convention but I'm just missing it, please\n>> > > ignore.  If I'm not, for eaxmaple,\n>> > > \n>> > > \"protected by ``zone->lock``\" could be re-wrote to\n>> > > \"protected by ``zone_[un]lock_*()`` locking helpers\" or,\n>> > > \"protected by zone lock helper functions (``zone_[un]lock_*()``)\" ?\n>> > > \n>> > >> \n>> > >> That said, I agree this creates inconsistency with the mechanical\n>> > >> rename, and I'm happy to adjust either way: either consistently refer\n>> > >> to the wrapper API, or keep documentation aligned with zone->_lock.\n>> > >> \n>> > >> I slightly prefer referring to the wrapper API, but don't have a strong\n>> > >> preference as long as we're consistent.\n>> > > \n>> > > I also think both approaches are good.  But for the wrapper approach, I think\n>> > > giving more contexts rather than just ``zone_lock`` to readers would be nice.\n>> > \n>> > Grep tells me that we also have comments mentioning simply \"zone lock\", btw.\n>> > And it's also a term used often in informal conversations. Maybe we could\n>> > just standardize on that in comments/documentations as it's easier to read.\n>> > Discovering that the field is called _lock and that wrappers should be used,\n>> > is hopefully not that difficult.\n>> \n>> Thanks for the suggestion, Vlastimil. That sounds reasonable to me as\n>> well. I'll update the comments and documentation to consistently use\n>> \"zone lock\".\n> \n> Following the suggestion from SJ and Vlastimil, I prepared fixup to\n> standardize documentation and comments on the term \"zone lock\".\n> \n> The patch is based on top of the current mm-new.\n> \n> Andrew, please let me know if you would prefer a respin of the series\n> instead.\n> \n> From 267cda3e0e160f97b346009bc48819bfeed92e52 Mon Sep 17 00:00:00 2001\n> From: Dmitry Ilvokhin <d@ilvokhin.com>\n> Date: Thu, 5 Mar 2026 10:36:17 -0800\n> Subject: [PATCH] mm: documentation: standardize on \"zone lock\" terminology\n> \n> During review of the zone lock tracing series it was suggested to\n> standardize documentation and comments on the term \"zone lock\"\n> instead of using zone_lock or referring to the internal field\n> zone->_lock.\n> \n> Update references accordingly.\n> \n> Signed-off-by: Dmitry Ilvokhin <d@ilvokhin.com>\n\nAcked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\n\nThanks!\n\n",
+              "reply_to": "",
+              "message_date": "2026-03-06",
+              "message_id": "",
+              "analysis_source": "heuristic"
+            }
+          ]
+        }
+      ],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
     }
   ]
 }
