@@ -234,8 +234,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH RFC 3/3] locking: Wire up contended_release tracepoint</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/8298e098d3418cb446ef396f119edac58a3414e9.1772642407.git.d@ilvokhin.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-04</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-05</strong><div class="date-range-nav">Active on: <a href="#2026-03-05">2026-03-05</a> &bull; <a href="#2026-03-04">2026-03-04</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds a new tracepoint called contended_release to track when a lock is released due to contention. The tracepoint is added to the slowpath unlock paths of various sleepable locks, including mutexes, rtmutexes, semaphores, and rwsems.</div></div>
+    <div class="date-range">Submitted: <strong>2026-03-04</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-05</strong><div class="date-range-nav">Active on: <a href="#2026-03-10">2026-03-10</a> &bull; <a href="#2026-03-05">2026-03-05</a> &bull; <a href="#2026-03-04">2026-03-04</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds calls to the `trace_contended_release` function in various slowpath unlock paths of sleepable locks, including mutexes, rtmutexes, semaphores, and rwsems. The purpose is to fire a tracepoint when there are blocked waiters being woken during an unlock operation. This allows for better tracing and debugging of lock contention issues.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-03-04">
 <div class="review-comment">
@@ -247,28 +247,28 @@
 </div>
 <div class="review-comment-text">Added the tracepoint to various slowpath unlock paths, including mutexes and rtmutexes. The tracepoint fires when there are blocked waiters being woken.</div>
 </div>
-</div>
-<div class="thread-node depth-0" id="2026-03-05">
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-03-05">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Steven Rostedt</span>
 <a class="date-chip" href="../2026-03-05.html" title="First appeared in report for 2026-03-05">2026-03-05</a>
 <span class="inline-review-badge">Inline Review</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Hmm, if statements should never be used just for tracepoints without a static branch. The above should be: if (trace_contended_release_enabled() &amp;&amp; rt_mutex_has_waiters(rtm)) trace_contended_release(rwb); The above &quot;trace_contened_release_enabled()&quot; is a static_branch where it turns the if statement into a nop when the tracepoint is not enabled, and a jmp when it is. Same here.</div>
+<div class="review-comment-text">reviewer noted that trace_contended_release() is called after the lock has been released, which may lead to a false positive in the contended release tracepoint
+
+Reviewer Steven Rostedt noted that using if statements for tracepoints without a static branch can lead to inefficient code paths, suggesting the use of trace_contended_release_enabled() and rt_mutex_has_waiters(rtm) to conditionally enable the tracepoint
+
+reviewer expressed agreement with the patch, using a single-word affirmative</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Wed,  4 Mar 2026 16:56:17 +0000
 Dmitry Ilvokhin &lt;d@ilvokhin.com&gt; wrote:
 
-&gt; @@ -204,6 +206,8 @@ static inline void rwbase_write_unlock(struct rwbase_rt *rwb)
-&gt;  	unsigned long flags;
-&gt;  
-&gt;  	raw_spin_lock_irqsave(&amp;rtm-&gt;wait_lock, flags);
-&gt; +	if (rt_mutex_has_waiters(rtm))
-&gt; +		trace_contended_release(rwb);
+---
 
 Hmm, if statements should never be used just for tracepoints without a
 static branch. The above should be:
@@ -280,112 +280,29 @@ The above &quot;trace_contened_release_enabled()&quot; is a static_branch where 
 turns the if statement into a nop when the tracepoint is not enabled, and a
 jmp when it is.
 
-
-&gt;  	__rwbase_write_unlock(rwb, WRITER_BIAS, flags);
-&gt;  }
-&gt;  
-&gt; @@ -213,6 +217,8 @@ static inline void rwbase_write_downgrade(struct rwbase_rt *rwb)
-&gt;  	unsigned long flags;
-&gt;  
-&gt;  	raw_spin_lock_irqsave(&amp;rtm-&gt;wait_lock, flags);
-&gt; +	if (rt_mutex_has_waiters(rtm))
-&gt; +		trace_contended_release(rwb);
+---
 
 Same here.
 
--- Steve
-
-&gt;  	/* Release it and account current as reader */
-&gt;  	__rwbase_write_unlock(rwb, WRITER_BIAS - 1, flags);
-&gt;  }
-&gt; diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c
-&gt; index 24df4d98f7d2..4e61dc0bb045 100644
-&gt; --- a/kernel/locking/rwsem.c
-&gt; +++ b/kernel/locking/rwsem.c
-&gt; @@ -1360,6 +1360,7 @@ static inline void __up_read(struct rw_semaphore *sem)
-&gt;  	if (unlikely((tmp &amp; (RWSEM_LOCK_MASK|RWSEM_FLAG_WAITERS)) ==
-&gt;  		      RWSEM_FLAG_WAITERS)) {
-&gt;  		clear_nonspinnable(sem);
-&gt; +		trace_contended_release(sem);
-&gt;  		rwsem_wake(sem);
-&gt;  	}
-&gt;  	preempt_enable();
-&gt; @@ -1383,8 +1384,10 @@ static inline void __up_write(struct rw_semaphore *sem)
-&gt;  	preempt_disable();
-&gt;  	rwsem_clear_owner(sem);
-&gt;  	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &amp;sem-&gt;count);
-&gt; -	if (unlikely(tmp &amp; RWSEM_FLAG_WAITERS))
-&gt; +	if (unlikely(tmp &amp; RWSEM_FLAG_WAITERS)) {
-&gt; +		trace_contended_release(sem);
-&gt;  		rwsem_wake(sem);
-&gt; +	}
-&gt;  	preempt_enable();
-&gt;  }
-&gt;  
-&gt; @@ -1407,8 +1410,10 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
-&gt;  	tmp = atomic_long_fetch_add_release(
-&gt;  		-RWSEM_WRITER_LOCKED+RWSEM_READER_BIAS, &amp;sem-&gt;count);
-&gt;  	rwsem_set_reader_owned(sem);
-&gt; -	if (tmp &amp; RWSEM_FLAG_WAITERS)
-&gt; +	if (tmp &amp; RWSEM_FLAG_WAITERS) {
-&gt; +		trace_contended_release(sem);
-&gt;  		rwsem_downgrade_wake(sem);
-&gt; +	}
-&gt;  	preempt_enable();
-&gt;  }
-&gt;  
-&gt; diff --git a/kernel/locking/semaphore.c b/kernel/locking/semaphore.c
-&gt; index 3ef032e22f7e..3cef5ba88f7e 100644
-&gt; --- a/kernel/locking/semaphore.c
-&gt; +++ b/kernel/locking/semaphore.c
-&gt; @@ -231,8 +231,10 @@ void __sched up(struct semaphore *sem)
-&gt;  	else
-&gt;  		__up(sem, &amp;wake_q);
-&gt;  	raw_spin_unlock_irqrestore(&amp;sem-&gt;lock, flags);
-&gt; -	if (!wake_q_empty(&amp;wake_q))
-&gt; +	if (!wake_q_empty(&amp;wake_q)) {
-&gt; +		trace_contended_release(sem);
-&gt;  		wake_up_q(&amp;wake_q);
-&gt; +	}
-&gt;  }
-&gt;  EXPORT_SYMBOL(up);
-&gt;  
-
-</pre>
+-- Steve</pre>
 </details>
+<div class="reply-to-label">&#8627; replying to Dmitry Ilvokhin</div>
+<div class="review-comment-signals">Signals: false positive, tracepoint, requested changes</div>
 </div>
-</div>
-<div class="thread-node depth-0">
+<div class="thread-children">
+<div class="thread-node depth-2">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Peter Zijlstra</span>
 <a class="date-chip" href="../2026-03-05.html" title="First appeared in report for 2026-03-05">2026-03-05</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">I still wish you would accept: if (trace_foo_enabled() &amp;&amp; foo) __do_trace_foo(); The compilers can&#x27;t optimize the static branches and thus you&#x27;ll get it twice for no reason. I really wish they would just accept __pure, but alas.</div>
+<div class="review-comment-text">Reviewer Peter Zijlstra pointed out that the trace_contended_release() calls will be executed twice due to static branches not being optimized by compilers, and suggested using a __pure function instead.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Mar 05, 2026 at 10:59:24AM -0500, Steven Rostedt wrote:
-&gt; On Wed,  4 Mar 2026 16:56:17 +0000
-&gt; Dmitry Ilvokhin &lt;d@ilvokhin.com&gt; wrote:
-&gt; 
-&gt; &gt; @@ -204,6 +206,8 @@ static inline void rwbase_write_unlock(struct rwbase_rt *rwb)
-&gt; &gt;  	unsigned long flags;
-&gt; &gt;  
-&gt; &gt;  	raw_spin_lock_irqsave(&amp;rtm-&gt;wait_lock, flags);
-&gt; &gt; +	if (rt_mutex_has_waiters(rtm))
-&gt; &gt; +		trace_contended_release(rwb);
-&gt; 
-&gt; Hmm, if statements should never be used just for tracepoints without a
-&gt; static branch. The above should be:
-&gt; 
-&gt; 	if (trace_contended_release_enabled() &amp;&amp; rt_mutex_has_waiters(rtm))
-&gt; 		trace_contended_release(rwb);
-&gt; 
-
-I still wish you would accept:
+<pre class="raw-body-text">I still wish you would accept:
 
 	if (trace_foo_enabled() &amp;&amp; foo)
 		__do_trace_foo();
@@ -393,45 +310,47 @@ I still wish you would accept:
 The compilers can&#x27;t optimize the static branches and thus you&#x27;ll get it
 twice for no reason.
 
-I really wish they would just accept __pure, but alas.
-</pre>
+I really wish they would just accept __pure, but alas.</pre>
 </details>
+<div class="reply-to-label">&#8627; replying to Steven Rostedt</div>
+<div class="review-comment-signals">Signals: compiler optimization, static branch</div>
 </div>
-</div>
-<div class="thread-node depth-0">
+<div class="thread-children">
+<div class="thread-node depth-3">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Steven Rostedt</span>
 <a class="date-chip" href="../2026-03-05.html" title="First appeared in report for 2026-03-05">2026-03-05</a>
 <span class="inline-review-badge">Inline Review</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Makes sense, and that could probably be done. It shouldn&#x27;t be too hard to do. If I find some time I could look at it, or perhaps someone lurking on this thread could possibly give it a try!</div>
+<div class="review-comment-text">reviewer noted that the trace_contended_release() call in percpu_up_write() always fires, even when there are no blocked waiters being woken, and requested a fix to only fire it when necessary
+
+reviewer suggested implementing the tracepoint for contended release, but noted that it shouldn&#x27;t be too hard and offered to look at it or have someone else try</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Thu, 5 Mar 2026 18:42:23 +0100
 Peter Zijlstra &lt;peterz@infradead.org&gt; wrote:
 
-&gt; I still wish you would accept:
-&gt; 
-&gt; 	if (trace_foo_enabled() &amp;&amp; foo)
-&gt; 		__do_trace_foo();
-&gt; 
-&gt; The compilers can&#x27;t optimize the static branches and thus you&#x27;ll get it
-&gt; twice for no reason.
-&gt; 
-&gt; I really wish they would just accept __pure, but alas.
+---
 
 Makes sense, and that could probably be done. It shouldn&#x27;t be too hard to
 do. If I find some time I could look at it, or perhaps someone lurking on
 this thread could possibly give it a try! (I may even Cc some people that
 want to learn this code).
 
--- Steve
-
-</pre>
+-- Steve</pre>
 </details>
+<div class="reply-to-label">&#8627; replying to Peter Zijlstra</div>
+<div class="review-comment-signals">Signals: lock ordering violation, tracepoint misuse, NEEDS_WORK</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
