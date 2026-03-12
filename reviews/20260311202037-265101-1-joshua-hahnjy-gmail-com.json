@@ -1,0 +1,60 @@
+{
+  "thread_id": "20260311202037.265101-1-joshua.hahnjy@gmail.com",
+  "subject": "[PATCH 03/11] mm/zsmalloc: Introduce conditional memcg awareness to zs_pool",
+  "url": "https://lore.kernel.org/all/20260311202037.265101-1-joshua.hahnjy@gmail.com/",
+  "dates": {
+    "2026-03-11": {
+      "report_file": "2026-03-11_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "Johannes Weiner",
+          "summary": "Identified unnecessary storage of values in every pool and suggested a cleaner approach using a struct with enum members.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "cleaner code"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": ""
+        },
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Approved the patch and suggested improvements to the function prototype and variable names.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "approval"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "> It's a bit awkward that 0 is valid (MEMCG_SWAP). Plus you store these\n> values in every pool, even though they're always the same for all\n> zswap pools.\n>\n> How about:\n>\n> /* zsmalloc.h */\n> struct zs_memcg_params {\n>         enum memcg_stat_item compressed;\n>         enum memcg_stat_item uncompressed;\n> };\n> struct zs_pool *zs_create_pool(const char *name, struct zs_memcg_params *memcg_params);\n>\n> /* zswap.c */\n> static struct zs_memcg_params zswap_memcg_params = {\n>         .compressed = MEMCG_ZSWAP_B,\n>         .uncompressed = MEMCG_ZSWAPPED,\n> };\n>\n> then pass &zswap_memcg_params from zswap and NULL from zram.\n>\n> > @@ -2071,6 +2079,9 @@ struct zs_pool *zs_create_pool(const char *name)\n> >       rwlock_init(&pool->lock);\n> >       atomic_set(&pool->compaction_in_progress, 0);\n> >\n> > +     pool->memcg_aware = memcg_aware;\n> > +     pool->compressed_stat = compressed_stat;\n> > +     pool->uncompressed_stat = uncompressed_stat;\n>\n>         pool->memcg_params = memcg_params;\n>\n> And then use if (pool->memcg_params) to gate in zsmalloc.c.\n\nI like this.\n\nI also didn't like the suggested prototype for zs_create_pool(), and\ndidn't like that compressed_stat and uncompressed_stat did not have\nmemcg anywhere in the name. Was going to suggest adding a warning if\nmemcg_aware=false but the stat indices are non-zero, but your\nsuggestion is so much cleaner.\n",
+          "reply_to": "",
+          "message_date": "2026-03-11",
+          "message_id": ""
+        },
+        {
+          "author": "Joshua Hahn",
+          "summary": "Agreed to implement the suggested changes and thanked Johannes for his review.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "agreement"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, 11 Mar 2026 16:16:34 -0400 Johannes Weiner <hannes@cmpxchg.org> wrote:\n\n> On Wed, Mar 11, 2026 at 12:51:40PM -0700, Joshua Hahn wrote:\n> > Introduce 3 new fields to struct zs_pool to allow individual zpools to\n> > be \"memcg-aware\": memcg_aware, compressed_stat, and uncompressed_stat.\n> > \n> > memcg_aware is used in later patches to determine whether memory\n> > should be allocated to keep track of per-compresed object objgs.\n> > compressed_stat and uncompressed_stat are enum indices that point into\n> > memcg (node) stats that zsmalloc will account towards.\n> > \n> > In reality, these fields help distinguish between the two users of\n> > zsmalloc, zswap and zram. The enum indices compressed_stat and\n> > uncompressed_stat are parametrized to minimize zswap-specific hardcoding\n> > in zsmalloc.\n> > \n> > Suggested-by: Yosry Ahmed <yosry@kernel.org>\n> > Signed-off-by: Joshua Hahn <joshua.hahnjy@gmail.com>\n> > ---\n> >  drivers/block/zram/zram_drv.c |  3 ++-\n> >  include/linux/zsmalloc.h      |  5 ++++-\n> >  mm/zsmalloc.c                 | 13 ++++++++++++-\n> >  mm/zswap.c                    |  3 ++-\n> >  4 files changed, 20 insertions(+), 4 deletions(-)\n> > \n> > diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c\n> > index bca33403fc8b..d1eae5c20df7 100644\n> > --- a/drivers/block/zram/zram_drv.c\n> > +++ b/drivers/block/zram/zram_drv.c\n> > @@ -1980,7 +1980,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)\n> >  \tif (!zram->table)\n> >  \t\treturn false;\n> >  \n> > -\tzram->mem_pool = zs_create_pool(zram->disk->disk_name);\n> > +\t/* zram does not support memcg accounting */\n> > +\tzram->mem_pool = zs_create_pool(zram->disk->disk_name, false, 0, 0);\n\nHello Johannes,\n\nThank you for your review! I hope you are doing well : -)\n\n> It's a bit awkward that 0 is valid (MEMCG_SWAP). Plus you store these\n> values in every pool, even though they're always the same for all\n> zswap pools.\n\nAgreed. Originally I thought of removing memcg_aware and doing a bitwise\nOR check of the two stats, but thought this was also a bit strange\n(also because 0 is not a valid enum state for memcg_stat_item anyways)\n\n> How about:\n> \n> /* zsmalloc.h */\n> struct zs_memcg_params {\n> \tenum memcg_stat_item compressed;\n> \tenum memcg_stat_item uncompressed;\n> };\n> struct zs_pool *zs_create_pool(const char *name, struct zs_memcg_params *memcg_params);\n> \n> /* zswap.c */\n> static struct zs_memcg_params zswap_memcg_params = {\n> \t.compressed = MEMCG_ZSWAP_B,\n> \t.uncompressed = MEMCG_ZSWAPPED,\n> };\n> \n> then pass &zswap_memcg_params from zswap and NULL from zram.\n> \n> > @@ -2071,6 +2079,9 @@ struct zs_pool *zs_create_pool(const char *name)\n> >  \trwlock_init(&pool->lock);\n> >  \tatomic_set(&pool->compaction_in_progress, 0);\n> >  \n> > +\tpool->memcg_aware = memcg_aware;\n> > +\tpool->compressed_stat = compressed_stat;\n> > +\tpool->uncompressed_stat = uncompressed_stat;\n> \n> \tpool->memcg_params = memcg_params;\n> \n> And then use if (pool->memcg_params) to gate in zsmalloc.c.\n\nThese definitely look a lot cleaner. Will make these changes in v3!\n\nThanks again. I hope you have a great day!\nJoshua\n",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-03-11",
+          "message_id": ""
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Conditional memcg awareness was introduced to zs_pool, addressing concerns about storing unnecessary values in every pool."
+    }
+  }
+}
