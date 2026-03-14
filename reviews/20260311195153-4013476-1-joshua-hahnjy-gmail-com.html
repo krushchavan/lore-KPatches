@@ -235,144 +235,1576 @@
     <h1>[PATCH 00/11] mm/zswap, zsmalloc: Per-memcg-lruvec zswap accounting</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260311195153.4013476-1-joshua.hahnjy@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-03-11</strong><div class="date-range-nav">Active on: <a href="#2026-03-11">2026-03-11</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">Conditional memcg awareness was introduced to zs_pool, addressing concerns about storing unnecessary values in every pool.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces per-memcg-lruvec zswap accounting by moving memory-cgroup awareness to the zsmalloc layer, allowing for more accurate tracking of compressed memory usage and enabling cgroups to control where their zswapped objects live. The changes also enable future consumers to account memory statistics using a new compressed object memory accounting infrastructure. The patch series includes 11 patches that make various modifications to the zswap and zsmalloc code to achieve this goal, including introducing a new per-zspage array of objcg pointers to track per-memcg-lruvec memory usage. The changes are expected to improve performance by reducing remote access latency costs and enabling more effective reclaim when pressure is localized to a single cgroup.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-03-11">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Johannes Weiner</span>
+<span class="review-author">Joshua Hahn (author)</span>
 <a class="date-chip" href="../2026-03-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-11">2026-03-11</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified unnecessary storage of values in every pool and suggested a cleaner approach using a struct with enum members.</div>
+<div class="review-comment-text">The author addressed a concern about inconsistent naming conventions in the zsmalloc code by renaming zs_object_copy to zs_obj_copy, and also fixed an issue where find_alloced_obj was returning a signed int instead of an unsigned int.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Wed, Mar 11, 2026 at 12:51:40PM -0700, Joshua Hahn wrote:
-&gt; Introduce 3 new fields to struct zs_pool to allow individual zpools to
-&gt; be &quot;memcg-aware&quot;: memcg_aware, compressed_stat, and uncompressed_stat.
-&gt; 
-&gt; memcg_aware is used in later patches to determine whether memory
-&gt; should be allocated to keep track of per-compresed object objgs.
-&gt; compressed_stat and uncompressed_stat are enum indices that point into
-&gt; memcg (node) stats that zsmalloc will account towards.
-&gt; 
-&gt; In reality, these fields help distinguish between the two users of
-&gt; zsmalloc, zswap and zram. The enum indices compressed_stat and
-&gt; uncompressed_stat are parametrized to minimize zswap-specific hardcoding
-&gt; in zsmalloc.
-&gt; 
-&gt; Suggested-by: Yosry Ahmed &lt;yosry@kernel.org&gt;
-&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
-&gt; ---
-&gt;  drivers/block/zram/zram_drv.c |  3 ++-
-&gt;  include/linux/zsmalloc.h      |  5 ++++-
-&gt;  mm/zsmalloc.c                 | 13 ++++++++++++-
-&gt;  mm/zswap.c                    |  3 ++-
-&gt;  4 files changed, 20 insertions(+), 4 deletions(-)
-&gt; 
-&gt; diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
-&gt; index bca33403fc8b..d1eae5c20df7 100644
-&gt; --- a/drivers/block/zram/zram_drv.c
-&gt; +++ b/drivers/block/zram/zram_drv.c
-&gt; @@ -1980,7 +1980,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
-&gt;  	if (!zram-&gt;table)
-&gt;  		return false;
-&gt;  
-&gt; -	zram-&gt;mem_pool = zs_create_pool(zram-&gt;disk-&gt;disk_name);
-&gt; +	/* zram does not support memcg accounting */
-&gt; +	zram-&gt;mem_pool = zs_create_pool(zram-&gt;disk-&gt;disk_name, false, 0, 0);
+<pre class="raw-body-text">All the zsmalloc functions that operate on a zsmalloc object (encoded
+location values) are named &quot;zs_obj_xxx&quot;, except for zs_object_copy.
 
-It&#x27;s a bit awkward that 0 is valid (MEMCG_SWAP). Plus you store these
-values in every pool, even though they&#x27;re always the same for all
-zswap pools.
+Rename zs_object_copy to zs_obj_copy to conform to the pattern.
+No functional changes intended.
 
-How about:
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/zsmalloc.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
 
-/* zsmalloc.h */
-struct zs_memcg_params {
-	enum memcg_stat_item compressed;
-	enum memcg_stat_item uncompressed;
-};
-struct zs_pool *zs_create_pool(const char *name, struct zs_memcg_params *memcg_params);
-
-/* zswap.c */
-static struct zs_memcg_params zswap_memcg_params = {
-	.compressed = MEMCG_ZSWAP_B,
-	.uncompressed = MEMCG_ZSWAPPED,
-};
-
-then pass &amp;zswap_memcg_params from zswap and NULL from zram.
-
-&gt; @@ -2071,6 +2079,9 @@ struct zs_pool *zs_create_pool(const char *name)
-&gt;  	rwlock_init(&amp;pool-&gt;lock);
-&gt;  	atomic_set(&amp;pool-&gt;compaction_in_progress, 0);
-&gt;  
-&gt; +	pool-&gt;memcg_aware = memcg_aware;
-&gt; +	pool-&gt;compressed_stat = compressed_stat;
-&gt; +	pool-&gt;uncompressed_stat = uncompressed_stat;
-
-	pool-&gt;memcg_params = memcg_params;
-
-And then use if (pool-&gt;memcg_params) to gate in zsmalloc.c.
-
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 2c1430bf8d57..7a9b8f55d529 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1416,7 +1416,7 @@ void zs_free(struct zs_pool *pool, unsigned long handle)
+ }
+ EXPORT_SYMBOL_GPL(zs_free);
+ 
+-static void zs_object_copy(struct size_class *class, unsigned long dst,
++static void zs_obj_copy(struct size_class *class, unsigned long dst,
+ 				unsigned long src)
+ {
+ 	struct zpdesc *s_zpdesc, *d_zpdesc;
+@@ -1537,7 +1537,7 @@ static void migrate_zspage(struct zs_pool *pool, struct zspage *src_zspage,
+ 
+ 		used_obj = handle_to_obj(handle);
+ 		free_obj = obj_malloc(pool, dst_zspage, handle);
+-		zs_object_copy(class, free_obj, used_obj);
++		zs_obj_copy(class, free_obj, used_obj);
+ 		obj_idx++;
+ 		obj_free(class-&gt;size, used_obj);
+ 
+-- 
+2.52.0
 
 ---
 
-On Wed, Mar 11, 2026 at 12:51:44PM -0700, Joshua Hahn wrote:
-&gt; @@ -1244,6 +1297,8 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
-&gt;  	if (objcg) {
-&gt;  		WARN_ON_ONCE(!pool-&gt;memcg_aware);
-&gt;  		zspage-&gt;objcgs[obj_idx] = objcg;
-&gt; +		obj_cgroup_get(objcg);
-&gt; +		zs_charge_objcg(pool, objcg, class-&gt;size);
-&gt;  	}
-&gt;  
-&gt;  	if (!ZsHugePage(zspage))
+object indices, which describe the location of an object in a zspage,
+cannot be negative. To reflect this most helpers calculate and return
+these values as unsigned ints.
 
-Note that the obj_cgroup_get() reference is for the pointer, not the
-charge. I think it all comes out right in the end, but it&#x27;s a bit
-confusing to follow and verify through the series.
+Convert find_alloced_obj, the only function that calculates obj_idx as
+a signed int, to use an unsigned int as well.
 
-IOW, it&#x27;s better move that obj_cgroup_get() when you add and store
-zspage-&gt;objcgs[]. If zswap stil has a reference at that point in the
-series, then it&#x27;s fine for there to be two separate obj_cgroup_get()
-as well, with later patches deleting the zswap one when its
-entry-&gt;objcg pointer disappears.
+No functional change intended.
 
-&gt; @@ -711,10 +711,6 @@ static void zswap_entry_free(struct zswap_entry *entry)
-&gt;  	zswap_lru_del(&amp;zswap_list_lru, entry, objcg);
-&gt;  	zs_free(entry-&gt;pool-&gt;zs_pool, entry-&gt;handle);
-&gt;  	zswap_pool_put(entry-&gt;pool);
-&gt; -	if (objcg) {
-&gt; -		obj_cgroup_uncharge_zswap(objcg, entry-&gt;length);
-&gt; -		obj_cgroup_put(objcg);
-&gt; -	}
-&gt;  	if (entry-&gt;length == PAGE_SIZE)
-&gt;  		atomic_long_dec(&amp;zswap_stored_incompressible_pages);
-&gt;  	zswap_entry_cache_free(entry);
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/zsmalloc.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
 
-[ I can see that this was misleading. It was really getting a
-  reference for the entry-&gt;objcg = objcg a few lines down, hitching a
-  ride on that existing `if (objcg)`. ]
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 7a9b8f55d529..7758486e1d06 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1491,10 +1491,11 @@ static void zs_obj_copy(struct size_class *class, unsigned long dst,
+  * return handle.
+  */
+ static unsigned long find_alloced_obj(struct size_class *class,
+-				      struct zpdesc *zpdesc, int *obj_idx)
++				      struct zpdesc *zpdesc,
++				      unsigned int *obj_idx)
+ {
+ 	unsigned int offset;
+-	int index = *obj_idx;
++	unsigned int index = *obj_idx;
+ 	unsigned long handle = 0;
+ 	void *addr = kmap_local_zpdesc(zpdesc);
+ 
+@@ -1521,7 +1522,7 @@ static void migrate_zspage(struct zs_pool *pool, struct zspage *src_zspage,
+ {
+ 	unsigned long used_obj, free_obj;
+ 	unsigned long handle;
+-	int obj_idx = 0;
++	unsigned int obj_idx = 0;
+ 	struct zpdesc *s_zpdesc = get_first_zpdesc(src_zspage);
+ 	struct size_class *class = pool-&gt;size_class[src_zspage-&gt;class];
+ 
+-- 
+2.52.0
 
-</pre>
+---
+
+Introduce 3 new fields to struct zs_pool to allow individual zpools to
+be &quot;memcg-aware&quot;: memcg_aware, compressed_stat, and uncompressed_stat.
+
+memcg_aware is used in later patches to determine whether memory
+should be allocated to keep track of per-compresed object objgs.
+compressed_stat and uncompressed_stat are enum indices that point into
+memcg (node) stats that zsmalloc will account towards.
+
+In reality, these fields help distinguish between the two users of
+zsmalloc, zswap and zram. The enum indices compressed_stat and
+uncompressed_stat are parametrized to minimize zswap-specific hardcoding
+in zsmalloc.
+
+Suggested-by: Yosry Ahmed &lt;yosry@kernel.org&gt;
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ drivers/block/zram/zram_drv.c |  3 ++-
+ include/linux/zsmalloc.h      |  5 ++++-
+ mm/zsmalloc.c                 | 13 ++++++++++++-
+ mm/zswap.c                    |  3 ++-
+ 4 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index bca33403fc8b..d1eae5c20df7 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1980,7 +1980,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
+ 	if (!zram-&gt;table)
+ 		return false;
+ 
+-	zram-&gt;mem_pool = zs_create_pool(zram-&gt;disk-&gt;disk_name);
++	/* zram does not support memcg accounting */
++	zram-&gt;mem_pool = zs_create_pool(zram-&gt;disk-&gt;disk_name, false, 0, 0);
+ 	if (!zram-&gt;mem_pool) {
+ 		vfree(zram-&gt;table);
+ 		zram-&gt;table = NULL;
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 478410c880b1..24fb2e0fdf67 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -23,8 +23,11 @@ struct zs_pool_stats {
+ 
+ struct zs_pool;
+ struct scatterlist;
++enum memcg_stat_item;
+ 
+-struct zs_pool *zs_create_pool(const char *name);
++struct zs_pool *zs_create_pool(const char *name, bool memcg_aware,
++			       enum memcg_stat_item compressed_stat,
++			       enum memcg_stat_item uncompressed_stat);
+ void zs_destroy_pool(struct zs_pool *pool);
+ 
+ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t flags,
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 7758486e1d06..3f0f42b78314 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -214,6 +214,9 @@ struct zs_pool {
+ #ifdef CONFIG_COMPACTION
+ 	struct work_struct free_work;
+ #endif
++	bool memcg_aware;
++	enum memcg_stat_item compressed_stat;
++	enum memcg_stat_item uncompressed_stat;
+ 	/* protect zspage migration/compaction */
+ 	rwlock_t lock;
+ 	atomic_t compaction_in_progress;
+@@ -2050,6 +2053,9 @@ static int calculate_zspage_chain_size(int class_size)
+ /**
+  * zs_create_pool - Creates an allocation pool to work from.
+  * @name: pool name to be created
++ * @memcg_aware: whether the consumer of this pool will account memcg stats
++ * @compressed_stat: compressed memcontrol stat item to account
++ * @uncompressed_stat: uncompressed memcontrol stat item to account
+  *
+  * This function must be called before anything when using
+  * the zsmalloc allocator.
+@@ -2057,7 +2063,9 @@ static int calculate_zspage_chain_size(int class_size)
+  * On success, a pointer to the newly created pool is returned,
+  * otherwise NULL.
+  */
+-struct zs_pool *zs_create_pool(const char *name)
++struct zs_pool *zs_create_pool(const char *name, bool memcg_aware,
++			       enum memcg_stat_item compressed_stat,
++			       enum memcg_stat_item uncompressed_stat)
+ {
+ 	int i;
+ 	struct zs_pool *pool;
+@@ -2071,6 +2079,9 @@ struct zs_pool *zs_create_pool(const char *name)
+ 	rwlock_init(&amp;pool-&gt;lock);
+ 	atomic_set(&amp;pool-&gt;compaction_in_progress, 0);
+ 
++	pool-&gt;memcg_aware = memcg_aware;
++	pool-&gt;compressed_stat = compressed_stat;
++	pool-&gt;uncompressed_stat = uncompressed_stat;
+ 	pool-&gt;name = kstrdup(name, GFP_KERNEL);
+ 	if (!pool-&gt;name)
+ 		goto err;
+diff --git a/mm/zswap.c b/mm/zswap.c
+index e6ec3295bdb0..ff9abaa8aa38 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -257,7 +257,8 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
+ 
+ 	/* unique name for each pool specifically required by zsmalloc */
+ 	snprintf(name, 38, &quot;zswap%x&quot;, atomic_inc_return(&amp;zswap_pools_count));
+-	pool-&gt;zs_pool = zs_create_pool(name);
++	pool-&gt;zs_pool = zs_create_pool(name, true, MEMCG_ZSWAP_B,
++				       MEMCG_ZSWAPPED);
+ 	if (!pool-&gt;zs_pool)
+ 		goto error;
+ 
+-- 
+2.52.0
+
+---
+
+Introduce an array of struct obj_cgroup pointers to zspage to keep track
+of compressed objects&#x27; memcg ownership, if the zs_pool has been made to
+be memcg-aware at creation time.
+
+Move the error path for alloc_zspage to a jump label to simplify the
+growing error handling path for a failed zpdesc allocation.
+
+Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+Suggested-by: Harry Yoo &lt;harry.yoo@oracle.com&gt;
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/zsmalloc.c | 34 ++++++++++++++++++++++++++--------
+ 1 file changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 3f0f42b78314..dcf99516227c 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -39,6 +39,7 @@
+ #include &lt;linux/zsmalloc.h&gt;
+ #include &lt;linux/fs.h&gt;
+ #include &lt;linux/workqueue.h&gt;
++#include &lt;linux/memcontrol.h&gt;
+ #include &quot;zpdesc.h&quot;
+ 
+ #define ZSPAGE_MAGIC	0x58
+@@ -273,6 +274,7 @@ struct zspage {
+ 	struct zpdesc *first_zpdesc;
+ 	struct list_head list; /* fullness list */
+ 	struct zs_pool *pool;
++	struct obj_cgroup **objcgs;
+ 	struct zspage_lock zsl;
+ };
+ 
+@@ -825,6 +827,8 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
+ 		zpdesc = next;
+ 	} while (zpdesc != NULL);
+ 
++	if (pool-&gt;memcg_aware)
++		kfree(zspage-&gt;objcgs);
+ 	cache_free_zspage(zspage);
+ 
+ 	class_stat_sub(class, ZS_OBJS_ALLOCATED, class-&gt;objs_per_zspage);
+@@ -946,6 +950,16 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+ 	if (!IS_ENABLED(CONFIG_COMPACTION))
+ 		gfp &amp;= ~__GFP_MOVABLE;
+ 
++	if (pool-&gt;memcg_aware) {
++		zspage-&gt;objcgs = kcalloc(class-&gt;objs_per_zspage,
++					 sizeof(struct obj_cgroup *),
++					 gfp &amp; ~__GFP_HIGHMEM);
++		if (!zspage-&gt;objcgs) {
++			cache_free_zspage(zspage);
++			return NULL;
++		}
++	}
++
+ 	zspage-&gt;magic = ZSPAGE_MAGIC;
+ 	zspage-&gt;pool = pool;
+ 	zspage-&gt;class = class-&gt;index;
+@@ -955,14 +969,8 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+ 		struct zpdesc *zpdesc;
+ 
+ 		zpdesc = alloc_zpdesc(gfp, nid);
+-		if (!zpdesc) {
+-			while (--i &gt;= 0) {
+-				zpdesc_dec_zone_page_state(zpdescs[i]);
+-				free_zpdesc(zpdescs[i]);
+-			}
+-			cache_free_zspage(zspage);
+-			return NULL;
+-		}
++		if (!zpdesc)
++			goto err;
+ 		__zpdesc_set_zsmalloc(zpdesc);
+ 
+ 		zpdesc_inc_zone_page_state(zpdesc);
+@@ -973,6 +981,16 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+ 	init_zspage(class, zspage);
+ 
+ 	return zspage;
++
++err:
++	while (--i &gt;= 0) {
++		zpdesc_dec_zone_page_state(zpdescs[i]);
++		free_zpdesc(zpdescs[i]);
++	}
++	if (pool-&gt;memcg_aware)
++		kfree(zspage-&gt;objcgs);
++	cache_free_zspage(zspage);
++	return NULL;
+ }
+ 
+ static struct zspage *find_get_zspage(struct size_class *class)
+-- 
+2.52.0
+
+---
+
+With each zspage now having an array of obj_cgroup pointers, plumb the
+obj_cgroup pointer from the zswap / zram layer down to zsmalloc.
+
+zram still sees no visible change from its end. For the zswap path,
+store the obj_cgroup pointer after compression when writing the object,
+and erase the pointer when the object gets freed.
+
+The lifetime and charging of the obj_cgroup is still handled in the
+zswap layer.
+
+Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ drivers/block/zram/zram_drv.c |  7 ++++---
+ include/linux/zsmalloc.h      |  3 ++-
+ mm/zsmalloc.c                 | 25 ++++++++++++++++++++++++-
+ mm/zswap.c                    |  6 +++---
+ 4 files changed, 33 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index d1eae5c20df7..e68e408992e7 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -2232,7 +2232,7 @@ static int write_incompressible_page(struct zram *zram, struct page *page,
+ 	}
+ 
+ 	src = kmap_local_page(page);
+-	zs_obj_write(zram-&gt;mem_pool, handle, src, PAGE_SIZE);
++	zs_obj_write(zram-&gt;mem_pool, handle, src, PAGE_SIZE, NULL);
+ 	kunmap_local(src);
+ 
+ 	slot_lock(zram, index);
+@@ -2297,7 +2297,7 @@ static int zram_write_page(struct zram *zram, struct page *page, u32 index)
+ 		return -ENOMEM;
+ 	}
+ 
+-	zs_obj_write(zram-&gt;mem_pool, handle, zstrm-&gt;buffer, comp_len);
++	zs_obj_write(zram-&gt;mem_pool, handle, zstrm-&gt;buffer, comp_len, NULL);
+ 	zcomp_stream_put(zstrm);
+ 
+ 	slot_lock(zram, index);
+@@ -2521,7 +2521,8 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
+ 		return PTR_ERR((void *)handle_new);
+ 	}
+ 
+-	zs_obj_write(zram-&gt;mem_pool, handle_new, zstrm-&gt;buffer, comp_len_new);
++	zs_obj_write(zram-&gt;mem_pool, handle_new, zstrm-&gt;buffer,
++		     comp_len_new, NULL);
+ 	zcomp_stream_put(zstrm);
+ 
+ 	slot_free(zram, index);
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 24fb2e0fdf67..645957a156c4 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -23,6 +23,7 @@ struct zs_pool_stats {
+ 
+ struct zs_pool;
+ struct scatterlist;
++struct obj_cgroup;
+ enum memcg_stat_item;
+ 
+ struct zs_pool *zs_create_pool(const char *name, bool memcg_aware,
+@@ -51,7 +52,7 @@ void zs_obj_read_sg_begin(struct zs_pool *pool, unsigned long handle,
+ 			  struct scatterlist *sg, size_t mem_len);
+ void zs_obj_read_sg_end(struct zs_pool *pool, unsigned long handle);
+ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+-		  void *handle_mem, size_t mem_len);
++		  void *handle_mem, size_t mem_len, struct obj_cgroup *objcg);
+ 
+ extern const struct movable_operations zsmalloc_mops;
+ 
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index dcf99516227c..d4735451c273 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1195,7 +1195,7 @@ void zs_obj_read_sg_end(struct zs_pool *pool, unsigned long handle)
+ EXPORT_SYMBOL_GPL(zs_obj_read_sg_end);
+ 
+ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+-		  void *handle_mem, size_t mem_len)
++		  void *handle_mem, size_t mem_len, struct obj_cgroup *objcg)
+ {
+ 	struct zspage *zspage;
+ 	struct zpdesc *zpdesc;
+@@ -1216,6 +1216,11 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+ 	class = zspage_class(pool, zspage);
+ 	off = offset_in_page(class-&gt;size * obj_idx);
+ 
++	if (objcg) {
++		WARN_ON_ONCE(!pool-&gt;memcg_aware);
++		zspage-&gt;objcgs[obj_idx] = objcg;
++	}
++
+ 	if (!ZsHugePage(zspage))
+ 		off += ZS_HANDLE_SIZE;
+ 
+@@ -1388,6 +1393,9 @@ static void obj_free(int class_size, unsigned long obj)
+ 	f_offset = offset_in_page(class_size * f_objidx);
+ 	zspage = get_zspage(f_zpdesc);
+ 
++	if (zspage-&gt;pool-&gt;memcg_aware)
++		zspage-&gt;objcgs[f_objidx] = NULL;
++
+ 	vaddr = kmap_local_zpdesc(f_zpdesc);
+ 	link = (struct link_free *)(vaddr + f_offset);
+ 
+@@ -1538,6 +1546,16 @@ static unsigned long find_alloced_obj(struct size_class *class,
+ 	return handle;
+ }
+ 
++static void zs_migrate_objcg(struct zspage *s_zspage, struct zspage *d_zspage,
++			     unsigned long used_obj, unsigned long free_obj)
++{
++	unsigned int s_idx = used_obj &amp; OBJ_INDEX_MASK;
++	unsigned int d_idx = free_obj &amp; OBJ_INDEX_MASK;
++
++	d_zspage-&gt;objcgs[d_idx] = s_zspage-&gt;objcgs[s_idx];
++	s_zspage-&gt;objcgs[s_idx] = NULL;
++}
++
+ static void migrate_zspage(struct zs_pool *pool, struct zspage *src_zspage,
+ 			   struct zspage *dst_zspage)
+ {
+@@ -1560,6 +1578,11 @@ static void migrate_zspage(struct zs_pool *pool, struct zspage *src_zspage,
+ 		used_obj = handle_to_obj(handle);
+ 		free_obj = obj_malloc(pool, dst_zspage, handle);
+ 		zs_obj_copy(class, free_obj, used_obj);
++
++		if (pool-&gt;memcg_aware)
++			zs_migrate_objcg(src_zspage, dst_zspage,
++					 used_obj, free_obj);
++
+ 		obj_idx++;
+ 		obj_free(class-&gt;size, used_obj);
+ 
+diff --git a/mm/zswap.c b/mm/zswap.c
+index ff9abaa8aa38..68b87c3cc326 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -852,7 +852,7 @@ static void acomp_ctx_put_unlock(struct crypto_acomp_ctx *acomp_ctx)
+ }
+ 
+ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
+-			   struct zswap_pool *pool)
++			   struct zswap_pool *pool, struct obj_cgroup *objcg)
+ {
+ 	struct crypto_acomp_ctx *acomp_ctx;
+ 	struct scatterlist input, output;
+@@ -912,7 +912,7 @@ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
+ 		goto unlock;
+ 	}
+ 
+-	zs_obj_write(pool-&gt;zs_pool, handle, dst, dlen);
++	zs_obj_write(pool-&gt;zs_pool, handle, dst, dlen, objcg);
+ 	entry-&gt;handle = handle;
+ 	entry-&gt;length = dlen;
+ 
+@@ -1414,7 +1414,7 @@ static bool zswap_store_page(struct page *page,
+ 		return false;
+ 	}
+ 
+-	if (!zswap_compress(page, entry, pool))
++	if (!zswap_compress(page, entry, pool, objcg))
+ 		goto compress_failed;
+ 
+ 	old = xa_store(swap_zswap_tree(page_swpentry),
+-- 
+2.52.0
+
+---
+
+Now that obj_cgroups are tracked in the zspage, redirect the zswap layer
+to use the pointer stored in the zspage and remove the pointer in
+struct zswap_entry.
+
+This offsets the temporary memory increase caused by the duplicate
+storage of the obj_cgroup pointer and results in a net zero memory
+footprint change (aside from the array pointer and flags in zspage).
+
+The lifetime and charging of the obj_cgroup is still handled in the
+zswap layer.
+
+Clean up mem_cgroup_from_entry, which has no remaining callers.
+
+Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h |  5 ++++
+ include/linux/zsmalloc.h   |  1 +
+ mm/zsmalloc.c              | 25 +++++++++++++++++++
+ mm/zswap.c                 | 50 +++++++++++++++++---------------------
+ 4 files changed, 53 insertions(+), 28 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 70b685a85bf4..0652db4ff2d5 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1072,6 +1072,11 @@ static inline struct mem_cgroup *get_mem_cgroup_from_objcg(struct obj_cgroup *ob
+ 	return NULL;
+ }
+ 
++static inline struct mem_cgroup *obj_cgroup_memcg(struct obj_cgroup *objcg)
++{
++	return NULL;
++}
++
+ static inline bool folio_memcg_kmem(struct folio *folio)
+ {
+ 	return false;
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 645957a156c4..6010d8dac9ff 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -41,6 +41,7 @@ unsigned long zs_get_total_pages(struct zs_pool *pool);
+ unsigned long zs_compact(struct zs_pool *pool);
+ 
+ unsigned int zs_lookup_class_index(struct zs_pool *pool, unsigned int size);
++struct obj_cgroup *zs_lookup_objcg(struct zs_pool *pool, unsigned long handle);
+ 
+ void zs_pool_stats(struct zs_pool *pool, struct zs_pool_stats *stats);
+ 
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index d4735451c273..a94ca8c26ad9 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1049,6 +1049,31 @@ unsigned int zs_lookup_class_index(struct zs_pool *pool, unsigned int size)
+ }
+ EXPORT_SYMBOL_GPL(zs_lookup_class_index);
+ 
++struct obj_cgroup *zs_lookup_objcg(struct zs_pool *pool, unsigned long handle)
++{
++	unsigned long obj;
++	struct zpdesc *zpdesc;
++	struct zspage *zspage;
++	struct obj_cgroup *objcg;
++	unsigned int obj_idx;
++
++	if (!pool-&gt;memcg_aware)
++		return NULL;
++
++	read_lock(&amp;pool-&gt;lock);
++	obj = handle_to_obj(handle);
++	obj_to_location(obj, &amp;zpdesc, &amp;obj_idx);
++
++	zspage = get_zspage(zpdesc);
++	zspage_read_lock(zspage);
++	read_unlock(&amp;pool-&gt;lock);
++
++	objcg = zspage-&gt;objcgs[obj_idx];
++	zspage_read_unlock(zspage);
++
++	return objcg;
++}
++
+ unsigned long zs_get_total_pages(struct zs_pool *pool)
+ {
+ 	return atomic_long_read(&amp;pool-&gt;pages_allocated);
+diff --git a/mm/zswap.c b/mm/zswap.c
+index 68b87c3cc326..436066965413 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -193,7 +193,6 @@ struct zswap_entry {
+ 	bool referenced;
+ 	struct zswap_pool *pool;
+ 	unsigned long handle;
+-	struct obj_cgroup *objcg;
+ 	struct list_head lru;
+ };
+ 
+@@ -602,25 +601,13 @@ static int zswap_enabled_param_set(const char *val,
+ * lru functions
+ **********************************/
+ 
+-/* should be called under RCU */
+-#ifdef CONFIG_MEMCG
+-static inline struct mem_cgroup *mem_cgroup_from_entry(struct zswap_entry *entry)
+-{
+-	return entry-&gt;objcg ? obj_cgroup_memcg(entry-&gt;objcg) : NULL;
+-}
+-#else
+-static inline struct mem_cgroup *mem_cgroup_from_entry(struct zswap_entry *entry)
+-{
+-	return NULL;
+-}
+-#endif
+-
+ static inline int entry_to_nid(struct zswap_entry *entry)
+ {
+ 	return page_to_nid(virt_to_page(entry));
+ }
+ 
+-static void zswap_lru_add(struct list_lru *list_lru, struct zswap_entry *entry)
++static void zswap_lru_add(struct list_lru *list_lru, struct zswap_entry *entry,
++			  struct obj_cgroup *objcg)
+ {
+ 	int nid = entry_to_nid(entry);
+ 	struct mem_cgroup *memcg;
+@@ -637,19 +624,20 @@ static void zswap_lru_add(struct list_lru *list_lru, struct zswap_entry *entry)
+ 	 * Similar reasoning holds for list_lru_del().
+ 	 */
+ 	rcu_read_lock();
+-	memcg = mem_cgroup_from_entry(entry);
++	memcg = objcg ? obj_cgroup_memcg(objcg) : NULL;
+ 	/* will always succeed */
+ 	list_lru_add(list_lru, &amp;entry-&gt;lru, nid, memcg);
+ 	rcu_read_unlock();
+ }
+ 
+-static void zswap_lru_del(struct list_lru *list_lru, struct zswap_entry *entry)
++static void zswap_lru_del(struct list_lru *list_lru, struct zswap_entry *entry,
++			  struct obj_cgroup *objcg)
+ {
+ 	int nid = entry_to_nid(entry);
+ 	struct mem_cgroup *memcg;
+ 
+ 	rcu_read_lock();
+-	memcg = mem_cgroup_from_entry(entry);
++	memcg = objcg ? obj_cgroup_memcg(objcg) : NULL;
+ 	/* will always succeed */
+ 	list_lru_del(list_lru, &amp;entry-&gt;lru, nid, memcg);
+ 	rcu_read_unlock();
+@@ -717,12 +705,15 @@ static void zswap_entry_cache_free(struct zswap_entry *entry)
+  */
+ static void zswap_entry_free(struct zswap_entry *entry)
+ {
+-	zswap_lru_del(&amp;zswap_list_lru, entry);
++	struct obj_cgroup *objcg = zs_lookup_objcg(entry-&gt;pool-&gt;zs_pool,
++						   entry-&gt;handle);
++
++	zswap_lru_del(&amp;zswap_list_lru, entry, objcg);
+ 	zs_free(entry-&gt;pool-&gt;zs_pool, entry-&gt;handle);
+ 	zswap_pool_put(entry-&gt;pool);
+-	if (entry-&gt;objcg) {
+-		obj_cgroup_uncharge_zswap(entry-&gt;objcg, entry-&gt;length);
+-		obj_cgroup_put(entry-&gt;objcg);
++	if (objcg) {
++		obj_cgroup_uncharge_zswap(objcg, entry-&gt;length);
++		obj_cgroup_put(objcg);
+ 	}
+ 	if (entry-&gt;length == PAGE_SIZE)
+ 		atomic_long_dec(&amp;zswap_stored_incompressible_pages);
+@@ -995,6 +986,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 	struct mempolicy *mpol;
+ 	bool folio_was_allocated;
+ 	struct swap_info_struct *si;
++	struct obj_cgroup *objcg;
+ 	int ret = 0;
+ 
+ 	/* try to allocate swap cache folio */
+@@ -1044,8 +1036,9 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 	xa_erase(tree, offset);
+ 
+ 	count_vm_event(ZSWPWB);
+-	if (entry-&gt;objcg)
+-		count_objcg_events(entry-&gt;objcg, ZSWPWB, 1);
++	objcg = zs_lookup_objcg(entry-&gt;pool-&gt;zs_pool, entry-&gt;handle);
++	if (objcg)
++		count_objcg_events(objcg, ZSWPWB, 1);
+ 
+ 	zswap_entry_free(entry);
+ 
+@@ -1464,11 +1457,10 @@ static bool zswap_store_page(struct page *page,
+ 	 */
+ 	entry-&gt;pool = pool;
+ 	entry-&gt;swpentry = page_swpentry;
+-	entry-&gt;objcg = objcg;
+ 	entry-&gt;referenced = true;
+ 	if (entry-&gt;length) {
+ 		INIT_LIST_HEAD(&amp;entry-&gt;lru);
+-		zswap_lru_add(&amp;zswap_list_lru, entry);
++		zswap_lru_add(&amp;zswap_list_lru, entry, objcg);
+ 	}
+ 
+ 	return true;
+@@ -1593,6 +1585,7 @@ int zswap_load(struct folio *folio)
+ 	bool swapcache = folio_test_swapcache(folio);
+ 	struct xarray *tree = swap_zswap_tree(swp);
+ 	struct zswap_entry *entry;
++	struct obj_cgroup *objcg;
+ 
+ 	VM_WARN_ON_ONCE(!folio_test_locked(folio));
+ 
+@@ -1621,8 +1614,9 @@ int zswap_load(struct folio *folio)
+ 	folio_mark_uptodate(folio);
+ 
+ 	count_vm_event(ZSWPIN);
+-	if (entry-&gt;objcg)
+-		count_objcg_events(entry-&gt;objcg, ZSWPIN, 1);
++	objcg = zs_lookup_objcg(entry-&gt;pool-&gt;zs_pool, entry-&gt;handle);
++	if (objcg)
++		count_objcg_events(objcg, ZSWPIN, 1);
+ 
+ 	/*
+ 	 * When reading into the swapcache, invalidate our entry. The
+-- 
+2.52.0</pre>
 </details>
-<div class="review-comment-signals">Signals: cleaner code</div>
+<a href="https://lore.kernel.org/r/20260311195153.4013476-2-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, no functional change intended</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1">
+</div>
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Joshua Hahn</span>
+<span class="review-author">Joshua Hahn (author)</span>
 <a class="date-chip" href="../2026-03-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-11">2026-03-11</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Agreed to implement the suggested changes and thanked Johannes for his review.</div>
+<div class="review-comment-text">The author addressed a concern about the accuracy of memory consumption accounting in zswap by changing how entries are charged to the zsmalloc layer, specifically using the size_class slot they occupy instead of the compressed object&#x27;s size.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Wed, 11 Mar 2026 16:16:34 -0400 Johannes Weiner &lt;hannes@cmpxchg.org&gt; wrote:
+<pre class="raw-body-text">Now that zswap_entries do not directly track obj_cgroups of the entries,
+handle the lifetime management and charging of these entries into the
+zsmalloc layer.
+
+One functional change is that zswap entries are now no longer accounted
+by the size of the compressed object, but by the size of the size_class
+slot they occupy.
+
+This brings charging one step closer to an accurate representation of
+the memory consumed in the zpdesc; even if a compressed object doesn&#x27;t
+consume the entirety of a obj slot, we should account the entirety of
+the compressed object slot that the object makes unusable.
+
+While at it, also remove an unnecessary newline in obj_free.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h | 10 ------
+ mm/memcontrol.c            | 54 ++-----------------------------
+ mm/zsmalloc.c              | 65 ++++++++++++++++++++++++++++++++++++--
+ mm/zswap.c                 |  8 -----
+ 4 files changed, 66 insertions(+), 71 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 0652db4ff2d5..701d9ab6fef1 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1851,22 +1851,12 @@ static inline bool memcg_is_dying(struct mem_cgroup *memcg)
+ 
+ #if defined(CONFIG_MEMCG) &amp;&amp; defined(CONFIG_ZSWAP)
+ bool obj_cgroup_may_zswap(struct obj_cgroup *objcg);
+-void obj_cgroup_charge_zswap(struct obj_cgroup *objcg, size_t size);
+-void obj_cgroup_uncharge_zswap(struct obj_cgroup *objcg, size_t size);
+ bool mem_cgroup_zswap_writeback_enabled(struct mem_cgroup *memcg);
+ #else
+ static inline bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
+ {
+ 	return true;
+ }
+-static inline void obj_cgroup_charge_zswap(struct obj_cgroup *objcg,
+-					   size_t size)
+-{
+-}
+-static inline void obj_cgroup_uncharge_zswap(struct obj_cgroup *objcg,
+-					     size_t size)
+-{
+-}
+ static inline bool mem_cgroup_zswap_writeback_enabled(struct mem_cgroup *memcg)
+ {
+ 	/* if zswap is disabled, do not block pages going to the swapping device */
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index a52da3a5e4fd..68139be66a4f 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -716,6 +716,7 @@ void mod_memcg_state(struct mem_cgroup *memcg, enum memcg_stat_item idx,
+ 
+ 	put_cpu();
+ }
++EXPORT_SYMBOL(mod_memcg_state);
+ 
+ #ifdef CONFIG_MEMCG_V1
+ /* idx can be of type enum memcg_stat_item or node_stat_item. */
+@@ -3169,11 +3170,13 @@ int obj_cgroup_charge(struct obj_cgroup *objcg, gfp_t gfp, size_t size)
+ {
+ 	return obj_cgroup_charge_account(objcg, gfp, size, NULL, 0);
+ }
++EXPORT_SYMBOL(obj_cgroup_charge);
+ 
+ void obj_cgroup_uncharge(struct obj_cgroup *objcg, size_t size)
+ {
+ 	refill_obj_stock(objcg, size, true, 0, NULL, 0);
+ }
++EXPORT_SYMBOL(obj_cgroup_uncharge);
+ 
+ static inline size_t obj_full_size(struct kmem_cache *s)
+ {
+@@ -5488,57 +5491,6 @@ bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
+ 	return ret;
+ }
+ 
+-/**
+- * obj_cgroup_charge_zswap - charge compression backend memory
+- * @objcg: the object cgroup
+- * @size: size of compressed object
+- *
+- * This forces the charge after obj_cgroup_may_zswap() allowed
+- * compression and storage in zswap for this cgroup to go ahead.
+- */
+-void obj_cgroup_charge_zswap(struct obj_cgroup *objcg, size_t size)
+-{
+-	struct mem_cgroup *memcg;
+-
+-	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+-		return;
+-
+-	VM_WARN_ON_ONCE(!(current-&gt;flags &amp; PF_MEMALLOC));
+-
+-	/* PF_MEMALLOC context, charging must succeed */
+-	if (obj_cgroup_charge(objcg, GFP_KERNEL, size))
+-		VM_WARN_ON_ONCE(1);
+-
+-	rcu_read_lock();
+-	memcg = obj_cgroup_memcg(objcg);
+-	mod_memcg_state(memcg, MEMCG_ZSWAP_B, size);
+-	mod_memcg_state(memcg, MEMCG_ZSWAPPED, 1);
+-	rcu_read_unlock();
+-}
+-
+-/**
+- * obj_cgroup_uncharge_zswap - uncharge compression backend memory
+- * @objcg: the object cgroup
+- * @size: size of compressed object
+- *
+- * Uncharges zswap memory on page in.
+- */
+-void obj_cgroup_uncharge_zswap(struct obj_cgroup *objcg, size_t size)
+-{
+-	struct mem_cgroup *memcg;
+-
+-	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+-		return;
+-
+-	obj_cgroup_uncharge(objcg, size);
+-
+-	rcu_read_lock();
+-	memcg = obj_cgroup_memcg(objcg);
+-	mod_memcg_state(memcg, MEMCG_ZSWAP_B, -size);
+-	mod_memcg_state(memcg, MEMCG_ZSWAPPED, -1);
+-	rcu_read_unlock();
+-}
+-
+ bool mem_cgroup_zswap_writeback_enabled(struct mem_cgroup *memcg)
+ {
+ 	/* if zswap is disabled, do not block pages going to the swapping device */
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index a94ca8c26ad9..291194572a09 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1028,6 +1028,59 @@ static bool zspage_empty(struct zspage *zspage)
+ 	return get_zspage_inuse(zspage) == 0;
+ }
+ 
++#ifdef CONFIG_MEMCG
++static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
++			    int size)
++{
++	struct mem_cgroup *memcg;
++
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
++		return;
++
++	VM_WARN_ON_ONCE(!(current-&gt;flags &amp; PF_MEMALLOC));
++	WARN_ON_ONCE(!pool-&gt;memcg_aware);
++
++	/* PF_MEMALLOC context, charging must succeed */
++	if (obj_cgroup_charge(objcg, GFP_KERNEL, size))
++		VM_WARN_ON_ONCE(1);
++
++	rcu_read_lock();
++	memcg = obj_cgroup_memcg(objcg);
++	mod_memcg_state(memcg, pool-&gt;compressed_stat, size);
++	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, 1);
++	rcu_read_unlock();
++}
++
++static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
++			      int size)
++{
++	struct mem_cgroup *memcg;
++
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
++		return;
++
++	WARN_ON_ONCE(!pool-&gt;memcg_aware);
++
++	obj_cgroup_uncharge(objcg, size);
++
++	rcu_read_lock();
++	memcg = obj_cgroup_memcg(objcg);
++	mod_memcg_state(memcg, pool-&gt;compressed_stat, -size);
++	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, -1);
++	rcu_read_unlock();
++}
++#else
++static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
++			    int size)
++{
++}
++
++static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
++			      int size)
++{
++}
++#endif
++
+ /**
+  * zs_lookup_class_index() - Returns index of the zsmalloc &amp;size_class
+  * that hold objects of the provided size.
+@@ -1244,6 +1297,8 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+ 	if (objcg) {
+ 		WARN_ON_ONCE(!pool-&gt;memcg_aware);
+ 		zspage-&gt;objcgs[obj_idx] = objcg;
++		obj_cgroup_get(objcg);
++		zs_charge_objcg(pool, objcg, class-&gt;size);
+ 	}
+ 
+ 	if (!ZsHugePage(zspage))
+@@ -1409,17 +1464,23 @@ static void obj_free(int class_size, unsigned long obj)
+ 	struct link_free *link;
+ 	struct zspage *zspage;
+ 	struct zpdesc *f_zpdesc;
++	struct zs_pool *pool;
+ 	unsigned long f_offset;
+ 	unsigned int f_objidx;
+ 	void *vaddr;
+ 
+-
+ 	obj_to_location(obj, &amp;f_zpdesc, &amp;f_objidx);
+ 	f_offset = offset_in_page(class_size * f_objidx);
+ 	zspage = get_zspage(f_zpdesc);
++	pool = zspage-&gt;pool;
++
++	if (pool-&gt;memcg_aware &amp;&amp; zspage-&gt;objcgs[f_objidx]) {
++		struct obj_cgroup *objcg = zspage-&gt;objcgs[f_objidx];
+ 
+-	if (zspage-&gt;pool-&gt;memcg_aware)
++		zs_uncharge_objcg(pool, objcg, class_size);
++		obj_cgroup_put(objcg);
+ 		zspage-&gt;objcgs[f_objidx] = NULL;
++	}
+ 
+ 	vaddr = kmap_local_zpdesc(f_zpdesc);
+ 	link = (struct link_free *)(vaddr + f_offset);
+diff --git a/mm/zswap.c b/mm/zswap.c
+index 436066965413..bca29a6e18f3 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -711,10 +711,6 @@ static void zswap_entry_free(struct zswap_entry *entry)
+ 	zswap_lru_del(&amp;zswap_list_lru, entry, objcg);
+ 	zs_free(entry-&gt;pool-&gt;zs_pool, entry-&gt;handle);
+ 	zswap_pool_put(entry-&gt;pool);
+-	if (objcg) {
+-		obj_cgroup_uncharge_zswap(objcg, entry-&gt;length);
+-		obj_cgroup_put(objcg);
+-	}
+ 	if (entry-&gt;length == PAGE_SIZE)
+ 		atomic_long_dec(&amp;zswap_stored_incompressible_pages);
+ 	zswap_entry_cache_free(entry);
+@@ -1437,10 +1433,6 @@ static bool zswap_store_page(struct page *page,
+ 	 * when the entry is removed from the tree.
+ 	 */
+ 	zswap_pool_get(pool);
+-	if (objcg) {
+-		obj_cgroup_get(objcg);
+-		obj_cgroup_charge_zswap(objcg, entry-&gt;length);
+-	}
+ 	atomic_long_inc(&amp;zswap_stored_pages);
+ 	if (entry-&gt;length == PAGE_SIZE)
+ 		atomic_long_inc(&amp;zswap_stored_incompressible_pages);
+-- 
+2.52.0
+
+---
+
+Zswap compresses and uncompresses in PAGE_SIZE units, which simplifies
+the accounting for how much memory it has compressed. However, when a
+compressed object is stored at the boundary of two zspages, accounting
+at a PAGE_SIZE granularity makes it difficult to fractionally charge
+each backing zspage with the ratio of memory it backs for the
+compressed object.
+
+To make sub-PAGE_SIZE granularity charging possible for MEMCG_ZSWAPPED,
+track the value in bytes and adjust its accounting accordingly.
+
+No functional changes intended.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h | 2 +-
+ mm/memcontrol.c            | 5 +++--
+ mm/zsmalloc.c              | 4 ++--
+ mm/zswap.c                 | 8 +++++---
+ 4 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 701d9ab6fef1..ce2e598b5963 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -38,7 +38,7 @@ enum memcg_stat_item {
+ 	MEMCG_VMALLOC,
+ 	MEMCG_KMEM,
+ 	MEMCG_ZSWAP_B,
+-	MEMCG_ZSWAPPED,
++	MEMCG_ZSWAPPED_B,
+ 	MEMCG_NR_STAT,
+ };
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 68139be66a4f..1cb02d2febe8 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -342,7 +342,7 @@ static const unsigned int memcg_stat_items[] = {
+ 	MEMCG_VMALLOC,
+ 	MEMCG_KMEM,
+ 	MEMCG_ZSWAP_B,
+-	MEMCG_ZSWAPPED,
++	MEMCG_ZSWAPPED_B,
+ };
+ 
+ #define NR_MEMCG_NODE_STAT_ITEMS ARRAY_SIZE(memcg_node_stat_items)
+@@ -1364,7 +1364,7 @@ static const struct memory_stat memory_stats[] = {
+ 	{ &quot;shmem&quot;,			NR_SHMEM			},
+ #ifdef CONFIG_ZSWAP
+ 	{ &quot;zswap&quot;,			MEMCG_ZSWAP_B			},
+-	{ &quot;zswapped&quot;,			MEMCG_ZSWAPPED			},
++	{ &quot;zswapped&quot;,			MEMCG_ZSWAPPED_B		},
+ #endif
+ 	{ &quot;file_mapped&quot;,		NR_FILE_MAPPED			},
+ 	{ &quot;file_dirty&quot;,			NR_FILE_DIRTY			},
+@@ -1412,6 +1412,7 @@ static int memcg_page_state_unit(int item)
+ 	switch (item) {
+ 	case MEMCG_PERCPU_B:
+ 	case MEMCG_ZSWAP_B:
++	case MEMCG_ZSWAPPED_B:
+ 	case NR_SLAB_RECLAIMABLE_B:
+ 	case NR_SLAB_UNRECLAIMABLE_B:
+ 		return 1;
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 291194572a09..24665d7cd4a9 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1047,7 +1047,7 @@ static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+ 	rcu_read_lock();
+ 	memcg = obj_cgroup_memcg(objcg);
+ 	mod_memcg_state(memcg, pool-&gt;compressed_stat, size);
+-	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, 1);
++	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, PAGE_SIZE);
+ 	rcu_read_unlock();
+ }
+ 
+@@ -1066,7 +1066,7 @@ static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+ 	rcu_read_lock();
+ 	memcg = obj_cgroup_memcg(objcg);
+ 	mod_memcg_state(memcg, pool-&gt;compressed_stat, -size);
+-	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, -1);
++	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, -(int)PAGE_SIZE);
+ 	rcu_read_unlock();
+ }
+ #else
+diff --git a/mm/zswap.c b/mm/zswap.c
+index bca29a6e18f3..d81e2db4490b 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -257,7 +257,7 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
+ 	/* unique name for each pool specifically required by zsmalloc */
+ 	snprintf(name, 38, &quot;zswap%x&quot;, atomic_inc_return(&amp;zswap_pools_count));
+ 	pool-&gt;zs_pool = zs_create_pool(name, true, MEMCG_ZSWAP_B,
+-				       MEMCG_ZSWAPPED);
++				       MEMCG_ZSWAPPED_B);
+ 	if (!pool-&gt;zs_pool)
+ 		goto error;
+ 
+@@ -1214,8 +1214,10 @@ static unsigned long zswap_shrinker_count(struct shrinker *shrinker,
+ 	 */
+ 	if (!mem_cgroup_disabled()) {
+ 		mem_cgroup_flush_stats(memcg);
+-		nr_backing = memcg_page_state(memcg, MEMCG_ZSWAP_B) &gt;&gt; PAGE_SHIFT;
+-		nr_stored = memcg_page_state(memcg, MEMCG_ZSWAPPED);
++		nr_backing = memcg_page_state(memcg, MEMCG_ZSWAP_B);
++		nr_backing &gt;&gt;= PAGE_SHIFT;
++		nr_stored = memcg_page_state(memcg, MEMCG_ZSWAPPED_B);
++		nr_stored &gt;&gt;= PAGE_SHIFT;
+ 	} else {
+ 		nr_backing = zswap_total_pages();
+ 		nr_stored = atomic_long_read(&amp;zswap_stored_pages);
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260311195153.4013476-8-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-03-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-11">2026-03-11</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the inaccuracy of node stats due to the coarse PAGE_SIZE granularity, acknowledged that only NR_ZSWAP_B can be kept accurate, and accepted the small inaccuracy as part of these changes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Now that memcg charging happens in the zsmalloc layer where we have both
+objcg and page information, we can specify which node&#x27;s memcg lruvec
+zswapped memory should be accounted to.
+
+Move MEMCG_ZSWAP_B and MEMCG_ZSWAPPED_B from enum memcg_stat_item to
+enum node_stat_item. Reanme their prefixes from MEMCG to NR to reflect
+this move as well.
+
+In addition, decouple the updates of node stats (vmstat) and
+memcg-lruvec stats, since node stats can only track values at a
+PAGE_SIZE granularity.
+
+As a result of tracking zswap statistics at a finer granularity, the
+charging from zsmalloc also gets more complicated to cover the cases
+when the compressed object spans two zpdescs, which both live on
+different nodes. In this case, the memcg-lruvec of both node-memcg
+combinations are partially charged.
+
+memcg-lruvec stats are now updated precisely and proportionally when
+compressed objects are split across pages. Unfortunately for node stats,
+only NR_ZSWAP_B can be kept accurate. NR_ZSWAPPED_B works as a good
+best-effort value, but cannot proportionally account for compressed
+objects split across nodes due to the coarse PAGE_SIZE granularity of
+node stats. For such objects, NR_ZSWAPPED_B is accounted to the first
+zpdesc&#x27;s node stats.
+
+Note that this is not a new inaccuracy, but one that is simply left
+unable to be fixed as part of these changes. The small inaccuracy is
+accepted in place of invasive changes across all of vmstat
+infrastructure to begin tracking stats at byte granularity.
+
+Finally, note that handling of objcg migrations across zspages (and
+their subsequent migrations across nodes) are handled in the next patch.
+
+Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h |   5 +-
+ include/linux/mmzone.h     |   2 +
+ include/linux/zsmalloc.h   |   6 +--
+ mm/memcontrol.c            |  22 ++++----
+ mm/vmstat.c                |   2 +
+ mm/zsmalloc.c              | 104 +++++++++++++++++++++++++++----------
+ mm/zswap.c                 |   7 ++-
+ 7 files changed, 102 insertions(+), 46 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index ce2e598b5963..b03501e0c09b 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -37,8 +37,6 @@ enum memcg_stat_item {
+ 	MEMCG_PERCPU_B,
+ 	MEMCG_VMALLOC,
+ 	MEMCG_KMEM,
+-	MEMCG_ZSWAP_B,
+-	MEMCG_ZSWAPPED_B,
+ 	MEMCG_NR_STAT,
+ };
+ 
+@@ -927,6 +925,9 @@ struct mem_cgroup *mem_cgroup_get_oom_group(struct task_struct *victim,
+ 					    struct mem_cgroup *oom_domain);
+ void mem_cgroup_print_oom_group(struct mem_cgroup *memcg);
+ 
++void mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++			    int val);
++
+ /* idx can be of type enum memcg_stat_item or node_stat_item */
+ void mod_memcg_state(struct mem_cgroup *memcg,
+ 		     enum memcg_stat_item idx, int val);
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 3e51190a55e4..ae16a90491ac 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -258,6 +258,8 @@ enum node_stat_item {
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	NR_HUGETLB,
+ #endif
++	NR_ZSWAP_B,
++	NR_ZSWAPPED_B,
+ 	NR_BALLOON_PAGES,
+ 	NR_KERNEL_FILE_PAGES,
+ 	NR_VM_NODE_STAT_ITEMS
+diff --git a/include/linux/zsmalloc.h b/include/linux/zsmalloc.h
+index 6010d8dac9ff..fd79916c7740 100644
+--- a/include/linux/zsmalloc.h
++++ b/include/linux/zsmalloc.h
+@@ -24,11 +24,11 @@ struct zs_pool_stats {
+ struct zs_pool;
+ struct scatterlist;
+ struct obj_cgroup;
+-enum memcg_stat_item;
++enum node_stat_item;
+ 
+ struct zs_pool *zs_create_pool(const char *name, bool memcg_aware,
+-			       enum memcg_stat_item compressed_stat,
+-			       enum memcg_stat_item uncompressed_stat);
++			       enum node_stat_item compressed_stat,
++			       enum node_stat_item uncompressed_stat);
+ void zs_destroy_pool(struct zs_pool *pool);
+ 
+ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t flags,
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 1cb02d2febe8..d87bc4beff16 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -333,6 +333,8 @@ static const unsigned int memcg_node_stat_items[] = {
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	NR_HUGETLB,
+ #endif
++	NR_ZSWAP_B,
++	NR_ZSWAPPED_B,
+ };
+ 
+ static const unsigned int memcg_stat_items[] = {
+@@ -341,8 +343,6 @@ static const unsigned int memcg_stat_items[] = {
+ 	MEMCG_PERCPU_B,
+ 	MEMCG_VMALLOC,
+ 	MEMCG_KMEM,
+-	MEMCG_ZSWAP_B,
+-	MEMCG_ZSWAPPED_B,
+ };
+ 
+ #define NR_MEMCG_NODE_STAT_ITEMS ARRAY_SIZE(memcg_node_stat_items)
+@@ -737,9 +737,8 @@ unsigned long memcg_page_state_local(struct mem_cgroup *memcg, int idx)
+ }
+ #endif
+ 
+-static void mod_memcg_lruvec_state(struct lruvec *lruvec,
+-				     enum node_stat_item idx,
+-				     int val)
++void mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++			    int val)
+ {
+ 	struct mem_cgroup_per_node *pn;
+ 	struct mem_cgroup *memcg;
+@@ -766,6 +765,7 @@ static void mod_memcg_lruvec_state(struct lruvec *lruvec,
+ 
+ 	put_cpu();
+ }
++EXPORT_SYMBOL(mod_memcg_lruvec_state);
+ 
+ /**
+  * mod_lruvec_state - update lruvec memory statistics
+@@ -1363,8 +1363,8 @@ static const struct memory_stat memory_stats[] = {
+ 	{ &quot;vmalloc&quot;,			MEMCG_VMALLOC			},
+ 	{ &quot;shmem&quot;,			NR_SHMEM			},
+ #ifdef CONFIG_ZSWAP
+-	{ &quot;zswap&quot;,			MEMCG_ZSWAP_B			},
+-	{ &quot;zswapped&quot;,			MEMCG_ZSWAPPED_B		},
++	{ &quot;zswap&quot;,			NR_ZSWAP_B			},
++	{ &quot;zswapped&quot;,			NR_ZSWAPPED_B			},
+ #endif
+ 	{ &quot;file_mapped&quot;,		NR_FILE_MAPPED			},
+ 	{ &quot;file_dirty&quot;,			NR_FILE_DIRTY			},
+@@ -1411,8 +1411,8 @@ static int memcg_page_state_unit(int item)
+ {
+ 	switch (item) {
+ 	case MEMCG_PERCPU_B:
+-	case MEMCG_ZSWAP_B:
+-	case MEMCG_ZSWAPPED_B:
++	case NR_ZSWAP_B:
++	case NR_ZSWAPPED_B:
+ 	case NR_SLAB_RECLAIMABLE_B:
+ 	case NR_SLAB_UNRECLAIMABLE_B:
+ 		return 1;
+@@ -5482,7 +5482,7 @@ bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
+ 
+ 		/* Force flush to get accurate stats for charging */
+ 		__mem_cgroup_flush_stats(memcg, true);
+-		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
++		pages = memcg_page_state(memcg, NR_ZSWAP_B) / PAGE_SIZE;
+ 		if (pages &lt; max)
+ 			continue;
+ 		ret = false;
+@@ -5511,7 +5511,7 @@ static u64 zswap_current_read(struct cgroup_subsys_state *css,
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+ 
+ 	mem_cgroup_flush_stats(memcg);
+-	return memcg_page_state(memcg, MEMCG_ZSWAP_B);
++	return memcg_page_state(memcg, NR_ZSWAP_B);
+ }
+ 
+ static int zswap_max_show(struct seq_file *m, void *v)
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 86b14b0f77b5..389ff986ceac 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1279,6 +1279,8 @@ const char * const vmstat_text[] = {
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	[I(NR_HUGETLB)]				= &quot;nr_hugetlb&quot;,
+ #endif
++	[I(NR_ZSWAP_B)]				= &quot;zswap&quot;,
++	[I(NR_ZSWAPPED_B)]			= &quot;zswapped&quot;,
+ 	[I(NR_BALLOON_PAGES)]			= &quot;nr_balloon_pages&quot;,
+ 	[I(NR_KERNEL_FILE_PAGES)]		= &quot;nr_kernel_file_pages&quot;,
+ #undef I
+diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+index 24665d7cd4a9..ab085961b0e2 100644
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -216,8 +216,8 @@ struct zs_pool {
+ 	struct work_struct free_work;
+ #endif
+ 	bool memcg_aware;
+-	enum memcg_stat_item compressed_stat;
+-	enum memcg_stat_item uncompressed_stat;
++	enum node_stat_item compressed_stat;
++	enum node_stat_item uncompressed_stat;
+ 	/* protect zspage migration/compaction */
+ 	rwlock_t lock;
+ 	atomic_t compaction_in_progress;
+@@ -823,6 +823,9 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
+ 		reset_zpdesc(zpdesc);
+ 		zpdesc_unlock(zpdesc);
+ 		zpdesc_dec_zone_page_state(zpdesc);
++		if (pool-&gt;memcg_aware)
++			dec_node_page_state(zpdesc_page(zpdesc),
++					    pool-&gt;compressed_stat);
+ 		zpdesc_put(zpdesc);
+ 		zpdesc = next;
+ 	} while (zpdesc != NULL);
+@@ -974,6 +977,9 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+ 		__zpdesc_set_zsmalloc(zpdesc);
+ 
+ 		zpdesc_inc_zone_page_state(zpdesc);
++		if (pool-&gt;memcg_aware)
++			inc_node_page_state(zpdesc_page(zpdesc),
++					    pool-&gt;compressed_stat);
+ 		zpdescs[i] = zpdesc;
+ 	}
+ 
+@@ -985,6 +991,9 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+ err:
+ 	while (--i &gt;= 0) {
+ 		zpdesc_dec_zone_page_state(zpdescs[i]);
++		if (pool-&gt;memcg_aware)
++			dec_node_page_state(zpdesc_page(zpdescs[i]),
++					    pool-&gt;compressed_stat);
+ 		free_zpdesc(zpdescs[i]);
+ 	}
+ 	if (pool-&gt;memcg_aware)
+@@ -1029,10 +1038,48 @@ static bool zspage_empty(struct zspage *zspage)
+ }
+ 
+ #ifdef CONFIG_MEMCG
+-static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+-			    int size)
++static void __zs_mod_memcg_lruvec(struct zs_pool *pool, struct zpdesc *zpdesc,
++				  struct obj_cgroup *objcg, int size,
++				  int sign, unsigned long offset)
+ {
+ 	struct mem_cgroup *memcg;
++	struct lruvec *lruvec;
++	int compressed_size = size, original_size = PAGE_SIZE;
++	int nid = page_to_nid(zpdesc_page(zpdesc));
++	int next_nid = nid;
++
++	if (offset + size &gt; PAGE_SIZE) {
++		struct zpdesc *next_zpdesc = get_next_zpdesc(zpdesc);
++
++		next_nid = page_to_nid(zpdesc_page(next_zpdesc));
++		if (nid != next_nid) {
++			compressed_size = PAGE_SIZE - offset;
++			original_size = (PAGE_SIZE * compressed_size) / size;
++		}
++	}
++
++	rcu_read_lock();
++	memcg = obj_cgroup_memcg(objcg);
++	lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
++	mod_memcg_lruvec_state(lruvec, pool-&gt;compressed_stat,
++			       sign * compressed_size);
++	mod_memcg_lruvec_state(lruvec, pool-&gt;uncompressed_stat,
++			       sign * original_size);
++
++	if (nid != next_nid) {
++		lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(next_nid));
++		mod_memcg_lruvec_state(lruvec, pool-&gt;compressed_stat,
++				       sign * (size - compressed_size));
++		mod_memcg_lruvec_state(lruvec, pool-&gt;uncompressed_stat,
++				       sign * (PAGE_SIZE - original_size));
++	}
++	rcu_read_unlock();
++}
++
++static void zs_charge_objcg(struct zs_pool *pool, struct zpdesc *zpdesc,
++			    struct obj_cgroup *objcg, int size,
++			    unsigned long offset)
++{
+ 
+ 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+ 		return;
+@@ -1044,18 +1091,19 @@ static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+ 	if (obj_cgroup_charge(objcg, GFP_KERNEL, size))
+ 		VM_WARN_ON_ONCE(1);
+ 
+-	rcu_read_lock();
+-	memcg = obj_cgroup_memcg(objcg);
+-	mod_memcg_state(memcg, pool-&gt;compressed_stat, size);
+-	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, PAGE_SIZE);
+-	rcu_read_unlock();
++	__zs_mod_memcg_lruvec(pool, zpdesc, objcg, size, 1, offset);
++
++	/*
++	 * Node-level vmstats are charged in PAGE_SIZE units. As a best-effort,
++	 * always charge the uncompressed stats to the first zpdesc.
++	 */
++	inc_node_page_state(zpdesc_page(zpdesc), pool-&gt;uncompressed_stat);
+ }
+ 
+-static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+-			      int size)
++static void zs_uncharge_objcg(struct zs_pool *pool, struct zpdesc *zpdesc,
++			      struct obj_cgroup *objcg, int size,
++			      unsigned long offset)
+ {
+-	struct mem_cgroup *memcg;
+-
+ 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+ 		return;
+ 
+@@ -1063,20 +1111,24 @@ static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+ 
+ 	obj_cgroup_uncharge(objcg, size);
+ 
+-	rcu_read_lock();
+-	memcg = obj_cgroup_memcg(objcg);
+-	mod_memcg_state(memcg, pool-&gt;compressed_stat, -size);
+-	mod_memcg_state(memcg, pool-&gt;uncompressed_stat, -(int)PAGE_SIZE);
+-	rcu_read_unlock();
++	__zs_mod_memcg_lruvec(pool, zpdesc, objcg, size, -1, offset);
++
++	/*
++	 * Node-level vmstats are charged in PAGE_SIZE units. As a best-effort,
++	 * always uncharged the uncompressed stats from the first zpdesc.
++	 */
++	dec_node_page_state(zpdesc_page(zpdesc), pool-&gt;uncompressed_stat);
+ }
+ #else
+-static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+-			    int size)
++static void zs_charge_objcg(struct zs_pool *pool, struct zpdesc *zpdesc,
++			    struct obj_cgroup *objcg, int size,
++			    unsigned long offset)
+ {
+ }
+ 
+-static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+-			      int size)
++static void zs_uncharge_objcg(struct zs_pool *pool, struct zpdesc *zpdesc,
++			      struct obj_cgroup *objcg, int size,
++			      unsigned long offset)
+ {
+ }
+ #endif
+@@ -1298,7 +1350,7 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+ 		WARN_ON_ONCE(!pool-&gt;memcg_aware);
+ 		zspage-&gt;objcgs[obj_idx] = objcg;
+ 		obj_cgroup_get(objcg);
+-		zs_charge_objcg(pool, objcg, class-&gt;size);
++		zs_charge_objcg(pool, zpdesc, objcg, class-&gt;size, off);
+ 	}
+ 
+ 	if (!ZsHugePage(zspage))
+@@ -1477,7 +1529,7 @@ static void obj_free(int class_size, unsigned long obj)
+ 	if (pool-&gt;memcg_aware &amp;&amp; zspage-&gt;objcgs[f_objidx]) {
+ 		struct obj_cgroup *objcg = zspage-&gt;objcgs[f_objidx];
+ 
+-		zs_uncharge_objcg(pool, objcg, class_size);
++		zs_uncharge_objcg(pool, f_zpdesc, objcg, class_size, f_offset);
+ 		obj_cgroup_put(objcg);
+ 		zspage-&gt;objcgs[f_objidx] = NULL;
+ 	}
+@@ -2191,8 +2243,8 @@ static int calculate_zspage_chain_size(int class_size)
+  * otherwise NULL.
+  */
+ struct zs_pool *zs_create_pool(const char *name, bool memcg_aware,
+-			       enum memcg_stat_item compressed_stat,
+-			       enum memcg_stat_item uncompressed_stat)
++			       enum node_stat_item compressed_stat,
++			       enum node_stat_item uncompressed_stat)
+ {
+ 	int i;
+ 	struct zs_pool *pool;
+diff --git a/mm/zswap.c b/mm/zswap.c
+index d81e2db4490b..2e9352b46693 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -256,8 +256,7 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
+ 
+ 	/* unique name for each pool specifically required by zsmalloc */
+ 	snprintf(name, 38, &quot;zswap%x&quot;, atomic_inc_return(&amp;zswap_pools_count));
+-	pool-&gt;zs_pool = zs_create_pool(name, true, MEMCG_ZSWAP_B,
+-				       MEMCG_ZSWAPPED_B);
++	pool-&gt;zs_pool = zs_create_pool(name, true, NR_ZSWAP_B, NR_ZSWAPPED_B);
+ 	if (!pool-&gt;zs_pool)
+ 		goto error;
+ 
+@@ -1214,9 +1213,9 @@ static unsigned long zswap_shrinker_count(struct shrinker *shrinker,
+ 	 */
+ 	if (!mem_cgroup_disabled()) {
+ 		mem_cgroup_flush_stats(memcg);
+-		nr_backing = memcg_page_state(memcg, MEMCG_ZSWAP_B);
++		nr_backing = memcg_page_state(memcg, NR_ZSWAP_B);
+ 		nr_backing &gt;&gt;= PAGE_SHIFT;
+-		nr_stored = memcg_page_state(memcg, MEMCG_ZSWAPPED_B);
++		nr_stored = memcg_page_state(memcg, NR_ZSWAPPED_B);
+ 		nr_stored &gt;&gt;= PAGE_SHIFT;
+ 	} else {
+ 		nr_backing = zswap_total_pages();
+-- 
+2.52.0
+
+---
+
+On Wed, 11 Mar 2026 12:51:37 -0700 Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+
+Ouch, immediately after sending these out I realized that I forgot to
+add a &quot;V2&quot; indicator in the subjects of all of these patches.
+
+I apologize for the noise.
+
+&gt; Joshua Hahn (11):
+&gt;   mm/zsmalloc: Rename zs_object_copy to zs_obj_copy
+&gt;   mm/zsmalloc: Make all obj_idx unsigned ints
+&gt;   mm/zsmalloc: Introduce conditional memcg awareness to zs_pool
+&gt;   mm/zsmalloc: Introduce objcgs pointer in struct zspage
+&gt;   mm/zsmalloc: Store obj_cgroup pointer in zspage
+&gt;   mm/zsmalloc, zswap: Redirect zswap_entry-&gt;objcg to zspage
+&gt;   mm/zsmalloc, zswap: Handle objcg charging and lifetime in zsmalloc
+&gt;   mm/memcontrol: Track MEMCG_ZSWAPPED in bytes
+&gt;   mm/vmstat, memcontrol: Track ZSWAP_B, ZSWAPPED_B per-memcg-lruvec
+&gt;   mm/zsmalloc: Handle single object charge migration in migrate_zspage
+&gt;   mm/zsmalloc: Handle charge migration in zpdesc substitution
+&gt; 
+&gt;  drivers/block/zram/zram_drv.c |  10 +-
+&gt;  include/linux/memcontrol.h    |  20 +-
+&gt;  include/linux/mmzone.h        |   2 +
+&gt;  include/linux/zsmalloc.h      |   9 +-
+&gt;  mm/memcontrol.c               |  75 ++-----
+&gt;  mm/vmstat.c                   |   2 +
+&gt;  mm/zsmalloc.c                 | 381 ++++++++++++++++++++++++++++++++--
+&gt;  mm/zswap.c                    |  66 +++---
+&gt;  8 files changed, 431 insertions(+), 134 deletions(-)
+&gt; 
+&gt; -- 
+&gt; 2.52.0
+
+---
+
+On Wed, 11 Mar 2026 16:16:34 -0400 Johannes Weiner &lt;hannes@cmpxchg.org&gt; wrote:
 
 &gt; On Wed, Mar 11, 2026 at 12:51:40PM -0700, Joshua Hahn wrote:
 &gt; &gt; Introduce 3 new fields to struct zs_pool to allow individual zpools to
@@ -454,12 +1886,125 @@ These definitely look a lot cleaner. Will make these changes in v3!
 
 Thanks again. I hope you have a great day!
 Joshua
-</pre>
+
+---
+
+On Wed, 11 Mar 2026 13:17:22 -0700 Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+
+&gt; On Wed, Mar 11, 2026 at 12:52\u202fPM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt; &gt;
+&gt; &gt; Introduce an array of struct obj_cgroup pointers to zspage to keep track
+&gt; &gt; of compressed objects&#x27; memcg ownership, if the zs_pool has been made to
+&gt; &gt; be memcg-aware at creation time.
+&gt; &gt;
+&gt; &gt; Move the error path for alloc_zspage to a jump label to simplify the
+&gt; &gt; growing error handling path for a failed zpdesc allocation.
+&gt; &gt;
+&gt; &gt; Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+&gt; &gt; Suggested-by: Harry Yoo &lt;harry.yoo@oracle.com&gt;
+&gt; &gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+&gt; &gt; ---
+&gt; &gt;  mm/zsmalloc.c | 34 ++++++++++++++++++++++++++--------
+&gt; &gt;  1 file changed, 26 insertions(+), 8 deletions(-)
+&gt; &gt;
+&gt; &gt; diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+&gt; &gt; index 3f0f42b78314..dcf99516227c 100644
+&gt; &gt; --- a/mm/zsmalloc.c
+&gt; &gt; +++ b/mm/zsmalloc.c
+&gt; &gt; @@ -39,6 +39,7 @@
+&gt; &gt;  #include &lt;linux/zsmalloc.h&gt;
+&gt; &gt;  #include &lt;linux/fs.h&gt;
+&gt; &gt;  #include &lt;linux/workqueue.h&gt;
+&gt; &gt; +#include &lt;linux/memcontrol.h&gt;
+&gt; &gt;  #include &quot;zpdesc.h&quot;
+&gt; &gt;
+&gt; &gt;  #define ZSPAGE_MAGIC   0x58
+&gt; &gt; @@ -273,6 +274,7 @@ struct zspage {
+&gt; &gt;         struct zpdesc *first_zpdesc;
+&gt; &gt;         struct list_head list; /* fullness list */
+&gt; &gt;         struct zs_pool *pool;
+&gt; &gt; +       struct obj_cgroup **objcgs;
+&gt; &gt;         struct zspage_lock zsl;
+&gt; &gt;  };
+&gt; &gt;
+&gt; &gt; @@ -825,6 +827,8 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
+&gt; &gt;                 zpdesc = next;
+&gt; &gt;         } while (zpdesc != NULL);
+&gt; &gt;
+&gt; &gt; +       if (pool-&gt;memcg_aware)
+&gt; &gt; +               kfree(zspage-&gt;objcgs);
+&gt; &gt;         cache_free_zspage(zspage);
+&gt; &gt;
+&gt; &gt;         class_stat_sub(class, ZS_OBJS_ALLOCATED, class-&gt;objs_per_zspage);
+&gt; &gt; @@ -946,6 +950,16 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+&gt; &gt;         if (!IS_ENABLED(CONFIG_COMPACTION))
+&gt; &gt;                 gfp &amp;= ~__GFP_MOVABLE;
+&gt; &gt;
+&gt; &gt; +       if (pool-&gt;memcg_aware) {
+&gt; &gt; +               zspage-&gt;objcgs = kcalloc(class-&gt;objs_per_zspage,
+&gt; &gt; +                                        sizeof(struct obj_cgroup *),
+&gt; &gt; +                                        gfp &amp; ~__GFP_HIGHMEM);
+&gt; 
+&gt; I remembered asking this, so my apologies if I missed/forgot your
+&gt; response - but would vmalloc work here? i.e kvcalloc to fallback to
+&gt; vmalloc etc.?
+
+Hello Nhat : -)
+
+Thank you for reviewing, and for your acks on the other parts!
+
+You&#x27;re right, I missed changing that on my end after v1. No reason
+vmalloc shouldn&#x27;t work here, let me make that change in v3.
+
+Thanks, I hope you have a great day!
+Joshua
+
+---
+
+On Wed, 11 Mar 2026 13:17:26 -0700 Yosry Ahmed &lt;yosry@kernel.org&gt; wrote:
+
+&gt; [..]
+&gt; &gt; @@ -1216,6 +1216,11 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+&gt; &gt;         class = zspage_class(pool, zspage);
+&gt; &gt;         off = offset_in_page(class-&gt;size * obj_idx);
+&gt; &gt;
+&gt; &gt; +       if (objcg) {
+&gt; &gt; +               WARN_ON_ONCE(!pool-&gt;memcg_aware);
+&gt; &gt; +               zspage-&gt;objcgs[obj_idx] = objcg;
+&gt; &gt; +       }
+
+Hello Yosry,
+
+I hope you are doing well. Thank you for reviewing this series! : -)
+
+&gt; If pool-&gt;memcg_aware is not set the warning will fire, but the
+&gt; following line will write to uninitialized memory and probably crash.
+&gt; We should avoid the write if the warning fires.
+&gt; 
+&gt; Maybe:
+&gt; 
+&gt; if (objcg &amp;&amp; !WARN_ON_ONCE(!pool-&gt;memcg_aware))
+&gt;        zspage-&gt;objcgs[obj_idx] = objcg;
+
+Ack. 
+
+&gt; Not pretty, but the same pattern is followed in many places in the kernel.
+&gt; 
+&gt; &gt; +
+&gt; &gt;         if (!ZsHugePage(zspage))
+&gt; &gt;                 off += ZS_HANDLE_SIZE;
+&gt; &gt;
+
+Definitely better than writing garbage and crashing : -)
+I&#x27;ll make this change in the next version, I think I should also sprinkle
+these WARN_ON_ONCEs in a few other places as well. I&#x27;ll be more
+mindful of this for those cases as well.
+
+Thank you again Yosry, I hope you have a great day!
+Joshua</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
-<div class="review-comment-signals">Signals: agreement</div>
-</div>
-</div>
+<a href="https://lore.kernel.org/r/20260311195153.4013476-10-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: accepted_inaccuracy, acknowledged_limitation</div>
 </div>
 </div>
 <div class="thread-node depth-0">
@@ -467,13 +2012,74 @@ Joshua
 <div class="review-comment-header">
 <span class="review-author">Yosry Ahmed</span>
 <a class="date-chip" href="../2026-03-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-11">2026-03-11</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Approved the patch and suggested improvements to the function prototype and variable names.</div>
+<div class="review-comment-text">Reviewer Yosry Ahmed noted that when pool-&gt;memcg_aware is not set, writing to zspage-&gt;objcgs[obj_idx] will access uninitialized memory and likely crash; he suggested adding a conditional statement to avoid the write if the WARN_ON_ONCE warning fires.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">&gt; It&#x27;s a bit awkward that 0 is valid (MEMCG_SWAP). Plus you store these
+<pre class="raw-body-text">On Wed, Mar 11, 2026 at 12:52 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; All the zsmalloc functions that operate on a zsmalloc object (encoded
+&gt; location values) are named &quot;zs_obj_xxx&quot;, except for zs_object_copy.
+&gt;
+&gt; Rename zs_object_copy to zs_obj_copy to conform to the pattern.
+&gt; No functional changes intended.
+&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+
+Reviewed-by: Yosry Ahmed &lt;yosry@kernel.org&gt;
+
+---
+
+On Wed, Mar 11, 2026 at 12:52 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; object indices, which describe the location of an object in a zspage,
+&gt; cannot be negative. To reflect this most helpers calculate and return
+&gt; these values as unsigned ints.
+&gt;
+&gt; Convert find_alloced_obj, the only function that calculates obj_idx as
+&gt; a signed int, to use an unsigned int as well.
+&gt;
+&gt; No functional change intended.
+&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+
+Reviewed-by: Yosry Ahmed &lt;yosry@kernel.org&gt;
+
+---
+
+[..]
+&gt; @@ -1216,6 +1216,11 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+&gt;         class = zspage_class(pool, zspage);
+&gt;         off = offset_in_page(class-&gt;size * obj_idx);
+&gt;
+&gt; +       if (objcg) {
+&gt; +               WARN_ON_ONCE(!pool-&gt;memcg_aware);
+&gt; +               zspage-&gt;objcgs[obj_idx] = objcg;
+&gt; +       }
+
+If pool-&gt;memcg_aware is not set the warning will fire, but the
+following line will write to uninitialized memory and probably crash.
+We should avoid the write if the warning fires.
+
+Maybe:
+
+if (objcg &amp;&amp; !WARN_ON_ONCE(!pool-&gt;memcg_aware))
+       zspage-&gt;objcgs[obj_idx] = objcg;
+
+Not pretty, but the same pattern is followed in many places in the kernel.
+
+&gt; +
+&gt;         if (!ZsHugePage(zspage))
+&gt;                 off += ZS_HANDLE_SIZE;
+&gt;
+
+---
+
+&gt; It&#x27;s a bit awkward that 0 is valid (MEMCG_SWAP). Plus you store these
 &gt; values in every pool, even though they&#x27;re always the same for all
 &gt; zswap pools.
 &gt;
@@ -512,10 +2118,428 @@ I also didn&#x27;t like the suggested prototype for zs_create_pool(), and
 didn&#x27;t like that compressed_stat and uncompressed_stat did not have
 memcg anywhere in the name. Was going to suggest adding a warning if
 memcg_aware=false but the stat indices are non-zero, but your
-suggestion is so much cleaner.
-</pre>
+suggestion is so much cleaner.</pre>
 </details>
-<div class="review-comment-signals">Signals: approval</div>
+<a href="https://lore.kernel.org/r/CAO9r8zPzf-u5L0XZwmS-zdDX8od2JA5yCQJ0+poiT-2z4DaatQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested change, suggested improvement</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham</span>
+<a class="date-chip" href="../2026-03-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-11">2026-03-11</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Nhat Pham asked whether vmalloc could be used instead of kcalloc for allocating memory for the obj_cgroup array in alloc_zspage, suggesting a fallback to vmalloc if necessary.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Wed, Mar 11, 2026 at 12:51 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; All the zsmalloc functions that operate on a zsmalloc object (encoded
+&gt; location values) are named &quot;zs_obj_xxx&quot;, except for zs_object_copy.
+&gt;
+&gt; Rename zs_object_copy to zs_obj_copy to conform to the pattern.
+&gt; No functional changes intended.
+&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+&gt; ---
+&gt;  mm/zsmalloc.c | 4 ++--
+&gt;  1 file changed, 2 insertions(+), 2 deletions(-)
+&gt;
+&gt; diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+&gt; index 2c1430bf8d57..7a9b8f55d529 100644
+&gt; --- a/mm/zsmalloc.c
+&gt; +++ b/mm/zsmalloc.c
+&gt; @@ -1416,7 +1416,7 @@ void zs_free(struct zs_pool *pool, unsigned long handle)
+&gt;  }
+&gt;  EXPORT_SYMBOL_GPL(zs_free);
+&gt;
+&gt; -static void zs_object_copy(struct size_class *class, unsigned long dst,
+&gt; +static void zs_obj_copy(struct size_class *class, unsigned long dst,
+&gt;                                 unsigned long src)
+&gt;  {
+&gt;         struct zpdesc *s_zpdesc, *d_zpdesc;
+&gt; @@ -1537,7 +1537,7 @@ static void migrate_zspage(struct zs_pool *pool, struct zspage *src_zspage,
+&gt;
+&gt;                 used_obj = handle_to_obj(handle);
+&gt;                 free_obj = obj_malloc(pool, dst_zspage, handle);
+&gt; -               zs_object_copy(class, free_obj, used_obj);
+&gt; +               zs_obj_copy(class, free_obj, used_obj);
+&gt;                 obj_idx++;
+
+Reviewed-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
+
+---
+
+On Wed, Mar 11, 2026 at 12:51 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; object indices, which describe the location of an object in a zspage,
+&gt; cannot be negative. To reflect this most helpers calculate and return
+&gt; these values as unsigned ints.
+&gt;
+&gt; Convert find_alloced_obj, the only function that calculates obj_idx as
+&gt; a signed int, to use an unsigned int as well.
+&gt;
+&gt; No functional change intended.
+&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+
+Reviewed-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
+
+---
+
+On Wed, Mar 11, 2026 at 12:51 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; Introduce 3 new fields to struct zs_pool to allow individual zpools to
+&gt; be &quot;memcg-aware&quot;: memcg_aware, compressed_stat, and uncompressed_stat.
+&gt;
+&gt; memcg_aware is used in later patches to determine whether memory
+&gt; should be allocated to keep track of per-compresed object objgs.
+&gt; compressed_stat and uncompressed_stat are enum indices that point into
+&gt; memcg (node) stats that zsmalloc will account towards.
+&gt;
+&gt; In reality, these fields help distinguish between the two users of
+&gt; zsmalloc, zswap and zram. The enum indices compressed_stat and
+&gt; uncompressed_stat are parametrized to minimize zswap-specific hardcoding
+&gt; in zsmalloc.
+&gt;
+&gt; Suggested-by: Yosry Ahmed &lt;yosry@kernel.org&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+
+Zswap side LGTM :) And for that:
+
+Acked-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
+
+---
+
+On Wed, Mar 11, 2026 at 12:52 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; Introduce an array of struct obj_cgroup pointers to zspage to keep track
+&gt; of compressed objects&#x27; memcg ownership, if the zs_pool has been made to
+&gt; be memcg-aware at creation time.
+&gt;
+&gt; Move the error path for alloc_zspage to a jump label to simplify the
+&gt; growing error handling path for a failed zpdesc allocation.
+&gt;
+&gt; Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+&gt; Suggested-by: Harry Yoo &lt;harry.yoo@oracle.com&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+&gt; ---
+&gt;  mm/zsmalloc.c | 34 ++++++++++++++++++++++++++--------
+&gt;  1 file changed, 26 insertions(+), 8 deletions(-)
+&gt;
+&gt; diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+&gt; index 3f0f42b78314..dcf99516227c 100644
+&gt; --- a/mm/zsmalloc.c
+&gt; +++ b/mm/zsmalloc.c
+&gt; @@ -39,6 +39,7 @@
+&gt;  #include &lt;linux/zsmalloc.h&gt;
+&gt;  #include &lt;linux/fs.h&gt;
+&gt;  #include &lt;linux/workqueue.h&gt;
+&gt; +#include &lt;linux/memcontrol.h&gt;
+&gt;  #include &quot;zpdesc.h&quot;
+&gt;
+&gt;  #define ZSPAGE_MAGIC   0x58
+&gt; @@ -273,6 +274,7 @@ struct zspage {
+&gt;         struct zpdesc *first_zpdesc;
+&gt;         struct list_head list; /* fullness list */
+&gt;         struct zs_pool *pool;
+&gt; +       struct obj_cgroup **objcgs;
+&gt;         struct zspage_lock zsl;
+&gt;  };
+&gt;
+&gt; @@ -825,6 +827,8 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
+&gt;                 zpdesc = next;
+&gt;         } while (zpdesc != NULL);
+&gt;
+&gt; +       if (pool-&gt;memcg_aware)
+&gt; +               kfree(zspage-&gt;objcgs);
+&gt;         cache_free_zspage(zspage);
+&gt;
+&gt;         class_stat_sub(class, ZS_OBJS_ALLOCATED, class-&gt;objs_per_zspage);
+&gt; @@ -946,6 +950,16 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+&gt;         if (!IS_ENABLED(CONFIG_COMPACTION))
+&gt;                 gfp &amp;= ~__GFP_MOVABLE;
+&gt;
+&gt; +       if (pool-&gt;memcg_aware) {
+&gt; +               zspage-&gt;objcgs = kcalloc(class-&gt;objs_per_zspage,
+&gt; +                                        sizeof(struct obj_cgroup *),
+&gt; +                                        gfp &amp; ~__GFP_HIGHMEM);
+
+I remembered asking this, so my apologies if I missed/forgot your
+response - but would vmalloc work here? i.e kvcalloc to fallback to
+vmalloc etc.?
+
+&gt; +               if (!zspage-&gt;objcgs) {
+&gt; +                       cache_free_zspage(zspage);
+&gt; +                       return NULL;
+&gt; +               }
+&gt; +       }
+&gt; +
+&gt;         zspage-&gt;magic = ZSPAGE_MAGIC;
+&gt;         zspage-&gt;pool = pool;
+&gt;         zspage-&gt;class = class-&gt;index;
+&gt; @@ -955,14 +969,8 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+&gt;                 struct zpdesc *zpdesc;
+&gt;
+&gt;                 zpdesc = alloc_zpdesc(gfp, nid);
+&gt; -               if (!zpdesc) {
+&gt; -                       while (--i &gt;= 0) {
+&gt; -                               zpdesc_dec_zone_page_state(zpdescs[i]);
+&gt; -                               free_zpdesc(zpdescs[i]);
+&gt; -                       }
+&gt; -                       cache_free_zspage(zspage);
+&gt; -                       return NULL;
+&gt; -               }
+&gt; +               if (!zpdesc)
+&gt; +                       goto err;
+&gt;                 __zpdesc_set_zsmalloc(zpdesc);
+&gt;
+&gt;                 zpdesc_inc_zone_page_state(zpdesc);
+&gt; @@ -973,6 +981,16 @@ static struct zspage *alloc_zspage(struct zs_pool *pool,
+&gt;         init_zspage(class, zspage);
+&gt;
+&gt;         return zspage;
+&gt; +
+&gt; +err:
+&gt; +       while (--i &gt;= 0) {
+&gt; +               zpdesc_dec_zone_page_state(zpdescs[i]);
+&gt; +               free_zpdesc(zpdescs[i]);
+&gt; +       }
+&gt; +       if (pool-&gt;memcg_aware)
+&gt; +               kfree(zspage-&gt;objcgs);
+&gt; +       cache_free_zspage(zspage);
+&gt; +       return NULL;
+&gt;  }
+&gt;
+&gt;  static struct zspage *find_get_zspage(struct size_class *class)
+&gt; --
+&gt; 2.52.0
+&gt;
+
+---
+
+On Wed, Mar 11, 2026 at 12:52 PM Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+&gt;
+&gt; Zswap compresses and uncompresses in PAGE_SIZE units, which simplifies
+&gt; the accounting for how much memory it has compressed. However, when a
+&gt; compressed object is stored at the boundary of two zspages, accounting
+&gt; at a PAGE_SIZE granularity makes it difficult to fractionally charge
+&gt; each backing zspage with the ratio of memory it backs for the
+&gt; compressed object.
+&gt;
+&gt; To make sub-PAGE_SIZE granularity charging possible for MEMCG_ZSWAPPED,
+&gt; track the value in bytes and adjust its accounting accordingly.
+&gt;
+&gt; No functional changes intended.
+&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+
+LGTM.
+Reviewed-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
+
+&gt; ---
+&gt;  include/linux/memcontrol.h | 2 +-
+&gt;  mm/memcontrol.c            | 5 +++--
+&gt;  mm/zsmalloc.c              | 4 ++--
+&gt;  mm/zswap.c                 | 8 +++++---
+&gt;  4 files changed, 11 insertions(+), 8 deletions(-)
+&gt;
+&gt; diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+&gt; index 701d9ab6fef1..ce2e598b5963 100644
+&gt; --- a/include/linux/memcontrol.h
+&gt; +++ b/include/linux/memcontrol.h
+&gt; @@ -38,7 +38,7 @@ enum memcg_stat_item {
+&gt;         MEMCG_VMALLOC,
+&gt;         MEMCG_KMEM,
+&gt;         MEMCG_ZSWAP_B,
+&gt; -       MEMCG_ZSWAPPED,
+&gt; +       MEMCG_ZSWAPPED_B,
+&gt;         MEMCG_NR_STAT,
+&gt;  };
+&gt;
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 68139be66a4f..1cb02d2febe8 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -342,7 +342,7 @@ static const unsigned int memcg_stat_items[] = {
+&gt;         MEMCG_VMALLOC,
+&gt;         MEMCG_KMEM,
+&gt;         MEMCG_ZSWAP_B,
+&gt; -       MEMCG_ZSWAPPED,
+&gt; +       MEMCG_ZSWAPPED_B,
+&gt;  };
+&gt;
+&gt;  #define NR_MEMCG_NODE_STAT_ITEMS ARRAY_SIZE(memcg_node_stat_items)
+&gt; @@ -1364,7 +1364,7 @@ static const struct memory_stat memory_stats[] = {
+&gt;         { &quot;shmem&quot;,                      NR_SHMEM                        },
+&gt;  #ifdef CONFIG_ZSWAP
+&gt;         { &quot;zswap&quot;,                      MEMCG_ZSWAP_B                   },
+&gt; -       { &quot;zswapped&quot;,                   MEMCG_ZSWAPPED                  },
+&gt; +       { &quot;zswapped&quot;,                   MEMCG_ZSWAPPED_B                },
+&gt;  #endif
+&gt;         { &quot;file_mapped&quot;,                NR_FILE_MAPPED                  },
+&gt;         { &quot;file_dirty&quot;,                 NR_FILE_DIRTY                   },
+&gt; @@ -1412,6 +1412,7 @@ static int memcg_page_state_unit(int item)
+&gt;         switch (item) {
+&gt;         case MEMCG_PERCPU_B:
+&gt;         case MEMCG_ZSWAP_B:
+&gt; +       case MEMCG_ZSWAPPED_B:
+&gt;         case NR_SLAB_RECLAIMABLE_B:
+&gt;         case NR_SLAB_UNRECLAIMABLE_B:
+&gt;                 return 1;
+&gt; diff --git a/mm/zsmalloc.c b/mm/zsmalloc.c
+&gt; index 291194572a09..24665d7cd4a9 100644
+&gt; --- a/mm/zsmalloc.c
+&gt; +++ b/mm/zsmalloc.c
+&gt; @@ -1047,7 +1047,7 @@ static void zs_charge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+&gt;         rcu_read_lock();
+&gt;         memcg = obj_cgroup_memcg(objcg);
+&gt;         mod_memcg_state(memcg, pool-&gt;compressed_stat, size);
+&gt; -       mod_memcg_state(memcg, pool-&gt;uncompressed_stat, 1);
+&gt; +       mod_memcg_state(memcg, pool-&gt;uncompressed_stat, PAGE_SIZE);
+&gt;         rcu_read_unlock();
+&gt;  }
+&gt;
+&gt; @@ -1066,7 +1066,7 @@ static void zs_uncharge_objcg(struct zs_pool *pool, struct obj_cgroup *objcg,
+&gt;         rcu_read_lock();
+&gt;         memcg = obj_cgroup_memcg(objcg);
+&gt;         mod_memcg_state(memcg, pool-&gt;compressed_stat, -size);
+&gt; -       mod_memcg_state(memcg, pool-&gt;uncompressed_stat, -1);
+&gt; +       mod_memcg_state(memcg, pool-&gt;uncompressed_stat, -(int)PAGE_SIZE);
+
+nit: seems a bit awkward lol?</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAKEwX=MmnnTcxQxSJB86ZMfQ0cCndx3sBDo_xKJWwBuzVJkOgw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: question, request_for_info</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-03-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-11">2026-03-11</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Johannes Weiner noted that the patch introduces two enum indices for memcg stats in zsmalloc, but these values are hardcoded to specific values (MEMCG_ZSWAP_B and MEMCG_ZSWAPPED) which could be problematic if other consumers of zsmalloc also use these values. He suggested using a struct to store these parameters and passing it from the caller, as done for zram.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Wed, Mar 11, 2026 at 12:51:40PM -0700, Joshua Hahn wrote:
+&gt; Introduce 3 new fields to struct zs_pool to allow individual zpools to
+&gt; be &quot;memcg-aware&quot;: memcg_aware, compressed_stat, and uncompressed_stat.
+&gt; 
+&gt; memcg_aware is used in later patches to determine whether memory
+&gt; should be allocated to keep track of per-compresed object objgs.
+&gt; compressed_stat and uncompressed_stat are enum indices that point into
+&gt; memcg (node) stats that zsmalloc will account towards.
+&gt; 
+&gt; In reality, these fields help distinguish between the two users of
+&gt; zsmalloc, zswap and zram. The enum indices compressed_stat and
+&gt; uncompressed_stat are parametrized to minimize zswap-specific hardcoding
+&gt; in zsmalloc.
+&gt; 
+&gt; Suggested-by: Yosry Ahmed &lt;yosry@kernel.org&gt;
+&gt; Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+&gt; ---
+&gt;  drivers/block/zram/zram_drv.c |  3 ++-
+&gt;  include/linux/zsmalloc.h      |  5 ++++-
+&gt;  mm/zsmalloc.c                 | 13 ++++++++++++-
+&gt;  mm/zswap.c                    |  3 ++-
+&gt;  4 files changed, 20 insertions(+), 4 deletions(-)
+&gt; 
+&gt; diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+&gt; index bca33403fc8b..d1eae5c20df7 100644
+&gt; --- a/drivers/block/zram/zram_drv.c
+&gt; +++ b/drivers/block/zram/zram_drv.c
+&gt; @@ -1980,7 +1980,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
+&gt;  	if (!zram-&gt;table)
+&gt;  		return false;
+&gt;  
+&gt; -	zram-&gt;mem_pool = zs_create_pool(zram-&gt;disk-&gt;disk_name);
+&gt; +	/* zram does not support memcg accounting */
+&gt; +	zram-&gt;mem_pool = zs_create_pool(zram-&gt;disk-&gt;disk_name, false, 0, 0);
+
+It&#x27;s a bit awkward that 0 is valid (MEMCG_SWAP). Plus you store these
+values in every pool, even though they&#x27;re always the same for all
+zswap pools.
+
+How about:
+
+/* zsmalloc.h */
+struct zs_memcg_params {
+	enum memcg_stat_item compressed;
+	enum memcg_stat_item uncompressed;
+};
+struct zs_pool *zs_create_pool(const char *name, struct zs_memcg_params *memcg_params);
+
+/* zswap.c */
+static struct zs_memcg_params zswap_memcg_params = {
+	.compressed = MEMCG_ZSWAP_B,
+	.uncompressed = MEMCG_ZSWAPPED,
+};
+
+then pass &amp;zswap_memcg_params from zswap and NULL from zram.
+
+&gt; @@ -2071,6 +2079,9 @@ struct zs_pool *zs_create_pool(const char *name)
+&gt;  	rwlock_init(&amp;pool-&gt;lock);
+&gt;  	atomic_set(&amp;pool-&gt;compaction_in_progress, 0);
+&gt;  
+&gt; +	pool-&gt;memcg_aware = memcg_aware;
+&gt; +	pool-&gt;compressed_stat = compressed_stat;
+&gt; +	pool-&gt;uncompressed_stat = uncompressed_stat;
+
+	pool-&gt;memcg_params = memcg_params;
+
+And then use if (pool-&gt;memcg_params) to gate in zsmalloc.c.
+
+---
+
+On Wed, Mar 11, 2026 at 12:51:44PM -0700, Joshua Hahn wrote:
+&gt; @@ -1244,6 +1297,8 @@ void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+&gt;  	if (objcg) {
+&gt;  		WARN_ON_ONCE(!pool-&gt;memcg_aware);
+&gt;  		zspage-&gt;objcgs[obj_idx] = objcg;
+&gt; +		obj_cgroup_get(objcg);
+&gt; +		zs_charge_objcg(pool, objcg, class-&gt;size);
+&gt;  	}
+&gt;  
+&gt;  	if (!ZsHugePage(zspage))
+
+Note that the obj_cgroup_get() reference is for the pointer, not the
+charge. I think it all comes out right in the end, but it&#x27;s a bit
+confusing to follow and verify through the series.
+
+IOW, it&#x27;s better move that obj_cgroup_get() when you add and store
+zspage-&gt;objcgs[]. If zswap stil has a reference at that point in the
+series, then it&#x27;s fine for there to be two separate obj_cgroup_get()
+as well, with later patches deleting the zswap one when its
+entry-&gt;objcg pointer disappears.
+
+&gt; @@ -711,10 +711,6 @@ static void zswap_entry_free(struct zswap_entry *entry)
+&gt;  	zswap_lru_del(&amp;zswap_list_lru, entry, objcg);
+&gt;  	zs_free(entry-&gt;pool-&gt;zs_pool, entry-&gt;handle);
+&gt;  	zswap_pool_put(entry-&gt;pool);
+&gt; -	if (objcg) {
+&gt; -		obj_cgroup_uncharge_zswap(objcg, entry-&gt;length);
+&gt; -		obj_cgroup_put(objcg);
+&gt; -	}
+&gt;  	if (entry-&gt;length == PAGE_SIZE)
+&gt;  		atomic_long_dec(&amp;zswap_stored_incompressible_pages);
+&gt;  	zswap_entry_cache_free(entry);
+
+[ I can see that this was misleading. It was really getting a
+  reference for the entry-&gt;objcg = objcg a few lines down, hitching a
+  ride on that existing `if (objcg)`. ]</pre>
+</details>
+<a href="https://lore.kernel.org/r/abHNog8CV0mWummY@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested improvements</div>
 </div>
 </div>
 </div>
