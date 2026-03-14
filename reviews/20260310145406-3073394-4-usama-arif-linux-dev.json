@@ -8,23 +8,43 @@
       "developer": "Usama Arif",
       "reviews": [
         {
-          "author": "David Hildenbrand",
-          "summary": "Identified a potential issue with the alignment calculation and suggested using max() instead of << to ensure correct alignment.",
+          "author": "Usama Arif (author)",
+          "summary": "The author is addressing a concern about the alignment of ET_DYN base to exec folio order for contpte mapping, specifically on ARM architecture where 64K page size is used. They explain that they chose to align with 2M (cont-pte size) to get both page fault benefit and iTLB coverage, which is already the case on x86.\n\nThe author is addressing a concern that the patch only checks for alignment when there's at least one PT_LOAD segment large enough to contain a full folio, and proposes to check all segments with PT_LOAD instead. The author agrees that this makes sense and suggests applying the change over the entire series.",
           "sentiment": "NEUTRAL",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "clarification",
+            "explanation",
+            "agreement",
+            "proposed_change"
           ],
           "has_inline_review": false,
           "tags_given": [],
-          "raw_body": "",
+          "raw_body": "For us it came about because we use 64K page size on ARM, and none of the\ntext sections were getting hugified (because PMD size is 512M). I went with\nexec_folio_order() = cont-pte size (2M) for 16K and 64K as we can get both page\nfault benefit (which might not be that important) and iTLB coverage (due to\ncont-pte).\nx86 already faults in at 2M (HPAGE_PMD_ORDER) due to force_thp_readahead path in\ndo_sync_mmap_readahead() so the memory pressure introduced in ARM won't be worse\nthan what already exists in x86.\n\n---\n\nYes I think this makes sense!\n\nAlthough maybe we should check all segments with PT_LOAD. So maybe something\nlike below over this series?\n\ndiff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c\nindex 2d2b3e9fd474f..a0e83b541a7d8 100644\n--- a/fs/binfmt_elf.c\n+++ b/fs/binfmt_elf.c\n@@ -1116,10 +1116,30 @@ static int load_elf_binary(struct linux_binprm *bprm)\n                         * the hardware cannot coalesce PTEs (e.g. arm64\n                         * contpte) even though the physical memory and\n                         * file offset are correctly aligned.\n+                        *\n+                        * Only increase alignment when at least one\n+                        * PT_LOAD segment is large enough to contain a\n+                        * full folio and has its file offset and virtual\n+                        * address folio-aligned. This avoids reducing\n+                        * ASLR entropy for small binaries that cannot\n+                        * benefit from contpte mapping.\n                         */\n-                       if (exec_folio_order())\n-                               alignment = max(alignment,\n-                                       (unsigned long)PAGE_SIZE << exec_folio_order());\n+                       if (exec_folio_order()) {\n+                               unsigned long folio_sz = PAGE_SIZE << exec_folio_order();\n+\n+                               for (i = 0; i < elf_ex->e_phnum; i++) {\n+                                       if (elf_phdata[i].p_type != PT_LOAD)\n+                                               continue;\n+                                       if (elf_phdata[i].p_filesz < folio_sz)\n+                                               continue;\n+                                       if (!IS_ALIGNED(elf_phdata[i].p_vaddr, folio_sz))\n+                                               continue;\n+                                       if (!IS_ALIGNED(elf_phdata[i].p_offset, folio_sz))\n+                                               continue;\n+                                       alignment = max(alignment, folio_sz);\n+                                       break;\n+                               }\n+                       }\n \n                        /**\n                         * DOC: PIE handling",
           "reply_to": "",
-          "message_date": "",
-          "message_id": "",
+          "message_date": "2026-03-13",
+          "message_id": "d3f60289-3ea1-43ce-9271-58c8b79bf7a0@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "hev",
+          "summary": "Reviewer hev suggested moving the logic for aligning ET_DYN base to exec folio order into a separate function called should_align_to_exec_folio(), and further proposed that this new function be placed within the maximum_alignment() function to avoid duplicate segment walks.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "I think this logic should live in maximum_alignment(), so we don't\nhave to walk the segments twice. It might be better to move it into a\nseparate helper, something like should_align_to_exec_folio()?",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-03-14",
+          "message_id": "CAHirt9g=drGaeNN7C1hbND4=zXQifhQyP4cUaCz27=tYpHYgfQ@mail.gmail.com",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "The patch aligns the ELF binary load address to the exec folio order for PIE binaries, ensuring proper virtual address alignment and enabling iTLB coalescing benefits on architectures like arm64."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adjusts the alignment of ELF binaries (ET_DYN) to ensure that their load address is aligned to the size of large folios allocated for execution memory. This is necessary because some architectures, such as arm64, require a specific alignment for contpte mapping to work correctly. Without this adjustment, the readahead patches cannot benefit from contpte mapping, leading to reduced iTLB coalescing benefits. The patch introduces a new calculation for ELF alignment based on the arch's requested folio size, ensuring that virtual addresses of exec pages are aligned to the folio boundary."
     }
   }
 }
