@@ -8,23 +8,67 @@
       "developer": "Johannes Weiner",
       "reviews": [
         {
-          "author": "Johannes Weiner",
-          "summary": "Identified a double-put bug in fuse_try_move_page() where the folio refcount drops to zero prematurely. Suggested adding an extra folio_get() before replace_page_cache_folio() to maintain the reference.",
-          "sentiment": "NEUTRAL",
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) suggested combining vma_alloc_folio and memcg_list_lru_alloc_folio into a single API, vma_alloc_anon_folio, to simplify anon alloc paths and reduce code duplication.\n\nReviewer David (Arm) noted that the patch introduces a potential RCU lock ordering issue and suggested using get/put-like logic or helpers to simplify the list_lru_lock+unlock operations.\n\nReviewer noted that the patch looks mostly mechanical and is well done, but requires another review pass for thoroughness.",
+          "sentiment": "NEEDS_WORK",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "requested changes",
+            "RCU lock ordering issue",
+            "suggested simplification",
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "So, in all anon alloc paths, we essentialy have\n\n1) vma_alloc_folio / __folio_alloc (khugepaged being odd)\n2) mem_cgroup_charge / mem_cgroup_swapin_charge_folio\n3) memcg_list_lru_alloc_folio\n\nI wonder if we could do better in most cases and have something like a\n\n\tvma_alloc_anon_folio()\n\nThat wraps the vma_alloc_folio() + memcg_list_lru_alloc_folio(), but\nstill leaves the charging to the caller?\n\nThe would at least combine 1) and 3) in a single API. (except for the\nodd cases without a VMA).\n\nI guess we would want to skip the memcg_list_lru_alloc_folio() for\norder-0 folios, correct?\n\n---\n\nThe RCU lock is for the folio_memcg(), right?\n\nI recall I raised in the past that some get/put-like logic (that wraps\nthe rcu_read_lock() + folio_memcg()) might make this a lot easier to get.\n\n\nmemcg = folio_memcg_lookup(folio)\n\n... do stuff\n\nfolio_memcg_putback(folio, memcg);\n\nOr sth like that.\n\n\nAlternativey, you could have some helpers that do the\nlist_lru_lock+unlock etc.\n\nfolio_memcg_list_lru_lock()\n...\nfolio_memcg_list_ru_unlock(l);\n\nJust some thoughts as inspiration :)\n\n---\n\n[...]\n\nMost changes here look mostly mechanically, quite nice. I'll probably\nhave to go over some bits once again with a fresh mind :)\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-03-18",
+          "message_id": "61d86249-cd89-4e99-99d8-ab7c72e95f34@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Johannes Weiner (author)",
+          "summary": "Author acknowledged that the charging mechanism is responsible for setting folio_memcg(), which was a concern about how the deferred split queue handles cgroups, and did not commit to revising the patch.\n\nAuthor acknowledged that order-1 folios are not added to the deferred split queue, explaining it's due to memory constraints and no significant waste.\n\nAuthor acknowledged David's concern about inconsistent RCU locking patterns and agreed to address it in a future patch, but not in the current submission.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged",
+            "did not commit to revising",
+            "acknowledged a specific detail",
+            "provided explanation",
+            "acknowledged fix needed",
+            "agreed to follow-up"
           ],
           "has_inline_review": false,
           "tags_given": [],
-          "raw_body": "",
-          "reply_to": "",
-          "message_date": "",
-          "message_id": "",
+          "raw_body": "Hm, but it's the charging that figures out the memcg and sets\nfolio_memcg() :(\n\n---\n\nYeah, we don't use the queue for < order-1. In deferred_split_folio():\n\n\t/*\n\t * Order 1 folios have no space for a deferred list, but we also\n\t * won't waste much memory by not adding them to the deferred list.\n\t */\n\tif (folio_order(folio) <= 1)\n\t\treturn;\n\n---\n\nI remember you raising this in the objcg + reparenting patches. There\nare a few more instances of\n\n\trcu_read_lock()\n\tfoo = folio_memcg()\n\t...\n\trcu_read_unlock()\n\nin other parts of the code not touched by these patches here, so the\nfirst pattern is a more universal encapsulation.\n\nLet me look into this. Would you be okay with a follow-up that covers\nthe others as well?",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-03-18",
+          "message_id": "absr1vgNP_tM1OEP@cmpxchg.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer noted that implementing list_lru for deferred split shrinker requires additional complexity, as it needs to handle three operations simultaneously, and pointed out a discrepancy in collapse_file() which allocates anonymous folios without placing them on the queue.\n\nReviewer suggested that the list_lru lock helpers should be moved to a different series if they are indeed correct",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "additional complexity",
+            "discrepancy in collapse_file()",
+            "questioning the correctness of the patch"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Oh ... right. I guess we would then have to do all 3 things at the same\ntime, which makes the helper a bit more involved.\n\nI'll note that collapse_file() also calls alloc_charge_folio(), but not\nfor allocating an anonymous folio that would have to be placed on the\ndeferred split queue.\n\n---\n\nOf course :) If list_lru lock helpers would be the right thing to do, it\nmight be better placed in this series.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-03-19",
+          "message_id": "e9631520-857f-4f67-8944-6af7a2b47e89@kernel.org",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series switches the deferred split shrinker to use list_lru, which properly sets up per-node and per-cgroup lists for efficient memory management. This change streamlines list operations and reclaim walks, aligning with existing major shrinkers' usage of list_lru."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch replaces the deferred split shrinker's queue handling with list_lru, which sets up per-node and per-cgroup lists. This change improves handling of cgroups on NUMA systems by avoiding splitting large pages across nodes. The new approach streamlines list operations and reclaim walks, and is used by other major shrinkers. The patch also adds calls to create node heads for the cgroup when splittable pages are created, eliminating the need for special migration code."
     }
   }
 }

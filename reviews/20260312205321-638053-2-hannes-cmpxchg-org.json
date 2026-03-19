@@ -8,23 +8,73 @@
       "developer": "Johannes Weiner",
       "reviews": [
         {
-          "author": "David Hildenbrand (Arm)",
-          "summary": "Gave a Reviewed-by tag without providing any specific feedback or comments.",
-          "sentiment": "NEUTRAL",
+          "author": "David (Arm)",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "POSITIVE",
           "sentiment_signals": [],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
           "raw_body": "",
-          "reply_to": "",
-          "message_date": "",
-          "message_id": "",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-03-17",
+          "message_id": "f5533ad1-d3a7-415e-a1b7-e4482a177ec2@kernel.org",
+          "analysis_source": "heuristic"
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Shakeel Butt noted that the lock_list_lru_of_memcg() function cannot return NULL if !skip_empty as per the original patch description, but the updated code still contains a path where it can return NULL when skip_empty is false. He requested to remove the NULL check in this case.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "From: Shakeel Butt <shakeel.butt@linux.dev>\nDate: Wed, 18 Mar 2026 10:43:53 -0700\nSubject: [PATCH] list_lru: cleanup\n\nSigned-off-by: Shakeel Butt <shakeel.butt@linux.dev>\n---\n mm/list_lru.c | 53 ++++++++++++++++++++++++++++-----------------------\n 1 file changed, 29 insertions(+), 24 deletions(-)\n\ndiff --git a/mm/list_lru.c b/mm/list_lru.c\nindex 26463ae29c64..062394c598d4 100644\n--- a/mm/list_lru.c\n+++ b/mm/list_lru.c\n@@ -77,27 +77,30 @@ static inline bool lock_list_lru(struct list_lru_one *l, bool irq)\n }\n \n static inline struct list_lru_one *\n-lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n-\t\t       bool irq, bool skip_empty)\n+__lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n+\t\t       bool irq)\n {\n \tstruct list_lru_one *l;\n \n \trcu_read_lock();\n-again:\n \tl = list_lru_from_memcg_idx(lru, nid, memcg_kmem_id(memcg));\n-\tif (likely(l) && lock_list_lru(l, irq)) {\n-\t\trcu_read_unlock();\n+\tif (likely(l) && !lock_list_lru(l, irq))\n+\t\tl = NULL;\n+\trcu_read_unlock();\n+\n+\treturn l;\n+}\n+\n+static inline struct list_lru_one *\n+lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg)\n+{\n+\tstruct list_lru_one *l;\n+again:\n+\tl = __lock_list_lru_of_memcg(lru, nid, memcg, false);\n+\tif (likely(l))\n \t\treturn l;\n-\t}\n-\t/*\n-\t * Caller may simply bail out if raced with reparenting or\n-\t * may iterate through the list_lru and expect empty slots.\n-\t */\n-\tif (skip_empty) {\n-\t\trcu_read_unlock();\n-\t\treturn NULL;\n-\t}\n-\tVM_WARN_ON(!css_is_dying(&memcg->css));\n+\n+\tVM_WARN_ON_ONCE(!css_is_dying(&memcg->css));\n \tmemcg = parent_mem_cgroup(memcg);\n \tgoto again;\n }\n@@ -135,8 +138,8 @@ list_lru_from_memcg_idx(struct list_lru *lru, int nid, int idx)\n }\n \n static inline struct list_lru_one *\n-lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n-\t\t       bool irq, bool skip_empty)\n+__lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n+\t\t       bool irq)\n {\n \tstruct list_lru_one *l = &lru->node[nid].lru;\n \n@@ -148,6 +151,12 @@ lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n \treturn l;\n }\n \n+static inline struct list_lru_one *\n+lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg)\n+{\n+\treturn __lock_list_lru_of_memcg(lru, nid, memcg, false);\n+}\n+\n static inline void unlock_list_lru(struct list_lru_one *l, bool irq_off)\n {\n \tif (irq_off)\n@@ -164,9 +173,7 @@ bool list_lru_add(struct list_lru *lru, struct list_head *item, int nid,\n \tstruct list_lru_node *nlru = &lru->node[nid];\n \tstruct list_lru_one *l;\n \n-\tl = lock_list_lru_of_memcg(lru, nid, memcg, false, false);\n-\tif (!l)\n-\t\treturn false;\n+\tl = lock_list_lru_of_memcg(lru, nid, memcg);\n \tif (list_empty(item)) {\n \t\tlist_add_tail(item, &l->list);\n \t\t/* Set shrinker bit if the first element was added */\n@@ -203,9 +210,7 @@ bool list_lru_del(struct list_lru *lru, struct list_head *item, int nid,\n {\n \tstruct list_lru_node *nlru = &lru->node[nid];\n \tstruct list_lru_one *l;\n-\tl = lock_list_lru_of_memcg(lru, nid, memcg, false, false);\n-\tif (!l)\n-\t\treturn false;\n+\tl = lock_list_lru_of_memcg(lru, nid, memcg);\n \tif (!list_empty(item)) {\n \t\tlist_del_init(item);\n \t\tl->nr_items--;\n@@ -287,7 +292,7 @@ __list_lru_walk_one(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n \tunsigned long isolated = 0;\n \n restart:\n-\tl = lock_list_lru_of_memcg(lru, nid, memcg, irq_off, true);\n+\tl = __lock_list_lru_of_memcg(lru, nid, memcg, irq_off);\n \tif (!l)\n \t\treturn isolated;\n \tlist_for_each_safe(item, n, &l->list) {\n-- \n2.52.0",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-03-18",
+          "message_id": "abrnEU-wHNkqGK2k@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Johannes Weiner (author)",
+          "summary": "Author acknowledged a concern about the complexity of adding another level to the lock function stack and is unsure if it's worth the effort.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "uncertainty",
+            "complexity"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Thanks for taking a look!\n\nThere is some overlap and conflict between your delta and what later\npatches in the series do.\n\nAFAICS, the main thing left over would be: to have\n__lock_list_lru_of_memcg() for the reclaimer (which does not walk the\nparents during a cgroup deletion race) and lock_list_lru_of_memcg()\nwhich does. Thereby eliminating the @skip_empty bool. The downside\nwould be to have another level in the lock function stack which is\nduplicated for CONFIG_MEMCG and !CONFIG_MEMCG, and the !CONFIG_MEMCG\nversions are identical.\n\nI'm not sure that's worth it?\n\n---\n mm/list_lru.c | 50 +++++++++++++++++++++++++++++++-------------------\n 1 file changed, 31 insertions(+), 19 deletions(-)\n\ndiff --git a/mm/list_lru.c b/mm/list_lru.c\nindex 1ccdd45b1d14..cab716d94ac5 100644\n--- a/mm/list_lru.c\n+++ b/mm/list_lru.c\n@@ -83,13 +83,12 @@ list_lru_from_memcg_idx(struct list_lru *lru, int nid, int idx)\n }\n \n static inline struct list_lru_one *\n-lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n-\t\t       bool irq, unsigned long *irq_flags, bool skip_empty)\n+__lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n+\t\t\t bool irq, unsigned long *irq_flags)\n {\n \tstruct list_lru_one *l;\n \n \trcu_read_lock();\n-again:\n \tl = list_lru_from_memcg_idx(lru, nid, memcg_kmem_id(memcg));\n \tif (likely(l)) {\n \t\tlock_list_lru(l, irq, irq_flags);\n@@ -99,18 +98,24 @@ lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n \t\t}\n \t\tunlock_list_lru(l, irq, irq_flags);\n \t}\n-\t/*\n-\t * Caller may simply bail out if raced with reparenting or\n-\t * may iterate through the list_lru and expect empty slots.\n-\t */\n-\tif (skip_empty) {\n-\t\trcu_read_unlock();\n-\t\treturn NULL;\n+\treturn NULL;\n+}\n+\n+static inline struct list_lru_one *\n+lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n+\t\t       bool irq, unsigned long *irq_flags)\n+{\n+\tstruct list_lru_one *l;\n+\n+\tfor (;;) {\n+\t\tl = __lock_list_lru_of_memcg(lru, nid, memcg, irq, irq_flags);\n+\t\tif (likely(l))\n+\t\t\treturn l;\n+\t\tVM_WARN_ON(!css_is_dying(&memcg->css));\n+\t\tmemcg = parent_mem_cgroup(memcg);\n \t}\n-\tVM_WARN_ON(!css_is_dying(&memcg->css));\n-\tmemcg = parent_mem_cgroup(memcg);\n-\tgoto again;\n }\n+\n #else\n static void list_lru_register(struct list_lru *lru)\n {\n@@ -137,8 +142,8 @@ list_lru_from_memcg_idx(struct list_lru *lru, int nid, int idx)\n }\n \n static inline struct list_lru_one *\n-lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n-\t\t       bool irq, unsigned long *irq_flags, bool skip_empty)\n+__lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n+\t\t\t bool irq, unsigned long *irq_flags)\n {\n \tstruct list_lru_one *l = &lru->node[nid].lru;\n \n@@ -146,13 +151,20 @@ lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n \n \treturn l;\n }\n+\n+static inline struct list_lru_one *\n+lock_list_lru_of_memcg(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n+\t\t       bool irq, unsigned long *irq_flags)\n+{\n+\treturn __lock_list_lru_of_memcg(lru, nid, memcg, irq, irq_flags);\n+}\n #endif /* CONFIG_MEMCG */\n \n struct list_lru_one *list_lru_lock(struct list_lru *lru, int nid,\n \t\t\t\t   struct mem_cgroup *memcg)\n {\n \treturn lock_list_lru_of_memcg(lru, nid, memcg, /*irq=*/false,\n-\t\t\t\t      /*irq_flags=*/NULL, /*skip_empty=*/false);\n+\t\t\t\t      /*irq_flags=*/NULL);\n }\n \n void list_lru_unlock(struct list_lru_one *l)\n@@ -165,7 +177,7 @@ struct list_lru_one *list_lru_lock_irqsave(struct list_lru *lru, int nid,\n \t\t\t\t\t   unsigned long *flags)\n {\n \treturn lock_list_lru_of_memcg(lru, nid, memcg, /*irq=*/true,\n-\t\t\t\t      /*irq_flags=*/flags, /*skip_empty=*/false);\n+\t\t\t\t      /*irq_flags=*/flags);\n }\n \n void list_lru_unlock_irqrestore(struct list_lru_one *l, unsigned long *flags)\n@@ -313,8 +325,8 @@ __list_lru_walk_one(struct list_lru *lru, int nid, struct mem_cgroup *memcg,\n \tunsigned long isolated = 0;\n \n restart:\n-\tl = lock_list_lru_of_memcg(lru, nid, memcg, /*irq=*/irq_off,\n-\t\t\t\t   /*irq_flags=*/NULL, /*skip_empty=*/true);\n+\tl = __lock_list_lru_of_memcg(lru, nid, memcg, /*irq=*/irq_off,\n+\t\t\t\t     /*irq_flags=*/NULL);\n \tif (!l)\n \t\treturn isolated;\n \tlist_for_each_safe(item, n, &l->list) {\n-- \n2.53.0",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-03-18",
+          "message_id": "abr8Kf38paSBh9H_@cmpxchg.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Reviewer Shakeel Butt suggested reducing the number of parameters in lock_list_lru_of_memcg() based on a discussion with David, but did not provide specific technical details or suggestions for improvement.\n\nReviewer Shakeel Butt expressed agreement with Johannes Weiner's patch and stated he would review the remaining patches in the next version, indicating no specific technical concerns or objections.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "suggested reduction of function parameters"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Yeah, I saw your discussion with David and thought on how can we further reduce\nthe params.\n\n---\n\nI am fine with whatever route you take. I know you have next version ready to\nsend, I will review the remaining patches for the next version (though I have\ntaken a look on the current series but will add my tags for the next one :P).",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-03-18",
+          "message_id": "abr9sDFvueL6fGPv@linux.dev",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series aims to simplify the list_lru locking mechanism by removing unnecessary NULL checks in certain scenarios, ensuring that locks are always acquired successfully."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch removes unnecessary NULL checks in the list_lru_add and list_lru_del functions, as acquiring a lock on the list LRU will never fail when walking up the cgroup hierarchy or falling back to the node list."
     }
   }
 }
