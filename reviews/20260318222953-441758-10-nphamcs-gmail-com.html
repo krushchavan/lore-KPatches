@@ -238,19 +238,129 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 09/21] mm: swap: allocate a virtual swap slot for each swapped out page</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260318222953.441758-10-nphamcs@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-18</strong><div class="date-range-nav">Active on: <a href="#2026-03-18">2026-03-18</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new virtual swap slot design for each swapped out page, replacing the old physical swap slot approach. The virtual swap slot is dynamically allocated and associated with its corresponding physical swap slot on the swapfile or partition. This change affects various swap-related data structures, including the swap cache, zswap tree, and swap cgroup array.</div></div>
+    <div class="date-range">Submitted: <strong>2026-03-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-19</strong><div class="date-range-nav">Active on: <a href="#2026-03-18">2026-03-18</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new virtual swap slot design, where each swapped out page is dynamically allocated a virtual swap slot and associated metadata structure. The virtual swap slot replaces the physical swap slot in page table entries and is used to index into swap data structures such as the swap cache and zswap tree. The patch also repurposes the swap table infrastructure as a reverse map to look up the virtual swap slot from its associated physical swap slot on the swapfile. This change improves the efficiency of swap operations, including cluster readahead and swap file reclamation.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-03-18">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> David Hildenbrand</span>
-<a class="date-chip" href="../2026-03-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
+<span class="review-author">Nhat Pham (author)</span>
+<a class="date-chip" href="../2026-03-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Raised concerns about the potential performance impact of the new virtual swap slot design and suggested exploring alternative solutions.</div>
-<div class="review-comment-signals">Signals: performance</div>
+<div class="review-comment-text">Author acknowledged the need to defer-free on the cpu_dead path and suggested using call_rcu() to safely handle this scenario, indicating a planned fix.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hmm seems like we can just defer-free on the cpu_dead path, and that
+should be safe?
+
+Right now, if a cluster is cached on a CPU, we know that it&#x27;s not
+cached on any other CPU, and it&#x27;s not on any other partial lists.
+Maybe can call_rcu() here to defer-free it. Hopefully cpu dead is rare
+enough of an event that we dont have a backlog of free deferrals :)
+
+The other alternative is workqueue (with some careful rcu handling in
+the free callback), but that seems unnecessary.</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAKEwX=Mp3=E_nVhFFvdyKWjHtdp6TB=edp9-x4OajZp6MPRwrA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged need for fix, planned fix</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-03-18">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Peter Zijlstra</span>
+<a class="date-chip" href="../2026-03-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Peter Zijlstra requested the addition of a guard to protect against RCU callbacks during certain operations, specifically mentioning the need for a &#x27;guard(rcu)()&#x27; statement.
+
+Reviewer noted that the patch breaks on PREEMPT_RT due to running with IRQs disabled, and requested the use of a raw_spinlock_t instead of a regular spinlock
+
+Reviewer Peter Zijlstra requested the use of lockdep_assert_held to ensure that cluster-&gt;lock is held before accessing swap_cluster_info, citing concerns about potential deadlocks.
+
+Reviewer Peter Zijlstra noted that the vswap_free() function is being called from a DEAD callback with IRQs disabled, which creates a potential issue due to lock ordering violations with reclaim paths.
+
+Reviewer Peter Zijlstra noted that the vswap_free() function may be called from a DEAD callback, specifically xas_alloc(), and this is not allowed due to lock ordering issues.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">nit:
+	guard(rcu)();
+
+---
+
+This breaks on PREEMPT_RT as this is ran with IRQs disabled. This must
+be a raw_spinlock_t.
+
+---
+
+This is terrible, please use:
+
+	lockdep_assert_held(&amp;cluster-&gt;lock);
+
+---
+
+This is again broken, this cannot be from a DEAD callback with IRQs
+disabled.
+
+---
+
+Strictly speaking this can end up in xas_alloc(), which is again, not
+allowed in a DEAD callback.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/20260319075621.GR3738010@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, lock ordering violation, potential issue</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham (author)</span>
+<a class="date-chip" href="../2026-03-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in a future version.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">No worries at all. Thanks for help taking a look - the other comment
+regarding lock-checking still hold regardless, and will be amended in
+the next version :)
+
+I&#x27;ll stare at it a bit more while the context of this portion of the
+code is still in my head.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Peter Zijlstra</div>
+<a href="https://lore.kernel.org/r/CAKEwX=N_oAjYy3pKzXG+oq9arhNrmPVBm6gvVC_Hx2Utvjfr7A@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, agreed to restructure</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Peter Zijlstra</span>
+<a class="date-chip" href="../2026-03-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Peter Zijlstra noted a potential naming conflict between CPUHP_MM_VSWAP_DEAD and the existing DYING state, suggesting that DEAD is safe to use instead.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Oh, I think I might have confused DEAD and DYING here. DYING is the
+tricky one, DEAD should be okay. Sorry about that.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/20260319210319.GK3738786@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: potential naming conflict, suggestion</div>
+</div>
+</div>
 </div>
 </div>
 </div>
