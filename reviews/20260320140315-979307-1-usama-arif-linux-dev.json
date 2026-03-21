@@ -1,0 +1,221 @@
+{
+  "thread_id": "20260320140315.979307-1-usama.arif@linux.dev",
+  "subject": "[PATCH v2 0/4] mm: improve large folio readahead and alignment for exec memory",
+  "url": "https://lore.kernel.org/all/20260320140315.979307-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-03-20": {
+      "report_file": "2026-03-20_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif (author)",
+          "summary": "The author is addressing a concern about the mmap_miss heuristic disabling exec readahead after 100 page faults. They acknowledge that this issue prevents optimal operation of exec_folio_order() and explain how their patch addresses it by excluding VM_EXEC VMAs from the mmap_miss logic, similar to how VM_SEQ_READ is already excluded.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges a fix is needed",
+            "explains the solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "v2 takes a different approach from v1 trying to move away from\nexec_folio_order() and comeup with a generic arch independent solution\nwhich is what I think David was suggesting in [1].\nI thought I would send it as code rather than try and discuss it in v1\nas its easier :)\n\nv1 -> v2: https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev/\n- disable mmap_miss logic for VM_EXEC (Jan Kara)\n- Align in elf only when segment VA and file offset are already aligned (Rui)\n- preferred_exec_order() for VM_EXEC sync mmap_readahead which takes into\n  account zone high watermarks (as an approximation of memory pressure)\n  (David, or atleast my approach to what David suggested in [1] :))\n- Extend max alignment to mapping_max_folio_size() instead of\n  exec_folio_order()\n\nMotiviation\n===========\nexec_folio_order() was introduced [2] to request readahead at an\narch-preferred folio order for executable memory, enabling hardware PTE\ncoalescing (e.g. arm64 contpte) and PMD mappings on the fault path.\n\nHowever, several things prevent this from working optimally:\n\n1. The mmap_miss heuristic in do_sync_mmap_readahead() silently disables\n   exec readahead after 100 page faults. The mmap_miss counter tracks\n   whether readahead is useful for mmap'd file access:\n\n   - Incremented by 1 in do_sync_mmap_readahead() on every page cache\n     miss (page needed IO).\n\n   - Decremented by N in filemap_map_pages() for N pages successfully\n     mapped via fault-around (pages found in cache without faulting,\n     evidence that readahead was useful). Only non-workingset pages\n     count and recently evicted and re-read pages don't count as hits.\n\n   - Decremented by 1 in do_async_mmap_readahead() when a PG_readahead\n     marker page is found (indicates sequential consumption of readahead\n     pages).\n\n   When mmap_miss exceeds MMAP_LOTSAMISS (100), all readahead is\n   disabled. On arm64 with 64K pages, both decrement paths are inactive:\n\n   - filemap_map_pages() is never called because fault_around_pages\n     (65536 >> PAGE_SHIFT = 1) disables should_fault_around(), which\n     requires fault_around_pages > 1. With only 1 page in the\n     fault-around window, there is nothing \"around\" to map.\n\n   - do_async_mmap_readahead() never fires for exec mappings because\n     exec readahead sets async_size = 0, so no PG_readahead markers\n     are placed.\n\n   With no decrements, mmap_miss monotonically increases past\n   MMAP_LOTSAMISS after 100 faults, disabling exec readahead\n   for the remainder of the mapping. Patch 1 fixes this by excluding\n   VM_EXEC VMAs from the mmap_miss logic, similar to how VM_SEQ_READ\n   is already excluded.\n\n2. exec_folio_order() is an arch-specific hook that returns a static\n   order (ilog2(SZ_64K >> PAGE_SHIFT)), which is suboptimal for non-4K\n   page sizes and doesn't adapt to runtime conditions. Patch 2 replaces\n   it with a generic preferred_exec_order() that targets min(PMD_ORDER,\n   2M), which naturally gives the right answer across architectures and\n   different page sizes: contpte on arm64 (2M for all page sizes), PMD\n   mapping on x86 (2M), and smaller PMDs like s390 (1M). The 2M cap also\n   avoids requesting excessively large folios on configurations where\n   PMD_ORDER is much larger (32M on arm64 16K pages, 512M on arm64 64K\n   pages), which would cause unnecessary memory pressure. The function\n   adapts at runtime based on VMA size and memory pressure (zone\n   watermarks), stepping down the order when memory is tight.\n\n3. Even with correct folio order and readahead, hardware PTE coalescing\n   (e.g. contpte) and PMD mapping require the virtual address to be\n   aligned to the folio size. The readahead path aligns file offsets and\n   the buddy allocator aligns physical memory, but the virtual address\n   depends on the VMA start. For PIE binaries, ASLR randomizes the load\n   address at PAGE_SIZE granularity, so on arm64 with 64K pages only\n   1/32 of load addresses are 2M-aligned. When misaligned, contpte\n   cannot be used for any folio in the VMA.\n\n   Patch 3 fixes this for the main binary by extending maximum_alignment()\n   in the ELF loader to consider mapping_max_folio_size(), aligning\n   load_bias to the largest folio the filesystem will allocate.\n\n   Patch 4 fixes this for shared libraries by adding a folio-size\n   alignment fallback in thp_get_unmapped_area_vmflags(). The existing\n   PMD_SIZE alignment (512M on arm64 64K pages) is too large for typical\n   shared libraries, so this smaller fallback succeeds where PMD fails.\n\nI created a benchmark that mmaps a large executable file and calls\nRET-stub functions at PAGE_SIZE offsets across it. \"Cold\" measures\nfault + readahead cost. \"Random\" first faults in all pages with a\nsequential sweep (not measured), then measures time for calling random\noffsets, isolating iTLB miss cost for scattered execution.\n\nThe benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,\n512MB executable file on ext4, averaged over 3 runs:\n\n  Phase      | Baseline     | Patched      | Improvement\n  -----------|--------------|--------------|------------------\n  Cold fault | 83.4 ms      | 41.3 ms      | 50% faster\n  Random     | 76.0 ms      | 58.3 ms      | 23% faster\n\n[1] https://lore.kernel.org/all/d72d5ca3-4b92-470e-9f89-9f39a3975f1e@kernel.org/\n[2] https://lore.kernel.org/all/20250430145920.3748738-6-ryan.roberts@arm.com/\n \nUsama Arif (4):\n  mm: bypass mmap_miss heuristic for VM_EXEC readahead\n  mm: replace exec_folio_order() with generic preferred_exec_order()\n  elf: align ET_DYN base to max folio size for PTE coalescing\n  mm: align file-backed mmap to max folio order in thp_get_unmapped_area\n\n arch/arm64/include/asm/pgtable.h |  8 -----\n fs/binfmt_elf.c                  | 38 ++++++++++++++++++--\n include/linux/pgtable.h          | 11 ------\n mm/filemap.c                     | 59 ++++++++++++++++++++++++++++----\n mm/huge_memory.c                 | 14 ++++++++\n 5 files changed, 102 insertions(+), 28 deletions(-)\n\n-- \n2.52.0",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "20260320140315.979307-1-usama.arif@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jan Kara",
+          "summary": "Reviewer Jan Kara approved the patch and requested to be added as a Reviewed-by, indicating no specific technical issues or concerns.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "approval",
+            "positive feedback"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Looks good to me. Feel free to add:\n\nReviewed-by: Jan Kara <jack@suse.cz>\n\n\t\t\t\t\t\t\t\tHonza",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "er6pfnbasao53shfs3vwznosqy4k74tjh4lxcegzwgdaweahdu@vgkhrdrhv5oe",
+          "email": "jack@suse.cz",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Reviewer noted that VM_EXEC is a good enough proxy for instruction fetch, but pointed out that FAULT_FLAG_INSTRUCTION is the actual signal and only provided by a handful of architectures.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "requested clarification",
+            "provided alternative perspective"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Strictly speaking the fact that the file mapped as executable doesn't\nmean we are serving instruction fetch page fault.\n\nFAULT_FLAG_INSTRUCTION would be the signal, but it is only provided by\nhandful of architectures.\n\nVM_EXEC is good enough proxy.\n\nReviewed-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "ab1Y5fLNJ466kK-7@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Reviewer Kiryl Shutsemau criticized the patch as an overkill and layering violation, suggesting that a range or mask of acceptable order should be handled within the page allocator's allocation interface.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "overkill",
+            "layering violation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Eww. That's overkill and layering violation.\n\nIf we need something like this, it has to be do within page allocator:\nan allocation interface that takes a range (or mask) of acceptable\norder.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "ab1ZopAY7JCUOYvr@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jan Kara",
+          "summary": "Jan Kara noted that do_sync_mmap_readahead() already trims down ra->order to fit within the file and vma, making unnecessary any order trimming based on vma length.\n\nReviewer Jan Kara suggested moving the logic for trimming readahead order based on memory pressure to a more general function like page_cache_ra_order(), citing potential issues with large order folios in the page cache and suggesting it's not specific to exec memory.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested clarification",
+            "highlighted existing behavior",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hum, as far as I'm checking page_cache_ra_order() used in\ndo_sync_mmap_readahead(), ra->order is the preferred order but it will be\ntrimmed down to fit both within the file and within ra->size. And ra->size\nis set for the readahead to fit within the vma so I don't think any order\ntrimming based on vma length is needed in this place?\n\n---\n\nIt looks wrong for this logic to be here. Trimming order based on memory\npressure makes sense (and we've already got reports that on memory limited\ndevices large order folios in the page cache have too big memory overhead\nso we'll likely need to handle that for page cache allocations in general)\nbut IMHO it belongs to page_cache_ra_order() or some other common place\nlike that.\n\n\t\t\t\t\t\t\t\tHonza\n-- \nJan Kara <jack@suse.com>\nSUSE Labs, CR",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "k45xs6btmt62uerbglqe665jozrtkeoklu4rek6odgxjdj63ni@ftw6ef3ug33x",
+          "email": "jack@suse.cz",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "ab1fvJxFYQP-ByQG@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Reviewer suggested integrating the alignment logic inside __thp_get_unmapped_area, starting with PMD_SIZE alignment and then adjusting based on mapping size",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Have you considered to integrate inside __thp_get_unmapped_area?\n\nLike, start with PMD_SIZE alignment, then lower to\nmapping_max_folio_size if needed and then lower further based on mapping\nsize.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "ab1gW5tR6LhX0fQ0@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Matthew Wilcox",
+          "summary": "Reviewer Matthew Wilcox asked about the circumstances under which bprm->file can be NULL and suggested using the name 'file' instead of 'filp' for new code.\n\nReviewer Matthew Wilcox suggested refactoring the code into a separate function and pointed to an example of how it was done better in another patch",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "question",
+            "suggestion",
+            "requested changes",
+            "suggested improvement"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Under what circumstances can bprm->file be NULL?\n\nAlso we tend to prefer the name \"file\" rather than \"filp\" for new code\n(yes, there's a lot of old code out there).\n\n---\n\nCan this not all be factored out into a different function?  Also, I\nthink it was done a bit better here:\nhttps://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc/\n\n+\tif (!IS_ALIGNED(cmd->p_vaddr | cmd->p_offset, PMD_SIZE))\n+\t\treturn false;",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "ab1uqdcMBP1cBr7Q@casper.infradead.org",
+          "email": "willy@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Matthew Wilcox",
+          "summary": "The reviewer noted that the patch does not account for btrfs's experimental large folio support and suggested caution in introducing new features.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "btrfs only supports large folios with CONFIG_BTRFS_EXPERIMENTAL.\nI mean, it's only been five years since it was added to XFS, can't rush\nthese things.",
+          "reply_to": "WANG Rui",
+          "message_date": "2026-03-20",
+          "message_id": "ab2IIwKzmK9qwIlZ@casper.infradead.org",
+          "email": "willy@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series improves large folio readahead and alignment for executable memory by introducing a generic, architecture-independent solution to replace the arch-specific exec_folio_order() function. The patches address two main issues: the mmap_miss heuristic that disables readahead after 100 page faults, and the suboptimal static order returned by exec_folio_order() for non-4K page sizes. The new approach uses preferred_exec_order() to sync mmap_readahead with zone high watermarks, and extends max alignment to mapping_max_folio_size()."
+    },
+    "2026-03-21": {
+      "report_file": "2026-03-20_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "WANG Rui",
+          "summary": "Reviewer WANG Rui noted that the patch does not handle the case where the segment VA and file offset are already aligned, which is a requirement for alignment in elf only.\n\nReviewer WANG Rui noted that the current implementation of mapping_max_folio_size() returns a fixed value based on the filesystem, which is overly conservative and misses potential optimizations.\n\nReviewer WANG Rui noted that the current behavior of not aligning eligible segments to PMD_SIZE prevents THP from quickly collapsing them into large mappings, and suggested allowing a reasonably sized PMD (<= 32M) for virtual address alignment, leaving the rest to THP under always.\n\nReviewer WANG Rui pointed out that the patch does not align in ELF only when segment VA and file offset are already aligned, which is a requirement for exec memory.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "overly conservative",
+            "missing practical optimization opportunities",
+            "requested change"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Usama,\n\nOn Fri, Mar 20, 2026 at 10:04\\u202fPM Usama Arif <usama.arif@linux.dev> wrote:\n\n---\n\ndepend on the filesystem. It returns 8M on ext4, while on btrfs it always\nfalls back to PAGE_SIZE (it seems CONFIG_BTRFS_EXPERIMENTAL=y may change this).\nThis looks overly conservative and ends up missing practical optimization\nopportunities.\n\n---\n\nIn my patch [1], by aligning eligible segments to PMD_SIZE, THP can quickly\ncollapse them into large mappings with minimal warmup. That doesn\\u2019t happen\nwith the current behavior. I think allowing a reasonably sized PMD (say <= 32M)\nis worth considering. All we really need here is to ensure virtual address\nalignment. The rest can be left to THP under always, which can decide whether\nto collapse or not based on memory pressure and other factors.\n\n[1] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc\n\n---\n\nThanks,\nRui",
+          "reply_to": "",
+          "message_date": "2026-03-21",
+          "message_id": "20260320160519.80962-1-r@hev.cc",
+          "email": "r@hev.cc",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series improves large folio readahead and alignment for executable memory by introducing a generic, architecture-independent solution to replace the arch-specific exec_folio_order() function. The patches address two main issues: the mmap_miss heuristic that disables readahead after 100 page faults, and the suboptimal static order returned by exec_folio_order() for non-4K page sizes. The new approach uses preferred_exec_order() to sync mmap_readahead with zone high watermarks, and extends max alignment to mapping_max_folio_size()."
+    }
+  }
+}

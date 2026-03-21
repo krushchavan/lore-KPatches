@@ -1,0 +1,64 @@
+{
+  "thread_id": "20260320140315.979307-3-usama.arif@linux.dev",
+  "subject": "[PATCH v2 2/4] mm: replace exec_folio_order() with generic preferred_exec_order()",
+  "url": "https://lore.kernel.org/all/20260320140315.979307-3-usama.arif@linux.dev/",
+  "dates": {
+    "2026-03-20": {
+      "report_file": "2026-03-20_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif (author)",
+          "summary": "The author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Replace the arch-specific exec_folio_order() hook with a generic\npreferred_exec_order() that dynamically computes the readahead folio\norder for executable memory. It targets min(PMD_ORDER, 2M) as the\nmaximum, which optimally gives the right answer for contpte (arm64),\nPMD mapping (x86, arm64 4K), and architectures with smaller PMDs\n(s390 1M). It adapts at runtime based on:\n\n- VMA size: caps the order so folios fit within the mapping\n- Memory pressure: steps down the order when the local node's free\n  memory is below the high watermark for the requested order\n\nThis avoids over-allocating on memory-constrained systems while still\nrequesting the optimal order when memory is plentiful.\n\nSince exec_folio_order() is no longer needed, remove the arm64\ndefinition and the generic default from pgtable.h.\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n arch/arm64/include/asm/pgtable.h |  8 -----\n include/linux/pgtable.h          | 11 ------\n mm/filemap.c                     | 57 ++++++++++++++++++++++++++++----\n 3 files changed, 51 insertions(+), 25 deletions(-)\n\ndiff --git a/arch/arm64/include/asm/pgtable.h b/arch/arm64/include/asm/pgtable.h\nindex b3e58735c49bd..b1e74940624d8 100644\n--- a/arch/arm64/include/asm/pgtable.h\n+++ b/arch/arm64/include/asm/pgtable.h\n@@ -1599,14 +1599,6 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,\n  */\n #define arch_wants_old_prefaulted_pte\tcpu_has_hw_af\n \n-/*\n- * Request exec memory is read into pagecache in at least 64K folios. This size\n- * can be contpte-mapped when 4K base pages are in use (16 pages into 1 iTLB\n- * entry), and HPA can coalesce it (4 pages into 1 TLB entry) when 16K base\n- * pages are in use.\n- */\n-#define exec_folio_order() ilog2(SZ_64K >> PAGE_SHIFT)\n-\n static inline bool pud_sect_supported(void)\n {\n \treturn PAGE_SIZE == SZ_4K;\ndiff --git a/include/linux/pgtable.h b/include/linux/pgtable.h\nindex a50df42a893fb..874333549eb3c 100644\n--- a/include/linux/pgtable.h\n+++ b/include/linux/pgtable.h\n@@ -577,17 +577,6 @@ static inline bool arch_has_hw_pte_young(void)\n }\n #endif\n \n-#ifndef exec_folio_order\n-/*\n- * Returns preferred minimum folio order for executable file-backed memory. Must\n- * be in range [0, PMD_ORDER). Default to order-0.\n- */\n-static inline unsigned int exec_folio_order(void)\n-{\n-\treturn 0;\n-}\n-#endif\n-\n #ifndef arch_check_zapped_pte\n static inline void arch_check_zapped_pte(struct vm_area_struct *vma,\n \t\t\t\t\t pte_t pte)\ndiff --git a/mm/filemap.c b/mm/filemap.c\nindex 7d89c6b384cc4..aebfb78e487d7 100644\n--- a/mm/filemap.c\n+++ b/mm/filemap.c\n@@ -3290,6 +3290,52 @@ static int lock_folio_maybe_drop_mmap(struct vm_fault *vmf, struct folio *folio,\n \treturn 1;\n }\n \n+/*\n+ * Compute the preferred folio order for executable memory readahead.\n+ * Targets min(PMD_ORDER, 2M) as the maximum, which gives the\n+ * optimal order for contpte (arm64), PMD mapping (x86, arm64 4K), and\n+ * architectures with smaller PMDs (s390 1M). The 2M cap also avoids\n+ * requesting excessively large folios on configurations where PMD_ORDER\n+ * is much larger (32M on 16K pages, 512M on 64K pages), which would cause\n+ * unnecessary memory pressure. Adapts at runtime based on:\n+ *\n+ * - VMA size: cap the order so folios fit within the mapping.\n+ *\n+ * - Memory pressure: step down the order when free memory on the local\n+ *   node is below the high watermark for the requested order. This\n+ *   avoids expensive reclaim or compaction to satisfy large folio\n+ *   allocations when memory is tight.\n+ */\n+static unsigned int preferred_exec_order(struct vm_area_struct *vma)\n+{\n+\tint order;\n+\tunsigned long vma_len = vma_pages(vma);\n+\tstruct zone *zone;\n+\tgfp_t gfp;\n+\n+\tif (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))\n+\t\treturn 0;\n+\n+\t/* Cap at min(PMD_ORDER, 2M) */\n+\torder = min(HPAGE_PMD_ORDER, ilog2(SZ_2M >> PAGE_SHIFT));\n+\n+\t/* Don't request folios larger than the VMA */\n+\torder = min(order, ilog2(vma_len));\n+\n+\t/* Step down under memory pressure */\n+\tgfp = mapping_gfp_mask(vma->vm_file->f_mapping);\n+\tzone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),\n+\t\t\t\t    gfp_zone(gfp), NULL)->zone;\n+\tif (zone) {\n+\t\twhile (order > 0 &&\n+\t\t       !zone_watermark_ok(zone, order,\n+\t\t\t\t\t  high_wmark_pages(zone), 0, 0))\n+\t\t\torder--;\n+\t}\n+\n+\treturn order;\n+}\n+\n /*\n  * Synchronous readahead happens when we don't even find a page in the page\n  * cache at all.  We don't want to perform IO under the mmap sem, so if we have\n@@ -3363,11 +3409,10 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)\n \n \tif (vm_flags & VM_EXEC) {\n \t\t/*\n-\t\t * Allow arch to request a preferred minimum folio order for\n-\t\t * executable memory. This can often be beneficial to\n-\t\t * performance if (e.g.) arm64 can contpte-map the folio.\n-\t\t * Executable memory rarely benefits from readahead, due to its\n-\t\t * random access nature, so set async_size to 0.\n+\t\t * Request a preferred folio order for executable memory,\n+\t\t * dynamically adapted to VMA size and memory pressure.\n+\t\t * Executable memory rarely benefits from speculative readahead\n+\t\t * due to its random access nature, so set async_size to 0.\n \t\t *\n \t\t * Limit to the boundaries of the VMA to avoid reading in any\n \t\t * pad that might exist between sections, which would be a waste\n@@ -3378,7 +3423,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)\n \t\tunsigned long end = start + vma_pages(vma);\n \t\tunsigned long ra_end;\n \n-\t\tra->order = exec_folio_order();\n+\t\tra->order = preferred_exec_order(vma);\n \t\tra->start = round_down(vmf->pgoff, 1UL << ra->order);\n \t\tra->start = max(ra->start, start);\n \t\tra_end = round_up(ra->start + ra->ra_pages, 1UL << ra->order);\n-- \n2.52.0",
+          "reply_to": "",
+          "message_date": "2026-03-20",
+          "message_id": "20260320140315.979307-3-usama.arif@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Reviewer Kiryl Shutsemau expressed strong disagreement with the patch, citing it as an overkill and layering violation, suggesting that a more suitable approach would be to modify the page allocator to accept a range or mask of acceptable order for allocations.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "overkill",
+            "layering violation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Eww. That's overkill and layering violation.\n\nIf we need something like this, it has to be do within page allocator:\nan allocation interface that takes a range (or mask) of acceptable\norder.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-03-20",
+          "message_id": "ab1ZopAY7JCUOYvr@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Jan Kara",
+          "summary": "Reviewer Jan Kara questioned whether trimming down the preferred folio order (ra->order) to fit within the file and ra->size is necessary, suggesting that page_cache_ra_order() already takes care of this in do_sync_mmap_readahead().\n\nReviewer Jan Kara noted that the logic for trimming the folio order based on memory pressure is misplaced in this patch and suggested it should be moved to page_cache_ra_order() or a similar common place.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hum, as far as I'm checking page_cache_ra_order() used in\ndo_sync_mmap_readahead(), ra->order is the preferred order but it will be\ntrimmed down to fit both within the file and within ra->size. And ra->size\nis set for the readahead to fit within the vma so I don't think any order\ntrimming based on vma length is needed in this place?\n\n---\n\nIt looks wrong for this logic to be here. Trimming order based on memory\npressure makes sense (and we've already got reports that on memory limited\ndevices large order folios in the page cache have too big memory overhead\nso we'll likely need to handle that for page cache allocations in general)\nbut IMHO it belongs to page_cache_ra_order() or some other common place\nlike that.\n\n\t\t\t\t\t\t\t\tHonza\n-- \nJan Kara <jack@suse.com>\nSUSE Labs, CR",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-03-20",
+          "message_id": "k45xs6btmt62uerbglqe665jozrtkeoklu4rek6odgxjdj63ni@ftw6ef3ug33x",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch replaces the arch-specific exec_folio_order() hook with a generic preferred_exec_order() function that dynamically computes the readahead folio order for executable memory based on VMA size and memory pressure. The new function targets min(PMD_ORDER, 2M) as the maximum order to balance optimal performance with memory constraints. It removes the need for arch-specific definitions and provides a more flexible solution for various architectures."
+    }
+  }
+}
