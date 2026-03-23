@@ -3,57 +3,6 @@
   "subject": "[PATCH v1 11/11] io_uring/cmd: set selected buffer index in __io_uring_cmd_done()",
   "url": "https://lore.kernel.org/all/20260210002852.1394504-12-joannelkoong@gmail.com/",
   "dates": {
-    "2026-02-20": {
-      "report_file": "2026-02-20_ollama_llama3.1-8b.html",
-      "developer": "Joanne Koong",
-      "reviews": [
-        {
-          "author": "Pavel Begunkov",
-          "summary": "Reviewer Pavel Begunkov questioned whether kernel-managed buffer rings (km rings) should be exposed as io_uring uapi, specifically asking if a server or user space program can issue I/O requests that consume buffers/entries from the km ring without fuse kernel code involved. He requested clarification on this point to inform the decision of exposing km rings in the uapi.\n\nReviewer Pavel Begunkov suggested reusing registered buffers instead of introducing a new mechanism for kernel-managed buffer rings, citing efficiency and similarity to zero-copy internally registered buffers as benefits.\n\nReviewer noted that kernel-managed buffer rings would hold page references or require pinning of regions, suggesting a different approach using registered buffers\n\nreviewer suggested adding a liburing helper for the fuse server to avoid dealing with mmap'ing\n\nreviewer expressed conditional approval, requesting confirmation that the patch allows for desired fast path optimizations",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "requested changes",
-            "clarification needed",
-            "alternative solution",
-            "suggestion",
-            "alternative",
-            "conditional approval",
-            "request for confirmation"
-          ],
-          "has_inline_review": true,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "You mention OP_READ_FIXED and below agreed not exposing km rings\nan io_uring uapi, which makes me believe we're still talking about\ndifferent things.\n\nCorrect me if I'm wrong. Currently, only fuse cmds use the buffer\nring itself, I'm not talking about buffer, i.e. fuse cmds consume\nentries from the ring (!!! that's the part I'm interested in), then\nprocess them and tell the server \"this offset in the region has user\ndata to process or should be populated with data\".\n\nNaturally, the server should be able to use the buffers to issue\nsome I/O and process it in other ways, whether it's a normal\nOP_READ to which you pass the user space address (you can since\nit's mmap()'ed by the server) or something else is important but\na separate question than the one I'm trying to understand.\n\nSo I'm asking whether you expect that a server or other user space\nprogram should be able to issue a READ_OP_RECV, READ_OP_READ or any\nother similar request, which would consume buffers/entries from the\nkm ring without any fuse kernel code involved? Do you have some\nuse case for that in mind?\n\nUnderstanding that is the key in deciding whether km rings should\nbe exposed as io_uring uapi or not, regardless of where buffers\nto populate the ring come from.\n\n...\n\n---\n\nSo you already can do all that using the mmap()'ed region user\npointer, and you just want it to be more efficient, right?\nFor that let's just reuse registered buffers, we don't need a\nnew mechanism that needs to be propagated to all request types.\nAnd registered buffer are already optimised for I/O in a bunch\nof ways. And as a bonus, it'll be similar to the zero-copy\ninternally registered buffers if you still plan to add them.\n\nThe simplest way to do that is to create a registered buffer out\nof the mmap'ed region pointer. Pseudo code:\n\n// mmap'ed if it's kernel allocated.\n{region_ptr, region_size} = create_region();\n\nstruct iovec iov;\niov.iov_base = region_ptr;\niov.iov_len = region_size;\nio_uring_register_buffers(ring, &iov, 1);\n\n// later instead of this:\nptr = region_ptr + off;\nio_uring_prep_read(sqe, fd, ptr, ...);\n\n// you use registered buffers as usual:\nio_uring_prep_read_fixed(sqe, fd, off, regbuf_idx, ...);\n\n\nIIRC the registration would fail because it doesn't allow file\nbacked pages, but it should be fine if we know it's io_uring\nregion memory, so that would need to be patched.\n\nThere might be a bunch of other ways you can do that like\ncreate a kernel allocated registered buffer like what Cristoph\nwants, and then register it as a region. Or allow creating\nregistered buffers out of a region. etc.\n\nI wanted to unify registered buffers and regions internally\nat some point, but then drifted away from active io_uring core\ninfrastructure development, so I guess that could've been useful.\n\n---\n\nLet's talk about it when it's needed or something changes, but if\nyou do registered buffers instead as per above, they'll be holding\npage references and or have to pin the region in some other way.\n\n---\n\nFWIW, we should just add a liburing helper, so that fuse server\ndoesn't need to deal with mmap'ing.\n\n---\n\nThat's sounds clean to me _if_ it allows you to achieve all\n(fast path) optimisations you want to have. I hope it does?\n\n-- \nPavel Begunkov",
-          "reply_to": "Joanne Koong",
-          "message_date": "2026-02-20",
-          "message_id": ""
-        },
-        {
-          "author": "Joanne Koong (author)",
-          "summary": "The author is addressing a question from Pavel Begunkov about whether the concept of kernel-managed buffer rings (kmbuf rings) is fuse-specific and whether it would be useful to optimize for READ_OP_RECV/READ_OP_READ operations directly on the ring. The author agrees that this optimization would be beneficial in certain scenarios, such as network-backed servers with high concurrency and unpredictable latencies, but notes that kmbuf rings are not exclusively fuse-specific and could be useful for other subsystems/users.\n\nAuthor expressed concern about added complexity and potential confusion in the design, specifically questioning the need for kernel-managed buffer rings when memory regions could be used instead.\n\nAuthor addressed Pavel's concern that the caller cannot guarantee the memory region will be registered as a fixed buffer, explaining that this would introduce extra overhead for every I/O operation and suggesting pinning to a registered memory region as an alternative.",
-          "sentiment": "neutral",
-          "sentiment_signals": [
-            "acknowledged a question",
-            "provided additional context",
-            "questioning",
-            "expressed concern",
-            "acknowledged a technical issue",
-            "provided an explanation"
-          ],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "Thanks for clarifying your question. Yes, this would be a useful\noptimization in the future for fuse servers with certain workload\ncharacteristics (eg network-backed servers with high concurrency and\nunpredictable latencies). I don't think the concept of kmbufrings is\nexclusively fuse-specific though (for example, Christoph's use case\nbeing a recent instance); I think other subsystems/users that'll use\nkmbuf rings would also generically find it useful to have the option\nof READ_OP_RECV/READ_OP_READ operating directly on the ring.\n\n---\n\nI feel like this design makes the interface more convoluted and now\nmuddies different concepts together by adding new complexity /\nrelationships between them whereas they were otherwise cleanly\nisolated. Maybe I'm just not seeing/understanding the overarching\nvision for why conceptually it makes sense for them to be tied\ntogether besides as a mechanism to tell io-uring requests where to\ncopy from by reusing what exists for fixed buffer ids. There's more\ncomplexity now on the kernel side (eg having to detect if the buffer\npassed in is kernel-allocated to know whether to pin the pages /\ncharge it against the user's RLIMIT_MEMLOCK limit) but I'm not\nunderstanding what we gain from it. I got the sense from your previous\ncomments that memory regions are the de facto way to go and should be\ndecoupled from other structures, so if that's the case, why doesn't it\nmake sense for io-uring to add native support for using memory regions\nfor io-uring requests? I feel like from the userspace side it makes\nthings more confusing with this extra layer of indirection that now\nhas to go through a fixed buffer.\n\n---\n\nI don't think we can guarantee that the caller will register the\nmemory region as a fixed buffer (eg if it doesn't need/want to use the\nbuffer for normal io-uring requests). On the kernel side, the internal\nbuffer entry uses the kaddr of the registered memory region buffer for\nany memcpys. If it's not guaranteed that registered memory regions\npersist for the lifetime of the ring, there'll have to be extra\noverhead for every I/O (eg grab the io-uring lock, checking if the mem\nregion is still registered, grab a refcount to that mem region, unlock\nthe ring, do the memcpy to the kaddr, then grab the io-uring lock\nagain, decrement the refcount, and unlock). Or I guess we could add\npinning to a registered memory region.\n\nThanks,\nJoanne",
-          "reply_to": "Pavel Begunkov",
-          "message_date": "2026-02-20",
-          "message_id": ""
-        }
-      ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch adds the ability to set the selected buffer index in the __io_uring_cmd_done() function, which is part of the io_uring command handling code. This allows the kernel to keep track of the currently selected buffer when issuing commands through the io_uring interface. The change is a part of a larger series that introduces kernel-managed buffer rings, where the kernel allocates and manages buffers on behalf of applications using io_uring. The patch builds upon previous changes in the series, including support for kernel-managed buffer rings, mmap support, and recycling of buffers."
-    },
     "2026-02-23": {
       "report_file": "2026-02-23_ollama_llama3.1-8b.html",
       "developer": "Joanne Koong",
