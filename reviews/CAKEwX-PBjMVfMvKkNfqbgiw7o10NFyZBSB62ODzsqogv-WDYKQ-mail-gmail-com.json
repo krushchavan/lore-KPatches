@@ -1,0 +1,66 @@
+{
+  "thread_id": "CAKEwX=PBjMVfMvKkNfqbgiw7o10NFyZBSB62ODzsqogv-WDYKQ@mail.gmail.com",
+  "subject": "[PATCH v5 00/21] Virtual Swap Space",
+  "url": "https://lore.kernel.org/all/CAKEwX=PBjMVfMvKkNfqbgiw7o10NFyZBSB62ODzsqogv-WDYKQ@mail.gmail.com/",
+  "dates": {
+    "2026-03-24": {
+      "report_file": "2026-03-23_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Kairui Song",
+          "summary": "Reviewer noted that same-filled pages are not necessarily zero-filled and requested support for non-zero same-filled pages in vswap, suggesting changing VSWAP_ZERO to VSWAP_SAME_FILLED and using the backend field to store the value.\n\nReviewer Kairui Song noted that the patch series still exhibits performance issues even when swapping out zero-filled pages, and identified a critical issue with cgroup and global swap usage accounting being broken due to skipped allocations.\n\nReviewer noted that the patch series' performance issue on zero-filled pages is likely due to memhog populating memory with 0xff, which triggers full swapfile-backed swap entry overhead, and suggested handling non-zero same-filled pages by changing the VSWAP_ZERO swap entry type to VSWAP_SAME_FILLED.\n\nReviewer noted that the patch's performance issue is due to memhog populating memory with 0xff, which triggers full overhead of swapfile-backed swap entry even though it's 'same-filled' and not zero-filled.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "performance_issues",
+            "accounting_broken",
+            "suggested improvements"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I vaguely remember some workloads like Java or some JS engine\ninitialize their heap with fixed value, same fill might not be that\ncommon but not a rare thing, it strongly depends on the workload.\n\n---\n\nActually I don't think that's the main problem. For example, I just\nwrote a few lines C bench program to zerofill ~50G of memory\nand swapout sequentially:\n\nBefore:\nSwapout: 4415467us\nSwapin: 49573297us\n\nAfter:\nSwapout: 4955874us\nSwapin: 56223658us\n\nAnd vmstat:\ncat /proc/vmstat | grep zero\nthp_zero_page_alloc 0\nthp_zero_page_alloc_failed 0\nswpin_zero 12239329\nswpout_zero 21516634\n\nThere are all zero filled pages, but still slower. And what's more, a\nmore critical issue, I just found the cgroup and global swap usage\naccounting are both somehow broken for zero page swap,\nmaybe because you skipped some allocation? Users can\nno longer see how many pages are swapped out. I don't think you can\nbreak that, that's one major reason why we use a zero entry instead of\nmapping to a zero readonly page. If that is acceptable, we can have\na very nice optimization right away with current swap.\n\nThat's still just an example. bypassing the accounting and still\nslower is not a good sign. We should focus on the generic\nperformance and design.\n\nYet this is just another new found issue, there are many other parts\nlike the folio swap allocation may still occur even if a lower device\ncan no longer accept more whole folios, which I'm currently\nunsure how it will affect swap.\n\n---\n\nYeah, ZRAM has a very similar number for some cases, but storage is\ngetting faster and faster and swap occurs through high speed networks\ntoo. We definitely shouldn't ignore that.\n\n---\n\nI can try to post that somewhere, really nothing fancy just some\nwrapper to make use of systemd for reboot and auto test. But all test\nsteps I mentioned before are already posted and publically available.",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-03-24",
+          "message_id": "CAMgjq7AzySv801qDxfc8mEkEsFDv4P=_qw0rNOTe0n+qy7Fz6A@mail.gmail.com",
+          "email": "ryncsn@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series aims to improve the performance of virtual swap space (vswap) by addressing a regression in handling zero-filled pages. The issue arises when memhog populates memory with 0xff, triggering full overhead for swapfile-backed swap entries even though they are 'same-filled'. The developer plans to handle non-zero same-filled pages and support this case in vswap without extra metadata overhead."
+    },
+    "2026-03-23": {
+      "report_file": "2026-03-23_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Nhat Pham (author)",
+          "summary": "Author acknowledges that the vswap implementation has an issue when dealing with non-zero same-filled pages and agrees to fix this in a future version by changing the VSWAP_ZERO swap entry type to VSWAP_SAME_FILLED.\n\nAuthor acknowledged that swap charging is not applicable for non-swapfile backends, such as zswap and zero swap pages, because they occupy virtual swap space rather than limited swapfile slots.\n\nAuthor acknowledges that the patch has a limitation when dealing with non-zero same-filled pages and offers to fix it by adding support for VSWAP_SAME_FILLED swap entry type, but notes that this might be an artificial case.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges a fix is needed",
+            "acknowledged a technical point",
+            "explained reasoning",
+            "acknowledges limitation",
+            "offers fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "To a non-zero value? ISTR it was initialized to zero, but if I was\nwrong then yeah it should just be a small simple patch.\n\n---\n\nNo, that was intentional :) I probably should have documented this\nbetter - but we're only charging towards swap usage (cgroup and system\nwide) on memory. There was a whole patch that did that in the series\n:)\n\nI can add new counters to differentiate these cases, but it makes no\nsense to me to charge towards swap usage for non-swapfile backend\n(namely, zswap and zero swap pages). You are not actually occupying\nthe limited swapfile slots, but instead occupy a dynamic, vast virtual\nswap space only (and memory in the case of zswap - this is actually an\nargument against zram which does not do any cgroup accounting, but\nthat's another story for another day). I don't see a point in swap\ncharging here. It's the whole point of decoupling the backends - these\nare not the same resource domains.\n\nAnd if you follow Usama's work above, we actually were trying to\nfigure out a way to map it to a zero readonly page. That was Usama's\nv2 of the patch series IIRC - but there was a bug. I think it was a\npotential race between the reclaimer's rmap walk to unmap the page\nfrom PTEs pointing to the page, and concurrent modifiers to the page?\nWe couldn't fix the race in a way that does not induce more overhead\nthan it's worth. But had that work we would also not do any swap\ncharging :)\n\nBTW, if you can figure that part out, please let us know. We actually\nquite like that idea - we just never managed to make it work (and we\nhave a bunch more urgent tasks).\n\n---\n\nI can also simulate it using tmpfs as a swap backend (although it\nmight not work for certain benchmarks, like your usemem benchmark in\nwhich we allocate more memory than the host physical memory).",
+          "reply_to": "Kairui Song",
+          "message_date": "2026-03-23",
+          "message_id": "CAKEwX=P4syV38jAVCWq198r2OHXXc=xA-fx1dk6+qYef6yzxWQ@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series aims to improve the performance of virtual swap space (vswap) by addressing a regression in handling zero-filled pages. The issue arises when memhog populates memory with 0xff, triggering full overhead for swapfile-backed swap entries even though they are 'same-filled'. The developer plans to handle non-zero same-filled pages and support this case in vswap without extra metadata overhead."
+    }
+  }
+}
