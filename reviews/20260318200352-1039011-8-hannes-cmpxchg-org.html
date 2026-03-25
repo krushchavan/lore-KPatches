@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 7/7] mm: switch deferred split shrinker to list_lru</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260318200352.1039011-8-hannes@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-18</strong><div class="date-range-nav">Active on: <a href="#2026-03-18">2026-03-18</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-03-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-24</strong><div class="date-range-nav">Active on: <a href="#2026-03-18">2026-03-18</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch switches the deferred split shrinker to use list_lru, which properly sets up per-node and per-cgroup lists. This improves handling of cgroups on NUMA systems by avoiding splitting large pages on other nodes when a node-restricted allocation is reclaiming memory. The change also streamlines list operations and reclaim walks, and is consistent with how other major shrinkers use list_lru.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-03-18">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Shakeel Butt</span>
-<a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
+<a class="date-chip" href="../2026-03-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
 <span class="review-tag-badge">Acked-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
@@ -253,6 +253,260 @@
 <div class="review-comment-text">Gave Acked-by</div>
 <div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
 <a href="https://lore.kernel.org/r/absyranDm_lH59k8@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lorenzo (Oracle)</span>
+<a class="date-chip" href="../2026-03-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-18">2026-03-18</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer pointed out that the deferred split shrinker&#x27;s list_lru allocation is not properly synchronized, and suggested making the code more concise.
+
+The reviewer pointed out that the patch&#x27;s explanation of the deferred split shrinker&#x27;s call flow is unclear and suggested a more accurate representation by tracing through the function calls from shrink_slab_memcg() to deferred_split_scan().
+
+The reviewer noted that the deferred split queue uses a per-memcg list, but also sets a bit in shrinker_info-&gt;unit-&gt;map, which is used to determine the shrink_control in shrink_slab_memcg(), potentially leading to confusion or incorrect behavior.
+
+The reviewer noted that the deferred_split_scan() function walks the same memcg-&gt;split_queue regardless of node, which they consider suboptimal.
+
+Reviewer Lorenzo suggested exposing deferred_split_lru as a getter or creating a new function folio_memcg_alloc_deferred to encapsulate the allocation of the list lru, allowing callers outside huge_memory.c to access it without having to use the global variable.
+
+Reviewer Lorenzo suggested splitting the huge zero folio handling into its own function, but noted it&#x27;s out of scope for this series and should be addressed in a future patch.
+
+The reviewer questioned whether there&#x27;s a potential race condition when the shrinker is freed, causing the deferred_split_lru to be accessed by another thread.
+
+Reviewer Lorenzo suggested renaming the &#x27;lru&#x27; variable to something more descriptive, citing that single-letter variable names are not conventional
+
+Reviewer Lorenzo questioned why the deferred split queue was switched to list_lru for anonymous pages specifically, indicating a lack of understanding of the change and requesting clarification.
+
+Reviewer Lorenzo expressed concern about a hidden RCU lock in the code and suggested refactoring the function, possibly splitting out folio_ref_freeze() bits into a separate helper function.
+
+Reviewer Lorenzo pointed out a minor issue with variable naming conventions, specifically that single-letter variable names can be confusing and suggested that &#x27;l&#x27; is particularly problematic due to its similarity in appearance to the digit 1.
+
+The reviewer suggested refactoring the code to avoid duplicated logic in list_lru_del(), specifically by making it reference _deferred_list explicitly, instead of having it hardcoded in multiple places.
+
+The reviewer questioned the need for holding a lock while calling list_lru_add(), suggesting that using a locked_add_variant would be more intuitive and avoiding the need for irqsave/restore.
+
+Reviewer Lorenzo agrees that the partially mapped logic is correct, as folio_try_get() will only fail to add a reference if the folio has already lost the race.
+
+The reviewer suggests adding an irqsave/restore variant of list_lru_add() to handle the repeating pattern of acquiring and releasing locks in interrupt-safe manner.
+
+Reviewer Lorenzo suggested moving a stat counter increment operation underneath an if statement to prevent it from being incremented when the operation fails.
+
+The reviewer suggests refactoring the large if-branch in deferred_split_folio() into a separate patch for better bisectability and reviewability.
+
+The reviewer expressed appreciation for the patch&#x27;s code deletion and thanked the submitter, indicating a positive sentiment.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">So here it&#x27;s:
+
+__do_huge_pmd_anonymous_page() / do_huge_zero_wp_pmd()
+-&gt; map_anon_folio_pmd_pf()
+-&gt; map_anon_folio_pmd_nopf()
+-&gt; deferred_split_folio()
+-&gt; set_shrinker_bit()
+
+Yeah it makes sense to make the first bit succinct anyway :)
+
+---
+
+Hmm there&#x27;s no such function is this kind of pseudocode, essentially?
+
+Wouldn&#x27;t it be clearer to reference:
+
+shrink_slab_memcg() -&gt; do_shrink_slab() -&gt; shrinker-&gt;scan_objects -&gt;
+deferred_split_scan()?
+
+Though I get that it adds verbosity :)
+
+Sorry not (just) being pedantic here, also so I can understand myself :)
+
+---
+
+Ok so overall there&#x27;s a per-memcg memcg-&gt;split_queue, but we set a bit in
+memcg-&gt;nodeinfo[nid]-&gt;shrinker_info-&gt;unit[blah]-&gt;map for it, and when we
+enter shrink_slab_memcg(), we figure out the shrink_control from the
+for_each_set_bit() across memcg-&gt;...-&gt;unit-&gt;map?
+
+---
+
+So at this point, regardless of node, we are invoking deferred_split_scan()
+and it&#x27;s the same memcg-&gt;split_queue we are walking, regardless of node?
+
+Do let me know if my understanding is correct here!
+
+Hmm that does sound sub-optimal.
+
+---
+
+It might be nice for the sake of avoiding a global to instead expose this
+as a getter?
+
+Or actually better, since every caller outside of huge_memory.c that
+references this uses folio_memcg_list_lru_alloc(), do something like:
+
+int folio_memcg_alloc_deferred(struct folio *folio, gfp_t gfp);
+
+in mm/huge_memory.c:
+
+/**
+ * blah blah blah put on error blah
+ */
+int folio_memcg_alloc_deferred(struct folio *folio, gfp_t gfp)
+{
+	int err;
+
+	err = folio_memcg_list_lru_alloc(folio, &amp;deferred_split_lru, gfP);
+	if (err) {
+		folio_put(folio);
+		return err;
+	}
+
+	return 0;
+}
+
+And then the callers can just invoke this, and you can make
+deferred_split_lru static in mm/huge_memory.c?
+
+---
+
+It&#x27;s kind of out of scope for the series, but I hate that the huge zero
+folio stuff has an early exit for persistent but if not, falls through to
+trying to set that up - it&#x27;d be nice to split out the huge zero folio stuff
+into another function.
+
+But probably one for a follow up!
+
+---
+
+Presumably no probably-impossible-in-reality race on somebody entering the
+shrinker and referencing the deferred_split_lru before the shrinker is freed?
+
+---
+
+Nit, and maybe this is a convention, but hate single letter variable names,
+&#x27;lru&#x27; or something might be nicer?
+
+---
+
+Why anon? (This review is partly me learning about the shrinker, an area
+I&#x27;m weak on :)
+
+---
+
+Hm don&#x27;t adore this sort of almost &#x27;hidden&#x27; RCU lock here, but this
+function is pretty disgusting and needs serious work in general.
+
+And any function that took the RCU lock and list_lru lock/did the unlock
+equivalent would be equally horrible so yeah, I guess needs deferring to a
+refactor.
+
+OTOH, this could be a good excuse for us to pay down some technical debt
+and split out for instance the folio_ref_freeze() bits?
+
+Could we do something like:
+
+	bool frozen;
+
+	...
+
+	dequeue_deferred = folio_test_anon(folio) &amp;&amp; old_order &gt; 1;
+	frozen = folio_ref_freeze(folio, folio_cache_ref_count(folio) + 1);
+
+	if (dequeue_deferred &amp;&amp; frozen) {
+		struct list_lru_one *lru;
+
+		rcu_read_lock();
+		lru = list_lru_lock(&amp;deferred_split_lru,
+				    folio_nid(folio), folio_memcg(folio));
+		__list_lru_del(&amp;deferred_split_lru, lru,
+			       &amp;folio-&gt;_deferred_list, folio_nid(folio));
+		if (folio_test_partially_mapped(folio)) {
+			folio_clear_partially_mapped(folio);
+			mod_mthp_stat(old_order,
+				MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+		}
+		list_lru_unlock(lru);
+		rcu_read_unlock();
+	}
+
+	if (!frozen)
+		return -EAGAIN;
+
+	... rest of logic now one indent level lower ...
+
+Or maybe factor that out into a helper function or something?
+
+static void execute_deferred_dequeue(...) { ... }
+
+With this implemented either way you&#x27;d be able to get rid of the else block
+too.
+
+obviously only valid if you are able to do the freezing earlier?
+
+---
+
+Again nitty thing about single letter var name, OTOH if that&#x27;s somehow the
+convention maybe fine. &#x27;l&#x27; is especially problematic as it looks like a 1
+in many fonts :)
+
+---
+
+Maybe worth factoring __list_lru_del() into something that explicitly
+references &amp;folio-&gt;_deferred_list rather than open codingin both places?
+
+---
+
+Do we really need to hold the lock over all the below, but hmm we can&#x27;t do
+an irqsave/restore list_lru_add(), and maybe not worth adding one either,
+OK.
+
+Just seems odd to have &lt;lock&gt; &lt;__unlocked_add_variant&gt; &lt;unlock&gt;,
+instinctively feels like it should be just &lt;locked_add_variant&gt;.
+
+---
+
+Hmm, in the original code, this comment is associated with the partially
+mapped logic, BUT this seems actually correct, because folio_try_get()
+because it does folio_ref_add_unless_zero() only fails if the folio lost
+the race.
+
+So I think you&#x27;re more correct right?
+
+---
+
+Hmm this does make me think it&#x27;d be nice to have a list_lru_add() variant
+for irqsave/restore then, since it&#x27;s a repeating pattern!
+
+---
+
+Do we want to put this stat counter underneath the below so it&#x27;s not
+incremented on fail?
+
+---
+
+This applies to the above equivalent refactorings, but maybe worth
+separating out this:
+
+if (folio) { ... big branch ... } -&gt;
+if (!folio) goto next; ... what was big branch ...
+
+Refactoring into a separate patch? Makes it easier to see pertinent logic
+changes + helps review/bisectability/fixes/etc. etc.
+
+---
+
+Overall a lovely amount of code deletion here :)
+
+Thanks for doing this, Cheers Lorenzo</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
+<a href="https://lore.kernel.org/r/0cf8a859-b142-4e53-9113-94872dd68f40@lucifer.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: suggested changes, lack of synchronization, clarification_request</div>
 </div>
 </div>
 </div>
