@@ -1,0 +1,82 @@
+{
+  "thread_id": "20260326162611.693539-1-gourry@gourry.net",
+  "subject": "[PATCH] mm/shmem: use invalidate_lock to fix hole-punch race",
+  "url": "https://lore.kernel.org/all/20260326162611.693539-1-gourry@gourry.net/",
+  "dates": {
+    "2026-03-26": {
+      "report_file": "2026-03-26_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Pedro Falcato",
+          "summary": "Pedro Falcato questioned whether a child-parent relationship can occur when traversing the i_mmap tree, citing the vma_interval_tree_insert_after() function's behavior and its in-order traversal guarantee.\n\nReviewer Pedro Falcato noted that the races described in the patch are actually not broken, as the parent and child processes hold the corresponding PTE locks in order of traversal, preventing re-installation of PTEs for a folio being removed from page cache. He suggested adding protection against concurrent rmap by unlocking i_mmap_write before calling copy_page_range.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "question",
+            "uncertainty",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Sure, but can child - parent happen when traversing the i_mmap tree? I don't\nthink so? (in mm/mmap.c)\n\t/* insert tmp into the share list, just after mpnt */\n\tvma_interval_tree_insert_after(tmp, mpnt,\n\t\t\t&mapping->i_mmap);\n\nThe function itself is somewhat straightforward - find the leftmost node at the\nright of 'prev' (our parent) and link ourselves. So an in-order traversal should\nalways go parent - child. Unless there's some awful tree rotation that can\nhappen and screw us in the meanwhile.\n\n---\n\nIf we observe everything parent - child, there is no way this is broken - if\nfork observes the parent pte set, zap will have to observe parent *and* child,\nsince they hold the corresponding pte locks, and traversal is done in order.\nIf fork observes the parent pte as none, zap will have already traversed the\nparent, and as such there will be no additional mapping of the folio.\n\nIf this is broken, then every filesystem out there using filemap_fault() and\nfilemap_fault_around() has to be broken, and I hope that's not true :p\n\n_If_ there is indeed breakage here regarding tree rotations, I would suggest:\n\ndiff --git a/mm/mmap.c b/mm/mmap.c\nindex 5754d1c36462..7b4e39063d67 100644\n--- a/mm/mmap.c\n+++ b/mm/mmap.c\n@@ -1833,12 +1833,12 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)\n                        vma_interval_tree_insert_after(tmp, mpnt,\n                                        &mapping->i_mmap);\n                        flush_dcache_mmap_unlock(mapping);\n-                       i_mmap_unlock_write(mapping);\n                }\n \n                if (!(tmp->vm_flags & VM_WIPEONFORK))\n                        retval = copy_page_range(tmp, mpnt);\n-\n+               if (file)\n+                       i_mmap_unlock_write(mapping);\n                if (retval) {\n                        mpnt = vma_next(&vmi);\n                        goto loop_out;\n\n\nwhich should protect against concurrent rmap.\n\n-- \nPedro",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-03-26",
+          "message_id": "bnukmnuxxuhdfeasjz33miemgr7w35c4aa6pqdmgupx7oxmeeb@gozgc3yxhcdd",
+          "email": "pfalcato@suse.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges Pedro Falcato's feedback about the patch potentially introducing contention issues on unmaps and agrees to investigate further.\n\nAuthor acknowledges Pedro's concern about the patch not addressing all possible races and expresses a willingness to consider additional fixes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges potential issue",
+            "agrees to investigate",
+            "acknowledges concern",
+            "willingness to consider additional fixes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "hm, i think you're right, i have this inverted.\n\nBut this patch objectively fixed my issue, I no longer see this BUG(),\nI don't get softlocks, and I don't get the guest corruption I was seeing\npreviously. It could simply be that the contention added makes the race\nless likely.\n\nLet me dig into this and just smoke test your suggestion - but I think\nyour patch would cause some contention issues on unmaps.\n\nIt's been difficult to generate a reproducer for this without running\nhundreds of VMs, whatever race is going on here is extremely narrow.\n\n---\n\nMe too, but i never rule anything out.\n\n~Gregory",
+          "reply_to": "Pedro Falcato",
+          "message_date": "2026-03-26",
+          "message_id": "acWNn1sewTJhnA2f@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a race condition in the shmem (shared memory) module that can cause 'still mapped when deleted' errors and guest kernel panics. The issue occurs when inflating a VM's balloon while a helper process forks and executes, triggering two races: one around fault handling and another due to TOCTOU (time-of-check-to-time-of-use). To fix these issues, the patch introduces the use of invalidate_lock, which is shared under mmap_lock in fault handlers. This approach matches existing patterns used by other modules and requires removing an unnecessary rcu_read_lock from do_fault_around()."
+    },
+    "2026-03-27": {
+      "report_file": "2026-03-26_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges that their original patch does not resolve the BUG() they are observing, indicating a need for further investigation and potentially a revised patch.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges issue",
+            "need for further investigation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "fwiw this does not resolve the BUG() i'm observing.\n\nI'm still trying to find a good reproducer that doesn't require\nlaunching ~100s of VMs and ballooning them, but the condition here seems\nextremely narrow.\n\n~Gregory",
+          "reply_to": "Pedro Falcato",
+          "message_date": "2026-03-27",
+          "message_id": "acYI-gqDOBbZ-bEn@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a race condition in the shmem (shared memory) module that can cause 'still mapped when deleted' errors and guest kernel panics. The issue occurs when inflating a VM's balloon while a helper process forks and executes, triggering two races: one around fault handling and another due to TOCTOU (time-of-check-to-time-of-use). To fix these issues, the patch introduces the use of invalidate_lock, which is shared under mmap_lock in fault handlers. This approach matches existing patterns used by other modules and requires removing an unnecessary rcu_read_lock from do_fault_around()."
+    }
+  }
+}
