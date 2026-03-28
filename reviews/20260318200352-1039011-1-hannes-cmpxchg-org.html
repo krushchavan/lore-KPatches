@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 0/7] mm: switch THP shrinker to list_lru</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260318200352.1039011-1-hannes@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-24</strong><div class="date-range-nav">Active on: <a href="#2026-03-24">2026-03-24</a> &bull; <a href="#2026-03-20">2026-03-20</a> &bull; <a href="#2026-03-19">2026-03-19</a> &bull; <a href="#2026-03-18">2026-03-18</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-03-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-27</strong><div class="date-range-nav">Active on: <a href="#2026-03-27">2026-03-27</a> &bull; <a href="#2026-03-24">2026-03-24</a> &bull; <a href="#2026-03-20">2026-03-20</a> &bull; <a href="#2026-03-19">2026-03-19</a> &bull; <a href="#2026-03-18">2026-03-18</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series switches the THP (Transparent Huge Pages) shrinker to use list_lru instead of an open-coded deferred split queue. The current implementation has issues, including being non-NUMA-aware and complicated in its interactions with other code. Using list_lru fixes these problems and simplifies planned shrinker work. The patch series includes several cleanups and refactors in the list_lru code to make the conversion easier, as well as extensions to the list_lru API to allow for more control over locking scope and a convenience helper for allocating LRU heads when coming from a folio.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-03-18">
@@ -2620,6 +2620,758 @@ Overall a lovely amount of code deletion here :)
 Thanks for doing this, Cheers Lorenzo</pre>
 </details>
 <a href="https://lore.kernel.org/r/0cf8a859-b142-4e53-9113-94872dd68f40@lucifer.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-03-27">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-03-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-27">2026-03-27</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that the deferred split queue handles cgroups in a suboptimal fashion, as it is per-NUMA node or per-cgroup but not their intersection, leading to potential issues when splitting large pages on other nodes during reclaim. They suggested converting the deferred split queue to use list_lru, which properly sets up per-node and per-cgroup lists, streamlines list operations and reclaim walks, and is used by other major shrinkers.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, Mar 19, 2026 at 4:05 AM Johannes Weiner &lt;hannes@cmpxchg.org&gt; wrote:
+&gt;
+&gt; The deferred split queue handles cgroups in a suboptimal fashion. The
+&gt; queue is per-NUMA node or per-cgroup, not the intersection. That means
+&gt; on a cgrouped system, a node-restricted allocation entering reclaim
+&gt; can end up splitting large pages on other nodes:
+&gt;
+&gt;         alloc/unmap
+&gt;           deferred_split_folio()
+&gt;             list_add_tail(memcg-&gt;split_queue)
+&gt;             set_shrinker_bit(memcg, node, deferred_shrinker_id)
+&gt;
+&gt;         for_each_zone_zonelist_nodemask(restricted_nodes)
+&gt;           mem_cgroup_iter()
+&gt;             shrink_slab(node, memcg)
+&gt;               shrink_slab_memcg(node, memcg)
+&gt;                 if test_shrinker_bit(memcg, node, deferred_shrinker_id)
+&gt;                   deferred_split_scan()
+&gt;                     walks memcg-&gt;split_queue
+&gt;
+&gt; The shrinker bit adds an imperfect guard rail. As soon as the cgroup
+&gt; has a single large page on the node of interest, all large pages owned
+&gt; by that memcg, including those on other nodes, will be split.
+&gt;
+&gt; list_lru properly sets up per-node, per-cgroup lists. As a bonus, it
+&gt; streamlines a lot of the list operations and reclaim walks. It&#x27;s used
+&gt; widely by other major shrinkers already. Convert the deferred split
+&gt; queue as well.
+&gt;
+&gt; The list_lru per-memcg heads are instantiated on demand when the first
+&gt; object of interest is allocated for a cgroup, by calling
+&gt; folio_memcg_list_lru_alloc(). Add calls to where splittable pages are
+&gt; created: anon faults, swapin faults, khugepaged collapse.
+&gt;
+&gt; These calls create all possible node heads for the cgroup at once, so
+&gt; the migration code (between nodes) doesn&#x27;t need any special care.
+&gt;
+&gt; Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+&gt; ---
+&gt;  include/linux/huge_mm.h    |   6 +-
+&gt;  include/linux/memcontrol.h |   4 -
+&gt;  include/linux/mmzone.h     |  12 --
+&gt;  mm/huge_memory.c           | 342 ++++++++++++-------------------------
+&gt;  mm/internal.h              |   2 +-
+&gt;  mm/khugepaged.c            |   7 +
+&gt;  mm/memcontrol.c            |  12 +-
+&gt;  mm/memory.c                |  52 +++---
+&gt;  mm/mm_init.c               |  15 --
+&gt;  9 files changed, 151 insertions(+), 301 deletions(-)
+&gt;
+&gt; diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+&gt; index bd7f0e1d8094..8d801ed378db 100644
+&gt; --- a/include/linux/huge_mm.h
+&gt; +++ b/include/linux/huge_mm.h
+&gt; @@ -414,10 +414,9 @@ static inline int split_huge_page(struct page *page)
+&gt;  {
+&gt;         return split_huge_page_to_list_to_order(page, NULL, 0);
+&gt;  }
+&gt; +
+&gt; +extern struct list_lru deferred_split_lru;
+&gt;  void deferred_split_folio(struct folio *folio, bool partially_mapped);
+&gt; -#ifdef CONFIG_MEMCG
+&gt; -void reparent_deferred_split_queue(struct mem_cgroup *memcg);
+&gt; -#endif
+&gt;
+&gt;  void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+&gt;                 unsigned long address, bool freeze);
+&gt; @@ -650,7 +649,6 @@ static inline int try_folio_split_to_order(struct folio *folio,
+&gt;  }
+&gt;
+&gt;  static inline void deferred_split_folio(struct folio *folio, bool partially_mapped) {}
+&gt; -static inline void reparent_deferred_split_queue(struct mem_cgroup *memcg) {}
+&gt;  #define split_huge_pmd(__vma, __pmd, __address)        \
+&gt;         do { } while (0)
+&gt;
+&gt; diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+&gt; index 086158969529..0782c72a1997 100644
+&gt; --- a/include/linux/memcontrol.h
+&gt; +++ b/include/linux/memcontrol.h
+&gt; @@ -277,10 +277,6 @@ struct mem_cgroup {
+&gt;         struct memcg_cgwb_frn cgwb_frn[MEMCG_CGWB_FRN_CNT];
+&gt;  #endif
+&gt;
+&gt; -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+&gt; -       struct deferred_split deferred_split_queue;
+&gt; -#endif
+&gt; -
+&gt;  #ifdef CONFIG_LRU_GEN_WALKS_MMU
+&gt;         /* per-memcg mm_struct list */
+&gt;         struct lru_gen_mm_list mm_list;
+&gt; diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+&gt; index 7bd0134c241c..232b7a71fd69 100644
+&gt; --- a/include/linux/mmzone.h
+&gt; +++ b/include/linux/mmzone.h
+&gt; @@ -1429,14 +1429,6 @@ struct zonelist {
+&gt;   */
+&gt;  extern struct page *mem_map;
+&gt;
+&gt; -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+&gt; -struct deferred_split {
+&gt; -       spinlock_t split_queue_lock;
+&gt; -       struct list_head split_queue;
+&gt; -       unsigned long split_queue_len;
+&gt; -};
+&gt; -#endif
+&gt; -
+&gt;  #ifdef CONFIG_MEMORY_FAILURE
+&gt;  /*
+&gt;   * Per NUMA node memory failure handling statistics.
+&gt; @@ -1562,10 +1554,6 @@ typedef struct pglist_data {
+&gt;         unsigned long first_deferred_pfn;
+&gt;  #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+&gt;
+&gt; -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+&gt; -       struct deferred_split deferred_split_queue;
+&gt; -#endif
+&gt; -
+&gt;  #ifdef CONFIG_NUMA_BALANCING
+&gt;         /* start time in ms of current promote rate limit period */
+&gt;         unsigned int nbp_rl_start;
+&gt; diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+&gt; index 3fc02913b63e..e90d08db219d 100644
+&gt; --- a/mm/huge_memory.c
+&gt; +++ b/mm/huge_memory.c
+&gt; @@ -14,6 +14,7 @@
+&gt;  #include &lt;linux/mmu_notifier.h&gt;
+&gt;  #include &lt;linux/rmap.h&gt;
+&gt;  #include &lt;linux/swap.h&gt;
+&gt; +#include &lt;linux/list_lru.h&gt;
+&gt;  #include &lt;linux/shrinker.h&gt;
+&gt;  #include &lt;linux/mm_inline.h&gt;
+&gt;  #include &lt;linux/swapops.h&gt;
+&gt; @@ -67,6 +68,8 @@ unsigned long transparent_hugepage_flags __read_mostly =
+&gt;         (1&lt;&lt;TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG)|
+&gt;         (1&lt;&lt;TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
+&gt;
+&gt; +static struct lock_class_key deferred_split_key;
+&gt; +struct list_lru deferred_split_lru;
+&gt;  static struct shrinker *deferred_split_shrinker;
+&gt;  static unsigned long deferred_split_count(struct shrinker *shrink,
+&gt;                                           struct shrink_control *sc);
+&gt; @@ -919,6 +922,13 @@ static int __init thp_shrinker_init(void)
+&gt;         if (!deferred_split_shrinker)
+&gt;                 return -ENOMEM;
+&gt;
+&gt; +       if (list_lru_init_memcg_key(&amp;deferred_split_lru,
+&gt; +                                   deferred_split_shrinker,
+&gt; +                                   &amp;deferred_split_key)) {
+&gt; +               shrinker_free(deferred_split_shrinker);
+&gt; +               return -ENOMEM;
+&gt; +       }
+&gt; +
+&gt;         deferred_split_shrinker-&gt;count_objects = deferred_split_count;
+&gt;         deferred_split_shrinker-&gt;scan_objects = deferred_split_scan;
+&gt;         shrinker_register(deferred_split_shrinker);
+&gt; @@ -939,6 +949,7 @@ static int __init thp_shrinker_init(void)
+&gt;
+&gt;         huge_zero_folio_shrinker = shrinker_alloc(0, &quot;thp-zero&quot;);
+&gt;         if (!huge_zero_folio_shrinker) {
+&gt; +               list_lru_destroy(&amp;deferred_split_lru);
+&gt;                 shrinker_free(deferred_split_shrinker);
+&gt;                 return -ENOMEM;
+&gt;         }
+&gt; @@ -953,6 +964,7 @@ static int __init thp_shrinker_init(void)
+&gt;  static void __init thp_shrinker_exit(void)
+&gt;  {
+&gt;         shrinker_free(huge_zero_folio_shrinker);
+&gt; +       list_lru_destroy(&amp;deferred_split_lru);
+&gt;         shrinker_free(deferred_split_shrinker);
+&gt;  }
+&gt;
+&gt; @@ -1133,119 +1145,6 @@ pmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)
+&gt;         return pmd;
+&gt;  }
+&gt;
+&gt; -static struct deferred_split *split_queue_node(int nid)
+&gt; -{
+&gt; -       struct pglist_data *pgdata = NODE_DATA(nid);
+&gt; -
+&gt; -       return &amp;pgdata-&gt;deferred_split_queue;
+&gt; -}
+&gt; -
+&gt; -#ifdef CONFIG_MEMCG
+&gt; -static inline
+&gt; -struct mem_cgroup *folio_split_queue_memcg(struct folio *folio,
+&gt; -                                          struct deferred_split *queue)
+&gt; -{
+&gt; -       if (mem_cgroup_disabled())
+&gt; -               return NULL;
+&gt; -       if (split_queue_node(folio_nid(folio)) == queue)
+&gt; -               return NULL;
+&gt; -       return container_of(queue, struct mem_cgroup, deferred_split_queue);
+&gt; -}
+&gt; -
+&gt; -static struct deferred_split *memcg_split_queue(int nid, struct mem_cgroup *memcg)
+&gt; -{
+&gt; -       return memcg ? &amp;memcg-&gt;deferred_split_queue : split_queue_node(nid);
+&gt; -}
+&gt; -#else
+&gt; -static inline
+&gt; -struct mem_cgroup *folio_split_queue_memcg(struct folio *folio,
+&gt; -                                          struct deferred_split *queue)
+&gt; -{
+&gt; -       return NULL;
+&gt; -}
+&gt; -
+&gt; -static struct deferred_split *memcg_split_queue(int nid, struct mem_cgroup *memcg)
+&gt; -{
+&gt; -       return split_queue_node(nid);
+&gt; -}
+&gt; -#endif
+&gt; -
+&gt; -static struct deferred_split *split_queue_lock(int nid, struct mem_cgroup *memcg)
+&gt; -{
+&gt; -       struct deferred_split *queue;
+&gt; -
+&gt; -retry:
+&gt; -       queue = memcg_split_queue(nid, memcg);
+&gt; -       spin_lock(&amp;queue-&gt;split_queue_lock);
+&gt; -       /*
+&gt; -        * There is a period between setting memcg to dying and reparenting
+&gt; -        * deferred split queue, and during this period the THPs in the deferred
+&gt; -        * split queue will be hidden from the shrinker side.
+&gt; -        */
+&gt; -       if (unlikely(memcg_is_dying(memcg))) {
+&gt; -               spin_unlock(&amp;queue-&gt;split_queue_lock);
+&gt; -               memcg = parent_mem_cgroup(memcg);
+&gt; -               goto retry;
+&gt; -       }
+&gt; -
+&gt; -       return queue;
+&gt; -}
+&gt; -
+&gt; -static struct deferred_split *
+&gt; -split_queue_lock_irqsave(int nid, struct mem_cgroup *memcg, unsigned long *flags)
+&gt; -{
+&gt; -       struct deferred_split *queue;
+&gt; -
+&gt; -retry:
+&gt; -       queue = memcg_split_queue(nid, memcg);
+&gt; -       spin_lock_irqsave(&amp;queue-&gt;split_queue_lock, *flags);
+&gt; -       if (unlikely(memcg_is_dying(memcg))) {
+&gt; -               spin_unlock_irqrestore(&amp;queue-&gt;split_queue_lock, *flags);
+&gt; -               memcg = parent_mem_cgroup(memcg);
+&gt; -               goto retry;
+&gt; -       }
+&gt; -
+&gt; -       return queue;
+&gt; -}
+&gt; -
+&gt; -static struct deferred_split *folio_split_queue_lock(struct folio *folio)
+&gt; -{
+&gt; -       struct deferred_split *queue;
+&gt; -
+&gt; -       rcu_read_lock();
+&gt; -       queue = split_queue_lock(folio_nid(folio), folio_memcg(folio));
+&gt; -       /*
+&gt; -        * The memcg destruction path is acquiring the split queue lock for
+&gt; -        * reparenting. Once you have it locked, it&#x27;s safe to drop the rcu lock.
+&gt; -        */
+&gt; -       rcu_read_unlock();
+&gt; -
+&gt; -       return queue;
+&gt; -}
+&gt; -
+&gt; -static struct deferred_split *
+&gt; -folio_split_queue_lock_irqsave(struct folio *folio, unsigned long *flags)
+&gt; -{
+&gt; -       struct deferred_split *queue;
+&gt; -
+&gt; -       rcu_read_lock();
+&gt; -       queue = split_queue_lock_irqsave(folio_nid(folio), folio_memcg(folio), flags);
+&gt; -       rcu_read_unlock();
+&gt; -
+&gt; -       return queue;
+&gt; -}
+&gt; -
+&gt; -static inline void split_queue_unlock(struct deferred_split *queue)
+&gt; -{
+&gt; -       spin_unlock(&amp;queue-&gt;split_queue_lock);
+&gt; -}
+&gt; -
+&gt; -static inline void split_queue_unlock_irqrestore(struct deferred_split *queue,
+&gt; -                                                unsigned long flags)
+&gt; -{
+&gt; -       spin_unlock_irqrestore(&amp;queue-&gt;split_queue_lock, flags);
+&gt; -}
+&gt; -
+&gt;  static inline bool is_transparent_hugepage(const struct folio *folio)
+&gt;  {
+&gt;         if (!folio_test_large(folio))
+&gt; @@ -1346,6 +1245,14 @@ static struct folio *vma_alloc_anon_folio_pmd(struct vm_area_struct *vma,
+&gt;                 count_mthp_stat(order, MTHP_STAT_ANON_FAULT_FALLBACK_CHARGE);
+&gt;                 return NULL;
+&gt;         }
+&gt; +
+&gt; +       if (folio_memcg_list_lru_alloc(folio, &amp;deferred_split_lru, gfp)) {
+&gt; +               folio_put(folio);
+&gt; +               count_vm_event(THP_FAULT_FALLBACK);
+&gt; +               count_mthp_stat(order, MTHP_STAT_ANON_FAULT_FALLBACK);
+&gt; +               return NULL;
+&gt; +       }
+&gt; +
+&gt;         folio_throttle_swaprate(folio, gfp);
+&gt;
+&gt;         /*
+&gt; @@ -3854,34 +3761,34 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
+&gt;         struct folio *end_folio = folio_next(folio);
+&gt;         struct folio *new_folio, *next;
+&gt;         int old_order = folio_order(folio);
+&gt; +       struct list_lru_one *l;
+&gt; +       bool dequeue_deferred;
+&gt;         int ret = 0;
+&gt; -       struct deferred_split *ds_queue;
+&gt;
+&gt;         VM_WARN_ON_ONCE(!mapping &amp;&amp; end);
+&gt;         /* Prevent deferred_split_scan() touching -&gt;_refcount */
+&gt; -       ds_queue = folio_split_queue_lock(folio);
+&gt; +       dequeue_deferred = folio_test_anon(folio) &amp;&amp; old_order &gt; 1;
+&gt; +       if (dequeue_deferred) {
+&gt; +               rcu_read_lock();
+&gt; +               l = list_lru_lock(&amp;deferred_split_lru,
+&gt; +                                 folio_nid(folio), folio_memcg(folio));
+&gt; +       }
+&gt;         if (folio_ref_freeze(folio, folio_cache_ref_count(folio) + 1)) {
+&gt;                 struct swap_cluster_info *ci = NULL;
+&gt;                 struct lruvec *lruvec;
+&gt;
+&gt; -               if (old_order &gt; 1) {
+&gt; -                       if (!list_empty(&amp;folio-&gt;_deferred_list)) {
+&gt; -                               ds_queue-&gt;split_queue_len--;
+&gt; -                               /*
+&gt; -                                * Reinitialize page_deferred_list after removing the
+&gt; -                                * page from the split_queue, otherwise a subsequent
+&gt; -                                * split will see list corruption when checking the
+&gt; -                                * page_deferred_list.
+&gt; -                                */
+&gt; -                               list_del_init(&amp;folio-&gt;_deferred_list);
+&gt; -                       }
+&gt; +               if (dequeue_deferred) {
+&gt; +                       __list_lru_del(&amp;deferred_split_lru, l,
+&gt; +                                      &amp;folio-&gt;_deferred_list, folio_nid(folio));
+&gt;                         if (folio_test_partially_mapped(folio)) {
+&gt;                                 folio_clear_partially_mapped(folio);
+&gt;                                 mod_mthp_stat(old_order,
+&gt;                                         MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+&gt;                         }
+&gt; +                       list_lru_unlock(l);
+&gt; +                       rcu_read_unlock();
+&gt;                 }
+&gt; -               split_queue_unlock(ds_queue);
+&gt; +
+&gt;                 if (mapping) {
+&gt;                         int nr = folio_nr_pages(folio);
+&gt;
+&gt; @@ -3982,7 +3889,10 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
+&gt;                 if (ci)
+&gt;                         swap_cluster_unlock(ci);
+&gt;         } else {
+&gt; -               split_queue_unlock(ds_queue);
+&gt; +               if (dequeue_deferred) {
+&gt; +                       list_lru_unlock(l);
+&gt; +                       rcu_read_unlock();
+&gt; +               }
+&gt;                 return -EAGAIN;
+&gt;         }
+&gt;
+&gt; @@ -4349,33 +4259,35 @@ int split_folio_to_list(struct folio *folio, struct list_head *list)
+&gt;   * queueing THP splits, and that list is (racily observed to be) non-empty.
+&gt;   *
+&gt;   * It is unsafe to call folio_unqueue_deferred_split() until folio refcount is
+&gt; - * zero: because even when split_queue_lock is held, a non-empty _deferred_list
+&gt; - * might be in use on deferred_split_scan()&#x27;s unlocked on-stack list.
+&gt; + * zero: because even when the list_lru lock is held, a non-empty
+&gt; + * _deferred_list might be in use on deferred_split_scan()&#x27;s unlocked
+&gt; + * on-stack list.
+&gt;   *
+&gt; - * If memory cgroups are enabled, split_queue_lock is in the mem_cgroup: it is
+&gt; - * therefore important to unqueue deferred split before changing folio memcg.
+&gt; + * The list_lru sublist is determined by folio&#x27;s memcg: it is therefore
+&gt; + * important to unqueue deferred split before changing folio memcg.
+&gt;   */
+&gt;  bool __folio_unqueue_deferred_split(struct folio *folio)
+&gt;  {
+&gt; -       struct deferred_split *ds_queue;
+&gt; +       struct list_lru_one *l;
+&gt; +       int nid = folio_nid(folio);
+&gt;         unsigned long flags;
+&gt;         bool unqueued = false;
+&gt;
+&gt;         WARN_ON_ONCE(folio_ref_count(folio));
+&gt;         WARN_ON_ONCE(!mem_cgroup_disabled() &amp;&amp; !folio_memcg_charged(folio));
+&gt;
+&gt; -       ds_queue = folio_split_queue_lock_irqsave(folio, &amp;flags);
+&gt; -       if (!list_empty(&amp;folio-&gt;_deferred_list)) {
+&gt; -               ds_queue-&gt;split_queue_len--;
+&gt; +       rcu_read_lock();
+&gt; +       l = list_lru_lock_irqsave(&amp;deferred_split_lru, nid, folio_memcg(folio), &amp;flags);
+&gt; +       if (__list_lru_del(&amp;deferred_split_lru, l, &amp;folio-&gt;_deferred_list, nid)) {
+&gt;                 if (folio_test_partially_mapped(folio)) {
+&gt;                         folio_clear_partially_mapped(folio);
+&gt;                         mod_mthp_stat(folio_order(folio),
+&gt;                                       MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+&gt;                 }
+&gt; -               list_del_init(&amp;folio-&gt;_deferred_list);
+&gt;                 unqueued = true;
+&gt;         }
+&gt; -       split_queue_unlock_irqrestore(ds_queue, flags);
+&gt; +       list_lru_unlock_irqrestore(l, &amp;flags);
+&gt; +       rcu_read_unlock();
+&gt;
+&gt;         return unqueued;        /* useful for debug warnings */
+&gt;  }
+&gt; @@ -4383,7 +4295,9 @@ bool __folio_unqueue_deferred_split(struct folio *folio)
+&gt;  /* partially_mapped=false won&#x27;t clear PG_partially_mapped folio flag */
+&gt;  void deferred_split_folio(struct folio *folio, bool partially_mapped)
+&gt;  {
+&gt; -       struct deferred_split *ds_queue;
+&gt; +       struct list_lru_one *l;
+&gt; +       int nid;
+&gt; +       struct mem_cgroup *memcg;
+&gt;         unsigned long flags;
+&gt;
+&gt;         /*
+&gt; @@ -4406,7 +4320,11 @@ void deferred_split_folio(struct folio *folio, bool partially_mapped)
+&gt;         if (folio_test_swapcache(folio))
+&gt;                 return;
+&gt;
+&gt; -       ds_queue = folio_split_queue_lock_irqsave(folio, &amp;flags);
+&gt; +       nid = folio_nid(folio);
+&gt; +
+&gt; +       rcu_read_lock();
+&gt; +       memcg = folio_memcg(folio);
+&gt; +       l = list_lru_lock_irqsave(&amp;deferred_split_lru, nid, memcg, &amp;flags);
+&gt;         if (partially_mapped) {
+&gt;                 if (!folio_test_partially_mapped(folio)) {
+&gt;                         folio_set_partially_mapped(folio);
+&gt; @@ -4414,36 +4332,20 @@ void deferred_split_folio(struct folio *folio, bool partially_mapped)
+&gt;                                 count_vm_event(THP_DEFERRED_SPLIT_PAGE);
+&gt;                         count_mthp_stat(folio_order(folio), MTHP_STAT_SPLIT_DEFERRED);
+&gt;                         mod_mthp_stat(folio_order(folio), MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, 1);
+&gt; -
+&gt;                 }
+&gt;         } else {
+&gt;                 /* partially mapped folios cannot become non-partially mapped */
+&gt;                 VM_WARN_ON_FOLIO(folio_test_partially_mapped(folio), folio);
+&gt;         }
+&gt; -       if (list_empty(&amp;folio-&gt;_deferred_list)) {
+&gt; -               struct mem_cgroup *memcg;
+&gt; -
+&gt; -               memcg = folio_split_queue_memcg(folio, ds_queue);
+&gt; -               list_add_tail(&amp;folio-&gt;_deferred_list, &amp;ds_queue-&gt;split_queue);
+&gt; -               ds_queue-&gt;split_queue_len++;
+&gt; -               if (memcg)
+&gt; -                       set_shrinker_bit(memcg, folio_nid(folio),
+&gt; -                                        shrinker_id(deferred_split_shrinker));
+&gt; -       }
+&gt; -       split_queue_unlock_irqrestore(ds_queue, flags);
+&gt; +       __list_lru_add(&amp;deferred_split_lru, l, &amp;folio-&gt;_deferred_list, nid, memcg);
+&gt; +       list_lru_unlock_irqrestore(l, &amp;flags);
+&gt; +       rcu_read_unlock();
+&gt;  }
+&gt;
+&gt;  static unsigned long deferred_split_count(struct shrinker *shrink,
+&gt;                 struct shrink_control *sc)
+&gt;  {
+&gt; -       struct pglist_data *pgdata = NODE_DATA(sc-&gt;nid);
+&gt; -       struct deferred_split *ds_queue = &amp;pgdata-&gt;deferred_split_queue;
+&gt; -
+&gt; -#ifdef CONFIG_MEMCG
+&gt; -       if (sc-&gt;memcg)
+&gt; -               ds_queue = &amp;sc-&gt;memcg-&gt;deferred_split_queue;
+&gt; -#endif
+&gt; -       return READ_ONCE(ds_queue-&gt;split_queue_len);
+&gt; +       return list_lru_shrink_count(&amp;deferred_split_lru, sc);
+&gt;  }
+&gt;
+&gt;  static bool thp_underused(struct folio *folio)
+&gt; @@ -4473,45 +4375,47 @@ static bool thp_underused(struct folio *folio)
+&gt;         return false;
+&gt;  }
+&gt;
+&gt; +static enum lru_status deferred_split_isolate(struct list_head *item,
+&gt; +                                             struct list_lru_one *lru,
+&gt; +                                             void *cb_arg)
+&gt; +{
+&gt; +       struct folio *folio = container_of(item, struct folio, _deferred_list);
+&gt; +       struct list_head *freeable = cb_arg;
+&gt; +
+&gt; +       if (folio_try_get(folio)) {
+&gt; +               list_lru_isolate_move(lru, item, freeable);
+&gt; +               return LRU_REMOVED;
+&gt; +       }
+&gt; +
+&gt; +       /* We lost race with folio_put() */
+&gt; +       list_lru_isolate(lru, item);
+&gt; +       if (folio_test_partially_mapped(folio)) {
+&gt; +               folio_clear_partially_mapped(folio);
+&gt; +               mod_mthp_stat(folio_order(folio),
+&gt; +                             MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+&gt; +       }
+&gt; +       return LRU_REMOVED;
+&gt; +}
+&gt; +
+&gt;  static unsigned long deferred_split_scan(struct shrinker *shrink,
+&gt;                 struct shrink_control *sc)
+&gt;  {
+&gt; -       struct deferred_split *ds_queue;
+&gt; -       unsigned long flags;
+&gt; +       LIST_HEAD(dispose);
+&gt;         struct folio *folio, *next;
+&gt; -       int split = 0, i;
+&gt; -       struct folio_batch fbatch;
+&gt; +       int split = 0;
+&gt; +       unsigned long isolated;
+&gt;
+&gt; -       folio_batch_init(&amp;fbatch);
+&gt; +       isolated = list_lru_shrink_walk_irq(&amp;deferred_split_lru, sc,
+&gt; +                                           deferred_split_isolate, &amp;dispose);
+&gt;
+&gt; -retry:
+&gt; -       ds_queue = split_queue_lock_irqsave(sc-&gt;nid, sc-&gt;memcg, &amp;flags);
+&gt; -       /* Take pin on all head pages to avoid freeing them under us */
+&gt; -       list_for_each_entry_safe(folio, next, &amp;ds_queue-&gt;split_queue,
+&gt; -                                                       _deferred_list) {
+&gt; -               if (folio_try_get(folio)) {
+&gt; -                       folio_batch_add(&amp;fbatch, folio);
+&gt; -               } else if (folio_test_partially_mapped(folio)) {
+&gt; -                       /* We lost race with folio_put() */
+&gt; -                       folio_clear_partially_mapped(folio);
+&gt; -                       mod_mthp_stat(folio_order(folio),
+&gt; -                                     MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+&gt; -               }
+&gt; -               list_del_init(&amp;folio-&gt;_deferred_list);
+&gt; -               ds_queue-&gt;split_queue_len--;
+&gt; -               if (!--sc-&gt;nr_to_scan)
+&gt; -                       break;
+&gt; -               if (!folio_batch_space(&amp;fbatch))
+&gt; -                       break;
+&gt; -       }
+&gt; -       split_queue_unlock_irqrestore(ds_queue, flags);
+&gt; -
+&gt; -       for (i = 0; i &lt; folio_batch_count(&amp;fbatch); i++) {
+&gt; +       list_for_each_entry_safe(folio, next, &amp;dispose, _deferred_list) {
+&gt;                 bool did_split = false;
+&gt;                 bool underused = false;
+&gt; -               struct deferred_split *fqueue;
+&gt; +               struct list_lru_one *l;
+&gt; +               unsigned long flags;
+&gt; +
+&gt; +               list_del_init(&amp;folio-&gt;_deferred_list);
+&gt;
+&gt; -               folio = fbatch.folios[i];
+&gt;                 if (!folio_test_partially_mapped(folio)) {
+&gt;                         /*
+&gt;                          * See try_to_map_unused_to_zeropage(): we cannot
+&gt; @@ -4534,64 +4438,32 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+&gt;                 }
+&gt;                 folio_unlock(folio);
+&gt;  next:
+&gt; -               if (did_split || !folio_test_partially_mapped(folio))
+&gt; -                       continue;
+&gt;                 /*
+&gt;                  * Only add back to the queue if folio is partially mapped.
+&gt;                  * If thp_underused returns false, or if split_folio fails
+&gt;                  * in the case it was underused, then consider it used and
+&gt;                  * don&#x27;t add it back to split_queue.
+&gt;                  */
+&gt; -               fqueue = folio_split_queue_lock_irqsave(folio, &amp;flags);
+&gt; -               if (list_empty(&amp;folio-&gt;_deferred_list)) {
+&gt; -                       list_add_tail(&amp;folio-&gt;_deferred_list, &amp;fqueue-&gt;split_queue);
+&gt; -                       fqueue-&gt;split_queue_len++;
+&gt; +               if (!did_split &amp;&amp; folio_test_partially_mapped(folio)) {
+&gt; +                       rcu_read_lock();
+&gt; +                       l = list_lru_lock_irqsave(&amp;deferred_split_lru,
+&gt; +                                                 folio_nid(folio),
+&gt; +                                                 folio_memcg(folio),
+&gt; +                                                 &amp;flags);
+&gt; +                       __list_lru_add(&amp;deferred_split_lru, l,
+&gt; +                                      &amp;folio-&gt;_deferred_list,
+&gt; +                                      folio_nid(folio), folio_memcg(folio));
+&gt; +                       list_lru_unlock_irqrestore(l, &amp;flags);
+&gt; +                       rcu_read_unlock();
+&gt;                 }
+&gt; -               split_queue_unlock_irqrestore(fqueue, flags);
+&gt; -       }
+&gt; -       folios_put(&amp;fbatch);
+&gt; -
+&gt; -       if (sc-&gt;nr_to_scan &amp;&amp; !list_empty(&amp;ds_queue-&gt;split_queue)) {
+&gt; -               cond_resched();
+&gt; -               goto retry;
+&gt; +               folio_put(folio);
+&gt;         }
+&gt;
+&gt; -       /*
+&gt; -        * Stop shrinker if we didn&#x27;t split any page, but the queue is empty.
+&gt; -        * This can happen if pages were freed under us.
+&gt; -        */
+&gt; -       if (!split &amp;&amp; list_empty(&amp;ds_queue-&gt;split_queue))
+&gt; +       if (!split &amp;&amp; !isolated)
+&gt;                 return SHRINK_STOP;
+&gt;         return split;
+&gt;  }
+&gt;
+&gt; -#ifdef CONFIG_MEMCG
+&gt; -void reparent_deferred_split_queue(struct mem_cgroup *memcg)
+&gt; -{
+&gt; -       struct mem_cgroup *parent = parent_mem_cgroup(memcg);
+&gt; -       struct deferred_split *ds_queue = &amp;memcg-&gt;deferred_split_queue;
+&gt; -       struct deferred_split *parent_ds_queue = &amp;parent-&gt;deferred_split_queue;
+&gt; -       int nid;
+&gt; -
+&gt; -       spin_lock_irq(&amp;ds_queue-&gt;split_queue_lock);
+&gt; -       spin_lock_nested(&amp;parent_ds_queue-&gt;split_queue_lock, SINGLE_DEPTH_NESTING);
+&gt; -
+&gt; -       if (!ds_queue-&gt;split_queue_len)
+&gt; -               goto unlock;
+&gt; -
+&gt; -       list_splice_tail_init(&amp;ds_queue-&gt;split_queue, &amp;parent_ds_queue-&gt;split_queue);
+&gt; -       parent_ds_queue-&gt;split_queue_len += ds_queue-&gt;split_queue_len;
+&gt; -       ds_queue-&gt;split_queue_len = 0;
+&gt; -
+&gt; -       for_each_node(nid)
+&gt; -               set_shrinker_bit(parent, nid, shrinker_id(deferred_split_shrinker));
+&gt; -
+&gt; -unlock:
+&gt; -       spin_unlock(&amp;parent_ds_queue-&gt;split_queue_lock);
+&gt; -       spin_unlock_irq(&amp;ds_queue-&gt;split_queue_lock);
+&gt; -}
+&gt; -#endif
+&gt; -
+&gt;  #ifdef CONFIG_DEBUG_FS
+&gt;  static void split_huge_pages_all(void)
+&gt;  {
+&gt; diff --git a/mm/internal.h b/mm/internal.h
+&gt; index f98f4746ac41..d8c737338df5 100644
+&gt; --- a/mm/internal.h
+&gt; +++ b/mm/internal.h
+&gt; @@ -863,7 +863,7 @@ static inline bool folio_unqueue_deferred_split(struct folio *folio)
+&gt;         /*
+&gt;          * At this point, there is no one trying to add the folio to
+&gt;          * deferred_list. If folio is not in deferred_list, it&#x27;s safe
+&gt; -        * to check without acquiring the split_queue_lock.
+&gt; +        * to check without acquiring the list_lru lock.
+&gt;          */
+&gt;         if (data_race(list_empty(&amp;folio-&gt;_deferred_list)))
+&gt;                 return false;
+&gt; diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+&gt; index 4b0e59c7c0e6..b2ac28ddd480 100644
+&gt; --- a/mm/khugepaged.c
+&gt; +++ b/mm/khugepaged.c
+&gt; @@ -1081,6 +1081,7 @@ static enum scan_result alloc_charge_folio(struct folio **foliop, struct mm_stru
+&gt;         }
+&gt;
+&gt;         count_vm_event(THP_COLLAPSE_ALLOC);
+&gt; +
+&gt;         if (unlikely(mem_cgroup_charge(folio, mm, gfp))) {
+&gt;                 folio_put(folio);
+&gt;                 *foliop = NULL;
+&gt; @@ -1089,6 +1090,12 @@ static enum scan_result alloc_charge_folio(struct folio **foliop, struct mm_stru
+&gt;
+&gt;         count_memcg_folio_events(folio, THP_COLLAPSE_ALLOC, 1);
+&gt;
+&gt; +       if (folio_memcg_list_lru_alloc(folio, &amp;deferred_split_lru, gfp)) {
+&gt; +               folio_put(folio);
+&gt; +               *foliop = NULL;
+&gt; +               return SCAN_CGROUP_CHARGE_FAIL;
+&gt; +       }
+&gt; +
+&gt;         *foliop = folio;
+&gt;         return SCAN_SUCCEED;
+&gt;  }
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index a47fb68dd65f..f381cb6bdff1 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -4015,11 +4015,6 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
+&gt;         for (i = 0; i &lt; MEMCG_CGWB_FRN_CNT; i++)
+&gt;                 memcg-&gt;cgwb_frn[i].done =
+&gt;                         __WB_COMPLETION_INIT(&amp;memcg_cgwb_frn_waitq);
+&gt; -#endif
+&gt; -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+&gt; -       spin_lock_init(&amp;memcg-&gt;deferred_split_queue.split_queue_lock);
+&gt; -       INIT_LIST_HEAD(&amp;memcg-&gt;deferred_split_queue.split_queue);
+&gt; -       memcg-&gt;deferred_split_queue.split_queue_len = 0;
+&gt;  #endif
+&gt;         lru_gen_init_memcg(memcg);
+&gt;         return memcg;
+&gt; @@ -4167,11 +4162,10 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
+&gt;         zswap_memcg_offline_cleanup(memcg);
+&gt;
+&gt;         memcg_offline_kmem(memcg);
+&gt; -       reparent_deferred_split_queue(memcg);
+&gt;         /*
+&gt; -        * The reparenting of objcg must be after the reparenting of the
+&gt; -        * list_lru and deferred_split_queue above, which ensures that they will
+&gt; -        * not mistakenly get the parent list_lru and deferred_split_queue.
+&gt; +        * The reparenting of objcg must be after the reparenting of
+&gt; +        * the list_lru in memcg_offline_kmem(), which ensures that
+&gt; +        * they will not mistakenly get the parent list_lru.
+&gt;          */
+&gt;         memcg_reparent_objcgs(memcg);
+&gt;         reparent_shrinker_deferred(memcg);
+&gt; diff --git a/mm/memory.c b/mm/memory.c
+&gt; index 219b9bf6cae0..e68ceb4aa624 100644
+&gt; --- a/mm/memory.c
+&gt; +++ b/mm/memory.c
+&gt; @@ -4651,13 +4651,19 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
+&gt;         while (orders) {
+&gt;                 addr = ALIGN_DOWN(vmf-&gt;address, PAGE_SIZE &lt;&lt; order);
+&gt;                 folio = vma_alloc_folio(gfp, order, vma, addr);
+&gt; -               if (folio) {
+&gt; -                       if (!mem_cgroup_swapin_charge_folio(folio, vma-&gt;vm_mm,
+&gt; -                                                           gfp, entry))
+&gt; -                               return folio;
+&gt; +               if (!folio)
+&gt; +                       goto next;
+&gt; +               if (mem_cgroup_swapin_charge_folio(folio, vma-&gt;vm_mm, gfp, entry)) {
+&gt;                         count_mthp_stat(order, MTHP_STAT_SWPIN_FALLBACK_CHARGE);
+&gt;                         folio_put(folio);
+&gt; +                       goto next;
+&gt;                 }
+&gt; +               if (folio_memcg_list_lru_alloc(folio, &amp;deferred_split_lru, gfp)) {
+&gt; +                       folio_put(folio);
+&gt; +                       goto fallback;
+&gt; +               }
+
+Hi Johannes,
+
+Haven&#x27;t checked every detail yet, but one question here, might be
+trivial, will it be better if we fallback to the next order instead of
+fallback to 0 order directly? Suppose this is a 2M allocation and 1M
+fallback is allowed, releasing that folio and fallback to 1M will free
+1M memory which would be enough for the list lru metadata to be
+allocated.</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAMgjq7BA8BHMEwK-QVpH+gDgu9fHEKxs4p1A3CeY9p7G98xhPg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>

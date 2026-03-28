@@ -4,11 +4,130 @@
   "url": "https://lore.kernel.org/all/20260324-nfs-7-1-v2-2-d110da3c0036@kernel.org/",
   "dates": {
     "2026-03-24": {
-      "report_file": "2026-03-25_ollama_llama3.1-8b.html",
+      "report_file": "2026-03-27_ollama_llama3.1-8b.html",
       "developer": "Jeff Layton",
-      "reviews": [],
-      "analysis_source": "llm-chunked-no-replies",
-      "patch_summary": "This patch updates the inode ctime after a removexattr operation in NFSv4.2 to ensure that the cached timestamp is refreshed. The problem it solves is that the stat() system call does not trigger a GETATTR request when delegated timestamps are used, resulting in an outdated ctime value. To fix this, the patch adds a trailing GETATTR request to the removexattr operation, similar to how setxattr operations update the inode's timestamp. This change ensures that the inode's ctime is accurately updated after removing extended attributes."
+      "reviews": [
+        {
+          "author": "Olga Kornievskaia",
+          "summary": "Reviewer Olga Kornievskaia noted that the current approach relies on the server updating change_attr on operations that may not necessarily happen, and proposed an alternative fix to update the inode's mtime when delegated attributes are present.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "alternative fix",
+            "proposed solution"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "This approach relies on the fact that the server the serves delegated\nattributes would update change_attr on operations which might now\nnecessarily happen (ie, linux server does not update change_attribute\non writes or clone). I propose an alternative fix for the failing\ngeneric/728.\n\ndiff --git a/fs/nfs/nfs42proc.c b/fs/nfs/nfs42proc.c\nindex 7b3ca68fb4bb..ede1835a45b3 100644\n--- a/fs/nfs/nfs42proc.c\n+++ b/fs/nfs/nfs42proc.c\n@@ -1389,7 +1389,13 @@ static int _nfs42_proc_removexattr(struct inode\n*inode, const char *name)\n            &res.seq_res, 1);\n        trace_nfs4_removexattr(inode, name, ret);\n        if (!ret)\n-               nfs4_update_changeattr(inode, &res.cinfo, timestamp, 0);\n+               if (nfs_have_delegated_attributes(inode)) {\n+                       nfs_update_delegated_mtime(inode);\n+                       spin_lock(&inode->i_lock);\n+                       nfs_set_cache_invalid(inode, NFS_INO_INVALID_BLOCKS);\n+                       spin_unlock(&inode->i_lock);\n+               } else\n+                       nfs4_update_changeattr(inode, &res.cinfo, timestamp, 0);\n\n        return ret;\n }",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-03-27",
+          "message_id": "CAN-5tyFpsuE9+5ZvAASwvTYKtcN5jNpAxi8ejde90e-vpUzFKg@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author addressed concerns about the proposed patch's approach to updating inode ctime after removexattr operation, explaining that doing it this way allows the server to have the most up-to-date version of mtime and ctime, and potentially avoids unnecessary SETATTR operations.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "What's the advantage of doing it this way?\n\nYou just sent a REMOVEXATTR operation to the server that will change\nthe mtime there. The server has the most up-to-date version of the\nmtime and ctime at that point.\n\nIt's certainly possible that the REMOVEXATTR is the only change that\noccurred. With what I'm proposing, we don't even need to do a SETATTR\nat all if nothing else changed. With your version, you would.",
+          "reply_to": "Olga Kornievskaia",
+          "message_date": "2026-03-27",
+          "message_id": "284ca17e74af8c4f5942b2952f2bf75490dd17c0.camel@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Olga Kornievskaia",
+          "summary": "Olga Kornievskaia questioned whether the server should update its mtime/ctime on operations like WRITE, CLONE, and COPY, and wondered if some implementations might not follow this behavior for REMOVEXATTR as well. She suggested that the patch relies on receiving an updated value from the server.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "questioning implementation consistency",
+            "request for clarification in the spec"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "In presence of delegated attributes, Is the server required to update\nits mtime/ctime on an operation? As I mentioned, the linux server does\nnot update its ctime/mtime for WRITE, CLONE, COPY. Is possible that\nsome implementations might be different and also do not update the\nctime/mtime on REMOVEXATTR? Therefore I was suggesting that the patch\nrelies on the fact that it would receive an updated value. Of course\nperhaps all implementations are done the same as the linux server and\nmy point is moot. I didn't see anything in the spec that clarifies\nwhat the server supposed to do (and client rely on).",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-03-27",
+          "message_id": "CAN-5tyFsEUcSUycb4JjxH5v754SefwOH=zt24KtxEC_Ow4OjMw@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author acknowledges that delegated timestamps may not cover SETATTR style operations and asks for clarification on server requirements, specifically regarding disabling timestamp updates for such operations.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "clarification",
+            "interpretation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "(cc'ing Tom)\n\nThat is a very good point.\n\nMy interpretation was that delegated timestamps generally covered\nwrites, but SETATTR style operations that do anything beyond only\nchanging the mtime can't be cached.\n\nWe probably need some delstid spec clarification: for what operations\nis the server required to disable timestamp updates when a write\ndelegation is outstanding?\n\nIn the case of nfsd, we disable timestamp updates for WRITE/COPY/CLONE\nbut not SETATTR/SETXATTR/REMOVEXATTR.\n\nHow does the Hammerspace anvil behave? Does it disable c/mtime updates\nfor writes when there is an outstanding timestamp delegation like we're\ndoing in nfsd? If so, does it do the same for\nSETATTR/SETXATTR/REMOVEXATTR operations as well?",
+          "reply_to": "Olga Kornievskaia",
+          "message_date": "2026-03-27",
+          "message_id": "80b423c66dba84b46be1084307d2c66b935065bc.camel@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Thomas Haynes",
+          "summary": "Reviewer Thomas Haynes noted that the patch's approach to updating inode ctime after removexattr operation does not align with the delegated timestamp model described in RFC8881, where the server should query the client via CB_GETATTR to return updated timestamps while the delegation is outstanding. He suggested re-evaluating the semantics for metadata-style ops like CLONE/COPY/SETXATTR/REMOVEXATTR and considering whether delegated timestamps follow the same attribute-authority model as delegated size.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "spec question"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Jeff,\n\nI think the right way to look at this is closer to how size is\nhandled under delegation in RFC8881, rather than as a per-op rule.\n\nIn our implementation, because we are acting as an MDS and data I/O\ngoes to DSes, we already treat size as effectively delegated when\na write layout is outstanding. The MDS does not maintain authoritative\nsize locally in that case. We may refresh size/timestamps internally\n(e.g., on GETATTR by querying DSes), but we don\\u2019t treat that as\noverriding the delegated authority.\n\nFor timestamps, our behavior is effectively the same model. When\nthe client holds the relevant delegation, the server does not\nconsider itself authoritative for ctime/mtime. If current values\nare needed, we can obtain them from the client (e.g., via CB_GETATTR),\nand the client must present the delegation stateid to demonstrate\nthat authority. So the authority follows the delegation, not the\nspecific operation.\n\nThat said, I don\\u2019t think we\\u2019ve fully resolved the semantics for all\nmetadata-style ops either. WRITE and SETATTR are clear in our model,\nbut for things like CLONE/COPY/SETXATTR/REMOVEXATTR, we\\u2019ve likely\nbeen relying on assumptions rather than a fully consistent rule.\nI.e., CLONE and COPY we just pass through to the DS and we don't\nimplement SETXATTR/REMOVEXATTR.\n\nSo the spec question, as I see it, is not whether REMOVEXATTR (or\nany particular op) should update ctime/mtime, but whether delegated\ntimestamps are meant to follow the same attribute-authority model\nas delegated size in RFC8881. If so, then we expect that the server\nshould query the client via CB_GETATTR to return updated ctime/mtime\nafter such operations while the delegation is outstanding.\n\nThanks,\nTom",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-03-27",
+          "message_id": "acbJsryTMYCMlE_o@mana",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Olga Kornievskaia",
+          "summary": "Olga Kornievskaia questioned whether the server should query the client for attribute updates while the client holds an attribute delegation, specifically in cases where a CLONE operation is performed with a GETATTR attached.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "What happens when the client holding the attribute delegation (it's\nthe authority) is doing the query? Is it the server's responsibility\nto query the client before replying. Example, client sends a CLONE\noperation which has a GETATTR attached. (1) is the server supposed to\nissue a CB_GETATTR before replying to the compound? (2) is the client\nnot supposed to send any GETATTRs while holding an attribute\ndelegation? CLONE is a modifying operation but client hasn't done any\nactual modifications to the opened file so a CB_GETATTR would return\nthat file hasn't been modified. Is the server then not going to\nexpress that the file has indeed been modified when replying to\nGETATTR?",
+          "reply_to": "Thomas Haynes",
+          "message_date": "2026-03-27",
+          "message_id": "CAN-5tyFQrt7WyW4=qLodKS2-eckAetKjs15A6U1OOdGPSL58XQ@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Thomas Haynes",
+          "summary": "Reviewer noted that Hammerspace server may send CB_GETATTR before responding to getattr, and suggested implementing a shortcut for SETATTR in the same compound as a potential optimization\n\nReviewer Thomas Haynes noted that the server needs to query the values of the attributes before sending them, as it cannot assume the client wants to know what the server thinks.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "optimization suggestion",
+            "potential improvement",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "The Hammerspace server on a getattr checks to see if there is\na delegated stateid (and whether it is the client making the request\nor not). If it is and the GETATTR asks for FATTR4_SIZE, FATTR4_TIME_MODIFY,\nor FATTR4_TIME_METADATA, then it will send a CB_GETATTR before\nresponding to the client.\n\nWhile it does not do so, if the client sent in a SETATTR in the\nsame compound we could short circuit that. Think a sort of WCC.\n\n---\n\nThe server could argue that the client wants to know what it thinks.\nBut that isn't the argeement. The server has to query those values\nbefore sending them on.",
+          "reply_to": "Olga Kornievskaia",
+          "message_date": "2026-03-27",
+          "message_id": "acbfV0C-fAy4nZ-i@mana",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch updates the inode's ctime (last modification time) after a removexattr operation on an NFS file system. The problem it solves is that the stat() function does not trigger a GETATTR request when delegated timestamps are used, resulting in an incorrect cached ctime value. To fix this, the patch adds a trailing GETATTR to the removexattr compound, similar to how setxattr works. This ensures that the inode's ctime is updated correctly after removing an extended attribute."
     }
   }
 }
