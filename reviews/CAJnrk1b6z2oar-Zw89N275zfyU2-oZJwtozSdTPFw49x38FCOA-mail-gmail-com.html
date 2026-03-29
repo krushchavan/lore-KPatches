@@ -238,18 +238,166 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 19/25] fuse: add io-uring kernel-managed buffer ring</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/CAJnrk1b6z2oar_Zw89N275zfyU2+oZJwtozSdTPFw49x38FCOA@mail.gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-02-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-02-26</strong><div class="date-range-nav">Active on: <a href="#2026-02-26">2026-02-26</a> &bull; <a href="#2026-02-25">2026-02-25</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-02-26</strong><div class="date-range-nav">Active on: <a href="#2026-02-26">2026-02-26</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch adds kernel-managed buffer ring support for io-uring in the FUSE filesystem.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-02-25">
+<div class="thread-node depth-0" id="2026-02-26">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Joanne Koong</span>
-<a class="date-chip" href="../2026-02-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-25">2026-02-25</a>
+<a class="date-chip" href="../2026-02-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-02-26">2026-02-26</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
 <div class="review-comment-text">Raised questions about the handling of 0-byte payloads and the order of fuse_uring_headers_cleanup() and fuse_uring_get_next_fuse_req().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, Feb 26, 2026 at 10:21 AM Bernd Schubert &lt;bernd@bsbernd.com&gt; wrote:
+&gt;
+&gt; On 2/26/26 00:42, Joanne Koong wrote:
+&gt; &gt; On Wed, Feb 25, 2026 at 9:55 AM Bernd Schubert &lt;bernd@bsbernd.com&gt; wrote:
+&gt; &gt;&gt; On 1/28/26 22:44, Bernd Schubert wrote:
+&gt; &gt;&gt;&gt; On 1/17/26 00:30, Joanne Koong wrote:
+&gt; &gt;&gt;&gt;&gt; diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+&gt; &gt;&gt;&gt;&gt; @@ -940,6 +1188,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+&gt; &gt;&gt;&gt;&gt;      unsigned int qid = READ_ONCE(cmd_req-&gt;qid);
+&gt; &gt;&gt;&gt;&gt;      struct fuse_pqueue *fpq;
+&gt; &gt;&gt;&gt;&gt;      struct fuse_req *req;
+&gt; &gt;&gt;&gt;&gt; +    bool send;
+&gt; &gt;&gt;&gt;&gt;
+&gt; &gt;&gt;&gt;&gt;      err = -ENOTCONN;
+&gt; &gt;&gt;&gt;&gt;      if (!ring)
+&gt; &gt;&gt;&gt;&gt; @@ -990,7 +1239,12 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+&gt; &gt;&gt;&gt;&gt;
+&gt; &gt;&gt;&gt;&gt;      /* without the queue lock, as other locks are taken */
+&gt; &gt;&gt;&gt;&gt;      fuse_uring_prepare_cancel(cmd, issue_flags, ent);
+&gt; &gt;&gt;&gt;&gt; -    fuse_uring_commit(ent, req, issue_flags);
+&gt; &gt;&gt;&gt;&gt; +
+&gt; &gt;&gt;&gt;&gt; +    err = fuse_uring_headers_prep(ent, ITER_SOURCE, issue_flags);
+&gt; &gt;&gt;&gt;&gt; +    if (err)
+&gt; &gt;&gt;&gt;&gt; +            fuse_uring_req_end(ent, req, err);
+&gt; &gt;&gt;&gt;&gt; +    else
+&gt; &gt;&gt;&gt;&gt; +            fuse_uring_commit(ent, req, issue_flags);
+&gt; &gt;&gt;&gt;&gt;
+&gt; &gt;&gt;&gt;&gt;      /*
+&gt; &gt;&gt;&gt;&gt;       * Fetching the next request is absolutely required as queued
+&gt; &gt;&gt;&gt;&gt; @@ -998,7 +1252,9 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+&gt; &gt;&gt;&gt;&gt;       * and fetching is done in one step vs legacy fuse, which has separated
+&gt; &gt;&gt;&gt;&gt;       * read (fetch request) and write (commit result).
+&gt; &gt;&gt;&gt;&gt;       */
+&gt; &gt;&gt;&gt;&gt; -    if (fuse_uring_get_next_fuse_req(ent, queue))
+&gt; &gt;&gt;&gt;&gt; +    send = fuse_uring_get_next_fuse_req(ent, queue, issue_flags);
+&gt; &gt;&gt;&gt;&gt; +    fuse_uring_headers_cleanup(ent, issue_flags);
+&gt; &gt;&gt;&gt;&gt; +    if (send)
+&gt; &gt;&gt;&gt;&gt;              fuse_uring_send(ent, cmd, 0, issue_flags);
+&gt; &gt;&gt;&gt;&gt;      return 0;
+&gt; &gt;&gt;
+&gt; &gt;&gt;
+&gt; &gt;&gt; Hello Joanne,
+&gt; &gt;&gt;
+&gt; &gt;&gt; couldn&#x27;t it call fuse_uring_headers_cleanup() before the
+&gt; &gt;&gt; fuse_uring_get_next_fuse_req()? I find it a bit confusing that it firsts
+&gt; &gt;&gt; gets the next request and then cleans up the buffer from the previous
+&gt; &gt;&gt; request.
+&gt; &gt;
+&gt; &gt; Hi Bernd,
+&gt; &gt;
+&gt; &gt; Thanks for taking a look.
+&gt; &gt;
+&gt; &gt; The fuse_uring_headers_cleanup() call has to happen after the
+&gt; &gt; fuse_uring_get_next_fuse_req() call because
+&gt; &gt; fuse_uring_get_next_fuse_req() copies payload to the header, so we
+&gt; &gt; can&#x27;t yet relinquish the refcount on the headers buffer / clean it up
+&gt; &gt; yet. I can add a comment about this to make this more clear.
+&gt;
+&gt; I only found time right now and already super late (or early) here.
+&gt;
+&gt; I guess that is fuse_uring_copy_to_ring -&gt; copy_header_to_ring, but why
+&gt; can it then call fuse_uring_headers_cleanup() -&gt;
+&gt; io_uring_fixed_index_put(). I.e. doesn&#x27;t it put buffer it just copied
+&gt; to? Why not the sequence of
+&gt;
+&gt; err = fuse_uring_headers_prep(ent, ITER_SOURCE, issue_flags);
+&gt; fuse_uring_commit(ent, req, issue_flags);
+&gt; fuse_uring_headers_cleanup(ent, issue_flags);
+&gt;
+&gt; And then fuse_uring_get_next_fuse_req() does another
+&gt; fuse_uring_headers_prep() with ITER_DEST?
+
+The headers buffer is the same buffer for the request that&#x27;s being
+committed and the next request that is fetched (just like how the ent
+is the same ent for the request that&#x27;s committed and the next fetched
+request). Because of this we can just reuse the same headers_iter and
+call io_uring_fixed_index_put() after we&#x27;re done copying over the next
+request. I can add a comment about this to make this more clear.
+
+&gt;
+&gt;
+&gt; &gt;
+&gt; &gt;&gt;
+&gt; &gt;&gt; As I understand it, the the patch basically adds the feature of 0-byte
+&gt; &gt;&gt; payloads. Maybe worth mentioning in the commit message?
+&gt; &gt;
+&gt; &gt; Hmm I&#x27;m not really sure I am seeing where the 0-byte payload gets
+&gt; &gt; added. On the server side, they don&#x27;t receive payloads that are
+&gt; &gt; 0-bytes. If there is no next fuse request to send, then nothing gets
+&gt; &gt; sent. But maybe I&#x27;m not interpreting your comment about 0-byte
+&gt; &gt; payloads correctly?
+&gt;
+&gt; There is fuse_uring_req_has_payload() and
+&gt; fuse_uring_select_buffer()/fuse_uring_next_req_update_buffer() using
+&gt; that function. When a request doesn&#x27;t have a payload the ring entries
+&gt; runs without a payload - effectively that introduces 0-byte payloads,
+&gt; doesn&#x27;t it?
+
+When the request doesn&#x27;t have a payload, no ring entry gets used for
+the request. The check for this happens in fuse_uring_prep_buffer()
+
+static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
+                                  struct fuse_req *req, unsigned issue_flags)
+{
+        ...
+        /* no payload to copy, can skip selecting a buffer */
+        if (!fuse_uring_req_has_payload(req))
+                return 0;
+
+        return fuse_uring_select_buffer(ent, issue_flags);
+}
+
+&gt;
+&gt; &gt;
+&gt; &gt;&gt; I also wonder if it would be worth to document as code comment that
+&gt; &gt;&gt; fuse_uring_ent_assign_req / fuse_uring_next_req_update_buffer are
+&gt; &gt;&gt; allowed to fail for a buffer upgrade (i.e. 0 to max-payload). At least
+&gt; &gt;
+&gt; &gt; Good idea, I&#x27;ll add a comment about this.
+&gt; &gt;
+&gt; &gt;&gt; the current comment of  &quot;Fetching the next request is absolutely
+&gt; &gt;&gt; required&quot; is actually not entirely true anymore.
+&gt; &gt;&gt;
+&gt; &gt;
+&gt; &gt; I don&#x27;t think this patch introduces new behavior on this front.
+&gt; &gt; fuse_uring_get_next_fuse_req() is still called to fetch the next
+&gt; &gt; request AFAICS.
+&gt; &gt;
+&gt;
+&gt; It still does, but if the request didn&#x27;t have a payload it might not
+&gt; have a buffer and if it didn&#x27;t have a buffer and doesn&#x27;t manage to get a
+&gt; buffer, it doesn&#x27;t handle a request - that a bit change of
+&gt; &#x27;commit-and-fetch always fetches a new request if there is any request
+&gt; queued&#x27;.
+
+Ok, I&#x27;ll update the &quot;Fetching the next request is absolutely required&quot; comment.
+
+Thanks,
+Joanne
+&gt;
+&gt;
+&gt; Thanks,
+&gt; Bernd
+
+</pre>
+</details>
 <div class="review-comment-signals">Signals: NEEDS_WORK</div>
 </div>
 </div>
