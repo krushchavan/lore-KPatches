@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 0/4] mm: improve large folio readahead and alignment for exec memory</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260320140315.979307-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-29</strong><div class="date-range-nav">Active on: <a href="#2026-03-29">2026-03-29</a> &bull; <a href="#2026-03-27">2026-03-27</a> &bull; <a href="#2026-03-26">2026-03-26</a> &bull; <a href="#2026-03-21">2026-03-21</a> &bull; <a href="#2026-03-20">2026-03-20</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-03-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-29</strong><div class="date-range-nav">Active on: <a href="#2026-03-30">2026-03-30</a> &bull; <a href="#2026-03-29">2026-03-29</a> &bull; <a href="#2026-03-27">2026-03-27</a> &bull; <a href="#2026-03-26">2026-03-26</a> &bull; <a href="#2026-03-21">2026-03-21</a> &bull; <a href="#2026-03-20">2026-03-20</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series improves large folio readahead and alignment for executable memory by introducing a generic, architecture-independent solution to replace the arch-specific exec_folio_order() function. The patches address two main issues: the mmap_miss heuristic that disables readahead after 100 page faults, and the suboptimal static order returned by exec_folio_order() for non-4K page sizes. The new approach uses preferred_exec_order() to sync mmap_readahead with zone high watermarks, and extends max alignment to mapping_max_folio_size().</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-03-20">
@@ -249,7 +249,7 @@
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author is addressing a concern about the mmap_miss heuristic disabling exec readahead after 100 page faults. They acknowledge that this issue prevents optimal operation of exec_folio_order() and explain how their patch addresses it by excluding VM_EXEC VMAs from the mmap_miss logic, similar to how VM_SEQ_READ is already excluded.</div>
+<div class="review-comment-text">The author is addressing concerns about the mmap_miss heuristic disabling exec readahead after 100 page faults and the suboptimality of exec_folio_order() for non-4K page sizes. The author acknowledges that these issues prevent optimal performance, but does not explicitly state a plan to address them in v2.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">v2 takes a different approach from v1 trying to move away from
@@ -371,10 +371,409 @@ Usama Arif (4):
  5 files changed, 102 insertions(+), 28 deletions(-)
 
 -- 
-2.52.0</pre>
+2.52.0
+
+---
+
+On 20/03/2026 17:42, Jan Kara wrote:
+&gt; On Fri 20-03-26 06:58:52, Usama Arif wrote:
+&gt;&gt; Replace the arch-specific exec_folio_order() hook with a generic
+&gt;&gt; preferred_exec_order() that dynamically computes the readahead folio
+&gt;&gt; order for executable memory. It targets min(PMD_ORDER, 2M) as the
+&gt;&gt; maximum, which optimally gives the right answer for contpte (arm64),
+&gt;&gt; PMD mapping (x86, arm64 4K), and architectures with smaller PMDs
+&gt;&gt; (s390 1M). It adapts at runtime based on:
+&gt;&gt;
+&gt;&gt; - VMA size: caps the order so folios fit within the mapping
+&gt;&gt; - Memory pressure: steps down the order when the local node&#x27;s free
+&gt;&gt;   memory is below the high watermark for the requested order
+&gt;&gt;
+&gt;&gt; This avoids over-allocating on memory-constrained systems while still
+&gt;&gt; requesting the optimal order when memory is plentiful.
+&gt;&gt;
+&gt;&gt; Since exec_folio_order() is no longer needed, remove the arm64
+&gt;&gt; definition and the generic default from pgtable.h.
+&gt;&gt;
+&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; ...
+&gt;&gt; +static unsigned int preferred_exec_order(struct vm_area_struct *vma)
+&gt;&gt; +{
+&gt;&gt; +	int order;
+&gt;&gt; +	unsigned long vma_len = vma_pages(vma);
+&gt;&gt; +	struct zone *zone;
+&gt;&gt; +	gfp_t gfp;
+&gt;&gt; +
+&gt;&gt; +	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+&gt;&gt; +		return 0;
+&gt;&gt; +
+&gt;&gt; +	/* Cap at min(PMD_ORDER, 2M) */
+&gt;&gt; +	order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT));
+&gt;&gt; +
+&gt;&gt; +	/* Don&#x27;t request folios larger than the VMA */
+&gt;&gt; +	order = min(order, ilog2(vma_len));
+&gt; 
+
+Hi Jan,
+
+Thanks for the feedback and sorry for the late reply! I was travelling
+during the week.
+
+&gt; Hum, as far as I&#x27;m checking page_cache_ra_order() used in
+&gt; do_sync_mmap_readahead(), ra-&gt;order is the preferred order but it will be
+&gt; trimmed down to fit both within the file and within ra-&gt;size. And ra-&gt;size
+&gt; is set for the readahead to fit within the vma so I don&#x27;t think any order
+&gt; trimming based on vma length is needed in this place?
+
+Ack, yes makes sense.
+
+&gt; 
+&gt;&gt; +	/* Step down under memory pressure */
+&gt;&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt;&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt;&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt;&gt; +	if (zone) {
+&gt;&gt; +		while (order &gt; 0 &amp;&amp;
+&gt;&gt; +		       !zone_watermark_ok(zone, order,
+&gt;&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt;&gt; +			order--;
+&gt;&gt; +	}
+&gt; 
+&gt; It looks wrong for this logic to be here. Trimming order based on memory
+&gt; pressure makes sense (and we&#x27;ve already got reports that on memory limited
+&gt; devices large order folios in the page cache have too big memory overhead
+&gt; so we&#x27;ll likely need to handle that for page cache allocations in general)
+&gt; but IMHO it belongs to page_cache_ra_order() or some other common place
+&gt; like that.
+&gt; 
+&gt; 								Honza
+
+So I have been thinking about this. readahead_gfp_mask() already sets
+__GFP_NORETRY, so we wont try aggressive reclaim/compaction to satisfy
+the allocation. page_cache_ra_order() falls through to the fallback path
+faulting in order 0 page when allocation is not satsified.
+
+So the allocator already naturally steps down under memory pressure,
+the explicit zone_watermark_ok() loop might be redundant?
+
+What are your thoughts on just setting
+ra-&gt;order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT))?
+We can do the higher orlder allocation with gfp &amp;= ~__GFP_RECLAIM
+for the VM_EXEC case.
+
+---
+
+On 20/03/2026 17:42, Jan Kara wrote:
+&gt; On Fri 20-03-26 06:58:52, Usama Arif wrote:
+&gt;&gt; Replace the arch-specific exec_folio_order() hook with a generic
+&gt;&gt; preferred_exec_order() that dynamically computes the readahead folio
+&gt;&gt; order for executable memory. It targets min(PMD_ORDER, 2M) as the
+&gt;&gt; maximum, which optimally gives the right answer for contpte (arm64),
+&gt;&gt; PMD mapping (x86, arm64 4K), and architectures with smaller PMDs
+&gt;&gt; (s390 1M). It adapts at runtime based on:
+&gt;&gt;
+&gt;&gt; - VMA size: caps the order so folios fit within the mapping
+&gt;&gt; - Memory pressure: steps down the order when the local node&#x27;s free
+&gt;&gt;   memory is below the high watermark for the requested order
+&gt;&gt;
+&gt;&gt; This avoids over-allocating on memory-constrained systems while still
+&gt;&gt; requesting the optimal order when memory is plentiful.
+&gt;&gt;
+&gt;&gt; Since exec_folio_order() is no longer needed, remove the arm64
+&gt;&gt; definition and the generic default from pgtable.h.
+&gt;&gt;
+&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; ...
+&gt;&gt; +static unsigned int preferred_exec_order(struct vm_area_struct *vma)
+&gt;&gt; +{
+&gt;&gt; +	int order;
+&gt;&gt; +	unsigned long vma_len = vma_pages(vma);
+&gt;&gt; +	struct zone *zone;
+&gt;&gt; +	gfp_t gfp;
+&gt;&gt; +
+&gt;&gt; +	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+&gt;&gt; +		return 0;
+&gt;&gt; +
+&gt;&gt; +	/* Cap at min(PMD_ORDER, 2M) */
+&gt;&gt; +	order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT));
+&gt;&gt; +
+&gt;&gt; +	/* Don&#x27;t request folios larger than the VMA */
+&gt;&gt; +	order = min(order, ilog2(vma_len));
+&gt; 
+
+Hi Jan,
+
+Thanks for the feedback and sorry for the late reply! I was travelling
+during the week.
+
+&gt; Hum, as far as I&#x27;m checking page_cache_ra_order() used in
+&gt; do_sync_mmap_readahead(), ra-&gt;order is the preferred order but it will be
+&gt; trimmed down to fit both within the file and within ra-&gt;size. And ra-&gt;size
+&gt; is set for the readahead to fit within the vma so I don&#x27;t think any order
+&gt; trimming based on vma length is needed in this place?
+
+Ack, yes makes sense.
+
+&gt; 
+&gt;&gt; +	/* Step down under memory pressure */
+&gt;&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt;&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt;&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt;&gt; +	if (zone) {
+&gt;&gt; +		while (order &gt; 0 &amp;&amp;
+&gt;&gt; +		       !zone_watermark_ok(zone, order,
+&gt;&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt;&gt; +			order--;
+&gt;&gt; +	}
+&gt; 
+&gt; It looks wrong for this logic to be here. Trimming order based on memory
+&gt; pressure makes sense (and we&#x27;ve already got reports that on memory limited
+&gt; devices large order folios in the page cache have too big memory overhead
+&gt; so we&#x27;ll likely need to handle that for page cache allocations in general)
+&gt; but IMHO it belongs to page_cache_ra_order() or some other common place
+&gt; like that.
+&gt; 
+&gt; 								Honza
+
+So I have been thinking about this. readahead_gfp_mask() already sets
+__GFP_NORETRY, so we wont try aggressive reclaim/compaction to satisfy
+the allocation. page_cache_ra_order() falls through to the fallback path
+faulting in order 0 page when allocation is not satsified.
+
+So the allocator already naturally steps down under memory pressure,
+the explicit zone_watermark_ok() loop might be redundant?
+
+What are your thoughts on just setting
+ra-&gt;order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT))?
+We can do the higher orlder allocation with gfp &amp;= ~__GFP_RECLAIM
+for the VM_EXEC case.
+
+---
+
+On 20/03/2026 18:58, Matthew Wilcox wrote:
+&gt; On Fri, Mar 20, 2026 at 06:58:53AM -0700, Usama Arif wrote:
+&gt;&gt; -static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr)
+&gt;&gt; +static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr,
+&gt;&gt; +				       struct file *filp)
+&gt;&gt;  {
+&gt;&gt;  	unsigned long alignment = 0;
+&gt;&gt; +	unsigned long max_folio_size = PAGE_SIZE;
+&gt;&gt;  	int i;
+&gt;&gt;  
+&gt;&gt; +	if (filp &amp;&amp; filp-&gt;f_mapping)
+&gt;&gt; +		max_folio_size = mapping_max_folio_size(filp-&gt;f_mapping);
+&gt; 
+&gt; Under what circumstances can bprm-&gt;file be NULL?
+
+Yeah its unnecessary here. Its used in other places and this is never
+checked, so we can remove it.
+
+&gt; 
+&gt; Also we tend to prefer the name &quot;file&quot; rather than &quot;filp&quot; for new code
+&gt; (yes, there&#x27;s a lot of old code out there).
+&gt; 
+
+ack. will change in next revision.
+
+&gt;&gt; +
+&gt;&gt; +			/*
+&gt;&gt; +			 * Try to align the binary to the largest folio
+&gt;&gt; +			 * size that the page cache supports, so the
+&gt;&gt; +			 * hardware can coalesce PTEs (e.g. arm64
+&gt;&gt; +			 * contpte) or use PMD mappings for large folios.
+&gt;&gt; +			 *
+&gt;&gt; +			 * Use the largest power-of-2 that fits within
+&gt;&gt; +			 * the segment size, capped by what the page
+&gt;&gt; +			 * cache will allocate. Only align when the
+&gt;&gt; +			 * segment&#x27;s virtual address and file offset are
+&gt;&gt; +			 * already aligned to the folio size, as
+&gt;&gt; +			 * misalignment would prevent coalescing anyway.
+&gt;&gt; +			 *
+&gt;&gt; +			 * The segment size check avoids reducing ASLR
+&gt;&gt; +			 * entropy for small binaries that cannot
+&gt;&gt; +			 * benefit.
+&gt;&gt; +			 */
+&gt;&gt; +			if (!cmds[i].p_filesz)
+&gt;&gt; +				continue;
+&gt;&gt; +			size = rounddown_pow_of_two(cmds[i].p_filesz);
+&gt;&gt; +			size = min(size, max_folio_size);
+&gt;&gt; +			if (size &gt; PAGE_SIZE &amp;&amp;
+&gt;&gt; +			    IS_ALIGNED(cmds[i].p_vaddr, size) &amp;&amp;
+&gt;&gt; +			    IS_ALIGNED(cmds[i].p_offset, size))
+&gt;&gt; +				alignment = max(alignment, size);
+&gt; 
+&gt; Can this not all be factored out into a different function?  Also, I
+&gt; think it was done a bit better here:
+&gt; https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc/
+&gt; 
+&gt; +	if (!IS_ALIGNED(cmd-&gt;p_vaddr | cmd-&gt;p_offset, PMD_SIZE))
+&gt; +		return false;
+&gt; 
+
+
+ack, will try and address this accordingly.
+
+
+Thanks for the reviews!!
+
+---
+
+On 20/03/2026 19:05, WANG Rui wrote:
+&gt; Hi Usama,
+&gt; 
+&gt; On Fri, Mar 20, 2026 at 10:04\u202fPM Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
+&gt;&gt; diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+&gt;&gt; index 8e89cc5b28200..042af81766fcd 100644
+&gt;&gt; --- a/fs/binfmt_elf.c
+&gt;&gt; +++ b/fs/binfmt_elf.c
+&gt;&gt; @@ -49,6 +49,7 @@
+&gt;&gt;  #include &lt;uapi/linux/rseq.h&gt;
+&gt;&gt;  #include &lt;asm/param.h&gt;
+&gt;&gt;  #include &lt;asm/page.h&gt;
+&gt;&gt; +#include &lt;linux/pagemap.h&gt;
+&gt;&gt;
+&gt;&gt;  #ifndef ELF_COMPAT
+&gt;&gt;  #define ELF_COMPAT 0
+&gt;&gt; @@ -488,19 +489,51 @@ static int elf_read(struct file *file, void *buf, size_t len, loff_t pos)
+&gt;&gt;         return 0;
+&gt;&gt;  }
+&gt;&gt;
+&gt;&gt; -static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr)
+&gt;&gt; +static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr,
+&gt;&gt; +                                      struct file *filp)
+&gt;&gt;  {
+&gt;&gt;         unsigned long alignment = 0;
+&gt;&gt; +       unsigned long max_folio_size = PAGE_SIZE;
+&gt;&gt;         int i;
+&gt;&gt;
+&gt;&gt; +       if (filp &amp;&amp; filp-&gt;f_mapping)
+&gt;&gt; +               max_folio_size = mapping_max_folio_size(filp-&gt;f_mapping);
+&gt; 
+&gt; From experiments (with 16K base pages), mapping_max_folio_size() appears to
+&gt; depend on the filesystem. It returns 8M on ext4, while on btrfs it always
+&gt; falls back to PAGE_SIZE (it seems CONFIG_BTRFS_EXPERIMENTAL=y may change this).
+&gt; This looks overly conservative and ends up missing practical optimization
+&gt; opportunities.
+
+mapping_max_folio_size() reflects what the page cache will actually
+allocate for a given filesystem, since readahead caps folio allocation
+at mapping_max_folio_order() (in page_cache_ra_order()). If btrfs
+reports PAGE_SIZE, readahead won&#x27;t allocate large folios for it, so
+there are no large folios to coalesce PTEs for, aligning the binary
+beyond that would only reduce ASLR entropy for no benefit.
+
+I don&#x27;t think we should over-align binaries on filesystems that can&#x27;t
+take advantage of it.
+
+&gt; 
+&gt;&gt; +
+&gt;&gt;         for (i = 0; i &lt; nr; i++) {
+&gt;&gt;                 if (cmds[i].p_type == PT_LOAD) {
+&gt;&gt;                         unsigned long p_align = cmds[i].p_align;
+&gt;&gt; +                       unsigned long size;
+&gt;&gt;
+&gt;&gt;                         /* skip non-power of two alignments as invalid */
+&gt;&gt;                         if (!is_power_of_2(p_align))
+&gt;&gt;                                 continue;
+&gt;&gt;                         alignment = max(alignment, p_align);
+&gt;&gt; +
+&gt;&gt; +                       /*
+&gt;&gt; +                        * Try to align the binary to the largest folio
+&gt;&gt; +                        * size that the page cache supports, so the
+&gt;&gt; +                        * hardware can coalesce PTEs (e.g. arm64
+&gt;&gt; +                        * contpte) or use PMD mappings for large folios.
+&gt;&gt; +                        *
+&gt;&gt; +                        * Use the largest power-of-2 that fits within
+&gt;&gt; +                        * the segment size, capped by what the page
+&gt;&gt; +                        * cache will allocate. Only align when the
+&gt;&gt; +                        * segment&#x27;s virtual address and file offset are
+&gt;&gt; +                        * already aligned to the folio size, as
+&gt;&gt; +                        * misalignment would prevent coalescing anyway.
+&gt;&gt; +                        *
+&gt;&gt; +                        * The segment size check avoids reducing ASLR
+&gt;&gt; +                        * entropy for small binaries that cannot
+&gt;&gt; +                        * benefit.
+&gt;&gt; +                        */
+&gt;&gt; +                       if (!cmds[i].p_filesz)
+&gt;&gt; +                               continue;
+&gt;&gt; +                       size = rounddown_pow_of_two(cmds[i].p_filesz);
+&gt;&gt; +                       size = min(size, max_folio_size);
+&gt;&gt; +                       if (size &gt; PAGE_SIZE &amp;&amp;
+&gt;&gt; +                           IS_ALIGNED(cmds[i].p_vaddr, size) &amp;&amp;
+&gt;&gt; +                           IS_ALIGNED(cmds[i].p_offset, size))
+&gt;&gt; +                               alignment = max(alignment, size);
+&gt; 
+&gt; In my patch [1], by aligning eligible segments to PMD_SIZE, THP can quickly
+&gt; collapse them into large mappings with minimal warmup. That doesn\u2019t happen
+&gt; with the current behavior. I think allowing a reasonably sized PMD (say &lt;= 32M)
+&gt; is worth considering. All we really need here is to ensure virtual address
+&gt; alignment. The rest can be left to THP under always, which can decide whether
+&gt; to collapse or not based on memory pressure and other factors.
+&gt; 
+&gt; [1] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
+&gt; 
+&gt;&gt;                 }
+&gt;&gt;         }
+&gt;&gt;
+&gt;&gt; @@ -1104,7 +1137,8 @@ static int load_elf_binary(struct linux_binprm *bprm)
+&gt;&gt;                         }
+&gt;&gt;
+&gt;&gt;                         /* Calculate any requested alignment. */
+&gt;&gt; -                       alignment = maximum_alignment(elf_phdata, elf_ex-&gt;e_phnum);
+&gt;&gt; +                       alignment = maximum_alignment(elf_phdata, elf_ex-&gt;e_phnum,
+&gt;&gt; +                                                     bprm-&gt;file);
+&gt;&gt;
+&gt;&gt;                         /**
+&gt;&gt;                          * DOC: PIE handling
+&gt;&gt; --
+&gt;&gt; 2.52.0
+&gt;&gt;
+&gt; 
+&gt; Thanks,
+&gt; Rui
+
+---
+
+On 30/03/2026 15:56, Matthew Wilcox wrote:
+&gt; On Sun, Mar 29, 2026 at 12:37:00PM +0800, WANG Rui wrote:
+&gt;&gt;&gt; mapping_max_folio_size() reflects what the page cache will actually
+&gt;&gt;&gt; allocate for a given filesystem, since readahead caps folio allocation
+&gt;&gt;&gt; at mapping_max_folio_order() (in page_cache_ra_order()). If btrfs
+&gt;&gt;&gt; reports PAGE_SIZE, readahead won&#x27;t allocate large folios for it, so
+&gt;&gt;&gt; there are no large folios to coalesce PTEs for, aligning the binary
+&gt;&gt;&gt; beyond that would only reduce ASLR entropy for no benefit.
+&gt;&gt;&gt;
+&gt;&gt;&gt; I don&#x27;t think we should over-align binaries on filesystems that can&#x27;t
+&gt;&gt;&gt; take advantage of it.
+&gt;&gt;
+&gt;&gt; Ah, it looks like this might be overlooking another path that can create
+&gt;&gt; huge page mappings for read-only code segments: even when the filesystem
+&gt;&gt; (e.g. btrfs without experimental) didn&#x27;t support large folios,
+&gt;&gt; READ_ONLY_THP_FOR_FS still allowed read-only file-backed code segments
+&gt;&gt; to be collapsed into huge page mappings via khugepaged.
+
+ah yes, Thank you for pointing this out!
+
+Maybe we should rename mapping_max_folio_size() to mapping_fault_max_folio_size().
+
+&gt;&gt;
+&gt;&gt; As Wilcox pointed out, it may take quite some time for many filesystems
+&gt;&gt; to gain full large folio support? So what I&#x27;m trying to clarify is that
+&gt;&gt; using mapping_max_folio_size() on this path is not favorable for
+&gt;&gt; khugepaged-based optimizations.
+
+ack
+
+I am worried that 32M is too large and we lose out on a lot of ASLR bits.
+Instead of PMD_ORDER, should we do max(SZ_2M, PMD_ORDER)?
+
+&gt; Nono, that&#x27;s not what I&#x27;m pointing out!  btrfs is simply not putting
+&gt; in the effort to support large folios, and that needs to change.
+&gt; READ_ONLY_THP_FOR_FS unnecessaily burdens the rest of the kernel.
+&gt; It was a great hack for its time and paved the path for a lot of what
+&gt; we have today, but it&#x27;s time to remove it.</pre>
 </details>
 <a href="https://lore.kernel.org/r/20260320140315.979307-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledges a fix is needed, explains the solution</div>
+<div class="review-comment-signals">Signals: acknowledges technical issue, no clear resolution</div>
 </div>
 <div class="thread-children">
 <div class="thread-node depth-1">
@@ -451,20 +850,398 @@ Rui</pre>
 <span class="review-author">Jan Kara</span>
 <a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Jan Kara approved the patch and requested to be added as a Reviewed-by, indicating no specific technical issues or concerns.</div>
+<div class="review-comment-text">Reviewer Jan Kara noted that the mmap_miss counter in do_sync_mmap_readahead() disables all readahead when it exceeds MMAP_LOTSAMISS, including targeted VM_EXEC readahead for contpte mapping on arm64. He pointed out that both decrement paths are inactive on arm64 due to fault_around_pages being 1 and async_size being set to 0, leading to the counter monotonically increasing past MMAP_LOTSAMISS after 100 page faults. Jan suggested excluding VM_EXEC VMAs from the mmap_miss logic, similar to how VM_SEQ_READ is already excluded.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Looks good to me. Feel free to add:
+<pre class="raw-body-text">On Fri 20-03-26 06:58:51, Usama Arif wrote:
+&gt; The mmap_miss counter in do_sync_mmap_readahead() tracks whether
+&gt; readahead is useful for mmap&#x27;d file access. It is incremented by 1 on
+&gt; every page cache miss in do_sync_mmap_readahead(), and decremented in
+&gt; two places:
+&gt; 
+&gt;   - filemap_map_pages(): decremented by N for each of N pages
+&gt;     successfully mapped via fault-around (pages found already in cache,
+&gt;     evidence readahead was useful). Only pages not in the workingset
+&gt;     count as hits.
+&gt; 
+&gt;   - do_async_mmap_readahead(): decremented by 1 when a page with
+&gt;     PG_readahead is found in cache.
+&gt; 
+&gt; When the counter exceeds MMAP_LOTSAMISS (100), all readahead is
+&gt; disabled, including the targeted VM_EXEC readahead [1] that requests
+&gt; large folio orders for contpte mapping.
+&gt; 
+&gt; On arm64 with 64K base pages, both decrement paths are inactive:
+&gt; 
+&gt;   1. filemap_map_pages() is never called because fault_around_pages
+&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
+&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
+&gt;      fault-around window, there is nothing &quot;around&quot; to map.
+&gt; 
+&gt;   2. do_async_mmap_readahead() never fires for exec mappings because
+&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
+&gt;      are placed.
+&gt; 
+&gt; With no decrements, mmap_miss monotonically increases past
+&gt; MMAP_LOTSAMISS after 100 page faults, disabling all subsequent
+&gt; exec readahead.
+&gt; 
+&gt; Fix this by excluding VM_EXEC VMAs from the mmap_miss logic, similar
+&gt; to how VM_SEQ_READ is already excluded. The exec readahead path is
+&gt; targeted (one folio at the fault location, async_size=0), not
+&gt; speculative prefetch, so the mmap_miss heuristic designed to throttle
+&gt; wasteful speculative readahead should not apply to it.
+&gt; 
+&gt; [1] https://lore.kernel.org/all/20250430145920.3748738-6-ryan.roberts@arm.com/
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+
+Looks good to me. Feel free to add:
 
 Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
 
-								Honza</pre>
+								Honza
+
+&gt; ---
+&gt;  mm/filemap.c | 2 +-
+&gt;  1 file changed, 1 insertion(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/mm/filemap.c b/mm/filemap.c
+&gt; index 6cd7974d4adab..7d89c6b384cc4 100644
+&gt; --- a/mm/filemap.c
+&gt; +++ b/mm/filemap.c
+&gt; @@ -3331,7 +3331,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+&gt;  		}
+&gt;  	}
+&gt;  
+&gt; -	if (!(vm_flags &amp; VM_SEQ_READ)) {
+&gt; +	if (!(vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
+&gt;  		/* Avoid banging the cache line if not needed */
+&gt;  		mmap_miss = READ_ONCE(ra-&gt;mmap_miss);
+&gt;  		if (mmap_miss &lt; MMAP_LOTSAMISS * 10)
+&gt; -- 
+&gt; 2.52.0
+&gt; 
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR
+
+---
+
+On Fri 20-03-26 06:58:51, Usama Arif wrote:
+&gt; The mmap_miss counter in do_sync_mmap_readahead() tracks whether
+&gt; readahead is useful for mmap&#x27;d file access. It is incremented by 1 on
+&gt; every page cache miss in do_sync_mmap_readahead(), and decremented in
+&gt; two places:
+&gt; 
+&gt;   - filemap_map_pages(): decremented by N for each of N pages
+&gt;     successfully mapped via fault-around (pages found already in cache,
+&gt;     evidence readahead was useful). Only pages not in the workingset
+&gt;     count as hits.
+&gt; 
+&gt;   - do_async_mmap_readahead(): decremented by 1 when a page with
+&gt;     PG_readahead is found in cache.
+&gt; 
+&gt; When the counter exceeds MMAP_LOTSAMISS (100), all readahead is
+&gt; disabled, including the targeted VM_EXEC readahead [1] that requests
+&gt; large folio orders for contpte mapping.
+&gt; 
+&gt; On arm64 with 64K base pages, both decrement paths are inactive:
+&gt; 
+&gt;   1. filemap_map_pages() is never called because fault_around_pages
+&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
+&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
+&gt;      fault-around window, there is nothing &quot;around&quot; to map.
+&gt; 
+&gt;   2. do_async_mmap_readahead() never fires for exec mappings because
+&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
+&gt;      are placed.
+&gt; 
+&gt; With no decrements, mmap_miss monotonically increases past
+&gt; MMAP_LOTSAMISS after 100 page faults, disabling all subsequent
+&gt; exec readahead.
+&gt; 
+&gt; Fix this by excluding VM_EXEC VMAs from the mmap_miss logic, similar
+&gt; to how VM_SEQ_READ is already excluded. The exec readahead path is
+&gt; targeted (one folio at the fault location, async_size=0), not
+&gt; speculative prefetch, so the mmap_miss heuristic designed to throttle
+&gt; wasteful speculative readahead should not apply to it.
+&gt; 
+&gt; [1] https://lore.kernel.org/all/20250430145920.3748738-6-ryan.roberts@arm.com/
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+
+Looks good to me. Feel free to add:
+
+Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
+
+								Honza
+
+&gt; ---
+&gt;  mm/filemap.c | 2 +-
+&gt;  1 file changed, 1 insertion(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/mm/filemap.c b/mm/filemap.c
+&gt; index 6cd7974d4adab..7d89c6b384cc4 100644
+&gt; --- a/mm/filemap.c
+&gt; +++ b/mm/filemap.c
+&gt; @@ -3331,7 +3331,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+&gt;  		}
+&gt;  	}
+&gt;  
+&gt; -	if (!(vm_flags &amp; VM_SEQ_READ)) {
+&gt; +	if (!(vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
+&gt;  		/* Avoid banging the cache line if not needed */
+&gt;  		mmap_miss = READ_ONCE(ra-&gt;mmap_miss);
+&gt;  		if (mmap_miss &lt; MMAP_LOTSAMISS * 10)
+&gt; -- 
+&gt; 2.52.0
+&gt; 
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR
+
+---
+
+On Fri 20-03-26 06:58:52, Usama Arif wrote:
+&gt; Replace the arch-specific exec_folio_order() hook with a generic
+&gt; preferred_exec_order() that dynamically computes the readahead folio
+&gt; order for executable memory. It targets min(PMD_ORDER, 2M) as the
+&gt; maximum, which optimally gives the right answer for contpte (arm64),
+&gt; PMD mapping (x86, arm64 4K), and architectures with smaller PMDs
+&gt; (s390 1M). It adapts at runtime based on:
+&gt; 
+&gt; - VMA size: caps the order so folios fit within the mapping
+&gt; - Memory pressure: steps down the order when the local node&#x27;s free
+&gt;   memory is below the high watermark for the requested order
+&gt; 
+&gt; This avoids over-allocating on memory-constrained systems while still
+&gt; requesting the optimal order when memory is plentiful.
+&gt; 
+&gt; Since exec_folio_order() is no longer needed, remove the arm64
+&gt; definition and the generic default from pgtable.h.
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+...
+&gt; +static unsigned int preferred_exec_order(struct vm_area_struct *vma)
+&gt; +{
+&gt; +	int order;
+&gt; +	unsigned long vma_len = vma_pages(vma);
+&gt; +	struct zone *zone;
+&gt; +	gfp_t gfp;
+&gt; +
+&gt; +	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+&gt; +		return 0;
+&gt; +
+&gt; +	/* Cap at min(PMD_ORDER, 2M) */
+&gt; +	order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT));
+&gt; +
+&gt; +	/* Don&#x27;t request folios larger than the VMA */
+&gt; +	order = min(order, ilog2(vma_len));
+
+Hum, as far as I&#x27;m checking page_cache_ra_order() used in
+do_sync_mmap_readahead(), ra-&gt;order is the preferred order but it will be
+trimmed down to fit both within the file and within ra-&gt;size. And ra-&gt;size
+is set for the readahead to fit within the vma so I don&#x27;t think any order
+trimming based on vma length is needed in this place?
+
+&gt; +	/* Step down under memory pressure */
+&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt; +	if (zone) {
+&gt; +		while (order &gt; 0 &amp;&amp;
+&gt; +		       !zone_watermark_ok(zone, order,
+&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt; +			order--;
+&gt; +	}
+
+It looks wrong for this logic to be here. Trimming order based on memory
+pressure makes sense (and we&#x27;ve already got reports that on memory limited
+devices large order folios in the page cache have too big memory overhead
+so we&#x27;ll likely need to handle that for page cache allocations in general)
+but IMHO it belongs to page_cache_ra_order() or some other common place
+like that.
+
+								Honza
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR
+
+---
+
+On Fri 20-03-26 06:58:52, Usama Arif wrote:
+&gt; Replace the arch-specific exec_folio_order() hook with a generic
+&gt; preferred_exec_order() that dynamically computes the readahead folio
+&gt; order for executable memory. It targets min(PMD_ORDER, 2M) as the
+&gt; maximum, which optimally gives the right answer for contpte (arm64),
+&gt; PMD mapping (x86, arm64 4K), and architectures with smaller PMDs
+&gt; (s390 1M). It adapts at runtime based on:
+&gt; 
+&gt; - VMA size: caps the order so folios fit within the mapping
+&gt; - Memory pressure: steps down the order when the local node&#x27;s free
+&gt;   memory is below the high watermark for the requested order
+&gt; 
+&gt; This avoids over-allocating on memory-constrained systems while still
+&gt; requesting the optimal order when memory is plentiful.
+&gt; 
+&gt; Since exec_folio_order() is no longer needed, remove the arm64
+&gt; definition and the generic default from pgtable.h.
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+...
+&gt; +static unsigned int preferred_exec_order(struct vm_area_struct *vma)
+&gt; +{
+&gt; +	int order;
+&gt; +	unsigned long vma_len = vma_pages(vma);
+&gt; +	struct zone *zone;
+&gt; +	gfp_t gfp;
+&gt; +
+&gt; +	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+&gt; +		return 0;
+&gt; +
+&gt; +	/* Cap at min(PMD_ORDER, 2M) */
+&gt; +	order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT));
+&gt; +
+&gt; +	/* Don&#x27;t request folios larger than the VMA */
+&gt; +	order = min(order, ilog2(vma_len));
+
+Hum, as far as I&#x27;m checking page_cache_ra_order() used in
+do_sync_mmap_readahead(), ra-&gt;order is the preferred order but it will be
+trimmed down to fit both within the file and within ra-&gt;size. And ra-&gt;size
+is set for the readahead to fit within the vma so I don&#x27;t think any order
+trimming based on vma length is needed in this place?
+
+&gt; +	/* Step down under memory pressure */
+&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt; +	if (zone) {
+&gt; +		while (order &gt; 0 &amp;&amp;
+&gt; +		       !zone_watermark_ok(zone, order,
+&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt; +			order--;
+&gt; +	}
+
+It looks wrong for this logic to be here. Trimming order based on memory
+pressure makes sense (and we&#x27;ve already got reports that on memory limited
+devices large order folios in the page cache have too big memory overhead
+so we&#x27;ll likely need to handle that for page cache allocations in general)
+but IMHO it belongs to page_cache_ra_order() or some other common place
+like that.
+
+								Honza
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR
+
+---
+
+On Thu 26-03-26 08:40:21, Usama Arif wrote:
+&gt; On 20/03/2026 17:42, Jan Kara wrote:
+&gt; &gt;&gt; +	/* Step down under memory pressure */
+&gt; &gt;&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt; &gt;&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt; &gt;&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt; &gt;&gt; +	if (zone) {
+&gt; &gt;&gt; +		while (order &gt; 0 &amp;&amp;
+&gt; &gt;&gt; +		       !zone_watermark_ok(zone, order,
+&gt; &gt;&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt; &gt;&gt; +			order--;
+&gt; &gt;&gt; +	}
+&gt; &gt; 
+&gt; &gt; It looks wrong for this logic to be here. Trimming order based on memory
+&gt; &gt; pressure makes sense (and we&#x27;ve already got reports that on memory limited
+&gt; &gt; devices large order folios in the page cache have too big memory overhead
+&gt; &gt; so we&#x27;ll likely need to handle that for page cache allocations in general)
+&gt; &gt; but IMHO it belongs to page_cache_ra_order() or some other common place
+&gt; &gt; like that.
+&gt; &gt; 
+&gt; &gt; 								Honza
+&gt; 
+&gt; So I have been thinking about this. readahead_gfp_mask() already sets
+&gt; __GFP_NORETRY, so we wont try aggressive reclaim/compaction to satisfy
+&gt; the allocation. page_cache_ra_order() falls through to the fallback path
+&gt; faulting in order 0 page when allocation is not satsified.
+&gt; 
+&gt; So the allocator already naturally steps down under memory pressure,
+&gt; the explicit zone_watermark_ok() loop might be redundant?
+
+Probably yes. I still think we&#x27;ll have to somehow better tweak the used
+order based on expected size of the page cache (2M folios seem unreasonably
+large for a machine that has e.g. 1G of memory in total, even if it has
+enough free memory at this point in time - we&#x27;ll benefit from smaller
+folios and thus finer grained folio activity tracking for such cases). But
+that&#x27;s not for this patch set.
+
+&gt; What are your thoughts on just setting
+&gt; ra-&gt;order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT))?
+&gt; We can do the higher orlder allocation with gfp &amp;= ~__GFP_RECLAIM
+&gt; for the VM_EXEC case.
+
+Yes, it&#x27;s simple and it makes sense to me so if others are fine with it...
+
+								Honza
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR
+
+---
+
+On Thu 26-03-26 08:40:21, Usama Arif wrote:
+&gt; On 20/03/2026 17:42, Jan Kara wrote:
+&gt; &gt;&gt; +	/* Step down under memory pressure */
+&gt; &gt;&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt; &gt;&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt; &gt;&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt; &gt;&gt; +	if (zone) {
+&gt; &gt;&gt; +		while (order &gt; 0 &amp;&amp;
+&gt; &gt;&gt; +		       !zone_watermark_ok(zone, order,
+&gt; &gt;&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt; &gt;&gt; +			order--;
+&gt; &gt;&gt; +	}
+&gt; &gt; 
+&gt; &gt; It looks wrong for this logic to be here. Trimming order based on memory
+&gt; &gt; pressure makes sense (and we&#x27;ve already got reports that on memory limited
+&gt; &gt; devices large order folios in the page cache have too big memory overhead
+&gt; &gt; so we&#x27;ll likely need to handle that for page cache allocations in general)
+&gt; &gt; but IMHO it belongs to page_cache_ra_order() or some other common place
+&gt; &gt; like that.
+&gt; &gt; 
+&gt; &gt; 								Honza
+&gt; 
+&gt; So I have been thinking about this. readahead_gfp_mask() already sets
+&gt; __GFP_NORETRY, so we wont try aggressive reclaim/compaction to satisfy
+&gt; the allocation. page_cache_ra_order() falls through to the fallback path
+&gt; faulting in order 0 page when allocation is not satsified.
+&gt; 
+&gt; So the allocator already naturally steps down under memory pressure,
+&gt; the explicit zone_watermark_ok() loop might be redundant?
+
+Probably yes. I still think we&#x27;ll have to somehow better tweak the used
+order based on expected size of the page cache (2M folios seem unreasonably
+large for a machine that has e.g. 1G of memory in total, even if it has
+enough free memory at this point in time - we&#x27;ll benefit from smaller
+folios and thus finer grained folio activity tracking for such cases). But
+that&#x27;s not for this patch set.
+
+&gt; What are your thoughts on just setting
+&gt; ra-&gt;order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT))?
+&gt; We can do the higher orlder allocation with gfp &amp;= ~__GFP_RECLAIM
+&gt; for the VM_EXEC case.
+
+Yes, it&#x27;s simple and it makes sense to me so if others are fine with it...
+
+								Honza
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR</pre>
 </details>
 <a href="https://lore.kernel.org/r/er6pfnbasao53shfs3vwznosqy4k74tjh4lxcegzwgdaweahdu@vgkhrdrhv5oe" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: approval, positive feedback</div>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 <div class="thread-children">
 <div class="thread-node depth-1" id="2026-03-26">
@@ -512,14 +1289,27 @@ for the VM_EXEC case.</pre>
 <div class="review-comment-header">
 <span class="review-author">Kiryl Shutsemau</span>
 <a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that VM_EXEC is a good enough proxy for instruction fetch, but pointed out that FAULT_FLAG_INSTRUCTION is the actual signal and only provided by a handful of architectures.</div>
+<div class="review-comment-text">Reviewer Kiryl Shutsemau expressed concerns about the complexity and layering violation in the preferred_exec_order() function, suggesting that it should be implemented within the page allocator as an allocation interface that takes a range of acceptable orders.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Strictly speaking the fact that the file mapped as executable doesn&#x27;t
+<pre class="raw-body-text">On Fri, Mar 20, 2026 at 06:58:51AM -0700, Usama Arif wrote:
+&gt; diff --git a/mm/filemap.c b/mm/filemap.c
+&gt; index 6cd7974d4adab..7d89c6b384cc4 100644
+&gt; --- a/mm/filemap.c
+&gt; +++ b/mm/filemap.c
+&gt; @@ -3331,7 +3331,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+&gt;  		}
+&gt;  	}
+&gt;  
+&gt; -	if (!(vm_flags &amp; VM_SEQ_READ)) {
+&gt; +	if (!(vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
+
+Strictly speaking the fact that the file mapped as executable doesn&#x27;t
 mean we are serving instruction fetch page fault.
 
 FAULT_FLAG_INSTRUCTION would be the signal, but it is only provided by
@@ -530,101 +1320,133 @@ VM_EXEC is good enough proxy.
 Reviewed-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
 
 -- 
-  Kiryl Shutsemau / Kirill A. Shutemov</pre>
-</details>
-<a href="https://lore.kernel.org/r/ab1Y5fLNJ466kK-7@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested clarification, provided alternative perspective</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau</span>
-<a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Kiryl Shutsemau criticized the patch as an overkill and layering violation, suggesting that a range or mask of acceptable order should be handled within the page allocator&#x27;s allocation interface.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Eww. That&#x27;s overkill and layering violation.
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Fri, Mar 20, 2026 at 06:58:52AM -0700, Usama Arif wrote:
+&gt; + *   allocations when memory is tight.
+&gt; + */
+&gt; +static unsigned int preferred_exec_order(struct vm_area_struct *vma)
+&gt; +{
+&gt; +	int order;
+&gt; +	unsigned long vma_len = vma_pages(vma);
+&gt; +	struct zone *zone;
+&gt; +	gfp_t gfp;
+&gt; +
+&gt; +	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+&gt; +		return 0;
+&gt; +
+&gt; +	/* Cap at min(PMD_ORDER, 2M) */
+&gt; +	order = min(HPAGE_PMD_ORDER, ilog2(SZ_2M &gt;&gt; PAGE_SHIFT));
+&gt; +
+&gt; +	/* Don&#x27;t request folios larger than the VMA */
+&gt; +	order = min(order, ilog2(vma_len));
+&gt; +
+&gt; +	/* Step down under memory pressure */
+&gt; +	gfp = mapping_gfp_mask(vma-&gt;vm_file-&gt;f_mapping);
+&gt; +	zone = first_zones_zonelist(node_zonelist(numa_node_id(), gfp),
+&gt; +				    gfp_zone(gfp), NULL)-&gt;zone;
+&gt; +	if (zone) {
+&gt; +		while (order &gt; 0 &amp;&amp;
+&gt; +		       !zone_watermark_ok(zone, order,
+&gt; +					  high_wmark_pages(zone), 0, 0))
+&gt; +			order--;
+&gt; +	}
+
+Eww. That&#x27;s overkill and layering violation.
 
 If we need something like this, it has to be do within page allocator:
 an allocation interface that takes a range (or mask) of acceptable
 order.
 
 -- 
-  Kiryl Shutsemau / Kirill A. Shutemov</pre>
-</details>
-<a href="https://lore.kernel.org/r/ab1ZopAY7JCUOYvr@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: overkill, layering violation</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Jan Kara</span>
-<a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Jan Kara noted that do_sync_mmap_readahead() already trims down ra-&gt;order to fit within the file and vma, making unnecessary any order trimming based on vma length.
-
-Reviewer Jan Kara suggested moving the logic for trimming readahead order based on memory pressure to a more general function like page_cache_ra_order(), citing potential issues with large order folios in the page cache and suggesting it&#x27;s not specific to exec memory.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Hum, as far as I&#x27;m checking page_cache_ra_order() used in
-do_sync_mmap_readahead(), ra-&gt;order is the preferred order but it will be
-trimmed down to fit both within the file and within ra-&gt;size. And ra-&gt;size
-is set for the readahead to fit within the vma so I don&#x27;t think any order
-trimming based on vma length is needed in this place?
+  Kiryl Shutsemau / Kirill A. Shutemov
 
 ---
 
-It looks wrong for this logic to be here. Trimming order based on memory
-pressure makes sense (and we&#x27;ve already got reports that on memory limited
-devices large order folios in the page cache have too big memory overhead
-so we&#x27;ll likely need to handle that for page cache allocations in general)
-but IMHO it belongs to page_cache_ra_order() or some other common place
-like that.
+On Fri, Mar 20, 2026 at 06:58:53AM -0700, Usama Arif wrote:
+&gt; For PIE binaries (ET_DYN), the load address is randomized at PAGE_SIZE
+&gt; granularity via arch_mmap_rnd(). On arm64 with 64K base pages, this
+&gt; means the binary is 64K-aligned, but contpte mapping requires 2M
+&gt; (CONT_PTE_SIZE) alignment.
+&gt; 
+&gt; Without proper virtual address alignment, readahead patches that
+&gt; allocate 2M folios with 2M-aligned file offsets and physical addresses
+&gt; cannot benefit from contpte mapping, as the contpte fold check in
+&gt; contpte_set_ptes() requires the virtual address to be CONT_PTE_SIZE-
+&gt; aligned.
+&gt; 
+&gt; Fix this by extending maximum_alignment() to consider the maximum folio
+&gt; size supported by the page cache (via mapping_max_folio_size()). For
+&gt; each PT_LOAD segment, the alignment is bumped to the largest
+&gt; power-of-2 that fits within the segment size, capped by the max folio
+&gt; size the filesystem will allocate, if:
+&gt; 
+&gt;   - Both p_vaddr and p_offset are aligned to that size
+&gt;   - The segment is large enough (p_filesz &gt;= size)
+&gt; 
+&gt; This ensures load_bias is folio-aligned so that file-offset-aligned
+&gt; folios map to properly aligned virtual addresses, enabling hardware PTE
+&gt; coalescing (e.g. arm64 contpte) and PMD mappings for large folios.
+&gt; 
+&gt; The segment size check avoids reducing ASLR entropy for small binaries
+&gt; that cannot benefit from large folio alignment.
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
 
-								Honza
+Reviewed-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+
 -- 
-Jan Kara &lt;jack@suse.com&gt;
-SUSE Labs, CR</pre>
-</details>
-<a href="https://lore.kernel.org/r/k45xs6btmt62uerbglqe665jozrtkeoklu4rek6odgxjdj63ni@ftw6ef3ug33x" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested clarification, highlighted existing behavior, requested changes</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau</span>
-<a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
-</div>
-<div class="review-comment-text">Gave Reviewed-by</div>
-<a href="https://lore.kernel.org/r/ab1fvJxFYQP-ByQG@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau</span>
-<a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer suggested integrating the alignment logic inside __thp_get_unmapped_area, starting with PMD_SIZE alignment and then adjusting based on mapping size</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Have you considered to integrate inside __thp_get_unmapped_area?
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Fri, Mar 20, 2026 at 06:58:54AM -0700, Usama Arif wrote:
+&gt; thp_get_unmapped_area() is the get_unmapped_area callback for
+&gt; filesystems like ext4, xfs, and btrfs. It attempts to align the virtual
+&gt; address for PMD_SIZE THP mappings, but on arm64 with 64K base pages
+&gt; PMD_SIZE is 512M, which is too large for typical shared library mappings,
+&gt; so the alignment always fails and falls back to PAGE_SIZE.
+&gt; 
+&gt; This means shared libraries loaded by ld.so via mmap() get 64K-aligned
+&gt; virtual addresses, preventing contpte mapping even when 2M folios are
+&gt; allocated with properly aligned file offsets and physical addresses.
+&gt; 
+&gt; Add a fallback in thp_get_unmapped_area_vmflags() that uses the
+&gt; filesystem&#x27;s mapping_max_folio_size() to determine alignment, capped to
+&gt; the mapping length via rounddown_pow_of_two(len). This aligns mappings
+&gt; to the largest folio the page cache will actually allocate, without
+&gt; over-aligning small mappings.
+&gt; 
+&gt; The fallback is naturally a no-op for filesystems that don&#x27;t support
+&gt; large folios and skips the retry when the alignment would equal PMD_SIZE
+&gt; (already attempted above).
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; ---
+&gt;  mm/huge_memory.c | 14 ++++++++++++++
+&gt;  1 file changed, 14 insertions(+)
+&gt; 
+&gt; diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+&gt; index 8e2746ea74adf..4005084c9c65b 100644
+&gt; --- a/mm/huge_memory.c
+&gt; +++ b/mm/huge_memory.c
+&gt; @@ -1242,6 +1242,20 @@ unsigned long thp_get_unmapped_area_vmflags(struct file *filp, unsigned long add
+&gt;  	if (ret)
+&gt;  		return ret;
+&gt;  
+&gt; +	if (filp &amp;&amp; filp-&gt;f_mapping) {
+&gt; +		unsigned long max_folio_size =
+&gt; +			mapping_max_folio_size(filp-&gt;f_mapping);
+&gt; +		unsigned long size = rounddown_pow_of_two(len);
+&gt; +
+&gt; +		size = min(size, max_folio_size);
+&gt; +		if (size &gt; PAGE_SIZE &amp;&amp; size != PMD_SIZE) {
+&gt; +			ret = __thp_get_unmapped_area(filp, addr, len, off,
+&gt; +						      flags, size, vm_flags);
+
+Have you considered to integrate inside __thp_get_unmapped_area?
 
 Like, start with PMD_SIZE alignment, then lower to
 mapping_max_folio_size if needed and then lower further based on mapping
@@ -633,8 +1455,8 @@ size.
 -- 
   Kiryl Shutsemau / Kirill A. Shutemov</pre>
 </details>
-<a href="https://lore.kernel.org/r/ab1gW5tR6LhX0fQ0@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
+<a href="https://lore.kernel.org/r/ab1Y5fLNJ466kK-7@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: complexity, layering_violation</div>
 </div>
 </div>
 <div class="thread-node depth-0">
@@ -643,31 +1465,108 @@ size.
 <span class="review-author">Matthew Wilcox</span>
 <a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
 <span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Matthew Wilcox asked about the circumstances under which bprm-&gt;file can be NULL and suggested using the name &#x27;file&#x27; instead of &#x27;filp&#x27; for new code.
-
-Reviewer Matthew Wilcox suggested refactoring the code into a separate function and pointed to an example of how it was done better in another patch</div>
+<div class="review-comment-text">Reviewer Matthew Wilcox pointed out that the code in maximum_alignment() function can be factored out into a separate function and suggested looking at an example from linux-fsdevel mailing list for better implementation.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Under what circumstances can bprm-&gt;file be NULL?
+<pre class="raw-body-text">On Fri, Mar 20, 2026 at 06:58:53AM -0700, Usama Arif wrote:
+&gt; -static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr)
+&gt; +static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr,
+&gt; +				       struct file *filp)
+&gt;  {
+&gt;  	unsigned long alignment = 0;
+&gt; +	unsigned long max_folio_size = PAGE_SIZE;
+&gt;  	int i;
+&gt;  
+&gt; +	if (filp &amp;&amp; filp-&gt;f_mapping)
+&gt; +		max_folio_size = mapping_max_folio_size(filp-&gt;f_mapping);
+
+Under what circumstances can bprm-&gt;file be NULL?
 
 Also we tend to prefer the name &quot;file&quot; rather than &quot;filp&quot; for new code
 (yes, there&#x27;s a lot of old code out there).
 
----
+&gt; +
+&gt; +			/*
+&gt; +			 * Try to align the binary to the largest folio
+&gt; +			 * size that the page cache supports, so the
+&gt; +			 * hardware can coalesce PTEs (e.g. arm64
+&gt; +			 * contpte) or use PMD mappings for large folios.
+&gt; +			 *
+&gt; +			 * Use the largest power-of-2 that fits within
+&gt; +			 * the segment size, capped by what the page
+&gt; +			 * cache will allocate. Only align when the
+&gt; +			 * segment&#x27;s virtual address and file offset are
+&gt; +			 * already aligned to the folio size, as
+&gt; +			 * misalignment would prevent coalescing anyway.
+&gt; +			 *
+&gt; +			 * The segment size check avoids reducing ASLR
+&gt; +			 * entropy for small binaries that cannot
+&gt; +			 * benefit.
+&gt; +			 */
+&gt; +			if (!cmds[i].p_filesz)
+&gt; +				continue;
+&gt; +			size = rounddown_pow_of_two(cmds[i].p_filesz);
+&gt; +			size = min(size, max_folio_size);
+&gt; +			if (size &gt; PAGE_SIZE &amp;&amp;
+&gt; +			    IS_ALIGNED(cmds[i].p_vaddr, size) &amp;&amp;
+&gt; +			    IS_ALIGNED(cmds[i].p_offset, size))
+&gt; +				alignment = max(alignment, size);
 
 Can this not all be factored out into a different function?  Also, I
 think it was done a bit better here:
 https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc/
 
 +	if (!IS_ALIGNED(cmd-&gt;p_vaddr | cmd-&gt;p_offset, PMD_SIZE))
-+		return false;</pre>
++		return false;
+
+---
+
+On Sat, Mar 21, 2026 at 12:05:18AM +0800, WANG Rui wrote:
+&gt; &gt;From experiments (with 16K base pages), mapping_max_folio_size() appears to
+&gt; depend on the filesystem. It returns 8M on ext4, while on btrfs it always
+&gt; falls back to PAGE_SIZE (it seems CONFIG_BTRFS_EXPERIMENTAL=y may change this).
+&gt; This looks overly conservative and ends up missing practical optimization
+&gt; opportunities.
+
+btrfs only supports large folios with CONFIG_BTRFS_EXPERIMENTAL.
+I mean, it&#x27;s only been five years since it was added to XFS, can&#x27;t rush
+these things.
+
+---
+
+On Sun, Mar 29, 2026 at 12:37:00PM +0800, WANG Rui wrote:
+&gt; &gt; mapping_max_folio_size() reflects what the page cache will actually
+&gt; &gt; allocate for a given filesystem, since readahead caps folio allocation
+&gt; &gt; at mapping_max_folio_order() (in page_cache_ra_order()). If btrfs
+&gt; &gt; reports PAGE_SIZE, readahead won&#x27;t allocate large folios for it, so
+&gt; &gt; there are no large folios to coalesce PTEs for, aligning the binary
+&gt; &gt; beyond that would only reduce ASLR entropy for no benefit.
+&gt; &gt; 
+&gt; &gt; I don&#x27;t think we should over-align binaries on filesystems that can&#x27;t
+&gt; &gt; take advantage of it.
+&gt; 
+&gt; Ah, it looks like this might be overlooking another path that can create
+&gt; huge page mappings for read-only code segments: even when the filesystem
+&gt; (e.g. btrfs without experimental) didn&#x27;t support large folios,
+&gt; READ_ONLY_THP_FOR_FS still allowed read-only file-backed code segments
+&gt; to be collapsed into huge page mappings via khugepaged.
+&gt; 
+&gt; As Wilcox pointed out, it may take quite some time for many filesystems
+&gt; to gain full large folio support? So what I&#x27;m trying to clarify is that
+&gt; using mapping_max_folio_size() on this path is not favorable for
+&gt; khugepaged-based optimizations.
+
+Nono, that&#x27;s not what I&#x27;m pointing out!  btrfs is simply not putting
+in the effort to support large folios, and that needs to change.
+READ_ONLY_THP_FOR_FS unnecessaily burdens the rest of the kernel.
+It was a great hack for its time and paved the path for a lot of what
+we have today, but it&#x27;s time to remove it.</pre>
 </details>
 <a href="https://lore.kernel.org/r/ab1uqdcMBP1cBr7Q@casper.infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: question, suggestion, requested changes</div>
+<div class="review-comment-signals">Signals: requested changes, suggested improvement</div>
 </div>
 <div class="thread-children">
 <div class="thread-node depth-1" id="2026-03-27">
@@ -705,31 +1604,86 @@ Thanks for the reviews!!</pre>
 <div class="review-comment-header">
 <span class="review-author">WANG Rui</span>
 <a class="date-chip" href="../2026-03-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-21">2026-03-21</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer WANG Rui noted that the patch does not handle the case where the segment VA and file offset are already aligned, which is a requirement for alignment in elf only.
-
-Reviewer WANG Rui noted that the current implementation of mapping_max_folio_size() returns a fixed value based on the filesystem, which is overly conservative and misses potential optimizations.
-
-Reviewer WANG Rui noted that the current behavior of not aligning eligible segments to PMD_SIZE prevents THP from quickly collapsing them into large mappings, and suggested allowing a reasonably sized PMD (&lt;= 32M) for virtual address alignment, leaving the rest to THP under always.
-
-Reviewer WANG Rui pointed out that the patch does not align in ELF only when segment VA and file offset are already aligned, which is a requirement for exec memory.</div>
+<div class="review-comment-text">Reviewer WANG Rui noted that mapping_max_folio_size() returns a conservative value on some file systems, such as ext4, which can lead to missed optimization opportunities for large folio alignment and coalescing PTEs. He suggested allowing a reasonably sized PMD (up to 32M) and aligning the binary to this size when possible, leaving the decision to collapse or not to THP under always.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Hi Usama,
 
 On Fri, Mar 20, 2026 at 10:04\u202fPM Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
+&gt; diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+&gt; index 8e89cc5b28200..042af81766fcd 100644
+&gt; --- a/fs/binfmt_elf.c
+&gt; +++ b/fs/binfmt_elf.c
+&gt; @@ -49,6 +49,7 @@
+&gt;  #include &lt;uapi/linux/rseq.h&gt;
+&gt;  #include &lt;asm/param.h&gt;
+&gt;  #include &lt;asm/page.h&gt;
+&gt; +#include &lt;linux/pagemap.h&gt;
+&gt;
+&gt;  #ifndef ELF_COMPAT
+&gt;  #define ELF_COMPAT 0
+&gt; @@ -488,19 +489,51 @@ static int elf_read(struct file *file, void *buf, size_t len, loff_t pos)
+&gt;         return 0;
+&gt;  }
+&gt;
+&gt; -static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr)
+&gt; +static unsigned long maximum_alignment(struct elf_phdr *cmds, int nr,
+&gt; +                                      struct file *filp)
+&gt;  {
+&gt;         unsigned long alignment = 0;
+&gt; +       unsigned long max_folio_size = PAGE_SIZE;
+&gt;         int i;
+&gt;
+&gt; +       if (filp &amp;&amp; filp-&gt;f_mapping)
+&gt; +               max_folio_size = mapping_max_folio_size(filp-&gt;f_mapping);
 
----
-
+&gt;From experiments (with 16K base pages), mapping_max_folio_size() appears to
 depend on the filesystem. It returns 8M on ext4, while on btrfs it always
 falls back to PAGE_SIZE (it seems CONFIG_BTRFS_EXPERIMENTAL=y may change this).
 This looks overly conservative and ends up missing practical optimization
 opportunities.
 
----
+&gt; +
+&gt;         for (i = 0; i &lt; nr; i++) {
+&gt;                 if (cmds[i].p_type == PT_LOAD) {
+&gt;                         unsigned long p_align = cmds[i].p_align;
+&gt; +                       unsigned long size;
+&gt;
+&gt;                         /* skip non-power of two alignments as invalid */
+&gt;                         if (!is_power_of_2(p_align))
+&gt;                                 continue;
+&gt;                         alignment = max(alignment, p_align);
+&gt; +
+&gt; +                       /*
+&gt; +                        * Try to align the binary to the largest folio
+&gt; +                        * size that the page cache supports, so the
+&gt; +                        * hardware can coalesce PTEs (e.g. arm64
+&gt; +                        * contpte) or use PMD mappings for large folios.
+&gt; +                        *
+&gt; +                        * Use the largest power-of-2 that fits within
+&gt; +                        * the segment size, capped by what the page
+&gt; +                        * cache will allocate. Only align when the
+&gt; +                        * segment&#x27;s virtual address and file offset are
+&gt; +                        * already aligned to the folio size, as
+&gt; +                        * misalignment would prevent coalescing anyway.
+&gt; +                        *
+&gt; +                        * The segment size check avoids reducing ASLR
+&gt; +                        * entropy for small binaries that cannot
+&gt; +                        * benefit.
+&gt; +                        */
+&gt; +                       if (!cmds[i].p_filesz)
+&gt; +                               continue;
+&gt; +                       size = rounddown_pow_of_two(cmds[i].p_filesz);
+&gt; +                       size = min(size, max_folio_size);
+&gt; +                       if (size &gt; PAGE_SIZE &amp;&amp;
+&gt; +                           IS_ALIGNED(cmds[i].p_vaddr, size) &amp;&amp;
+&gt; +                           IS_ALIGNED(cmds[i].p_offset, size))
+&gt; +                               alignment = max(alignment, size);
 
 In my patch [1], by aligning eligible segments to PMD_SIZE, THP can quickly
 collapse them into large mappings with minimal warmup. That doesn\u2019t happen
@@ -740,36 +1694,56 @@ to collapse or not based on memory pressure and other factors.
 
 [1] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
 
+&gt;                 }
+&gt;         }
+&gt;
+&gt; @@ -1104,7 +1137,8 @@ static int load_elf_binary(struct linux_binprm *bprm)
+&gt;                         }
+&gt;
+&gt;                         /* Calculate any requested alignment. */
+&gt; -                       alignment = maximum_alignment(elf_phdata, elf_ex-&gt;e_phnum);
+&gt; +                       alignment = maximum_alignment(elf_phdata, elf_ex-&gt;e_phnum,
+&gt; +                                                     bprm-&gt;file);
+&gt;
+&gt;                         /**
+&gt;                          * DOC: PIE handling
+&gt; --
+&gt; 2.52.0
+&gt;
+
+Thanks,
+Rui
+
 ---
+
+&gt; mapping_max_folio_size() reflects what the page cache will actually
+&gt; allocate for a given filesystem, since readahead caps folio allocation
+&gt; at mapping_max_folio_order() (in page_cache_ra_order()). If btrfs
+&gt; reports PAGE_SIZE, readahead won&#x27;t allocate large folios for it, so
+&gt; there are no large folios to coalesce PTEs for, aligning the binary
+&gt; beyond that would only reduce ASLR entropy for no benefit.
+&gt; 
+&gt; I don&#x27;t think we should over-align binaries on filesystems that can&#x27;t
+&gt; take advantage of it.
+
+Ah, it looks like this might be overlooking another path that can create
+huge page mappings for read-only code segments: even when the filesystem
+(e.g. btrfs without experimental) didn&#x27;t support large folios,
+READ_ONLY_THP_FOR_FS still allowed read-only file-backed code segments
+to be collapsed into huge page mappings via khugepaged.
+
+As Wilcox pointed out, it may take quite some time for many filesystems
+to gain full large folio support? So what I&#x27;m trying to clarify is that
+using mapping_max_folio_size() on this path is not favorable for
+khugepaged-based optimizations.
 
 Thanks,
 Rui</pre>
 </details>
 <a href="https://lore.kernel.org/r/20260320160519.80962-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, overly conservative, missing practical optimization opportunities</div>
+<div class="review-comment-signals">Signals: requested changes, suggested improvements</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Matthew Wilcox</span>
-<a class="date-chip" href="../2026-03-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-20">2026-03-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The reviewer noted that the patch does not account for btrfs&#x27;s experimental large folio support and suggested caution in introducing new features.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">btrfs only supports large folios with CONFIG_BTRFS_EXPERIMENTAL.
-I mean, it&#x27;s only been five years since it was added to XFS, can&#x27;t rush
-these things.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to WANG Rui</div>
-<a href="https://lore.kernel.org/r/ab2IIwKzmK9qwIlZ@casper.infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
 <div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
