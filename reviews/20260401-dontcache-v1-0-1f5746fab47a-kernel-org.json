@@ -1,0 +1,88 @@
+{
+  "thread_id": "20260401-dontcache-v1-0-1f5746fab47a@kernel.org",
+  "subject": "[PATCH 0/4] mm: improve write performance with RWF_DONTCACHE",
+  "url": "https://lore.kernel.org/all/20260401-dontcache-v1-0-1f5746fab47a@kernel.org/",
+  "dates": {
+    "2026-04-01": {
+      "report_file": "2026-04-01_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer Christoph Hellwig expressed confusion about the connection between the first and second paragraphs of the patch description, but did not provide any specific technical feedback or suggestions.\n\nChristoph Hellwig questioned the purpose of the patch, pointing out that filemap_flush_range and filemap_writeback already cap the number of written pages to the range passed in, and requested clarification on what change this patch is intended to make.\n\nReviewer Christoph Hellwig noted that filemap_writeback() has only 5 arguments across all trees, including linux-next, and requested an update to match the patch's 6-argument version.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "confusion",
+            "lack of clear explanation",
+            "request for clarification",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I'm not sure the first how you think the first paragraph relate to\nthe second.\n\n---\n\nThis doesn't make any sense at all.\nfilemap_flush_range/filemap_writeback always caps the number of written\npages to the range passed in.  What do you think is the change here?\n\n---\n\nfilemap_writeback only has 5 arguments in any tree I've looked at\nincluding linux-next.",
+          "reply_to": "",
+          "message_date": "2026-04-01",
+          "message_id": "ac385Il8l-krKEOQ@infradead.org",
+          "email": "hch@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Christoph Hellwig expressed strong disagreement with the current implementation of IOCB_DONTCACHE write performance improvement, suggesting that it is a bad reimplementation of the single writeback thread and proposing alternative approaches to handle writeback for this flag.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "disagreement",
+            "alternative proposals"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "This sounds like a bad reimplementation of the single writeback thread\n:)\n\nHave you considered stopping to do in-caller writeback for\nIOCB_DONTCACHE vs just leaving it to the writeback daeon?\n\nEither by totally disabling the writeback and just leaving the\ndropbehind bit, or by queuing up wb_writeback_work instances for\nthe ranges, or by just increasing the pressure for the writeback\ndaemon.  Note that with all schemes including the one in this patch\nwe might eventually run into writeback scalability limits, which\nwill require multiple writeback workers.",
+          "reply_to": "",
+          "message_date": "2026-04-01",
+          "message_id": "ac3-SU7BElHJVCEL@infradead.org",
+          "email": "hch@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patchset improves write performance when using the RWF_DONTCACHE flag by addressing flush contention issues that occur during heavy write activity. The patches modify the Linux kernel's mm module to alleviate this contention, resulting in better performance for writes. The changes were tested with various workloads and IO modes, including buffered, direct, and unpatched dontcache, and showed significant improvements over the original RWF_DONTCACHE implementation. The patchset also includes benchmarking scripts to demonstrate the results of these tests."
+    },
+    "2026-04-02": {
+      "report_file": "2026-04-01_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Ritesh (IBM)",
+          "summary": "Reviewer Ritesh suspects that the 2.5x performance penalty in sequential writes is due to contention between the submission side and completion side taking the xa_lock, which allows the writer to do more work but causes a bottleneck on the completion callback holding folio_end_dropbehind().\n\nThe reviewer noted that filemap_dontcache_writeback_range() may not write the dirty pages of the previous writer if it skipped the flush call, and instead relies on background writeback to flush these pages unless a fsync/sync call is made.\n\nReviewer Ritesh questioned the patch's rebase status and pointed out an incorrect argument in one of the patches.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "lock ordering violation",
+            "potential data loss",
+            "rebased",
+            "argument"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I am not sure if this 2.5x performance penalty in a \"single\" sequential\nwriter is due to throttling logic. On giving it some thoughts, I suspect\nif this is because, the submission side and the completion side both\ntakes the xa_lock and hence could be contending on that.\n\nFor e.g. since this patch skips doing the flush the second time, (note\nthat writeback is active when the same writer dirtied the page during\nprevious write), this allows the writer to do more work of writing data\nto page cache pages, instead of waiting on the xa_lock which the\ncompletion callback could be holding (folio_end_writeback() -> folio_end_dropbehind())\n\nIf I see Peak Dirty data from the link you shared [1] in single writer case...\n\nMode                    MB/s\tp50 (ms)\tp99 (ms)\tp99.9 (ms)\tPeak Dirty\tPeak Cache\ndontcache (unpatched)\t1179\t3.2\t    103.3\t    170.9\t    14 MB\t    4.7 GB\ndontcache (patched)\t1453\t5.4\t    43.8\t    57.4\t    36 GB\t    45 GB\n\n... this too shows that the submission side is writing more dirty pages,\nthen the completion side able to write it... \n\nI suspect this contention (between submission and completion) could more\nin IOCB_DONTCACHE case, since the completion side also removes the folio\nfrom the page cache within the same xa_lock, which is not the same with\nnormal buffered writes.\n\nMaybe a perf callgraph showing the contention would be nicer thing to add\nhere [1] ;). \n\n[1]: https://markdownpastebin.com/?id=96249deb897a401ba32acbce05312dcc\n\n---\n\nYes, but the next writer may not write the dirty pages, of the previous\nwriter which skipped the flush call right (even if it finds the tag\nclear)? Because filemap_dontcache_writeback_range( ) passes the range\nand nr_to_write that means, unless the previous writer dirtied the same\nrange, the new writer won't be able to write the dirty pages of the\nprevious writer correct? So, it is mainly only the background writeback\nnow, which will flush this dirty pages of the writer which skipped the\nflush (unless of course a fsync/sync call is made).\n\nBut having said that, I agree, this patch series is a nice performance\nimprovement overall :)\n\n---\n\nWas this rebased against some other tree? I couldn't find it in\nlinux-next. I think, that last argument is wrong.",
+          "reply_to": "",
+          "message_date": "2026-04-02",
+          "message_id": "ikaam0ox.ritesh.list@gmail.com",
+          "email": "ritesh.list@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patchset improves write performance when using the RWF_DONTCACHE flag by addressing flush contention issues that occur during heavy write activity. The patches modify the Linux kernel's mm module to alleviate this contention, resulting in better performance for writes. The changes were tested with various workloads and IO modes, including buffered, direct, and unpatched dontcache, and showed significant improvements over the original RWF_DONTCACHE implementation. The patchset also includes benchmarking scripts to demonstrate the results of these tests."
+    }
+  }
+}
