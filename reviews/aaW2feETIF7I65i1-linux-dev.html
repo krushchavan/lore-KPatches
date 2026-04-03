@@ -238,9 +238,131 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 2/3] cgroup: add lockless fast-path checks to cgroup_file_notify()</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/aaW2feETIF7I65i1@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-03</strong><div class="date-range-nav">Active on: <a href="#2026-03-03">2026-03-03</a> &bull; <a href="#2026-03-02">2026-03-02</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-03-03</strong><div class="date-range-nav">Active on: <a href="#2026-03-03">2026-03-03</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">Patch adds lockless fast-path checks to cgroup_file_notify() to reduce lock contention.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-03-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chen Ridong</span>
+<a class="date-chip" href="../2026-03-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-03">2026-03-03</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Identified potential issues with the timer_pending() check, including inconsistent state and racing with del_timer() or mod_timer().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">
+
+On 2026/3/3 1:00, Shakeel Butt wrote:
+&gt; On Mon, Mar 02, 2026 at 08:14:05AM -0800, Shakeel Butt wrote:
+&gt;&gt; Hi Chen, thanks for taking a look.
+&gt;&gt;
+&gt;&gt; On Mon, Mar 02, 2026 at 09:50:53AM +0800, Chen Ridong wrote:
+&gt;&gt;&gt;
+&gt; [...]
+&gt;&gt;&gt;&gt; +	last = READ_ONCE(cfile-&gt;notified_at);
+&gt;&gt;&gt;&gt; +	if (time_before_eq(jiffies, last + CGROUP_FILE_NOTIFY_MIN_INTV))
+&gt;&gt;&gt;&gt; +		return;
+&gt;&gt;&gt;&gt; +
+&gt;&gt;&gt;
+&gt;&gt;&gt; Previously, if a notification arrived within the rate-limit window, we would
+&gt;&gt;&gt; still call timer_reduce(&amp;cfile-&gt;notify_timer, next) to schedule a deferred
+&gt;&gt;&gt; notification.
+&gt;&gt;&gt;
+&gt;&gt;&gt; With this change, returning early here bypasses that timer scheduling entirely.
+&gt;&gt;&gt; Does this risk missing notifications that would have been delivered by the timer?
+&gt;&gt;&gt;
+&gt;&gt;
+&gt;&gt; You are indeed right that this can cause missed notifications. After giving some
+&gt;&gt; thought I think the lockless check-and-return can be pretty much simplified to
+&gt;&gt; timer_pending() check. If timer is active, just do nothing and the notification
+&gt;&gt; will be delivered eventually.
+&gt;&gt;
+&gt;&gt; I will send the updated version soon. Any comments on the other two patches?
+&gt;&gt;
+&gt; 
+&gt; Something like the following:
+&gt; 
+&gt;&gt;&gt;From 598199723b50813b015393122796f6775eee02d7 Mon Sep 17 00:00:00 2001
+&gt; From: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; Date: Sat, 28 Feb 2026 04:01:28 -0800
+&gt; Subject: [PATCH] cgroup: add lockless fast-path checks to cgroup_file_notify()
+&gt; 
+&gt; Add two lockless checks before acquiring the lock:
+&gt; 
+&gt; 1. READ_ONCE(cfile-&gt;kn) NULL check to skip torn-down files.
+&gt; 2. timer_pending() check to skip when a deferred notification
+&gt;    timer is already armed.
+&gt; 
+&gt; Both checks have safe error directions -- a stale read can only
+&gt; cause unnecessary lock acquisition, never a missed notification.
+&gt; 
+&gt; Annotate cfile-&gt;kn write sites with WRITE_ONCE() to pair with the
+&gt; lockless reader.
+&gt; 
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; Reported-by: Jakub Kicinski &lt;kuba@kernel.org&gt;
+&gt; ---
+&gt;  kernel/cgroup/cgroup.c | 10 ++++++++--
+&gt;  1 file changed, 8 insertions(+), 2 deletions(-)
+&gt; 
+&gt; diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+&gt; index 2b298a2cf206..6e816d27ee25 100644
+&gt; --- a/kernel/cgroup/cgroup.c
+&gt; +++ b/kernel/cgroup/cgroup.c
+&gt; @@ -1749,7 +1749,7 @@ static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)
+&gt;  		struct cgroup_file *cfile = (void *)css + cft-&gt;file_offset;
+&gt;  
+&gt;  		spin_lock_irq(&amp;cgroup_file_kn_lock);
+&gt; -		cfile-&gt;kn = NULL;
+&gt; +		WRITE_ONCE(cfile-&gt;kn, NULL);
+&gt;  		spin_unlock_irq(&amp;cgroup_file_kn_lock);
+&gt;  
+&gt;  		timer_delete_sync(&amp;cfile-&gt;notify_timer);
+&gt; @@ -4430,7 +4430,7 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
+&gt;  		timer_setup(&amp;cfile-&gt;notify_timer, cgroup_file_notify_timer, 0);
+&gt;  
+&gt;  		spin_lock_irq(&amp;cgroup_file_kn_lock);
+&gt; -		cfile-&gt;kn = kn;
+&gt; +		WRITE_ONCE(cfile-&gt;kn, kn);
+&gt;  		spin_unlock_irq(&amp;cgroup_file_kn_lock);
+&gt;  	}
+&gt;  
+&gt; @@ -4689,6 +4689,12 @@ void cgroup_file_notify(struct cgroup_file *cfile)
+&gt;  	unsigned long flags;
+&gt;  	struct kernfs_node *kn = NULL;
+&gt;  
+&gt; +	if (!READ_ONCE(cfile-&gt;kn))
+&gt; +		return;
+&gt; +
+&gt; +	if (timer_pending(&amp;cfile-&gt;notify_timer))
+&gt; +		return;
+&gt; +
+
+The added timer_pending() check seems problematic. According to the function&#x27;s
+comment, callers must ensure serialization with other timer operations. Here
+we&#x27;re checking timer_pending() locklessly, which means we might:
+
+1. See an inconsistent state if another CPU is concurrently modifying the timer
+
+2. Race with del_timer() or mod_timer() from other contexts
+
+&gt;  	spin_lock_irqsave(&amp;cgroup_file_kn_lock, flags);
+&gt;  	if (cfile-&gt;kn) {
+&gt;  		unsigned long last = cfile-&gt;notified_at;
+
+-- 
+Best regards,
+Ridong
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
