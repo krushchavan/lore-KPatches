@@ -4,27 +4,64 @@
   "url": "https://lore.kernel.org/all/20260324-nfs-7-1-v2-1-d110da3c0036@kernel.org/",
   "dates": {
     "2026-03-24": {
-      "report_file": "2026-03-31_ollama_llama3.1-8b.html",
+      "report_file": "2026-04-07_ollama_llama3.1-8b.html",
       "developer": "Jeff Layton",
       "reviews": [
         {
-          "author": "Jeff Layton",
-          "summary": "Provided additional context and suggested adding a comment to explain the fix.",
+          "author": "Jeff Layton (author)",
+          "summary": "The author acknowledges that additional documentation is needed to clarify the logic behind the patch and agrees to add a comment to explain why an RPC must be issued for atime-only updates.",
           "sentiment": "NEUTRAL",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "acknowledges need for clarification",
+            "agrees to add comment"
           ],
           "has_inline_review": false,
           "tags_given": [],
-          "raw_body": "On Tue, 2026-03-24 at 13:32 -0400, Jeff Layton wrote:\n> xfstest generic/221 is failing with delegated timestamps enabled.  When\n> the client holds a WRITE_ATTRS_DELEG delegation, and a userland process\n> does a utimensat() for only the atime, the ctime is not properly\n> updated. The problem is that the client tries to cache the atime update,\n> but there is no mtime update, so the delegated attribute update never\n> updates the ctime.\n> \n> Delegated timestamps don't have a mechanism to update the ctime in\n> accordance with atime-only changes due to utimensat() and the like.\n> Change the client to issue an RPC in this case, so that the ctime gets\n> properly updated alongside the atime.\n> \n> Fixes: 40f45ab3814f (\"NFS: Further fixes to attribute delegation a/mtime changes\")\n> Reported-by: Olga Kornievskaia <aglo@umich.edu>\n> Signed-off-by: Jeff Layton <jlayton@kernel.org>\n> ---\n>  fs/nfs/inode.c | 9 +--------\n>  1 file changed, 1 insertion(+), 8 deletions(-)\n> \n> diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c\n> index 4786343eeee0f874aa1f31ace2f35fdcb83fc7a6..3a5bba7e3c92d4d4fcd65234cd2f10e56f78dee0 100644\n> --- a/fs/nfs/inode.c\n> +++ b/fs/nfs/inode.c\n> @@ -757,14 +757,7 @@ nfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,\n>  \t} else if (nfs_have_delegated_atime(inode) &&\n>  \t\t   attr->ia_valid & ATTR_ATIME &&\n>  \t\t   !(attr->ia_valid & ATTR_MTIME)) {\n> -\t\tif (attr->ia_valid & ATTR_ATIME_SET) {\n> -\t\t\tif (uid_eq(task_uid, owner_uid)) {\n> -\t\t\t\tspin_lock(&inode->i_lock);\n> -\t\t\t\tnfs_set_timestamps_to_ts(inode, attr);\n> -\t\t\t\tspin_unlock(&inode->i_lock);\n> -\t\t\t\tattr->ia_valid &= ~(ATTR_ATIME|ATTR_ATIME_SET);\n> -\t\t\t}\n> -\t\t} else {\n\nThis probably deserves a comment. How about something like:\n\n\t\t/*\n\t\t * An atime-only update via an explicit setattr (e.g.: utimensat() and\n\t\t * the like) requires updating the ctime as well. Delegated timestamps\n\t\t * don't have a mechanism for updating the ctime with a delegated\n\t\t * atime-only update, so an RPC must be issued.\n\t\t */\n\n> +\t\tif (!(attr->ia_valid & ATTR_ATIME_SET)) {\n>  \t\t\tnfs_update_delegated_atime(inode);\n>  \t\t\tattr->ia_valid &= ~ATTR_ATIME;\n>  \t\t}\n\n-- \nJeff Layton <jlayton@kernel.org>\n",
+          "raw_body": "This probably deserves a comment. How about something like:\n\n\t\t/*\n\t\t * An atime-only update via an explicit setattr (e.g.: utimensat() and\n\t\t * the like) requires updating the ctime as well. Delegated timestamps\n\t\t * don't have a mechanism for updating the ctime with a delegated\n\t\t * atime-only update, so an RPC must be issued.\n\t\t */",
           "reply_to": "",
           "message_date": "2026-03-25",
-          "message_id": "",
+          "message_id": "c36648f66b6e66f8aa555528c8969b1350c3a36f.camel@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Olga Kornievskaia",
+          "summary": "Olga Kornievskaia noted that the patch may cause timestamps to go 'backwards' when a client holds an attribute delegation and receives a GETATTR in a compound with CLONE(COPY), and questioned whether this is a problem of including a GETATTR in a compound while holding an attribute delegation or if it requires a different solution.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "uncertainty about patch's impact"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Jeff and all,\n\nWith this patch and running against a server that would update the\nc/mtime of a GETATTR in a compound with CLONE(COPY),  the timestamps\nis (might be) going \"backwards\"? I see that SETATTR+DELEGRETURN (after\nthe CLONE) is setting a timestamp which is earlier than what's\nreturned by the server in the GETATTR. Though I haven't figured out\nhow to \"show\" it via test (I observe it on a network trace).\n\nThis is seen testing either against Hammerspace which already updates\nthe values or the linux server with the patch I'm working on to update\ntimestamp for CLONE/COPY.\n\nI have to say I haven't figured out if this patch needs to modify such\nthat it fixes 221 but doesn't break 407 or we are fundamentally\ndealing with a problem of including a GETATTR in a compound while\nholding an attribute delegation that needs to be solved differently.\nLike I said before, if the server were to update the value upon\nreceiving the GETATTR in the compound (regardless of the origin),\nshould it then do a CB_GETATTR first (which I already grumbled seems\nlike a poor choice)? Or, should the client be changed to not send a\nGETATTR in CLONE of the compounds if it's holding an attribute\ndelegation and somehow figure out attributes differently then it does\nnow.\n\n\nOn Wed, Mar 25, 2026 at 8:30 AM Jeff Layton <jlayton@kernel.org> wrote:",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-04-07",
+          "message_id": "CAN-5tyF2nxMaGsQS1B3oAMizGoCGvnTBYNgS9kMOfNoKKcwHxA@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Olga Kornievskaia",
+          "summary": "Reviewer Olga Kornievskaia apologized for a previous misunderstanding about mtime going backwards, and clarified that she was confused by the interaction between two SETATTR operations and how access time is handled in one of them.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "apology",
+            "clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Apologies. Please excuse the noise about the mtime going backwards.\nThere are 2 SETATTRs going on and I was looking at the src file\nSETATTR. I believe I was also confused by the difference between\ntime_access value from time_modify in the SETATTR (for the dest file).\nIt's unclear why the access time wasn't modified (and the value\nreturned by the OPEN's GETATTR is used) but the mtime was modified\nbased on what's received in the CLONE's GETATTR.",
+          "reply_to": "",
+          "message_date": "2026-04-07",
+          "message_id": "CAN-5tyEgO2rk=nveNigFLroVGbExC=Ok3UYFGUrcBUGQ5f-i+w@mail.gmail.com",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch fixes a bug in the NFS client where delegated timestamps don't properly update the ctime when an atime-only change is made via utimensat(). The fix involves issuing an RPC to update the ctime alongside the atime. This addresses a regression introduced by a previous patch that further fixed attribute delegation and mtime changes."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the NFS client where utimensat() operations that only update the atime attribute do not properly update the ctime when delegated timestamps are enabled. The problem arises because there is no mechanism to update the ctime alongside atime-only changes. To fix this, the patch modifies the client to issue an RPC to update the ctime in such cases. This ensures that the ctime is correctly updated along with the atime."
     }
   }
 }

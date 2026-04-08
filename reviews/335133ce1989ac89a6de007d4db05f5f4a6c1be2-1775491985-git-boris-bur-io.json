@@ -9,18 +9,18 @@
       "reviews": [
         {
           "author": "Christoph Hellwig",
-          "summary": "Approved the patch with minor suggestions for improvement, specifically recommending the use of a switch statement to handle different error status codes more clearly.",
+          "summary": "The patch looks good and is ready for merge. However, Christoph suggests using a switch statement in the second pass for clarity.",
           "sentiment": "positive",
           "sentiment_signals": [
-            "APPROVAL"
+            "LGTM"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
           "analysis_source": "llm",
-          "raw_body": "On Mon, Apr 06, 2026 at 09:15:15AM -0700, Boris Burkov wrote:\n> As far as I can tell, we never intentionally constrained ourselves to\n> these status codes, and it is misleading and surprising to lack the\n> bdev error logging when we get a different error code from the block\n> layer. This can lead to jumping to a wrong conclusion like \"this\n> system didn't see any bio failures but aborted with EIO\".\n> \n> For example on nvme devices, I observe many failures coming back as\n> BLK_STS_MEDIUM. It is apparent that the nvme driver returns a variety of\n> BLK_STS_* status values in nvme_error_status().\n> \n> So handle the known expected errors and make some noise on the rest\n> which we expect won't really happen.\n\nLooks good:\n\nReviewed-by: Christoph Hellwig <hch@lst.de>\n\nalthough now that you have an unlikely annotation for the non-ok\nslow patch I'd use a switch statement for clarity int the second\npass.\n\n\n",
-          "reply_to": "Boris Burkov",
+          "raw_body": "On Mon, Apr 06, 2026 at 09:15:15AM -0700, Boris Burkov wrote:\n> As far as I can tell, we never intentionally constrained ourselves to\n> these status codes, and it is misleading and surprising to lack the\n> bdev error logging when we get a different error code from the block\n> layer. This can lead to jumping to a wrong conclusion like \"this\n> system didn't see any bio failures but aborted with EIO\".\n> \n> For example on nvme devices, I observe many failures coming back as\n> BLK_STS_MEDIUM. It is apparent that the nvme driver returns a variety of\n> BLK_STS_* status values in nvme_error_status().\n> \n> So handle the known expected errors and make some noise on the rest\n> which we expect won't really happen.\n\nLooks good:\n\nReviewed-by: Christoph Hellwig <hch@lst.de>\n\nalthough now that you have an unlikely annotation for the non-ok\nslow patch I'd use a switch statement for clarity int the second\npass.\n\n",
+          "reply_to": "",
           "message_date": "2026-04-06",
           "message_id": "",
           "email": "hch@infradead.org",
@@ -28,7 +28,51 @@
         }
       ],
       "analysis_source": "llm",
-      "patch_summary": "This patch modifies the btrfs_log_dev_io_error() function to log device I/O errors for all bio error status codes, not just BLK_STS_IOERR and BLK_STS_TARGET. The change is motivated by the observation that some block layer drivers return unexpected status values, leading to incorrect conclusions about system behavior."
+      "patch_summary": "This patch modifies the btrfs_log_dev_io_error() function to log device I/O errors for all bio error codes, not just BLK_STS_IOERR and BLK_STS_TARGET. The change is motivated by the observation that some devices return unexpected error codes, leading to incorrect conclusions about system behavior."
+    },
+    "2026-04-07": {
+      "report_file": "2026-04-07_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Anand Jain",
+          "summary": "Anand points out that BLK_STS_PROTECTION is interpreted differently depending on the device type and suggests that the patch is NVMe-specific.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "Clarification requested"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On 7/4/26 00:15, Boris Burkov wrote:\n> As far as I can tell, we never intentionally constrained ourselves to\n> these status codes, and it is misleading and surprising to lack the\n> bdev error logging when we get a different error code from the block\n> layer. This can lead to jumping to a wrong conclusion like \"this\n> system didn't see any bio failures but aborted with EIO\".\n> \n\n> For example on nvme devices, I observe many failures coming back as\n> BLK_STS_MEDIUM. It is apparent that the nvme driver returns a variety of\n> BLK_STS_* status values in nvme_error_status().\n\n\nBLK_STS_PROTECTION is interpreted differently depending on the device.\nIn NVMe, it indicates invalid Protection Information (PI), while in\nHDDs/SSDs it typically points to a malformed CDB (often a software bug).\nThis is one of several possible error conditions.\n\nRather than introducing new BLK_STS_* codes, vendors have reused\nexisting ones for newer device types to maintain backward compatibility.\n\nThere isn't much we can do about this for now. I assume the malformed\nCDB-related issues have largely been resolved, so this Btrfs fix is\neffectively NVMe-specific.\n\nReviewed-by: Anand Jain <asj@kernel.org>\n\nThanks\nAnand\n\n> So handle the known expected errors and make some noise on the rest\n> which we expect won't really happen.\n> \n> Signed-off-by: Boris Burkov <boris@bur.io>\n> ---\n> Changelog:\n> v3:\n> - actually do the change stated in v2...\n> v2:\n> - proper bdev err logging for expected block errors\n> - btrfs_warn_rl for all other errors\n> \n> ---\n>  fs/btrfs/bio.c | 12 ++++++++++--\n>  1 file changed, 10 insertions(+), 2 deletions(-)\n> \n> diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c\n> index 2a2a21aec817..9c3cd6978880 100644\n> --- a/fs/btrfs/bio.c\n> +++ b/fs/btrfs/bio.c\n> @@ -4,6 +4,7 @@\n>   * Copyright (C) 2022 Christoph Hellwig.\n>   */\n>  \n> +#include \"linux/blk_types.h\"\n>  #include <linux/bio.h>\n>  #include \"bio.h\"\n>  #include \"ctree.h\"\n> @@ -350,11 +351,18 @@ static void btrfs_check_read_bio(struct btrfs_bio *bbio, struct btrfs_device *de\n>  \n>  static void btrfs_log_dev_io_error(const struct bio *bio, struct btrfs_device *dev)\n>  {\n> +\tblk_status_t sts = bio->bi_status;\n> +\n>  \tif (!dev || !dev->bdev)\n>  \t\treturn;\n> -\tif (bio->bi_status != BLK_STS_IOERR && bio->bi_status != BLK_STS_TARGET)\n> +\tif (unlikely(sts == BLK_STS_OK))\n>  \t\treturn;\n> -\n> +\tif (unlikely(sts != BLK_STS_IOERR && sts != BLK_STS_TARGET &&\n> +\t\t     sts != BLK_STS_MEDIUM && sts != BLK_STS_PROTECTION)) {\n> +\t\tbtrfs_warn_rl(dev->fs_info, \"bdev %s unexpected block io error: %d\",\n> +\t\t\t      btrfs_dev_name(dev), sts);\n> +\t\treturn;\n> +\t}\n>  \tif (btrfs_op(bio) == BTRFS_MAP_WRITE)\n>  \t\tbtrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_WRITE_ERRS);\n>  \telse if (!(bio->bi_opf & REQ_RAHEAD))\n\n",
+          "reply_to": "",
+          "message_date": "2026-04-07",
+          "message_id": "",
+          "email": "anajain.sg@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Sterba",
+          "summary": "David agrees with the patch and will add it to the for-next branch.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "LGTM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Mon, Apr 06, 2026 at 09:15:15AM -0700, Boris Burkov wrote:\n> As far as I can tell, we never intentionally constrained ourselves to\n> these status codes, and it is misleading and surprising to lack the\n> bdev error logging when we get a different error code from the block\n> layer. This can lead to jumping to a wrong conclusion like \"this\n> system didn't see any bio failures but aborted with EIO\".\n> \n> For example on nvme devices, I observe many failures coming back as\n> BLK_STS_MEDIUM. It is apparent that the nvme driver returns a variety of\n> BLK_STS_* status values in nvme_error_status().\n> \n> So handle the known expected errors and make some noise on the rest\n> which we expect won't really happen.\n> \n> Signed-off-by: Boris Burkov <boris@bur.io>\n\nI'll add it to for-next so it's in the first 7.1 pull request. Thanks.\n\n",
+          "reply_to": "",
+          "message_date": "2026-04-07",
+          "message_id": "",
+          "email": "dsterba@suse.cz",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch modifies the btrfs_log_dev_io_error() function to log device I/O errors for all bio error codes, not just BLK_STS_IOERR and BLK_STS_TARGET. The change is motivated by the observation that some devices return unexpected error codes, leading to incorrect conclusions about system behavior."
     }
   }
 }
