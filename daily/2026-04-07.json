@@ -2,7 +2,7 @@
   "date": "2026-04-07",
   "report_file": "2026-04-07_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-04-08 07:13 UTC",
+  "last_updated": "2026-04-08 07:15 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -3163,6 +3163,75 @@
       "name": "Nhat Pham",
       "primary_email": "nphamcs@gmail.com",
       "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Rik van Riel",
+      "primary_email": "riel@surriel.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] sched/cpuacct: fix use-after-free in cpuacct_account_field()",
+          "message_id": "20260404224742.56d8df3e@fangorn",
+          "url": "https://lore.kernel.org/all/20260404224742.56d8df3e@fangorn/",
+          "date": "2026-04-05T02:47:54Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-04-05",
+          "patch_version": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260404224742.56d8df3e@fangorn",
+              "url": "https://lore.kernel.org/all/20260404224742.56d8df3e@fangorn/",
+              "subject": "[PATCH] sched/cpuacct: fix use-after-free in cpuacct_account_field()",
+              "date": "2026-04-05T02:47:54Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch addresses a use-after-free bug in the cpuacct_account_field() function, which can occur when a timer interrupt on one CPU accesses the cpuacct data of another CPU while it is being freed. The fix involves deferring the actual freeing of percpu data and the cpuacct struct to an RCU callback via call_rcu(), ensuring that all concurrent readers have completed before the memory is freed.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Peter Zijlstra",
+              "summary": "Identified the issue as a cgroup failure rather than a cpuacct failure and questioned whether it's actually a bug.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "QUESTIONING"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Sat, Apr 04, 2026 at 10:47:42PM -0400, Rik van Riel wrote:\n> cpuacct_css_free() calls free_percpu() on ca->cpustat and ca->cpuusage,\n> then kfree(ca). However, a timer interrupt on another CPU can\n> concurrently access this data through cpuacct_account_field(), which\n> walks the cpuacct hierarchy via task_ca()/parent_ca() and performs\n> __this_cpu_add(ca->cpustat->cpustat[index], val).\n> \n> The race window exists because put_css_set_locked() drops the CSS\n> reference (css_put) before the css_set is RCU-freed (kfree_rcu). This\n> means the CSS percpu_ref can reach zero and trigger the css_free chain\n> while readers obtained the CSS pointer from the old css_set that is\n> still visible via RCU.\n> \n> Although css_free_rwork_fn is already called after one RCU grace period,\n> the css_set -> CSS reference drop in put_css_set_locked() creates a\n> window where the CSS free chain races with readers still holding the\n> old css_set reference.\n\nTo me this reads like a cgroup fail, not a cpuacct fail per se. But I'm\nforever confused there. TJ?\n\n> With KASAN enabled, free_percpu() unmaps shadow pages, so the\n> KASAN-instrumented __this_cpu_add hits an unmapped shadow page\n> (PMD=0), causing a page fault in IRQ context that cascades into an\n> IRQ stack overflow.\n> \n> Fix this by deferring the actual freeing of percpu data and the cpuacct\n> struct to an RCU callback via call_rcu(), ensuring that all concurrent\n> readers in RCU read-side critical sections (including timer tick\n> handlers) have completed before the memory is freed.\n> \n> Found in an AI driven syzkaller run. The bug did not repeat in the\n> 14 hours since this patch was applied.\n> \n> Signed-off-by: Rik van Riel <riel@surriel.com>\n> Assisted-by: Claude:claude-opus-4.6 syzkaller\n> Fixes: 3eba0505d03a (\"sched/cpuacct: Remove redundant RCU read lock\")\n> Cc: stable@kernel.org\n> ---\n>  kernel/sched/cpuacct.c | 12 ++++++++++--\n>  1 file changed, 10 insertions(+), 2 deletions(-)\n> \n> diff --git a/kernel/sched/cpuacct.c b/kernel/sched/cpuacct.c\n> index ca9d52cb1ebb..b6e7b34de616 100644\n> --- a/kernel/sched/cpuacct.c\n> +++ b/kernel/sched/cpuacct.c\n> @@ -28,6 +28,7 @@ struct cpuacct {\n>  \t/* cpuusage holds pointer to a u64-type object on every CPU */\n>  \tu64 __percpu\t*cpuusage;\n>  \tstruct kernel_cpustat __percpu\t*cpustat;\n> +\tstruct rcu_head\trcu;\n>  };\n>  \n>  static inline struct cpuacct *css_ca(struct cgroup_subsys_state *css)\n> @@ -84,15 +85,22 @@ cpuacct_css_alloc(struct cgroup_subsys_state *parent_css)\n>  }\n>  \n>  /* Destroy an existing CPU accounting group */\n> -static void cpuacct_css_free(struct cgroup_subsys_state *css)\n> +static void cpuacct_free_rcu(struct rcu_head *rcu)\n>  {\n> -\tstruct cpuacct *ca = css_ca(css);\n> +\tstruct cpuacct *ca = container_of(rcu, struct cpuacct, rcu);\n>  \n>  \tfree_percpu(ca->cpustat);\n>  \tfree_percpu(ca->cpuusage);\n>  \tkfree(ca);\n>  }\n>  \n> +static void cpuacct_css_free(struct cgroup_subsys_state *css)\n> +{\n> +\tstruct cpuacct *ca = css_ca(css);\n> +\n> +\tcall_rcu(&ca->rcu, cpuacct_free_rcu);\n> +}\n> +\n>  static u64 cpuacct_cpuusage_read(struct cpuacct *ca, int cpu,\n>  \t\t\t\t enum cpuacct_stat_index index)\n>  {\n> -- \n> 2.52.0\n> \n> \n",
+              "reply_to": "",
+              "message_date": "2026-04-07",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "peterz@infradead.org"
+            },
+            {
+              "author": "Tejun Heo",
+              "summary": "Suggested that the patch is addressing a non-issue, as the cpuacct refcnt cannot reach zero while task->cgroups points to it and the built-in RCU grace period in cgroup core should be enough.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "QUESTIONING"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Hello,\n\nOn Tue, Apr 07, 2026 at 09:58:11AM +0200, Peter Zijlstra wrote:\n> On Sat, Apr 04, 2026 at 10:47:42PM -0400, Rik van Riel wrote:\n> > cpuacct_css_free() calls free_percpu() on ca->cpustat and ca->cpuusage,\n> > then kfree(ca). However, a timer interrupt on another CPU can\n> > concurrently access this data through cpuacct_account_field(), which\n> > walks the cpuacct hierarchy via task_ca()/parent_ca() and performs\n> > __this_cpu_add(ca->cpustat->cpustat[index], val).\n> > \n> > The race window exists because put_css_set_locked() drops the CSS\n> > reference (css_put) before the css_set is RCU-freed (kfree_rcu). This\n> > means the CSS percpu_ref can reach zero and trigger the css_free chain\n> > while readers obtained the CSS pointer from the old css_set that is\n> > still visible via RCU.\n> > \n> > Although css_free_rwork_fn is already called after one RCU grace period,\n> > the css_set -> CSS reference drop in put_css_set_locked() creates a\n> > window where the CSS free chain races with readers still holding the\n> > old css_set reference.\n> \n> To me this reads like a cgroup fail, not a cpuacct fail per se. But I'm\n> forever confused there. TJ?\n\ncss_free() is already called after a RCU grace period after the refcnt\nreaches zero. The patch is adding another RCU grace period in the path,\nwhich likely is just patching over the underlying problem.\n\ncpuacct_account_field() is called from ticks. The task->cgroups is the RCU\nprotected pointer to the css_set from which the cpuacct pointer is read.\nEach css_set pins the csses that it points to. The cpuacct's refcnt can't\nreach zero as long as task->cgroups point to it and if the timer tick is\nwhat's accessing it, the built-in RCU grace period in cgroup core should be\nenough.\n\nHow reproducible is the problem? Do you have the KASAN report?\n\nThanks.\n\n-- \ntejun\n\n",
+              "reply_to": "Peter Zijlstra",
+              "message_date": "2026-04-07",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "tj@kernel.org"
+            }
+          ],
+          "list_id": "linux-kernel@vger.kernel.org"
+        }
+      ],
       "patches_reviewed": [],
       "patches_acked": [],
       "discussions_posted": [],
