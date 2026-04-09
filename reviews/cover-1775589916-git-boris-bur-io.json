@@ -1,0 +1,91 @@
+{
+  "thread_id": "cover.1775589916.git.boris@bur.io",
+  "subject": "[PATCH v3 0/4] btrfs: improve stalls under sudden writeback",
+  "url": "https://lore.kernel.org/all/cover.1775589916.git.boris@bur.io/",
+  "dates": {
+    "2026-04-08": {
+      "report_file": "2026-04-08_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Filipe Manana",
+          "summary": "Filipe Manana noted that inserting an extent item into the extent tree requires COWing an extent tree leaf, creating a delayed tree ref for deletion, which is not accounted for in the patch.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "patch looks good otherwise"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Running the delayed data ref to insert the extent item in the extent\ntree requires COWing an extent tree leaf, which creates a delayed tree\nref for deletion too.\nSo, 2.\n\nOtherwise it looks good, thanks.",
+          "reply_to": "",
+          "message_date": "2026-04-08",
+          "message_id": "CAL3q7H7X6eFwrVXW6p21nuxawE8+O1dyXV-Yyg_uS4ipf1O5+w@mail.gmail.com",
+          "email": "fdmanana@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Filipe Manana",
+          "summary": "Reviewer noted that the patch includes an unnecessary include file, compression.h, which is not used in the code and can be safely removed.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "requested change",
+            "improvement suggestion"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "No need for this include. We're not using anything from compression.{h,c}.\n\nWith that removed:\n\nReviewed-by: Filipe Manana <fdmanana@suse.com>",
+          "reply_to": "",
+          "message_date": "2026-04-08",
+          "message_id": "CAL3q7H4fFVEjzwJj42ksK-nFwC=SfYS++pkCMwoN6i4ncHQ9og@mail.gmail.com",
+          "email": "fdmanana@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Filipe Manana",
+          "summary": "Reviewer noted that the assertion in the patch does not need to print the 'mod' value, as it must be -1 if it fails, and suggested removing this unnecessary output.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested change"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I don't think there is a need to print mod here, if the assertion\nfailed, we know it must be -1.\nIn the previous assertion, we don't print mod, which makes sense since\nit must be 1 if it fails.\n\nWith that change:\n\nReviewed-by: Filipe Manana <fdmanana@suse.com>\n\nThanks.",
+          "reply_to": "",
+          "message_date": "2026-04-08",
+          "message_id": "CAL3q7H6pMX7gzKbBfk89fG3hL40KrabmNsXnosS7Zia3M_3xbg@mail.gmail.com",
+          "email": "fdmanana@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author Boris Burkov addressed a concern about accurately counting delayed refs reservations in the transaction handle context, explaining his reasoning and proposing to shift from counting add_delayed_ref calls to predicting metadata reservation due to delayed refs. He agreed that two reservations should be made for each cow, but noted an inconsistency with btrfs_calc_delayed_ref_bytes() and asked for clarification.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "question"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I think I might be getting confused now :)\n\nI'll try to work it out \"out loud\" and hopefully I can reach a good\nconclusion.\n\nI have been trying to reserve for the calls to add_delayed_ref in the\ntransaction handle context. And tracing each cow in that context yields\n2 delayed refs each while tracing the data extent insertion only creates\none. The reason I care particularly about this context is the\ntrans_handle delayed_refs rsv accounting in\nbtrfs_update_delayed_refs_rsv(), as described in the patch. Ultimately,\nall the reservations get sunk into the global reserve from\ntrans->delayed_rsv at btrfs_end_transaction(). Does this all sound right\nto you so far?\n\nCows that we clearly do from finish_one_ordered() are the ones to:\nraid stripe tree, subvol tree, and csum tree. Notably, the free space\ntree *does not* happen in this context, it happens when we run the\ndelayed ref, so I think I was not consistent to include that. In that\ncontext we cow the extent and free space tree for the data extent.\n\nBut the point of reserving for a delayed ref is to account for the cows\nthat it will ultimately cause and reserve ahead for them. So I think it\ndoes make sense to reserve for the fst and extent tree. On the other\nhand, I think we actively *don't* want to account for the potential\ninfinite regress where each metadata delayed_ref run \"unluckily\" results\nin cow-ing the extent tree again and again since it doesn't actually\nhappen in practice (especially with Leo's writeback inhibition and\nhopefully eb overwriting soon). That series diverges so it would require\nan infinite reservation anyway.\n\nIn conclusion, I think I am agreeing and proposing that I shift the goal\nfrom \"count add_delayed_ref calls under the trans handle\" to \"predict\nmetadata reservation due to delayed refs\" and in that world, it should\nbe 2 for the data extent in the extent tree.\n\nThe other principled option is to count 1 for the data delayed ref now\nand not account for the fst or the extent tree cows that happen at\ndelayed_refs time, but I think that makes less sense.\n\nSorry if that was a lot of text to just agree with you, but I want to be\ncareful since it's easy to go astray and \"get away with it\" cause of the\nreservations being conservative and getting sloshed into the global\nreserves.\n\nOne final note / question:\nthe \"normal\" start_transaction() reservation which computes the space\nfor the cow itself and then the delayed_refs cows does *not* seem to\ncount 2 per cow for delayed refs in btrfs_calc_delayed_ref_bytes().\nBut in theory the same reasoning applies that we will touch two metadata\nitems for each cow.  I assume this is OK in practice because the depth\nis generally not 8 anyway, but do you think that is something I should\nclean up as well?\n\nThanks again,\nBoris",
+          "reply_to": "Filipe Manana",
+          "message_date": "2026-04-08",
+          "message_id": "20260408173425.GA2076825@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series aims to improve stalls under sudden writeback in Btrfs file systems, particularly on large memory systems with high dirty ratios. The problem arises when a system accumulates hundreds of gigabytes of dirty pages before triggering writeback, leading to a tailspin of metadata space management and eventual system stall. To address this issue, the patches introduce improved reservations for delayed refs in delalloc work and basic smoothing of flush_space() heuristics. This is achieved through targeted changes to Btrfs inode accounting, types counting, and shrink_delalloc iteration capping."
+    }
+  }
+}
