@@ -8,47 +8,106 @@
       "developer": "Jeff Layton",
       "reviews": [
         {
-          "author": "Christoph Hellwig",
-          "summary": "Identified potential downsides of limiting writeback to a specific inode, which aligns with previous concerns. Suggested considering the impact on performance and target release.",
-          "sentiment": "neutral",
+          "author": "Jeff Layton (author)",
+          "summary": "The author is addressing concerns about the performance of the per-inode writeback approach, specifically that it regresses on multi-writer and random write workloads due to lost I/O batching. The author acknowledges this regression and suggests sticking with v2, which has a different approach.",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "concerns",
-            "performance"
+            "regression",
+            "acknowledged"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Wed, Apr 08, 2026 at 02:45:32PM -0400, Jeff Layton wrote:\n> > Assuming that looks OK, I'll probably send a v3. Original cover letter\n> > from v1 follows:\n> > \n> \n> Actually, that version regressed performance in a couple of cases.\n> I think v2 is probably the best approach, on balance.\n\nLimiting writeback to a specific inode has many downsides as I explained\nbefore, so this is not surprising.\n\n> Maybe we can get this into -next so that it can make v7.2?\n\nIf you want to target 7.2 we're not in any rush.  If you were trying to\nsay 7.1 we're way to close too the merge window.  We also haven't\nheard from Jens at all, whom I'd really like to look over this.\n\n\n",
-          "reply_to": "Jeff Layton",
+          "raw_body": "Actually, that version regressed performance in a couple of cases. I think v2 is probably the best approach, on balance. Maybe we can get this into -next so that it can make v7.2?\n\nHere's the comparison between this version and a writeback_single_inode() flush version:\n\n------------------8<-----------------------\n\n● Comparing dontcache numbers against the previous whole-BDI flusher kernel (from /tmp/dontcache-local-4way-flusher.md):                                                                          \n\n  Per-Inode vs Whole-BDI Flusher — DONTCACHE on Local XFS                                                                                                                                         \n\n  Single-Client Writes\n\n  ┌──────────────────┬───────────┬───────────┬─────────────┐                                                                                                                                      \n  │    Benchmark     │ Whole-BDI │ Per-Inode │   Change    │                                                                                                                                      \n  ├──────────────────┼───────────┼───────────┼─────────────┤      \n  │ Seq write MB/s   │ 1450      │ 1438      │ -1% (noise) │\n  ├──────────────────┼───────────┼───────────┼─────────────┤\n  │ Seq write p99.9  │ 23.5 ms   │ 23.5 ms   │ identical   │\n  ├──────────────────┼───────────┼───────────┼─────────────┤                                                                                                                                      \n  │ Rand write MB/s  │ 363       │ 286       │ -21%        │\n  ├──────────────────┼───────────┼───────────┼─────────────┤                                                                                                                                      \n  │ Rand write p99.9 │ 1.8 ms    │ 16.7 ms   │ regression  │\n  └──────────────────┴───────────┴───────────┴─────────────┘\n\n  Seq write is identical. Rand write regressed — the whole-BDI flusher batched all dirty pages in one pass with writeback_sb_inodes() under a single blk_plug, while per-inode write_inode_now() loses that batching.\n\n  Single-Client Reads\n\n  ┌────────────────┬───────────┬───────────┬────────┐\n  │   Benchmark    │ Whole-BDI │ Per-Inode │ Change │\n  ├────────────────┼───────────┼───────────┼────────┤\n  │ Seq read MB/s  │ 2950      │ 2350      │ -20%   │\n  ├────────────────┼───────────┼───────────┼────────┤\n  │ Rand read MB/s │ 651       │ 519       │ -20%   │\n  └────────────────┴───────────┴───────────┴────────┘\n\n  Reads shouldn't be affected by writeback path changes. Buffered reads also dropped (2888 → 2331), suggesting different system conditions between runs rather than a per-inode regression.\n\n  Multi-Writer (Scenario A)\n\n  ┌────────────────┬───────────┬───────────┬────────────┐\n  │     Metric     │ Whole-BDI │ Per-Inode │   Change   │\n  ├────────────────┼───────────┼───────────┼────────────┤\n  │ Aggregate MB/s │ 1478      │ 999       │ -32%       │\n  ├────────────────┼───────────┼───────────┼────────────┤\n  │ p99.9          │ 46 ms     │ 77 ms     │ -67% worse │\n  └────────────────┴───────────┴───────────┴────────────┘\n\n  This is the biggest regression. With whole-BDI, the flusher did one batched pass through all dirty inodes via writeback_sb_inodes(). With per-inode, each of 4 writers queues a separate work item processed serially by write_inode_now() — losing the batch I/O merging benefit.\n\n  Scenario C & D (Noisy Neighbor)\n\n  ┌─────────────────────────┬───────────┬───────────┬─────────────┐\n  │         Metric          │ Whole-BDI │ Per-Inode │   Change    │\n  ├─────────────────────────┼───────────┼───────────┼─────────────┤\n  │ Scenario C writer       │ 1468      │ 1386      │ -6%         │\n  ├─────────────────────────┼───────────┼───────────┼─────────────┤\n  │ Scenario C readers      │ 18.7 MB/s │ 18.7 MB/s │ identical   │\n  ├─────────────────────────┼───────────┼───────────┼─────────────┤\n  │ Scenario D writer       │ 1472      │ 1467      │ identical   │\n  ├─────────────────────────┼───────────┼───────────┼─────────────┤\n  │ Scenario D readers      │ 496 MB/s  │ 507 MB/s  │ +2%         │\n  ├─────────────────────────┼───────────┼───────────┼─────────────┤\n  │ Scenario D reader p99.9 │ 440 us    │ 358 us    │ +19% better │\n  └─────────────────────────┴───────────┴───────────┴─────────────┘\n\n  Mixed-mode (Scenario D) is the intended production case and it's essentially identical or slightly better — per-inode writeback creates less device contention for buffered readers.\n\n  Summary\n\n  The per-inode approach is neutral-to-slightly-better for the production scenario (Scenario D), but regresses on multi-writer and random write workloads. The core issue is loss of I/O batching\n — writeback_sb_inodes() processes all dirty inodes in one blk_plug'd pass, while per-inode write_inode_now() calls are processed one at a time. The read regressions likely reflect different\n  system conditions since buffered/direct reads also dropped ~20%.\n\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "",
           "message_date": "2026-04-08",
-          "message_id": "",
+          "message_id": "c2351220336d0ad99396a331bad34c6177bf354e.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Christoph Hellwig noted that the current implementation of wakeup_flusher_threads_bdi causes WB_SYNC_NONE writeback to occur every time a DONTCACHE write finishes, which is inefficient and unnecessary. He suggested introducing a new WB_start_dontcache bit, a get_nr_dontcache_pages() helper function, and other related changes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "wakeup_flusher_threads_bdi ends up calling wb_start_writeback eventually,\nwhich sets WB_start_all, pushes the reason to start_all_reason and then\ndoes the actual wakeup.\n\nThe flusher thread then through wb_check_start_all does a WB_SYNC_NONE\nwriteback based on get_nr_dirty_pages.  Which seems wrong - we don't\nwant to do a huge writeback evertime the some DONTCACHE write finished.\n\nSo I think you'll want a new WB_start_dontcache bit, a new\nget_nr_dontcache_pages() helper on a new node counter, etc.",
+          "reply_to": "",
+          "message_date": "2026-04-08",
+          "message_id": "adc-Q1iDWHD5yxHH@infradead.org",
           "email": "hch@infradead.org",
           "is_maintainer": false
         },
         {
-          "author": "Jeff Layton",
-          "summary": "Provided a comparison between the current patch and a previous whole-BDI flusher kernel, highlighting performance regressions in some cases.",
-          "sentiment": "neutral",
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer Christoph Hellwig requested that the extra reason arguments for wide wakeups not be exposed outside the core writeback code, and also suggested marking wakeup_flusher_threads_bdi static in fs-writeback.c",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "regression",
-            "performance"
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I'd rather not expose that to wide with the extra reason arguments\nthat's not otherwise exposed outside the core writeback code.\n\nBtw, wakeup_flusher_threads_bdi should really be marked static in\nfs-writeback.c as well.",
+          "reply_to": "Ritesh (IBM)",
+          "message_date": "2026-04-08",
+          "message_id": "adc-h4bhUFGqbejN@infradead.org",
+          "email": "hch@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer noted that the benchmark results provided in the patch description are incomplete and potentially stale, suggesting they be included directly in the patch for better reproducibility. Additionally, he questioned the validity of certain benchmark numbers, specifically the read changes between patches and unpatched dontcache in XFS and NFSD, requesting further investigation into their causes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "questioned results"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
+          "raw_body": "Please add the results into the patch.  Besides having them in the patch\nvs the cover letter, URLs to random hosting sites tend to get stale\nvery easily.\n\nComments on the XFS numbers / benchmark setup:\n\nHow does O_DIRECT manage to create almost the same peek dirty as\nbuffered?  Similarly even this patched doncache show be lower, which\nfeels odd.\n\n(the editorializing in these results feels odd, not sure what tool\ngenerates them, but maybe edit it for the commit log to look a bit more\nserious).\n\nGiven that this patch does not change the read path, how do the pure read\nnumbers for patches vs unpatched dontcache manage to differ so much?\n\nComments on the NFSD numbers / benchmark setup:\n\nI though you were testing using dontcache on the server, but the\ncomments seem to imply it is done on the client, what is the case\nhere? \n\nAgain, the read changes between patches and unpatched look suspect.\nPlease drill down why they happen, the fact that patches is slower here\nand faster in XFS makes me wonder if the results might just be very\nvolatile?",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-04-08",
+          "message_id": "addBkBKySJUb8MB4@infradead.org",
+          "email": "hch@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer noted that limiting writeback to a specific inode has several drawbacks, which explains the poor performance of RWF_DONTCACHE in write-heavy workloads.\n\nReviewer expressed concern about the timing of the patchset's submission, noting that targeting 7.2 is not a priority and that the merge window for 7.1 is closing soon, also requesting input from Jens",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "no clear opinion or suggestion",
+            "concern",
+            "urgency"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Limiting writeback to a specific inode has many downsides as I explained\nbefore, so this is not surprising.\n\n---\n\nIf you want to target 7.2 we're not in any rush.  If you were trying to\nsay 7.1 we're way to close too the merge window.  We also haven't\nheard from Jens at all, whom I'd really like to look over this.",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-04-08",
+          "message_id": "addB-eRg5cXzZhHG@infradead.org",
+          "email": "hch@infradead.org",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "The patch aims to improve write performance by introducing RWF_DONTCACHE, but it has regressed in some cases."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch set improves write performance when using the RWF_DONTCACHE flag by kicking the flusher thread for the superblock instead of initiating writeback directly. This change is based on benchmarking results that show a clear improvement over the status quo, particularly in cases with heavy write activity. The patch also includes a comparison of different IO modes for nfsd and highlights the poor performance of RWF_DONTCACHE with write-heavy workloads. The approach taken involves modifying the generic_write_sync function to kick the flusher thread, which is expected to better isolate the DONTCACHE writeback behavior and improve overall performance."
     },
     "2026-04-09": {
-      "report_file": "2026-04-08_ollama_llama3.1-8b.html",
+      "report_file": "2026-04-09_ollama_llama3.1-8b.html",
       "developer": "Jeff Layton",
       "reviews": [
         {
@@ -68,6 +127,47 @@
           "message_date": "2026-04-09",
           "message_id": "tstklxm7.ritesh.list@gmail.com",
           "email": "ritesh.list@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jan Kara",
+          "summary": "Jan Kara noted that the patch can lead to performance regressions under certain workloads, specifically when a process creates a large temporary file and deletes it shortly after creation while another process does small DONTCACHE writes. This results in unnecessary allocation, writeback, and deletion of the temporary file.\n\nReviewer Jan Kara expressed concerns about the patch's approach to writeback and suggested two alternative solutions: either marking inodes with dropbehind set and restricting flush worker to only write such inodes, or lazily clearing an 'inode has dropbehind folios' flag once the inode is clean.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "performance regressions",
+            "potential issue under specific workload",
+            "concerns",
+            "suggested alternative solutions"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "This is all true and I can certainly construct a workload where this\nbehavior will lead to big regressions in performance - for example one\nprocess creating say 1G temporary file and deleting it shortly after\ncreation + one process doing small DONTCACHE writes. Before this change\nonly DONTCACHE writes will make it to the disk and temporary file will only\nbe in the page cache, after this change you pay for allocating, writing\nback, and deleting the temporary file.\n\n---\n\nBut I'm not sure how you imagine this would work without restricting\nwriteback to particular inodes. Maybe we could mark inodes which have\nfolios with dropbehind set and make flush worker only write such inodes?\nThat would probably require tracking number of folios with dropbehind flag\nper inode but that wouldn't be too bad. Or we could just lazily clear this\n\"inode has dropbehind folios\" flag once the inode is clean.\n\n\t\t\t\t\t\t\t\tHonza\n\n-- \nJan Kara <jack@suse.com>\nSUSE Labs, CR",
+          "reply_to": "Christoph Hellwig",
+          "message_date": "2026-04-09",
+          "message_id": "gpcc6t5unsoepakjdffsmnmd5duuvijxwdochd753ttix75h7l@nahwzi4qfdcq",
+          "email": "jack@suse.cz",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer suggested modifying the patch to expedite writes by the number of pending don't-cache folios, which would still prioritize writing the least recently dirtied inodes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I'd only expedite writing by the number of pending dontcache folios.\nIt would still write the least recently dirtied inodes.",
+          "reply_to": "Jan Kara",
+          "message_date": "2026-04-09",
+          "message_id": "ade14lOI1CDiraar@infradead.org",
+          "email": "hch@infradead.org",
           "is_maintainer": false
         }
       ],

@@ -1,0 +1,101 @@
+{
+  "thread_id": "53b4795292d1df2fe1569fc724325ab52fcab322.camel@kernel.org",
+  "subject": "[RFC PATCH v3 0/4] getting rid of busy-wait in shrink_dcache_parent()",
+  "url": "https://lore.kernel.org/all/53b4795292d1df2fe1569fc724325ab52fcab322.camel@kernel.org/",
+  "dates": {
+    "2026-04-09": {
+      "report_file": "2026-04-09_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Al Viro",
+          "summary": "Al Viro disagreed with Claude's explanation for how a livelock leads to a UAF, instead suggesting that d_invalidate() hitting in the middle of proc_invalidate_siblings_dcache() might be the cause.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "disagreement",
+            "suggestion"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Claude is full of substance likely to cause CoC complaints when mentioned,\nfilm at 11.  I agree with the \"livelock opens up some window\" part,\nwhat with the stack traces there, but I very much doubt that mechanism\nhas anything to do with the stuff on a shrink list staying around from\none iteration to another.  The thing is, *nothing* is held between the\niterations of loop in there; data.dispose is empty at the end of the loop\nbody in all cases and reference in data.victim is not retained either\nacross the iterations either.  We do have a weird RCU use pattern there,\nall right (unbalanced acquire in select_collect2() paired with drop in\nthe caller of caller of select_collect2()), but the scope is neither\nlong nor extended by the livelock - in that case the function between\nshrink_dentry_tree() and select_collect2() (d_walk()) is told to drop\nthe locks and return to its caller immediately.\n\nWhat I suspect might be getting opened up is the possibility\nof d_invalidate() (e.g. from pathname resolution trying\nto walk into /proc/<pid>/...) hitting in the middle of\nproc_invalidate_siblings_dcache().\n\nIncidentally, one thing to check would be whether anything on affected\nboxen had things mounted under /proc/<pid>/... - that would give\nsome idea whether detach_mounts() (and namespace_unlock() with its\nhandling of the list of mountpoints) might be needed in the mix.",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-04-09",
+          "message_id": "20260409190213.GQ3836593@ZenIV",
+          "email": "viro@zeniv.linux.org.uk",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author addressed Al Viro's concern that the crash in question involved submounts and namespace unlocking by providing evidence from a crashed machine: had_submounts was false, no mounts were found under /proc/<pid>/..., and the d_invalidate stack frame confirmed this. The author explains that the code path for the crash did not involve mount detachment.\n\nThe author is addressing Al Viro's concern about the livelock leading to a UAF, specifically the issue of two stack-based list heads in the dispose list and d_walk escaping its starting dentry. The author provides additional analysis from Claude, including a detailed example of the corrupted list structure and the traversal path taken by d_walk. There is no indication that a fix will be implemented in this patch series.\n\nAuthor acknowledged that reproducing the UAF is not trivial and plans to continue hunting for more vmcores, indicating a need for further investigation.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "clarification",
+            "explanation",
+            "no clear resolution signal",
+            "additional analysis provided",
+            "acknowledges issue complexity",
+            "plans additional work"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "● had_submounts = false. The d_invalidate code never found submounts, so\n   detach_mounts() was never called for this dentry. The find_submount /\n   namespace_unlock path was not involved in this crash.\n\n  Summary for Al: On this crashed machine, there were no mounts under\n  /proc/<pid>/... in any of the 49 mount namespaces checked (from\n  surviving tasks). The d_invalidate stack frame shows had_submounts =\n  false, confirming that detach_mounts() and namespace_unlock() were not\n   in the mix for this crash. The code path was purely\n  shrink_dcache_parent → shrink_dentry_list → lock_for_kill, without any\n   mount detachment involved.\n\n---\n\n...directories being shrunk from processes exiting. Here's what it\nfound when I told it to validate the integrity of the d_lru that the\nrealloc'ed entry was on.\n\nMore claude slop from the earlier vmcore analysis:\n\n------------------8<------------------\n### Dispose List: Two Merged Lists\nThe dispose list contains **55 unique entries** and **two stack-based\nlist heads** forming a single ring:\n1. **head_A** at `0xffffc900c0e8fcc0` — crashed thread's `data.dispose`\n2. **head_B** at `0xffffc900c0e7fcc0` — another thread's `data.dispose`\n(exited, stack freed, exactly 0x10000 bytes apart)\n```\nhead_A ↔ UAF ↔ mountinfo(1) ↔ swaps(/) ↔ ... ↔\n  head_B(STACK) ↔ status(5962) ↔ exe(5962) ↔ ... ↔\n  stat(8808) ↔ ... ↔ mountinfo(1) ↔ UAF ↔ head_A\n```\n### d_walk Escaped Its Starting Dentry\n`d_walk` was called with `parent = /proc/4530/task/5964` (`data.start`\nconfirmed in stack frame). It should only traverse descendants of 5964.\nBut the dispose list contains entries from:\n- `/proc/4530/task/5962/*` (151 children — sibling of 5964)\n- `/proc/4530/task/6830`, `/proc/4530/task/8808` — other task entries\n- `/proc/1/mountinfo`, `/proc/1/status`, `/proc/1/net` — PID 1 entries\n- `/proc/sys/vm/overcommit_memory`, `/proc/sys/fs/*` — sysctl entries\n- `/proc/pressure/{cpu,io,memory}` — PSI entries\n- `/proc/swaps`, `/proc/cpuinfo`, `/proc/kcore` — root proc entries\n------------------8<------------------\n\n---\n\n...and so far it's not trivially reproducible. I can reproduce the\nstalls on a recent kernel without your patches, but whatever causes\nthis UAF is not easily triggerable by just stalling things out.\n\nI think I'm going to have to hunt for more vmcores...\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "Al Viro",
+          "message_date": "2026-04-09",
+          "message_id": "41cfd0f95b7fde411c0d59463dce979be89cb8ef.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Al Viro",
+          "summary": "Reviewer Al Viro questioned the consistency of a cyclic list in the dispose list, specifically asking if the links between two UAF and mountinfo entries are correct, and requested information about the dentries' parent pointers.\n\nReviewer Al Viro noted that the dispose list contains entries from multiple threads and mount namespaces, indicating a potential UAF issue due to inconsistent ->prev and ->next pointers. He suggested verifying that these entries are from shrink lists by checking ->d_flags on the entries.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "question",
+            "request for clarification",
+            "UAF",
+            "inconsistent pointers"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Wait a bloody minute; *two* UAF and two mountinfo there?  Are the links\nin that cyclic list consistent?  ->next and ->prev, I mean.\nIf I understand the notation correctly... are there two different\ndentries, both with \"mountinfo\" for name and PROC_I(_->d_inode)->pid\nbeing PID 1?  What are their ->d_parent pointing to?  Are they hashed?\n\n---\n\nNot at all obvious; there's a list from another thread mixed into that,\nand we've no idea what had the root been for that one.  For that matter,\nI'd check ->d_flags on the entries, just to verify that those are\nfrom shrink lists and not from LRU - the fact that these UAF still\nhave pointers to plausible dentries does not mean they are from the\nsame moment in time; if dentry in question had been on a different\nlist before getting freed...  That's why the question about ->prev\nand ->next consistncy.\n\nAnd seeing that procfs has zero callers of d_splice_alias() or d_move(),\nI would expect ->d_parent on all dentries in there to be constant over\nthe entire lifetime; would be rather hard for d_walk() to escape in\nsuch conditions...",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-04-09",
+          "message_id": "20260409215733.GS3836593@ZenIV",
+          "email": "viro@zeniv.linux.org.uk",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "The author disputes Al Viro's analysis, stating that Claude's earlier findings were misleading due to a duplicate entry in the list walk.\n\nThe author is addressing Al Viro's concern that the dispose list was a proper ring, but instead found self-loops and cycles in the list. The author confirms this observation and clarifies that the list was not a valid ring.\n\nThe author addresses Al Viro's concern that the UAF (use-after-free) bug is likely due to a different cause than the busy-wait patch, and suggests that the dentry being freed is actually from the global LRU. The author provides comparative analysis across three vmcores, highlighting consistent findings such as had_submounts being False in every case, no mounts under /proc/<pid>/... in any mount namespace, and the UAF'd dentry being in a non-dentry slab in every case.",
+          "sentiment": "contentious",
+          "sentiment_signals": [
+            "disputes",
+            "strongly disagrees",
+            "clarification",
+            "no clear resolution",
+            "no clear resolution signal",
+            "author provides analysis but does not confirm or deny Al Viro's concern"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I think the above is BS. Claude says:\n\nIn the earlier analysis I walked the list both forward from \nhead_B (the stack entry) and backward from head_A  That was misleading\n— there's only one mountinfo node. The ring passes through it once. The\nduplicate in my listing was an artifact of walking the ring from two\nentry points and not  deduplicating.\n\n---\n\nNo:\n\nThe list was NOT a proper ring:\n\n  - FWD (head.next): LOOP at entry 1 — immediately hits a self-loop (the processed \"status\" dentry)\n  - BWD (head.prev): LOOP at entry 55 — walks 55 entries then hits a cycle\n\n---\n\nDefinitely not legitimately. I suspect some other sort of mem\ncorruption. /proc/1/mountinfo is on the list though:\n\nmountinfo dentries on dispose list: 1                                 \n                                                                                                    \n    /proc/1/mountinfo (dentry 0xffff88823deef800)                     \n      d_parent: 0xffff891373c06a80 \"1\" -> \"/\" (root)                  \n      hashed: yes (d_hash.pprev=0xffff893d337264d0)                   \n      PROC_I->pid nr: 3217077                                         \n      d_inode: 0xffff88ea55a44508                                     \n\nClaude's theory (maybe garbage):\n\nPID 1's mountinfo being on the list is actually a strong clue — it's\na dentry that would be on the global LRU (negative or zero-count\nafter someone closed /proc/1/mountinfo), and drop_caches would pull\nit off the LRU via prune_dcache_sb. That's likely how it ended up on\nThread B's dispose list.\n\nHere's a cursory comparitive analysis across the 3 vmcores I have so\nfar:\n\n  Comparative analysis across three vmcores                                                      \n  =========================================                                                      \n                                                                                                 \n  Kernel                  6.13.2-0_fbk5-hf2   6.13.2-0_fbk12-hf1      6.13.2-0_fbk5-hf2          \n  Date                    Mar 31               Apr 9                    Apr 2                    \n  Process                 SREventBase61        tokio-runtime-w          TTLSFWorkerU151          \n  d_invalidate target     /task/5964           /task/3555587            /task/1102               \n  had_submounts           False                False                    False                    \n  UAF slab                kmalloc-96           kmalloc-64               kmalloc-96               \n  UAF d_flags             0x0                  0x81e73ce0               0x0                      \n  UAF d_sb                0x0                  0x0                      0x0                      \n  UAF d_lockref.count     0                    -14080                   -771573072               \n\n  Consistent findings across all three cores:                                                    \n                        \n    - had_submounts is False in every case.  detach_mounts() and                                 \n      namespace_unlock() are not involved in any of these crashes.                               \n\n    - No mounts under /proc/<pid>/... in any mount namespace (checked                            \n      on the od0103 core across 49 namespaces, zero proc submounts).                             \n\n    - All three are in the same call path:                                                       \n        release_task -> proc_flush_pid -> d_invalidate ->                                        \n        shrink_dcache_parent -> shrink_dentry_list -> spin_lock (UAF)                            \n                                                \n    - The UAF'd dentry is in a non-dentry slab in every case (kmalloc-64                         \n      or kmalloc-96), confirming the dentry was freed and its page reused                        \n      by a different slab cache before shrink_dentry_list tried to lock it.                      \n                                                                                                 \n    - Different applications triggered the crash (Rust async runtime,                            \n      C++ worker, Java-like worker) -- not application-specific.",
+          "reply_to": "Al Viro",
+          "message_date": "2026-04-09",
+          "message_id": "a8fc5dfa19cf704c3f668f91443fdd1b2e01e612.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch aims to eliminate busy-waiting in the shrink_dcache_parent function, which is responsible for shrinking dentry lists when processes exit. The current implementation can lead to stalls and crashes due to a use-after-free (UAF) bug. The patch likely addresses this issue by modifying the code path that handles submounts and namespace locking, ensuring that detach_mounts() and namespace_unlock() are not involved in the crash. The problem is related to a complex scenario involving multiple threads, list heads, and dentry traversal, making it difficult to reproduce and debug. The patch is part of an ongoing effort to improve kernel stability and performance."
+    }
+  }
+}

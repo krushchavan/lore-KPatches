@@ -241,51 +241,262 @@
     <div class="date-range">Submitted: <strong>2026-04-08</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-09</strong><div class="date-range-nav">Active on: <a href="#2026-04-09">2026-04-09</a> &bull; <a href="#2026-04-08">2026-04-08</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch set improves write performance when using the RWF_DONTCACHE flag by kicking the flusher thread for the superblock instead of initiating writeback directly. This change is based on benchmarking results that show a clear improvement over the status quo, particularly in cases with heavy write activity. The patch also includes a comparison of different IO modes for nfsd and highlights the poor performance of RWF_DONTCACHE with write-heavy workloads. The approach taken involves modifying the generic_write_sync function to kick the flusher thread, which is expected to better isolate the DONTCACHE writeback behavior and improve overall performance.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0">
+<div class="thread-node depth-0" id="2026-04-08">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Jeff Layton</span>
+<span class="review-author">Jeff Layton (author)</span>
 <a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Provided a comparison between the current patch and a previous whole-BDI flusher kernel, highlighting performance regressions in some cases.</div>
-<div class="review-comment-signals">Signals: regression, performance</div>
+<div class="review-comment-text">The author is addressing concerns about the performance of the per-inode writeback approach, specifically that it regresses on multi-writer and random write workloads due to lost I/O batching. The author acknowledges this regression and suggests sticking with v2, which has a different approach.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Actually, that version regressed performance in a couple of cases. I think v2 is probably the best approach, on balance. Maybe we can get this into -next so that it can make v7.2?
+
+Here&#x27;s the comparison between this version and a writeback_single_inode() flush version:
+
+------------------8&lt;-----------------------
+
+● Comparing dontcache numbers against the previous whole-BDI flusher kernel (from /tmp/dontcache-local-4way-flusher.md):                                                                          
+
+  Per-Inode vs Whole-BDI Flusher — DONTCACHE on Local XFS                                                                                                                                         
+
+  Single-Client Writes
+
+  ┌──────────────────┬───────────┬───────────┬─────────────┐                                                                                                                                      
+  │    Benchmark     │ Whole-BDI │ Per-Inode │   Change    │                                                                                                                                      
+  ├──────────────────┼───────────┼───────────┼─────────────┤      
+  │ Seq write MB/s   │ 1450      │ 1438      │ -1% (noise) │
+  ├──────────────────┼───────────┼───────────┼─────────────┤
+  │ Seq write p99.9  │ 23.5 ms   │ 23.5 ms   │ identical   │
+  ├──────────────────┼───────────┼───────────┼─────────────┤                                                                                                                                      
+  │ Rand write MB/s  │ 363       │ 286       │ -21%        │
+  ├──────────────────┼───────────┼───────────┼─────────────┤                                                                                                                                      
+  │ Rand write p99.9 │ 1.8 ms    │ 16.7 ms   │ regression  │
+  └──────────────────┴───────────┴───────────┴─────────────┘
+
+  Seq write is identical. Rand write regressed — the whole-BDI flusher batched all dirty pages in one pass with writeback_sb_inodes() under a single blk_plug, while per-inode write_inode_now() loses that batching.
+
+  Single-Client Reads
+
+  ┌────────────────┬───────────┬───────────┬────────┐
+  │   Benchmark    │ Whole-BDI │ Per-Inode │ Change │
+  ├────────────────┼───────────┼───────────┼────────┤
+  │ Seq read MB/s  │ 2950      │ 2350      │ -20%   │
+  ├────────────────┼───────────┼───────────┼────────┤
+  │ Rand read MB/s │ 651       │ 519       │ -20%   │
+  └────────────────┴───────────┴───────────┴────────┘
+
+  Reads shouldn&#x27;t be affected by writeback path changes. Buffered reads also dropped (2888 → 2331), suggesting different system conditions between runs rather than a per-inode regression.
+
+  Multi-Writer (Scenario A)
+
+  ┌────────────────┬───────────┬───────────┬────────────┐
+  │     Metric     │ Whole-BDI │ Per-Inode │   Change   │
+  ├────────────────┼───────────┼───────────┼────────────┤
+  │ Aggregate MB/s │ 1478      │ 999       │ -32%       │
+  ├────────────────┼───────────┼───────────┼────────────┤
+  │ p99.9          │ 46 ms     │ 77 ms     │ -67% worse │
+  └────────────────┴───────────┴───────────┴────────────┘
+
+  This is the biggest regression. With whole-BDI, the flusher did one batched pass through all dirty inodes via writeback_sb_inodes(). With per-inode, each of 4 writers queues a separate work item processed serially by write_inode_now() — losing the batch I/O merging benefit.
+
+  Scenario C &amp; D (Noisy Neighbor)
+
+  ┌─────────────────────────┬───────────┬───────────┬─────────────┐
+  │         Metric          │ Whole-BDI │ Per-Inode │   Change    │
+  ├─────────────────────────┼───────────┼───────────┼─────────────┤
+  │ Scenario C writer       │ 1468      │ 1386      │ -6%         │
+  ├─────────────────────────┼───────────┼───────────┼─────────────┤
+  │ Scenario C readers      │ 18.7 MB/s │ 18.7 MB/s │ identical   │
+  ├─────────────────────────┼───────────┼───────────┼─────────────┤
+  │ Scenario D writer       │ 1472      │ 1467      │ identical   │
+  ├─────────────────────────┼───────────┼───────────┼─────────────┤
+  │ Scenario D readers      │ 496 MB/s  │ 507 MB/s  │ +2%         │
+  ├─────────────────────────┼───────────┼───────────┼─────────────┤
+  │ Scenario D reader p99.9 │ 440 us    │ 358 us    │ +19% better │
+  └─────────────────────────┴───────────┴───────────┴─────────────┘
+
+  Mixed-mode (Scenario D) is the intended production case and it&#x27;s essentially identical or slightly better — per-inode writeback creates less device contention for buffered readers.
+
+  Summary
+
+  The per-inode approach is neutral-to-slightly-better for the production scenario (Scenario D), but regresses on multi-writer and random write workloads. The core issue is loss of I/O batching
+ — writeback_sb_inodes() processes all dirty inodes in one blk_plug&#x27;d pass, while per-inode write_inode_now() calls are processed one at a time. The read regressions likely reflect different
+  system conditions since buffered/direct reads also dropped ~20%.
+
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/c2351220336d0ad99396a331bad34c6177bf354e.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: regression, acknowledged</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1" id="2026-04-08">
+<div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Christoph Hellwig</span>
 <a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the benchmark results provided in the patch description are incomplete and potentially stale, suggesting they be included directly in the patch for better reproducibility. Additionally, he questioned the validity of certain benchmark numbers, specifically the read changes between patches and unpatched dontcache in XFS and NFSD, requesting further investigation into their causes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Please add the results into the patch.  Besides having them in the patch
+vs the cover letter, URLs to random hosting sites tend to get stale
+very easily.
+
+Comments on the XFS numbers / benchmark setup:
+
+How does O_DIRECT manage to create almost the same peek dirty as
+buffered?  Similarly even this patched doncache show be lower, which
+feels odd.
+
+(the editorializing in these results feels odd, not sure what tool
+generates them, but maybe edit it for the commit log to look a bit more
+serious).
+
+Given that this patch does not change the read path, how do the pure read
+numbers for patches vs unpatched dontcache manage to differ so much?
+
+Comments on the NFSD numbers / benchmark setup:
+
+I though you were testing using dontcache on the server, but the
+comments seem to imply it is done on the client, what is the case
+here? 
+
+Again, the read changes between patches and unpatched look suspect.
+Please drill down why they happen, the fact that patches is slower here
+and faster in XFS makes me wonder if the results might just be very
+volatile?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/addBkBKySJUb8MB4@infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, questioned results</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Christoph Hellwig</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified potential downsides of limiting writeback to a specific inode, which aligns with previous concerns. Suggested considering the impact on performance and target release.</div>
+<div class="review-comment-text">Reviewer noted that limiting writeback to a specific inode has several drawbacks, which explains the poor performance of RWF_DONTCACHE in write-heavy workloads.
+
+Reviewer expressed concern about the timing of the patchset&#x27;s submission, noting that targeting 7.2 is not a priority and that the merge window for 7.1 is closing soon, also requesting input from Jens</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Wed, Apr 08, 2026 at 02:45:32PM -0400, Jeff Layton wrote:
-&gt; &gt; Assuming that looks OK, I&#x27;ll probably send a v3. Original cover letter
-&gt; &gt; from v1 follows:
-&gt; &gt; 
-&gt; 
-&gt; Actually, that version regressed performance in a couple of cases.
-&gt; I think v2 is probably the best approach, on balance.
-
-Limiting writeback to a specific inode has many downsides as I explained
+<pre class="raw-body-text">Limiting writeback to a specific inode has many downsides as I explained
 before, so this is not surprising.
 
-&gt; Maybe we can get this into -next so that it can make v7.2?
+---
 
 If you want to target 7.2 we&#x27;re not in any rush.  If you were trying to
 say 7.1 we&#x27;re way to close too the merge window.  We also haven&#x27;t
-heard from Jens at all, whom I&#x27;d really like to look over this.
-
-
-</pre>
+heard from Jens at all, whom I&#x27;d really like to look over this.</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Jeff Layton</div>
-<div class="review-comment-signals">Signals: concerns, performance</div>
+<a href="https://lore.kernel.org/r/addB-eRg5cXzZhHG@infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: no clear opinion or suggestion, concern, urgency</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Christoph Hellwig</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Christoph Hellwig noted that the current implementation of wakeup_flusher_threads_bdi causes WB_SYNC_NONE writeback to occur every time a DONTCACHE write finishes, which is inefficient and unnecessary. He suggested introducing a new WB_start_dontcache bit, a get_nr_dontcache_pages() helper function, and other related changes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">wakeup_flusher_threads_bdi ends up calling wb_start_writeback eventually,
+which sets WB_start_all, pushes the reason to start_all_reason and then
+does the actual wakeup.
+
+The flusher thread then through wb_check_start_all does a WB_SYNC_NONE
+writeback based on get_nr_dirty_pages.  Which seems wrong - we don&#x27;t
+want to do a huge writeback evertime the some DONTCACHE write finished.
+
+So I think you&#x27;ll want a new WB_start_dontcache bit, a new
+get_nr_dontcache_pages() helper on a new node counter, etc.</pre>
+</details>
+<a href="https://lore.kernel.org/r/adc-Q1iDWHD5yxHH@infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jan Kara</span>
+<a class="date-chip" href="../2026-04-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-09">2026-04-09</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Jan Kara noted that the patch can lead to performance regressions under certain workloads, specifically when a process creates a large temporary file and deletes it shortly after creation while another process does small DONTCACHE writes. This results in unnecessary allocation, writeback, and deletion of the temporary file.
+
+Reviewer Jan Kara expressed concerns about the patch&#x27;s approach to writeback and suggested two alternative solutions: either marking inodes with dropbehind set and restricting flush worker to only write such inodes, or lazily clearing an &#x27;inode has dropbehind folios&#x27; flag once the inode is clean.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This is all true and I can certainly construct a workload where this
+behavior will lead to big regressions in performance - for example one
+process creating say 1G temporary file and deleting it shortly after
+creation + one process doing small DONTCACHE writes. Before this change
+only DONTCACHE writes will make it to the disk and temporary file will only
+be in the page cache, after this change you pay for allocating, writing
+back, and deleting the temporary file.
+
+---
+
+But I&#x27;m not sure how you imagine this would work without restricting
+writeback to particular inodes. Maybe we could mark inodes which have
+folios with dropbehind set and make flush worker only write such inodes?
+That would probably require tracking number of folios with dropbehind flag
+per inode but that wouldn&#x27;t be too bad. Or we could just lazily clear this
+&quot;inode has dropbehind folios&quot; flag once the inode is clean.
+
+								Honza
+
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Christoph Hellwig</div>
+<a href="https://lore.kernel.org/r/gpcc6t5unsoepakjdffsmnmd5duuvijxwdochd753ttix75h7l@nahwzi4qfdcq" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: performance regressions, potential issue under specific workload, concerns</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Christoph Hellwig</span>
+<a class="date-chip" href="../2026-04-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-09">2026-04-09</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer suggested modifying the patch to expedite writes by the number of pending don&#x27;t-cache folios, which would still prioritize writing the least recently dirtied inodes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I&#x27;d only expedite writing by the number of pending dontcache folios.
+It would still write the least recently dirtied inodes.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jan Kara</div>
+<a href="https://lore.kernel.org/r/ade14lOI1CDiraar@infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -294,7 +505,7 @@ heard from Jens at all, whom I&#x27;d really like to look over this.
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Ritesh (IBM)</span>
-<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-09">2026-04-09</a>
+<a class="date-chip" href="../2026-04-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-09">2026-04-09</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
@@ -316,6 +527,31 @@ If not, then IMO at least making it...
 </details>
 <a href="https://lore.kernel.org/r/tstklxm7.ritesh.list@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Christoph Hellwig</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Christoph Hellwig requested that the extra reason arguments for wide wakeups not be exposed outside the core writeback code, and also suggested marking wakeup_flusher_threads_bdi static in fs-writeback.c</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I&#x27;d rather not expose that to wide with the extra reason arguments
+that&#x27;s not otherwise exposed outside the core writeback code.
+
+Btw, wakeup_flusher_threads_bdi should really be marked static in
+fs-writeback.c as well.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Ritesh (IBM)</div>
+<a href="https://lore.kernel.org/r/adc-h4bhUFGqbejN@infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 </div>
 </div>
 </div>
