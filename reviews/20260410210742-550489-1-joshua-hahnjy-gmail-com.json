@@ -1,0 +1,60 @@
+{
+  "thread_id": "20260410210742.550489-1-joshua.hahnjy@gmail.com",
+  "subject": "[PATCH 0/8 RFC] mm/memcontrol, page_counter: move stock from mem_cgroup to page_counter",
+  "url": "https://lore.kernel.org/all/20260410210742.550489-1-joshua.hahnjy@gmail.com/",
+  "dates": {
+    "2026-04-10": {
+      "report_file": "2026-04-10_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "David Hildenbrand",
+          "summary": "Raised concerns about the impact of the change on cgroup v1 and suggested further testing to ensure the new design doesn't introduce performance regressions.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "PERFORMANCE_REGRESSION"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Zi Yan",
+          "summary": "Provided feedback on the patch series, suggesting improvements to the documentation and code organization.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "DOCUMENTATION"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Joshua Hahn",
+          "summary": "Responded to reviewer comments, addressing concerns and providing additional information on the patch series.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "In order to avoid expensive hierarchy walks on every memcg charge and\nlimit check, memcontrol uses per-cpu stocks (memcg_stock_pcp) to cache\npre-charged pages and introduce a fast path to try_charge_memcg.\n\nHowever, there are a few quirks with the current implementation that\ncould be improved upon.\n\nFirst, each memcg_stock_pcp can only cache the charges of 7 memcgs\n(defined as NR_MEMCG_STOCK), which means that once a CPU starts handling\nthe charging of more than 7 memcgs, it randomly selects a victim memcg\nto evict and drain from the cpu, which can cause unnecessarily increased\nlatencies and thrashing as memcgs continually evict each others' stock.\n\nSecond, stock is tightly coupled with memcg, which means that all page\ncounters in a memcg share the same resource. This may simplify some of\nthe charging logic, but it prevents new page counters from being added\nand using a separate stock.\n\nWe can address these concerns by pushing the concept of stock down to\nthe page_counter level, which addresses the random eviction problem by\ngetting rid of the 7 slot limit, and makes enabling separate stock\ncaches for other page_counters simpler.\n\nIntroduce a generic per-cpu stock directly in struct page_counter.\nStock can optionally be enabled per-page_counter, limiting the overhead\nincrease for page_counters who do not benefit greatly from caching\ncharges.\n\nThis patch introduces the page_counter_stock struct and its\nenable/disable/free functions, but does not use these yet.\n\nSuggested-by: Johannes Weiner <hannes@cmpxchg.org>\nSigned-off-by: Joshua Hahn <joshua.hahnjy@gmail.com>\n---\n include/linux/page_counter.h | 13 ++++++++\n mm/page_counter.c            | 60 ++++++++++++++++++++++++++++++++++++\n 2 files changed, 73 insertions(+)\n\ndiff --git a/include/linux/page_counter.h b/include/linux/page_counter.h\nindex d649b6bbbc871..c7e3ab3356d20 100644\n--- a/include/linux/page_counter.h\n+++ b/include/linux/page_counter.h\n@@ -5,8 +5,15 @@\n #include <linux/atomic.h>\n #include <linux/cache.h>\n #include <linux/limits.h>\n+#include <linux/local_lock.h>\n+#include <linux/percpu.h>\n #include <asm/page.h>\n \n+struct page_counter_stock {\n+\tlocal_trylock_t lock;\n+\tunsigned long nr_pages;\n+};\n+\n struct page_counter {\n \t/*\n \t * Make sure 'usage' does not share cacheline with any other field in\n@@ -41,6 +48,8 @@ struct page_counter {\n \tunsigned long high;\n \tunsigned long max;\n \tstruct page_counter *parent;\n+\tstruct page_counter_stock __percpu *stock;\n+\tunsigned int batch;\n } ____cacheline_internodealigned_in_smp;\n \n #if BITS_PER_LONG == 32\n@@ -99,6 +108,10 @@ static inline void page_counter_reset_watermark(struct page_counter *counter)\n \tcounter->watermark = usage;\n }\n \n+int page_counter_enable_stock(struct page_counter *counter, unsigned int batch);\n+void page_counter_disable_stock(struct page_counter *counter);\n+void page_counter_free_stock(struct page_counter *counter);\n+\n #if IS_ENABLED(CONFIG_MEMCG) || IS_ENABLED(CONFIG_CGROUP_DMEM)\n void page_counter_calculate_protection(struct page_counter *root,\n \t\t\t\t       struct page_counter *counter,\ndiff --git a/mm/page_counter.c b/mm/page_counter.c\nindex 661e0f2a5127a..965021993e161 100644\n--- a/mm/page_counter.c\n+++ b/mm/page_counter.c\n@@ -8,6 +8,7 @@\n #include <linux/page_counter.h>\n #include <linux/atomic.h>\n #include <linux/kernel.h>\n+#include <linux/percpu.h>\n #include <linux/string.h>\n #include <linux/sched.h>\n #include <linux/bug.h>\n@@ -289,6 +290,65 @@ int page_counter_memparse(const char *buf, const char *max,\n \treturn 0;\n }\n \n+int page_counter_enable_stock(struct page_counter *counter, unsigned int batch)\n+{\n+\tstruct page_counter_stock __percpu *stock;\n+\tint cpu;\n+\n+\tstock = alloc_percpu(struct page_counter_stock);\n+\tif (!stock)\n+\t\treturn -ENOMEM;\n+\n+\tfor_each_possible_cpu(cpu) {\n+\t\tstruct page_counter_stock *s = per_cpu_ptr(stock, cpu);\n+\n+\t\tlocal_trylock_init(&s->lock);\n+\t}\n+\tcounter->stock = stock;\n+\tcounter->batch = batch;\n+\n+\treturn 0;\n+}\n+\n+void page_counter_disable_stock(struct page_counter *counter)\n+{\n+\tunsigned int stock_to_drain = 0;\n+\tint cpu;\n+\n+\tif (!counter->stock)\n+\t\treturn;\n+\n+\tfor_each_possible_cpu(cpu) {\n+\t\tstruct page_counter_stock *stock;\n+\n+\t\t/*\n+\t\t * No need for local lock; this is called during css_offline,\n+\t\t * after the cgroup has already been removed.\n+\t\t */\n+\t\tstock = per_cpu_ptr(counter->stock, cpu);\n+\t\tstock_to_drain += stock->nr_pages;\n+\t}\n+\n+\tif (stock_to_drain) {\n+\t\tstruct page_counter *c;\n+\n+\t\tfor (c = counter; c; c = c->parent)\n+\t\t\tpage_counter_cancel(c, stock_to_drain);\n+\t}\n+\n+\t/* This prevents future charges from trying to deposit pages */\n+\tcounter->batch = 0;\n+}\n+\n+void page_counter_free_stock(struct page_counter *counter)\n+{\n+\tif (!counter->stock)\n+\t\treturn;\n+\n+\tfree_percpu(counter->stock);\n+\tcounter->stock = NULL;\n+}\n+\n \n #if IS_ENABLED(CONFIG_MEMCG) || IS_ENABLED(CONFIG_CGROUP_DMEM)\n /*\n-- \n2.52.0\n\n",
+          "reply_to": "",
+          "message_date": "2026-04-10",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series moves the per-cpu stock from mem_cgroup to page_counter, addressing limitations in the current design such as slot traversal and css refcounting. The change also introduces independent stock management for cgroup v1 memsw page_counter."
+    }
+  }
+}

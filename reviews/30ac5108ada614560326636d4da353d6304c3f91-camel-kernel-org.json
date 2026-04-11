@@ -1,0 +1,137 @@
+{
+  "thread_id": "30ac5108ada614560326636d4da353d6304c3f91.camel@kernel.org",
+  "subject": "[RFC][PATCH] make sure that lock_for_kill() callers drop the locks in safe order",
+  "url": "https://lore.kernel.org/all/30ac5108ada614560326636d4da353d6304c3f91.camel@kernel.org/",
+  "dates": {
+    "2026-04-10": {
+      "report_file": "2026-04-10_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Calvin Owens",
+          "summary": "Reviewer Calvin Owens reported that a reproducer he provided causes the system to hang in an infinite loop in d_walk() when using a stock 7.0-rc7 kernel, and suggested that this is not related to Al's livelock issue because only one thread is spinning on an otherwise idle machine.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "infinite loop",
+            "hang"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Hi Jeff,\n\nI've been poking at this one too. With the attached reproducer, the\nwaiter will get stuck in an infinite loop apparently in d_walk() with a\nstock 7.0-rc7 (in my case with PREEMPT_LAZY):\n\n        d_walk\n        list_empty (inlined)\n        shrink_dcache_tree\n        d_invalidate\n        proc_invalidate_siblings_dcache\n        release_task\n        wait_task_zombie (inlined)\n        wait_consider_task\n        do_wait_thread (inlined)\n        __do_wait\n        do_wait\n        kernel_wait4\n        __do_sys_wait4 (inlined)\n        __se_sys_wait4 (inlined)\n        __x64_sys_wait4\n        do_syscall_64\n        entry_SYSCALL_64_after_hwframe\n        __internal_syscall_cancel\n        __syscall_cancel\n        __wait4 (inlined)\n        os_wait_impl (inlined)\n        os_wait\n        _Py_LeaveRecursiveCallTstate (inlined)\n        cfunction_vectorcall_NOARGS\n        _PyObject_VectorcallTstate (inlined)\n        PyObject_Vectorcall\n\nIt doesn't happen 100% of the time, but it's never taken more than three\nattempts on two different machines. I've SIGKILL'd it and waited over an\nhour, it really never comes back. Making NR_FORKS larger than 3 was\ncounterproductive on my 32-thread machines, but YMMV of course.\n\nI haven't had time to dig more yet, but wanted to share the reproducer,\nhopefully it yields something useful on your end.\n\nI don't think this is Al's livelock, because only one thread is\nspinning on an otherwise idle machine... but I apologize if it is and\nit's going over my head.\n\nCheers,\nCalvin\n\n---\n#!/usr/bin/python3\n# sudo prlimit --nofile=10000000:10000000 ./repro.py\n\nimport os\n\nNR_FORKS = 3\n\nfor _ in range(NR_FORKS):\n\tpid = os.fork()\n\tif pid == 0:\n\t\tbreak\n\nfor dirpath, _, filenames in os.walk(\"/proc\"):\n\tfor fn in filenames:\n\t\ttry:\n\t\t\tos.open(os.path.join(dirpath, fn), os.O_RDONLY)\n\t\texcept:\n\t\t\tpass\n\nif pid == 0:\n\tos._exit(0)\n\nwhile True:\n\ttry:\n\t\tos.wait()\n\texcept ChildProcessError:\n\t\tos._exit(0)",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-04-10",
+          "message_id": "adln5vp9HFbX-oz0@mozart.vkv.me",
+          "email": "calvin@wbinvd.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Al Viro",
+          "summary": "Reviewer Al Viro asked Calvin Owens to check if a specific Git repository branch reproduces the issue, indicating that he wants to verify whether the problem is consistent across different setups.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "request for verification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Interesting...  I'll try it in a bit, but just in case - could you check if\ngit://git.kernel.org/pub/scm/linux/kernel/git/viro/vfs.git #work.dcache-busy-wait\nsteps into the same thing on your setup?",
+          "reply_to": "Calvin Owens",
+          "message_date": "2026-04-10",
+          "message_id": "20260410212403.GY3836593@ZenIV",
+          "email": "viro@zeniv.linux.org.uk",
+          "is_maintainer": false
+        },
+        {
+          "author": "Calvin Owens",
+          "summary": "Calvin Owens noted that the infinite spins issue is related to 'magic' symlinks in /proc/$/fd/*, and provided a patch (fs/proc: Implement d_weak_revalidate()) that makes it impossible to trigger the hang with his reproducer.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "guessing",
+            "apologies"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Al,\n\nIt still reproduces on that branch in the exact same way.\n\nI'm absolutely 100% guessing... but I recall tomfoolery with the \"magic\"\nsymlinks in /proc/$/fd/* in the past... the below patch makes the infinite\nspins impossible to trigger with my reproducer, does my explanation make\nany sense to you? Apologies if I'm off in the weeds...\n\nThanks,\nCalvin\n\n---\nFrom: Calvin Owens <calvin@wbinvd.org>\nSubject: [PATCH] fs/proc: Implement d_weak_revalidate()\n\nI think this is necessary because ND_JUMPED can happen in /proc when\nthe magic symlinks in /proc/$/fd/* point to files in /proc. If true,\nthis is a problem, because the default behavior for d_weak_revalidate()\nis to assume the jumped-to dentries are always valid.\n\nFix by checking the in_use count in d_weak_revalidate() for procfs, the\nsame way it is checked in procfs d_revalidate() today.\n\nSigned-off-by: Calvin Owens <calvin@wbinvd.org>\n---\n fs/proc/generic.c | 22 +++++++++++++++++-----\n 1 file changed, 17 insertions(+), 5 deletions(-)\n\ndiff --git a/fs/proc/generic.c b/fs/proc/generic.c\nindex 501889856461..359176e5eeb3 100644\n--- a/fs/proc/generic.c\n+++ b/fs/proc/generic.c\n@@ -216,15 +216,26 @@ void proc_free_inum(unsigned int inum)\n \tida_free(&proc_inum_ida, inum - PROC_DYNAMIC_FIRST);\n }\n \n+static int __proc_misc_revalidate(struct dentry *dentry)\n+{\n+\tif (atomic_read(&PDE(d_inode(dentry))->in_use) < 0)\n+\t\treturn 0; /* revalidate */\n+\treturn 1;\n+}\n+\n static int proc_misc_d_revalidate(struct inode *dir, const struct qstr *name,\n \t\t\t\t  struct dentry *dentry, unsigned int flags)\n {\n \tif (flags & LOOKUP_RCU)\n \t\treturn -ECHILD;\n \n-\tif (atomic_read(&PDE(d_inode(dentry))->in_use) < 0)\n-\t\treturn 0; /* revalidate */\n-\treturn 1;\n+\treturn __proc_misc_revalidate(dentry);\n+}\n+\n+static int proc_misc_d_weak_revalidate(struct dentry * dentry,\n+\t\t\t\t       unsigned int flags)\n+{\n+\treturn __proc_misc_revalidate(dentry);\n }\n \n static int proc_misc_d_delete(const struct dentry *dentry)\n@@ -233,8 +244,9 @@ static int proc_misc_d_delete(const struct dentry *dentry)\n }\n \n static const struct dentry_operations proc_misc_dentry_ops = {\n-\t.d_revalidate\t= proc_misc_d_revalidate,\n-\t.d_delete\t= proc_misc_d_delete,\n+\t.d_revalidate\t\t= proc_misc_d_revalidate,\n+\t.d_weak_revalidate\t= proc_misc_d_weak_revalidate,\n+\t.d_delete\t\t= proc_misc_d_delete,\n };\n \n /*\n-- \n2.47.3",
+          "reply_to": "Al Viro",
+          "message_date": "2026-04-10",
+          "message_id": "adl2dMjN2hmVvORh@mozart.vkv.me",
+          "email": "calvin@wbinvd.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Calvin Owens",
+          "summary": "Reviewer Calvin Owens noted that a pathological behavior involving d_walk() spin consistently triggered when the reproducer didn't ignore itself in /proc, and suspected the magic symlinks as the cause.\n\nReviewer Calvin Owens expressed appreciation for the patch author's efforts and offered to test additional reproducer configurations, indicating that the issue is consistent on two different machines.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "pathological behavior",
+            "suspected magic symlinks",
+            "appreciation",
+            "willingness_to_test"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yes exactly, I was trying a lot of different pathological behaviors and\nthat was the first pattern I found that triggered the d_walk() spin\nconsistently.\n\nInitially I made the reproducer ignore itself in /proc. But it turns out\nto be much more reliable if it *doesn't*. I realized it was opening its\nown children's files in /proc/*/fd/*, and the children were also opening\nother /proc files, which is what made me suspect the magic symlinks.\n\n---\n\nI'm sure I can narrow down the reproducer more, I'll try a bit.\n\nI appreciate you taking a look. I'm happy to test anything else you like\nif that reproducer isn't working for you, it's very consistent for me on\ntwo different machines. Hopefully it works for Jeff.\n\nThanks,\nCalvin",
+          "reply_to": "Al Viro",
+          "message_date": "2026-04-10",
+          "message_id": "admIGCR-xGfKgIQ-@mozart.vkv.me",
+          "email": "calvin@wbinvd.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch ensures that callers of the lock_for_kill() function properly drop locks in a safe order to prevent potential deadlocks or hangs."
+    },
+    "2026-04-11": {
+      "report_file": "2026-04-10_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Al Viro",
+          "summary": "Reviewer Al Viro noted that the patch's test case is causing a livelock or UAF in dcache due to threads opening and exiting files in /proc/*, leading to invalidation of /proc/* and triggering unnecessary cleanup. He suggested that the mix of files being opened was unpredictable and requested further investigation.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "further investigation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "What it's doing, AFAICS, is a weird way of opening arseloads of files, mostly\nthe same ones again and again - the reason it needs that prlimit (there's\nway fewer files in procfs when it starts) is that these threads keep running\nthrough each other's /proc/*/fd and opening what they'd got again and again,\nadding to /proc/*/fd/* as they go.\n\nIOW, you are opening a random mix of files, both procfs and ones some processes\nhad opened, then exiting.  That triggers invalidation of your /proc/*, with\na _lot_ of shite that needs to be taken out.  It might be triggering a livelock\nor a UAF somewhere in dcache or it might be something entirely different -\nno idea at that point.  I'll look further into that, but I wouldn't be surprised\nif it turns out to be entirely unrelated.  Would be easier to deal with if the\nmix had been more predictable, but we have what we have...",
+          "reply_to": "Calvin Owens",
+          "message_date": "2026-04-11",
+          "message_id": "20260410230553.GZ3836593@ZenIV",
+          "email": "viro@zeniv.linux.org.uk",
+          "is_maintainer": false
+        },
+        {
+          "author": "Al Viro",
+          "summary": "Reviewer Al Viro demonstrated a pathological case where d_invalidate() gets stuck in an infinite loop due to a large number of busy dentries, and suggested that the patch should not use shrink_dcache_parent() in d_invalidate().",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "No need...  Just have parent and child share descriptor table, then let parent\nwait for child and child do\n\tchar buf[128], buf2[128];\n\tint fd = 0, n;\n\tdo {\n\t\tn = fd;\n\t\tsprintf(buf, \"/proc/self/fdinfo/%d\", fd);\n\t\tfd = open(buf, 0);\n\t} while (fd >= 0);\n\tfor (int i = 0; i <= n; i++) {\n\t\tsprintf(buf, \"/proc/self/fd/%d\", i);\n\t\treadlink(buf, buf2, sizeof(buf2));\n\t}\nand that's it.\n\nThat's a nice demonstration of how nasty conditions can be arranged for\nd_invalidate(); *plenty* of busy dentries in the tree (to the tune of\nseveral millions), with some evictables scattered here and there.\nIf you get enough busy stuff to wade through until you find an eviction\ncandidate, you'll get select_collect() return D_WALK_QUIT as soon as you\nget a single evictable sucker.  Of course, then you need to restart\nthe whole thing - with the same pile of busy ones to get through.  Repeat\nfor every single evictable left in there.\n\nNo memory corruption involved, just a fuckton of rescans ;-/\nIt *is* recoverable - you just need to flush caches hard enough and that'll\nunwedge the sucker.\n\nIMO that's a very convincing argument for not using shrink_dcache_parent()\nin d_invalidate().\n\nThat goes back to 2.1.65 - very early in dcache history.  Back then (and\nuntil about 2014, IIRC) it had been \"try to evict the subtree, unhash\nif they are all gone, fail otherwise\"; these days it's worse, since\nd_invalidate() is not allowed to fail.\n\n\"Rescan if we have found something and ran out of timeslice\" is there since\n2005 mingo's 116194f29f13 \"[PATCH] sched: vfs: fix scheduling latencies in\nprune_dcache() and select_parent()\" - latency problems prior to that got\ntraded for this \"rescan the same pile of busy stuff for each evictable\"\npathological behaviour.\n\nFWIW, it doesn't have to be on procfs - you can arrange for something similar\nwith fuse.\n\nJoy...",
+          "reply_to": "Calvin Owens",
+          "message_date": "2026-04-11",
+          "message_id": "20260411005126.GA3836593@ZenIV",
+          "email": "viro@zeniv.linux.org.uk",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch ensures that callers of the lock_for_kill() function properly drop locks in a safe order to prevent potential deadlocks or hangs."
+    }
+  }
+}
