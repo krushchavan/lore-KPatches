@@ -238,635 +238,22 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/4] arm64/mm: contpte-sized exec folios for 16K and 64K pages</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-13</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-18</strong><div class="date-range-nav">Active on: <a href="#2026-03-19">2026-03-19</a> &bull; <a href="#2026-03-18">2026-03-18</a> &bull; <a href="#2026-03-16">2026-03-16</a> &bull; <a href="#2026-03-14">2026-03-14</a> &bull; <a href="#2026-03-13">2026-03-13</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-03-14</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-18</strong><div class="date-range-nav">Active on: <a href="#2026-03-19">2026-03-19</a> &bull; <a href="#2026-03-18">2026-03-18</a> &bull; <a href="#2026-03-16">2026-03-16</a> &bull; <a href="#2026-03-14">2026-03-14</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses issues with contpte-sized exec folios on arm64, specifically for 16K and 64K page configurations. The first issue is that the current implementation returns an incorrect order for these page sizes, which is fixed by using a different calculation. The second issue is that readahead is disabled after 100 page faults due to the mmap_miss heuristic, but this only happens on 64K pages because the decrement paths are inactive. This is fixed by moving the VM_EXEC readahead block above the mmap_miss check. Finally, the patch ensures that the virtual address is aligned to CONT_PTE_SIZE (2M) for contpte mapping, which requires alignment of the VMA start address.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-03-13">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> David (Arm)</span>
-<a class="date-chip" href="../2026-03-13_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-13">2026-03-13</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer David (Arm) questioned the assumption that a single order is sufficient for contpte mapping, suggesting that decisions should be based on the mapping size instead.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On 3/10/26 15:51, Usama Arif wrote:
-&gt; On arm64, the contpte hardware feature coalesces multiple contiguous PTEs
-&gt; into a single iTLB entry, reducing iTLB pressure for large executable
-&gt; mappings.
-&gt; 
-&gt; exec_folio_order() was introduced [1] to request readahead at an
-&gt; arch-preferred folio order for executable memory, enabling contpte
-&gt; mapping on the fault path.
-&gt; 
-&gt; However, several things prevent this from working optimally on 16K and
-&gt; 64K page configurations:
-&gt; 
-&gt; 1. exec_folio_order() returns ilog2(SZ_64K &gt;&gt; PAGE_SHIFT), which only
-&gt;    produces the optimal contpte order for 4K pages. For 16K pages it
-&gt;    returns order 2 (64K) instead of order 7 (2M), and for 64K pages it
-&gt;    returns order 0 (64K) instead of order 5 (2M). Patch 1 fixes this by
-&gt;    using ilog2(CONT_PTES) which evaluates to the optimal order for all
-&gt;    page sizes.
-&gt; 
-&gt; 2. Even with the optimal order, the mmap_miss heuristic in
-&gt;    do_sync_mmap_readahead() silently disables exec readahead after 100
-&gt;    page faults. The mmap_miss counter tracks whether readahead is useful
-&gt;    for mmap&#x27;d file access:
-&gt; 
-&gt;    - Incremented by 1 in do_sync_mmap_readahead() on every page cache
-&gt;      miss (page needed IO).
-&gt; 
-&gt;    - Decremented by N in filemap_map_pages() for N pages successfully
-&gt;      mapped via fault-around (pages found in cache without faulting,
-&gt;      evidence that readahead was useful). Only non-workingset pages
-&gt;      count and recently evicted and re-read pages don&#x27;t count as hits.
-&gt; 
-&gt;    - Decremented by 1 in do_async_mmap_readahead() when a PG_readahead
-&gt;      marker page is found (indicates sequential consumption of readahead
-&gt;      pages).
-&gt; 
-&gt;    When mmap_miss exceeds MMAP_LOTSAMISS (100), all readahead is
-&gt;    disabled. On 64K pages, both decrement paths are inactive:
-&gt; 
-&gt;    - filemap_map_pages() is never called because fault_around_pages
-&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
-&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
-&gt;      fault-around window, there is nothing &quot;around&quot; to map.
-&gt; 
-&gt;    - do_async_mmap_readahead() never fires for exec mappings because
-&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
-&gt;      are placed.
-&gt; 
-&gt;    With no decrements, mmap_miss monotonically increases past
-&gt;    MMAP_LOTSAMISS after 100 faults, disabling exec readahead
-&gt;    for the remainder of the mapping.
-&gt;    Patch 2 fixes this by moving the VM_EXEC readahead block
-&gt;    above the mmap_miss check, since exec readahead is targeted (one
-&gt;    folio at the fault location, async_size=0) not speculative prefetch.
-&gt; 
-&gt; 3. Even with correct folio order and readahead, contpte mapping requires
-&gt;    the virtual address to be aligned to CONT_PTE_SIZE (2M on 64K pages).
-&gt;    The readahead path aligns file offsets and the buddy allocator aligns
-&gt;    physical memory, but the virtual address depends on the VMA start.
-&gt;    For PIE binaries, ASLR randomizes the load address at PAGE_SIZE (64K)
-&gt;    granularity, giving only a 1/32 chance of 2M alignment. When
-&gt;    misaligned, contpte_set_ptes() never sets the contiguous PTE bit for
-&gt;    any folio in the VMA, resulting in zero iTLB coalescing benefit.
-&gt; 
-&gt;    Patch 3 fixes this for the main binary by bumping the ELF loader&#x27;s
-&gt;    alignment to PAGE_SIZE &lt;&lt; exec_folio_order() for ET_DYN binaries.
-&gt; 
-&gt;    Patch 4 fixes this for shared libraries by adding a contpte-size
-&gt;    alignment fallback in thp_get_unmapped_area_vmflags(). The existing
-&gt;    PMD_SIZE alignment (512M on 64K pages) is too large for typical shared
-&gt;    libraries, so this smaller fallback (2M) succeeds where PMD fails.
-&gt; 
-&gt; I created a benchmark that mmaps a large executable file and calls
-&gt; RET-stub functions at PAGE_SIZE offsets across it. &quot;Cold&quot; measures
-&gt; fault + readahead cost. &quot;Random&quot; first faults in all pages with a
-&gt; sequential sweep (not measured), then measures time for calling random
-&gt; offsets, isolating iTLB miss cost for scattered execution.
-&gt; 
-&gt; The benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,
-&gt; 512MB executable file on ext4, averaged over 3 runs:
-&gt; 
-&gt;   Phase      | Baseline     | Patched      | Improvement
-&gt;   -----------|--------------|--------------|------------------
-&gt;   Cold fault | 83.4 ms      | 41.3 ms      | 50% faster
-&gt;   Random     | 76.0 ms      | 58.3 ms      | 23% faster
-
-I&#x27;m curious: is a single order really what we want?
-
-I&#x27;d instead assume that we might want to make decisions based on the
-mapping size.
-
-Assume you have a 128M mapping, wouldn&#x27;t we want to use a different
-alignment than, say, for a 1M mapping, a 128K mapping or a 8k mapping?
-
--- 
-Cheers,
-
-David
-
----
-
-On 3/13/26 20:59, Usama Arif wrote:
-&gt; 
-&gt; 
-&gt; On 13/03/2026 16:20, David Hildenbrand (Arm) wrote:
-&gt;&gt; On 3/10/26 15:51, Usama Arif wrote:
-&gt;&gt;&gt; On arm64, the contpte hardware feature coalesces multiple contiguous PTEs
-&gt;&gt;&gt; into a single iTLB entry, reducing iTLB pressure for large executable
-&gt;&gt;&gt; mappings.
-&gt;&gt;&gt;
-&gt;&gt;&gt; exec_folio_order() was introduced [1] to request readahead at an
-&gt;&gt;&gt; arch-preferred folio order for executable memory, enabling contpte
-&gt;&gt;&gt; mapping on the fault path.
-&gt;&gt;&gt;
-&gt;&gt;&gt; However, several things prevent this from working optimally on 16K and
-&gt;&gt;&gt; 64K page configurations:
-&gt;&gt;&gt;
-&gt;&gt;&gt; 1. exec_folio_order() returns ilog2(SZ_64K &gt;&gt; PAGE_SHIFT), which only
-&gt;&gt;&gt;    produces the optimal contpte order for 4K pages. For 16K pages it
-&gt;&gt;&gt;    returns order 2 (64K) instead of order 7 (2M), and for 64K pages it
-&gt;&gt;&gt;    returns order 0 (64K) instead of order 5 (2M). Patch 1 fixes this by
-&gt;&gt;&gt;    using ilog2(CONT_PTES) which evaluates to the optimal order for all
-&gt;&gt;&gt;    page sizes.
-&gt;&gt;&gt;
-&gt;&gt;&gt; 2. Even with the optimal order, the mmap_miss heuristic in
-&gt;&gt;&gt;    do_sync_mmap_readahead() silently disables exec readahead after 100
-&gt;&gt;&gt;    page faults. The mmap_miss counter tracks whether readahead is useful
-&gt;&gt;&gt;    for mmap&#x27;d file access:
-&gt;&gt;&gt;
-&gt;&gt;&gt;    - Incremented by 1 in do_sync_mmap_readahead() on every page cache
-&gt;&gt;&gt;      miss (page needed IO).
-&gt;&gt;&gt;
-&gt;&gt;&gt;    - Decremented by N in filemap_map_pages() for N pages successfully
-&gt;&gt;&gt;      mapped via fault-around (pages found in cache without faulting,
-&gt;&gt;&gt;      evidence that readahead was useful). Only non-workingset pages
-&gt;&gt;&gt;      count and recently evicted and re-read pages don&#x27;t count as hits.
-&gt;&gt;&gt;
-&gt;&gt;&gt;    - Decremented by 1 in do_async_mmap_readahead() when a PG_readahead
-&gt;&gt;&gt;      marker page is found (indicates sequential consumption of readahead
-&gt;&gt;&gt;      pages).
-&gt;&gt;&gt;
-&gt;&gt;&gt;    When mmap_miss exceeds MMAP_LOTSAMISS (100), all readahead is
-&gt;&gt;&gt;    disabled. On 64K pages, both decrement paths are inactive:
-&gt;&gt;&gt;
-&gt;&gt;&gt;    - filemap_map_pages() is never called because fault_around_pages
-&gt;&gt;&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
-&gt;&gt;&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
-&gt;&gt;&gt;      fault-around window, there is nothing &quot;around&quot; to map.
-&gt;&gt;&gt;
-&gt;&gt;&gt;    - do_async_mmap_readahead() never fires for exec mappings because
-&gt;&gt;&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
-&gt;&gt;&gt;      are placed.
-&gt;&gt;&gt;
-&gt;&gt;&gt;    With no decrements, mmap_miss monotonically increases past
-&gt;&gt;&gt;    MMAP_LOTSAMISS after 100 faults, disabling exec readahead
-&gt;&gt;&gt;    for the remainder of the mapping.
-&gt;&gt;&gt;    Patch 2 fixes this by moving the VM_EXEC readahead block
-&gt;&gt;&gt;    above the mmap_miss check, since exec readahead is targeted (one
-&gt;&gt;&gt;    folio at the fault location, async_size=0) not speculative prefetch.
-&gt;&gt;&gt;
-&gt;&gt;&gt; 3. Even with correct folio order and readahead, contpte mapping requires
-&gt;&gt;&gt;    the virtual address to be aligned to CONT_PTE_SIZE (2M on 64K pages).
-&gt;&gt;&gt;    The readahead path aligns file offsets and the buddy allocator aligns
-&gt;&gt;&gt;    physical memory, but the virtual address depends on the VMA start.
-&gt;&gt;&gt;    For PIE binaries, ASLR randomizes the load address at PAGE_SIZE (64K)
-&gt;&gt;&gt;    granularity, giving only a 1/32 chance of 2M alignment. When
-&gt;&gt;&gt;    misaligned, contpte_set_ptes() never sets the contiguous PTE bit for
-&gt;&gt;&gt;    any folio in the VMA, resulting in zero iTLB coalescing benefit.
-&gt;&gt;&gt;
-&gt;&gt;&gt;    Patch 3 fixes this for the main binary by bumping the ELF loader&#x27;s
-&gt;&gt;&gt;    alignment to PAGE_SIZE &lt;&lt; exec_folio_order() for ET_DYN binaries.
-&gt;&gt;&gt;
-&gt;&gt;&gt;    Patch 4 fixes this for shared libraries by adding a contpte-size
-&gt;&gt;&gt;    alignment fallback in thp_get_unmapped_area_vmflags(). The existing
-&gt;&gt;&gt;    PMD_SIZE alignment (512M on 64K pages) is too large for typical shared
-&gt;&gt;&gt;    libraries, so this smaller fallback (2M) succeeds where PMD fails.
-&gt;&gt;&gt;
-&gt;&gt;&gt; I created a benchmark that mmaps a large executable file and calls
-&gt;&gt;&gt; RET-stub functions at PAGE_SIZE offsets across it. &quot;Cold&quot; measures
-&gt;&gt;&gt; fault + readahead cost. &quot;Random&quot; first faults in all pages with a
-&gt;&gt;&gt; sequential sweep (not measured), then measures time for calling random
-&gt;&gt;&gt; offsets, isolating iTLB miss cost for scattered execution.
-&gt;&gt;&gt;
-&gt;&gt;&gt; The benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,
-&gt;&gt;&gt; 512MB executable file on ext4, averaged over 3 runs:
-&gt;&gt;&gt;
-&gt;&gt;&gt;   Phase      | Baseline     | Patched      | Improvement
-&gt;&gt;&gt;   -----------|--------------|--------------|------------------
-&gt;&gt;&gt;   Cold fault | 83.4 ms      | 41.3 ms      | 50% faster
-&gt;&gt;&gt;   Random     | 76.0 ms      | 58.3 ms      | 23% faster
-&gt;&gt;
-&gt;&gt; I&#x27;m curious: is a single order really what we want?
-&gt;&gt;
-&gt;&gt; I&#x27;d instead assume that we might want to make decisions based on the
-&gt;&gt; mapping size.
-&gt;&gt;
-&gt;&gt; Assume you have a 128M mapping, wouldn&#x27;t we want to use a different
-&gt;&gt; alignment than, say, for a 1M mapping, a 128K mapping or a 8k mapping?
-&gt;&gt;
-&gt; 
-&gt; So I see 2 benefits from this. Page fault and iTLB coverage. IMHO page
-&gt; faults are not that big of a deal? If the text section is hot, it wont
-&gt; get flushed after faulting in. So the real benefit comes from improved
-&gt; iTLB coverage.
-&gt; 
-&gt; For a 128M mapping, 2M alignment gives 64 contpte entries. Aligning
-&gt; to something larger (say 128M) wouldn&#x27;t give any additional TLB
-&gt; coalescing, each 2M-aligned region independently qualifies for contpte.
-&gt; 
-&gt; Mappings smaller than 2M can&#x27;t benefit from contpte regardless of
-&gt; alignment, so falling back to PAGE_SIZE would be the optimal behaviour.
-&gt; Adding intermediate sizes (e.g. 512K, 128K) wouldn&#x27;t map to any
-&gt; hardware boundary and adds complexity without TLB benefit?
-
-I might be wrong, but I think you are mixing two things here:
-
-(1) &quot;Minimum&quot; folio size (exec_folio_order())
-
-(2) VMA alignment.
-
-
-(2) should certainly be as large as (1), but assume we can get a 2M
-folio on arm64 4k, why shouldn&#x27;t we align it to 2M if the region is
-reasonably sized, and use a PMD?
-
-
--- 
-Cheers,
-
-David
-
----
-
-On 3/18/26 11:41, Usama Arif wrote:
-&gt; 
-&gt; 
-&gt; On 16/03/2026 19:06, David Hildenbrand (Arm) wrote:
-&gt;&gt; On 3/13/26 20:59, Usama Arif wrote:
-&gt;&gt;&gt;
-&gt;&gt;&gt;
-&gt;&gt;&gt;
-&gt;&gt;&gt; So I see 2 benefits from this. Page fault and iTLB coverage. IMHO page
-&gt;&gt;&gt; faults are not that big of a deal? If the text section is hot, it wont
-&gt;&gt;&gt; get flushed after faulting in. So the real benefit comes from improved
-&gt;&gt;&gt; iTLB coverage.
-&gt;&gt;&gt;
-&gt;&gt;&gt; For a 128M mapping, 2M alignment gives 64 contpte entries. Aligning
-&gt;&gt;&gt; to something larger (say 128M) wouldn&#x27;t give any additional TLB
-&gt;&gt;&gt; coalescing, each 2M-aligned region independently qualifies for contpte.
-&gt;&gt;&gt;
-&gt;&gt;&gt; Mappings smaller than 2M can&#x27;t benefit from contpte regardless of
-&gt;&gt;&gt; alignment, so falling back to PAGE_SIZE would be the optimal behaviour.
-&gt;&gt;&gt; Adding intermediate sizes (e.g. 512K, 128K) wouldn&#x27;t map to any
-&gt;&gt;&gt; hardware boundary and adds complexity without TLB benefit?
-&gt;&gt;
-&gt;&gt; I might be wrong, but I think you are mixing two things here:
-&gt;&gt;
-&gt;&gt; (1) &quot;Minimum&quot; folio size (exec_folio_order())
-&gt;&gt;
-&gt;&gt; (2) VMA alignment.
-&gt;&gt;
-&gt;&gt;
-&gt;&gt; (2) should certainly be as large as (1), but assume we can get a 2M
-&gt;&gt; folio on arm64 4k, why shouldn&#x27;t we align it to 2M if the region is
-&gt;&gt; reasonably sized, and use a PMD?
-&gt;&gt;
-&gt;&gt;
-&gt; 
-&gt; So this series is tackling both (1) and (2). When I started making changes
-&gt; to the code, what I wanted was 2M folios at fault with 64K base page size
-&gt; to reduce iTLB misses. This is what patch 1 (and 2) will achieve.
-&gt; 
-&gt; Yes, completely agree, (2) should be as large as (1). I didn&#x27;t think about
-&gt; PMD size on 4K which you pointed out. do_sync_mmap_readahead can give
-&gt; that with force_thp_readahead, so this should be supported.
-
-In particular, imagine if hw starts optimizing transparently on other
-granularity, then the &quot;smallest granularity&quot; (exec_folio_order())
-decision will soon be wrong.
-
-&gt; 
-&gt; But we shouldn&#x27;t align to PMD size for all base page sizes. As Rui pointed
-&gt; out, increasing alignment size reduces ASLR entropy [1]. Should we max alignement
-&gt; to 2M?
-
-That&#x27;s why I said that likely, as an input, we&#x27;d want to use the mapping
-size or other heuristics.
-
-We wouldn&#x27;t want to align a 4k mapping to either 64k or 2M.
-
-Long story short: the change in thp_get_unmapped_area_vmflags() needs
-some thought IMHO.
-
--- 
-Cheers,
-
-David
-
----
-
-On 3/10/26 15:51, Usama Arif wrote:
-&gt; exec_folio_order() was introduced [1] to request readahead of executable
-&gt; file-backed pages at an arch-preferred folio order, so that the hardware
-&gt; can coalesce contiguous PTEs into fewer iTLB entries (contpte).
-&gt; 
-&gt; The current implementation uses ilog2(SZ_64K &gt;&gt; PAGE_SHIFT), which
-&gt; requests 64K folios. This is optimal for 4K base pages (where CONT_PTES
-&gt; = 16, contpte size = 64K), but suboptimal for 16K and 64K base pages:
-&gt; 
-&gt; Page size | Before (order) | After (order) | contpte
-&gt; ----------|----------------|---------------|--------
-&gt; 4K        | 4 (64K)        | 4 (64K)       | Yes (unchanged)
-&gt; 16K       | 2 (64K)        | 7 (2M)        | Yes (new)
-&gt; 64K       | 0 (64K)        | 5 (2M)        | Yes (new)
-&gt; 
-&gt; For 16K pages, CONT_PTES = 128 and the contpte size is 2M (order 7).
-&gt; For 64K pages, CONT_PTES = 32 and the contpte size is 2M (order 5).
-&gt; 
-&gt; Use ilog2(CONT_PTES) instead, which directly evaluates to contpte-aligned
-&gt; order for all page sizes.
-&gt; 
-&gt; The worst-case waste is bounded to one folio (up to 2MB - 64KB)
-&gt; at the end of the file, since page_cache_ra_order() reduces the folio
-&gt; order near EOF to avoid allocating past i_size.
-
-So, if you have a smallish text segment in a larger file, we&#x27;d always
-try to allocate 2M on 16k/64k?
-
-That feels wrong.
-
-Asking the other way around: why not also use 2M on a 4k system and end
-up with a PMD?
-
-And no, I don&#x27;t think we should default to that, just emphasizing my
-point that *maybe* we really want to consider mapping (vma) size as well.
-
--- 
-Cheers,
-
-David
-
----
-
-On 3/18/26 17:43, Jan Kara wrote:
-&gt; On Tue 10-03-26 07:51:15, Usama Arif wrote:
-&gt;&gt; The mmap_miss counter in do_sync_mmap_readahead() tracks whether
-&gt;&gt; readahead is useful for mmap&#x27;d file access. It is incremented by 1 on
-&gt;&gt; every page cache miss in do_sync_mmap_readahead(), and decremented in
-&gt;&gt; two places:
-&gt;&gt;
-&gt;&gt;   - filemap_map_pages(): decremented by N for each of N pages
-&gt;&gt;     successfully mapped via fault-around (pages found already in cache,
-&gt;&gt;     evidence readahead was useful). Only pages not in the workingset
-&gt;&gt;     count as hits.
-&gt;&gt;
-&gt;&gt;   - do_async_mmap_readahead(): decremented by 1 when a page with
-&gt;&gt;     PG_readahead is found in cache.
-&gt;&gt;
-&gt;&gt; When the counter exceeds MMAP_LOTSAMISS (100), all readahead is
-&gt;&gt; disabled, including the targeted VM_EXEC readahead [1] that requests
-&gt;&gt; arch-preferred folio orders for contpte mapping.
-&gt;&gt;
-&gt;&gt; On arm64 with 64K base pages, both decrement paths are inactive:
-&gt;&gt;
-&gt;&gt;   1. filemap_map_pages() is never called because fault_around_pages
-&gt;&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
-&gt;&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
-&gt;&gt;      fault-around window, there is nothing &quot;around&quot; to map.
-&gt;&gt;
-&gt;&gt;   2. do_async_mmap_readahead() never fires for exec mappings because
-&gt;&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
-&gt;&gt;      are placed.
-&gt;&gt;
-&gt;&gt; With no decrements, mmap_miss monotonically increases past
-&gt;&gt; MMAP_LOTSAMISS after 100 page faults, disabling all subsequent
-&gt;&gt; exec readahead.
-&gt;&gt;
-&gt;&gt; Fix this by moving the VM_EXEC readahead block above the mmap_miss
-&gt;&gt; check. The exec readahead path is targeted. It reads a single folio at
-&gt;&gt; the fault location with async_size=0, not speculative prefetch, so the
-&gt;&gt; mmap_miss heuristic designed to throttle wasteful speculative readahead
-&gt;&gt; should not gate it. The page would need to be faulted in regardless,
-&gt;&gt; the only question is at what order.
-&gt;&gt;
-&gt;&gt; [1] https://lore.kernel.org/all/20250430145920.3748738-6-ryan.roberts@arm.com/
-&gt;&gt;
-&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
-&gt; 
-&gt; I can see the problem but I&#x27;m not sure what you propose is the right fix.
-&gt; If you move the VM_EXEC logic earlier, you&#x27;ll effectively disable
-&gt; VM_HUGEPAGE handling for VM_EXEC vmas which I don&#x27;t think we want. So
-&gt; shouldn&#x27;t we rather disable mmap_miss logic for VM_EXEC vmas like:
-&gt; 
-&gt; 	if (!(vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
-&gt; 		...
-&gt; 	}
-&gt; 
-
-That sounds reasonable to me.
-
--- 
-Cheers,
-
-David
-
----
-
-On 3/18/26 11:52, Usama Arif wrote:
-&gt; On Fri, 13 Mar 2026 13:55:38 -0700 Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
-&gt; 
-&gt;&gt; On Fri, 13 Mar 2026 16:33:42 +0000 Ryan Roberts &lt;ryan.roberts@arm.com&gt; wrote:
-&gt;&gt;
-&gt;&gt;&gt;
-&gt;&gt;&gt; This was deliberate, although perhaps a bit conservative. I was concerned about
-&gt;&gt;&gt; the possibility of read amplification; pointlessly reading in a load of memory
-&gt;&gt;&gt; that never actually gets used. And that is independent of page size.
-&gt;&gt;&gt;
-&gt;&gt;&gt; 2M seems quite big as a default IMHO, I could imagine Android might complain
-&gt;&gt;&gt; about memory pressure in their 16K config, for example.
-&gt;&gt;&gt;
-&gt;&gt;
-&gt;&gt; The force_thp_readahead path in do_sync_mmap_readahead() reads at
-&gt;&gt; HPAGE_PMD_ORDER (2M on x86) and even doubles it to 4M for
-&gt;&gt; non VM_RAND_READ mappings (ra-&gt;size *= 2), with async readahead
-&gt;&gt; enabled. exec_folio_order() is more conservative. a single 2M folio
-&gt;&gt; with async_size=0, no speculative prefetch. So I think the memory
-&gt;&gt; pressure would not be worse than what x86 has?
-&gt;&gt;
-&gt;&gt; For memory pressure on Android 16K: the readahead is clamped to VMA
-&gt;&gt; boundaries, so a small shared library won&#x27;t read 2M.
-&gt;&gt; page_cache_ra_order() reduces folio order near EOF and on allocation
-&gt;&gt; failure, so the 2M order is a preference, not a guarantee with the
-&gt;&gt; current code?
-&gt;&gt;
-&gt; 
-&gt; I am not a big fan of introducing Kconfig options, but would
-&gt; CONFIG_EXEC_FOLIO_ORDER with the default value being 64K be a better
-&gt; solution? Or maybe a default of 64K for 4K and 16K base page size,
-&gt; but 2M for 64K page size as 64K base page size is mostly for servers.
-&gt; 
-&gt; Using a default value of 64K would mean no change in behaviour.
-
-I don&#x27;t think such a tunable is the right approach. We should try to do
-something smarter in the kernel.
-
-We should have access to the mapping size and whether there is currently
-real memory pressure. We might even know the estimated speed of the
-device we&#x27;re loading data from :)
-
--- 
-Cheers,
-
-David</pre>
-</details>
-<a href="https://lore.kernel.org/r/608c87ce-10d9-4012-b6e9-298d5a356801@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: questioning assumptions, requesting alternative approach</div>
-</div>
-</div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">WANG Rui</span>
-<a class="date-chip" href="../2026-03-13_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-13">2026-03-13</a>
-<span class="inline-review-badge">Inline Review</span>
+<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer WANG Rui suggested adding constraints to exec_folio_order() to only increase alignment when the segment length, virtual address, and file offset are all huge-aligned, as done in their own patch to reduce ASLR entropy for small binaries. They also proposed checking all PT_LOAD segments instead of just one.</div>
+<div class="review-comment-text">Reviewer noted that even when a user-space shared library&#x27;s code segment satisfies PMD_SIZE (32MB), it may not end up at a PMD-aligned virtual address, and suggested skipping the PMD_SIZE == folio_sz case to avoid calling __thp_get_unmapped_area() twice with the same parameters.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Hi Usama,
-
-Glad to see you&#x27;re pushing on this, I&#x27;m also following it. I first noticed this when rustc&#x27;s perf regressed after a binutils upgrade. I&#x27;m trying to make ld.so to aware THP and adjust PT_LOAD alignment to increase the chances of shared libraries being mapped by THP [1]. As you&#x27;re probably seen, I&#x27;m doing something similar in the kernel to improve it for executables [2].
-
-&gt; +			if (exec_folio_order())
-&gt; +				alignment = max(alignment,
-&gt; +					(unsigned long)PAGE_SIZE &lt;&lt; exec_folio_order());
-
-I\u2019m curious, does it make sense to add some constraints here, like only increasing p_align when the segment length, virtual address, and file offset are all huge-aligned, as I did in my patch? This has come up several times in the glibc review, where increasing alignment was noted to reduce ASLR entropy.
-
-[1] https://sourceware.org/pipermail/libc-alpha/2026-March/175776.html
-[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-
-Thanks,
-Rui
-
----
-
-From: WANG Rui &lt;r@hev.cc&gt;
-
-Hi,
-
-I ran a quick bench on RK3399:
-
-Binutils: 2.46
-GCC: 15.2.1 (--enable-host-pie)
-
-Workload: building vmlinux from Linux v7.0-rc1 with allnoconfig.
-
-                Base                 Patchset [1]         Patchset [2]
-instructions    3,115,852,636,773    3,194,533,947,809    3,235,417,205,947
-cpu-cycles      8,374,429,970,450    8,457,398,871,141    8,323,881,987,768
-itlb-misses         9,250,336,037        8,033,415,293        2,946,152,935
-                                             ~ -13.16%            ~ -68.15%
-time elapsed             610.51 s             605.12 s             593.83 s
-
-[1] https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev
-[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-
-Should we prefer to PMD aligned here?
-
-Thanks,
-Rui
-
----
-
-On Sat, Mar 14, 2026 at 3:47 AM Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
-&gt;
-&gt;
-&gt;
-&gt; On 13/03/2026 17:42, WANG Rui wrote:
-&gt; &gt; Hi Usama,
-&gt; &gt;
-&gt;
-&gt; Hello!
-&gt;
-&gt; &gt; Glad to see you&#x27;re pushing on this, I&#x27;m also following it. I first noticed this when rustc&#x27;s perf regressed after a binutils upgrade. I&#x27;m trying to make ld.so to aware THP and adjust PT_LOAD alignment to increase the chances of shared libraries being mapped by THP [1]. As you&#x27;re probably seen, I&#x27;m doing something similar in the kernel to improve it for executables [2].
-&gt;
-&gt; For us it came about because we use 64K page size on ARM, and none of the
-&gt; text sections were getting hugified (because PMD size is 512M). I went with
-&gt; exec_folio_order() = cont-pte size (2M) for 16K and 64K as we can get both page
-&gt; fault benefit (which might not be that important) and iTLB coverage (due to
-&gt; cont-pte).
-&gt; x86 already faults in at 2M (HPAGE_PMD_ORDER) due to force_thp_readahead path in
-&gt; do_sync_mmap_readahead() so the memory pressure introduced in ARM won&#x27;t be worse
-&gt; than what already exists in x86.
-&gt;
-&gt; &gt;
-&gt; &gt;&gt; +                    if (exec_folio_order())
-&gt; &gt;&gt; +                            alignment = max(alignment,
-&gt; &gt;&gt; +                                    (unsigned long)PAGE_SIZE &lt;&lt; exec_folio_order());
-&gt; &gt;
-&gt; &gt; I’m curious, does it make sense to add some constraints here, like only increasing p_align when the segment length, virtual address, and file offset are all huge-aligned, as I did in my patch? This has come up several times in the glibc review, where increasing alignment was noted to reduce ASLR entropy.
-&gt; &gt;
-&gt;
-&gt; Yes I think this makes sense!
-&gt;
-&gt; Although maybe we should check all segments with PT_LOAD. So maybe something
-&gt; like below over this series?
-&gt;
-&gt; diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
-&gt; index 2d2b3e9fd474f..a0e83b541a7d8 100644
-&gt; --- a/fs/binfmt_elf.c
-&gt; +++ b/fs/binfmt_elf.c
-&gt; @@ -1116,10 +1116,30 @@ static int load_elf_binary(struct linux_binprm *bprm)
-&gt;                          * the hardware cannot coalesce PTEs (e.g. arm64
-&gt;                          * contpte) even though the physical memory and
-&gt;                          * file offset are correctly aligned.
-&gt; +                        *
-&gt; +                        * Only increase alignment when at least one
-&gt; +                        * PT_LOAD segment is large enough to contain a
-&gt; +                        * full folio and has its file offset and virtual
-&gt; +                        * address folio-aligned. This avoids reducing
-&gt; +                        * ASLR entropy for small binaries that cannot
-&gt; +                        * benefit from contpte mapping.
-&gt;                          */
-&gt; -                       if (exec_folio_order())
-&gt; -                               alignment = max(alignment,
-&gt; -                                       (unsigned long)PAGE_SIZE &lt;&lt; exec_folio_order());
-&gt; +                       if (exec_folio_order()) {
-&gt; +                               unsigned long folio_sz = PAGE_SIZE &lt;&lt; exec_folio_order();
-&gt; +
-&gt; +                               for (i = 0; i &lt; elf_ex-&gt;e_phnum; i++) {
-&gt; +                                       if (elf_phdata[i].p_type != PT_LOAD)
-&gt; +                                               continue;
-&gt; +                                       if (elf_phdata[i].p_filesz &lt; folio_sz)
-&gt; +                                               continue;
-&gt; +                                       if (!IS_ALIGNED(elf_phdata[i].p_vaddr, folio_sz))
-&gt; +                                               continue;
-&gt; +                                       if (!IS_ALIGNED(elf_phdata[i].p_offset, folio_sz))
-&gt; +                                               continue;
-&gt; +                                       alignment = max(alignment, folio_sz);
-&gt; +                                       break;
-&gt; +                               }
-&gt; +                       }
-
-I think this logic should live in maximum_alignment(), so we don&#x27;t
-have to walk the segments twice. It might be better to move it into a
-separate helper, something like should_align_to_exec_folio()?
-
-&gt;
-&gt;                         /**
-&gt;                          * DOC: PIE handling
-&gt;
-&gt; &gt; [1] https://sourceware.org/pipermail/libc-alpha/2026-March/175776.html
-&gt; &gt; [2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-&gt; &gt;
-&gt; &gt; Thanks,
-&gt; &gt; Rui
-&gt;
-
----
-
-&gt; +	if (exec_folio_order()) {
-&gt; +		unsigned long folio_size = PAGE_SIZE &lt;&lt; exec_folio_order();
-&gt; +
-&gt; +		ret = __thp_get_unmapped_area(filp, addr, len, off, flags,
-&gt; +					      folio_size, vm_flags);
-&gt; +		if (ret)
-&gt; +			return ret;
-&gt; +	}
-&gt; +
-
-I noticed that even when the code segment of a user-space shared library
+<pre class="raw-body-text">I noticed that even when the code segment of a user-space shared library
 satisfies PMD_SIZE (32MB), it still doesn\u2019t end up at a PMD-aligned virtual
 address. This might be the fallback you mentioned. Adjusting p_align in the
 ld.so ELF loader does work, though it also avoids extremely large PMD_SIZE
@@ -877,282 +264,13 @@ so we don\u2019t end up calling __thp_get_unmapped_area() twice with the same
 parameters.
 
 Thanks,
-Rui
-
----
-
-I only just realized your focus was on 64K normal pages, what I was
-referring to here is AArch64 with 4K normal pages.
-
-Sorry about the earlier numbers. They were a bit low precision.
-RK3399 has pretty limited PMU events, and it looks like it can\u2019t
-collect events from the A53 and A72 clusters at the same time, so
-I reran the measurements on the A53.
-
-Even though the A53 backend isn\u2019t very wide, we can still see the
-impact from iTLB pressure. With 4K pages, aligning the code to PMD
-size (2M) performs slightly better than 64K.
-
-Binutils: 2.46
-GCC: 15.2.1 (--enable-host-pie)
-
-Workload: building vmlinux from Linux v7.0-rc1 with allnoconfig.
-Loop: 5
-
-                Base                 Patchset [1]         Patchset [2]
-instructions    1,994,512,163,037    1,994,528,896,322    1,994,536,148,574
-cpu-cycles      6,890,054,789,351    6,870,685,379,047    6,720,442,248,967
-                                              ~ -0.28%             ~ -2.46%
-itlb-misses           579,692,117          455,848,211           43,814,795
-                                             ~ -21.36%            ~ -92.44%
-time elapsed            1331.15 s            1325.50 s            1296.35 s
-                                              ~ -0.42%             ~ -2.61%
-
-Maybe we could make exec_folio_order() choose differently folio size
-depending on the configuration and conditional in some way, for example
-based on the size of the code segment?
-
-[1] https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev
-[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-
-Thanks,
-Rui
-
----
-
-Hi Ryan,
-
-&gt; I don&#x27;t see how you can reliably influence this from the kernel? The ELF file
-&gt; alignment is, by default, 64K (16K on Android) and there is no guarrantee that
-&gt; the text section is the first section in the file. You need to align the start
-&gt; of the text section to the 2M boundary and to do that, you&#x27;ll need to align the
-&gt; start of the file to some 64K boundary at a specific offset to the 2M boundary,
-&gt; based on the size of any sections before the text section. That&#x27;s a job for the
-&gt; dynamic loader I think? Perhaps I&#x27;ve misunderstood what you&#x27;re doing...
-
-On Arch Linux for AArch64 and LoongArch64 I&#x27;ve observed that most
-binaries place the executable segment in the first PT_LOAD. In that
-case both the virtual address and file offset are 0, which happens to
-satisfy the alignment requirements for PMD-sized or large folio
-mappings.
-
-x86 looks quite different. The executable segment is usually not the
-first one.
-
-After digging into this I realized this mostly comes from the linker
-defaults. With GNU ld, -z noseparate-code merges the read-only and
-read-only-executable segments into one, while -z separate-code
-splits them, placing a non-executable read-only segment first. The
-latter is the default on x86, partly to avoid making the ELF headers
-executable when mappings start from the beginning of the file.
-
-Other architectures tend to default to -z noseparate-code, which
-makes it more likely that the text segment is the first PT_LOAD.
-
-LLVM lld behaves differently again: --rosegment (equivalent to
--z separate-code) is enabled by default on all architectures, which
-similarly tends to place the executable segment after an initial
-read-only one. That default is clearly less friendly to large-page
-text mappings.
-
-Thanks,
-Rui
-
----
-
-&gt; Thanks for running these! Just wanted to check what is the base page size
-&gt; of this experiment?
-
-base page size: 4K
-
-&gt; Yeah I think introducing Kconfig might be an option.
-
-I wonder if it would make sense for exec_folio_order() to vary the
-order based on the code size, instead of always returning a fixed
-value for a given architecture and base page size.
-
-For example, on AArch64 with 4K base pages, in the load_elf_binary()
-case: if exec_folio_order() only ever returns cont-PTE (64K), we may
-miss the opportunity to use PMD mappings. On the other hand, if it
-always returns PMD (2M), then for binaries smaller than 2M we end up
-reducing ASLR entropy.
-
-Maybe something along these lines would work better:
-
-unsigned int exec_folio_order(size_t code_size)
-{
-#if PAGE_SIZE == 4096
-    if (code_size &gt;= PMD_SIZE)
-        return ilog2(SZ_2M &gt;&gt; PAGE_SHIFT);
-    else if (code_size &gt;= SZ_64K)
-        return ilog2(SZ_64K &gt;&gt; PAGE_SHIFT);
-    else
-        return 0;
-#elif PAGE_SIZE == 16384
-    ...
-#elif PAGE_SIZE == ...
-    /* let the arch cap the max order here, rather
-       than hard-coding it at the use sites */
-#endif
-}
-
-Thanks,
 Rui</pre>
 </details>
-<a href="https://lore.kernel.org/r/20260313144213.95686-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, suggested improvements</div>
+<a href="https://lore.kernel.org/r/20260314034745.168715-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 <div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Ryan Roberts</span>
-<a class="date-chip" href="../2026-03-13_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-13">2026-03-13</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Ryan Roberts expressed concerns about the reliability of influencing ELF file alignment from the kernel, specifically pointing out that aligning the start of the text section to a 2M boundary requires knowledge of the file&#x27;s internal structure and is better handled by the dynamic loader.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On 10/03/2026 14:51, Usama Arif wrote:
-&gt; On arm64, the contpte hardware feature coalesces multiple contiguous PTEs
-&gt; into a single iTLB entry, reducing iTLB pressure for large executable
-&gt; mappings.
-&gt; 
-&gt; exec_folio_order() was introduced [1] to request readahead at an
-&gt; arch-preferred folio order for executable memory, enabling contpte
-&gt; mapping on the fault path.
-&gt; 
-&gt; However, several things prevent this from working optimally on 16K and
-&gt; 64K page configurations:
-&gt; 
-&gt; 1. exec_folio_order() returns ilog2(SZ_64K &gt;&gt; PAGE_SHIFT), which only
-&gt;    produces the optimal contpte order for 4K pages. For 16K pages it
-&gt;    returns order 2 (64K) instead of order 7 (2M), and for 64K pages it
-&gt;    returns order 0 (64K) instead of order 5 (2M). 
-
-This was deliberate, although perhaps a bit conservative. I was concerned about
-the possibility of read amplification; pointlessly reading in a load of memory
-that never actually gets used. And that is independent of page size.
-
-2M seems quite big as a default IMHO, I could imagine Android might complain
-about memory pressure in their 16K config, for example.
-
-Additionally, ELF files are normally only aligned to 64K and you can only get
-the TLB benefits if the memory is aligned in physical and virtual memory.
-
-&gt; Patch 1 fixes this by
-&gt;    using ilog2(CONT_PTES) which evaluates to the optimal order for all
-&gt;    page sizes.
-&gt; 
-&gt; 2. Even with the optimal order, the mmap_miss heuristic in
-&gt;    do_sync_mmap_readahead() silently disables exec readahead after 100
-&gt;    page faults. The mmap_miss counter tracks whether readahead is useful
-&gt;    for mmap&#x27;d file access:
-&gt; 
-&gt;    - Incremented by 1 in do_sync_mmap_readahead() on every page cache
-&gt;      miss (page needed IO).
-&gt; 
-&gt;    - Decremented by N in filemap_map_pages() for N pages successfully
-&gt;      mapped via fault-around (pages found in cache without faulting,
-&gt;      evidence that readahead was useful). Only non-workingset pages
-&gt;      count and recently evicted and re-read pages don&#x27;t count as hits.
-&gt; 
-&gt;    - Decremented by 1 in do_async_mmap_readahead() when a PG_readahead
-&gt;      marker page is found (indicates sequential consumption of readahead
-&gt;      pages).
-&gt; 
-&gt;    When mmap_miss exceeds MMAP_LOTSAMISS (100), all readahead is
-&gt;    disabled. On 64K pages, both decrement paths are inactive:
-&gt; 
-&gt;    - filemap_map_pages() is never called because fault_around_pages
-&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
-&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
-&gt;      fault-around window, there is nothing &quot;around&quot; to map.
-&gt; 
-&gt;    - do_async_mmap_readahead() never fires for exec mappings because
-&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
-&gt;      are placed.
-&gt; 
-&gt;    With no decrements, mmap_miss monotonically increases past
-&gt;    MMAP_LOTSAMISS after 100 faults, disabling exec readahead
-&gt;    for the remainder of the mapping.
-&gt;    Patch 2 fixes this by moving the VM_EXEC readahead block
-&gt;    above the mmap_miss check, since exec readahead is targeted (one
-&gt;    folio at the fault location, async_size=0) not speculative prefetch.
-
-Interesting!
-
-&gt; 
-&gt; 3. Even with correct folio order and readahead, contpte mapping requires
-&gt;    the virtual address to be aligned to CONT_PTE_SIZE (2M on 64K pages).
-&gt;    The readahead path aligns file offsets and the buddy allocator aligns
-&gt;    physical memory, but the virtual address depends on the VMA start.
-&gt;    For PIE binaries, ASLR randomizes the load address at PAGE_SIZE (64K)
-&gt;    granularity, giving only a 1/32 chance of 2M alignment. When
-&gt;    misaligned, contpte_set_ptes() never sets the contiguous PTE bit for
-&gt;    any folio in the VMA, resulting in zero iTLB coalescing benefit.
-&gt; 
-&gt;    Patch 3 fixes this for the main binary by bumping the ELF loader&#x27;s
-&gt;    alignment to PAGE_SIZE &lt;&lt; exec_folio_order() for ET_DYN binaries.
-&gt; 
-&gt;    Patch 4 fixes this for shared libraries by adding a contpte-size
-&gt;    alignment fallback in thp_get_unmapped_area_vmflags(). The existing
-&gt;    PMD_SIZE alignment (512M on 64K pages) is too large for typical shared
-&gt;    libraries, so this smaller fallback (2M) succeeds where PMD fails.
-
-I don&#x27;t see how you can reliably influence this from the kernel? The ELF file
-alignment is, by default, 64K (16K on Android) and there is no guarrantee that
-the text section is the first section in the file. You need to align the start
-of the text section to the 2M boundary and to do that, you&#x27;ll need to align the
-start of the file to some 64K boundary at a specific offset to the 2M boundary,
-based on the size of any sections before the text section. That&#x27;s a job for the
-dynamic loader I think? Perhaps I&#x27;ve misunderstood what you&#x27;re doing...
-
-&gt; 
-&gt; I created a benchmark that mmaps a large executable file and calls
-&gt; RET-stub functions at PAGE_SIZE offsets across it. &quot;Cold&quot; measures
-&gt; fault + readahead cost. &quot;Random&quot; first faults in all pages with a
-&gt; sequential sweep (not measured), then measures time for calling random
-&gt; offsets, isolating iTLB miss cost for scattered execution.
-&gt; 
-&gt; The benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,
-&gt; 512MB executable file on ext4, averaged over 3 runs:
-&gt; 
-&gt;   Phase      | Baseline     | Patched      | Improvement
-&gt;   -----------|--------------|--------------|------------------
-&gt;   Cold fault | 83.4 ms      | 41.3 ms      | 50% faster
-&gt;   Random     | 76.0 ms      | 58.3 ms      | 23% faster
-
-I think the proper way to do this is to link the text section with 2M alignment
-and have the dynamic linker mark the region with MADV_HUGEPAGE?
-
-Thanks,
-Ryan
-
-
-&gt; 
-&gt; [1] https://lore.kernel.org/all/20250430145920.3748738-6-ryan.roberts@arm.com/
-&gt; 
-&gt; Usama Arif (4):
-&gt;   arm64: request contpte-sized folios for exec memory
-&gt;   mm: bypass mmap_miss heuristic for VM_EXEC readahead
-&gt;   elf: align ET_DYN base to exec folio order for contpte mapping
-&gt;   mm: align file-backed mmap to exec folio order in
-&gt;     thp_get_unmapped_area
-&gt; 
-&gt;  arch/arm64/include/asm/pgtable.h |  9 ++--
-&gt;  fs/binfmt_elf.c                  | 15 +++++++
-&gt;  mm/filemap.c                     | 72 +++++++++++++++++---------------
-&gt;  mm/huge_memory.c                 | 17 ++++++++
-&gt;  4 files changed, 75 insertions(+), 38 deletions(-)
-&gt;</pre>
-</details>
-<a href="https://lore.kernel.org/r/cfdfca9c-4752-4037-a289-03e6e7a00d47@arm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: concerns, misunderstanding</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">WANG Rui</span>
@@ -1195,577 +313,6 @@ Rui</pre>
 <div class="reply-to-label">&#8627; replying to Ryan Roberts</div>
 <a href="https://lore.kernel.org/r/20260314132038.223901-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: NEEDS_WORK</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Usama Arif (author)</span>
-<a class="date-chip" href="../2026-03-13_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-13">2026-03-13</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author addressed a concern about reducing ASLR entropy by only increasing alignment when at least one PT_LOAD segment is large enough to contain a full folio and has its file offset and virtual address folio-aligned. Author agreed that this makes sense and proposed modifying the code in fs/binfmt_elf.c to check all segments with PT_LOAD.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On 13/03/2026 17:42, WANG Rui wrote:
-&gt; Hi Usama,
-&gt; 
-
-Hello!
-
-&gt; Glad to see you&#x27;re pushing on this, I&#x27;m also following it. I first noticed this when rustc&#x27;s perf regressed after a binutils upgrade. I&#x27;m trying to make ld.so to aware THP and adjust PT_LOAD alignment to increase the chances of shared libraries being mapped by THP [1]. As you&#x27;re probably seen, I&#x27;m doing something similar in the kernel to improve it for executables [2].
-
-For us it came about because we use 64K page size on ARM, and none of the
-text sections were getting hugified (because PMD size is 512M). I went with
-exec_folio_order() = cont-pte size (2M) for 16K and 64K as we can get both page
-fault benefit (which might not be that important) and iTLB coverage (due to
-cont-pte).
-x86 already faults in at 2M (HPAGE_PMD_ORDER) due to force_thp_readahead path in
-do_sync_mmap_readahead() so the memory pressure introduced in ARM won&#x27;t be worse
-than what already exists in x86.
-
-&gt; 
-&gt;&gt; +			if (exec_folio_order())
-&gt;&gt; +				alignment = max(alignment,
-&gt;&gt; +					(unsigned long)PAGE_SIZE &lt;&lt; exec_folio_order());
-&gt; 
-&gt; I\u2019m curious, does it make sense to add some constraints here, like only increasing p_align when the segment length, virtual address, and file offset are all huge-aligned, as I did in my patch? This has come up several times in the glibc review, where increasing alignment was noted to reduce ASLR entropy.
-&gt; 
-
-Yes I think this makes sense!
-
-Although maybe we should check all segments with PT_LOAD. So maybe something
-like below over this series?
-
-diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
-index 2d2b3e9fd474f..a0e83b541a7d8 100644
---- a/fs/binfmt_elf.c
-+++ b/fs/binfmt_elf.c
-@@ -1116,10 +1116,30 @@ static int load_elf_binary(struct linux_binprm *bprm)
-                         * the hardware cannot coalesce PTEs (e.g. arm64
-                         * contpte) even though the physical memory and
-                         * file offset are correctly aligned.
-+                        *
-+                        * Only increase alignment when at least one
-+                        * PT_LOAD segment is large enough to contain a
-+                        * full folio and has its file offset and virtual
-+                        * address folio-aligned. This avoids reducing
-+                        * ASLR entropy for small binaries that cannot
-+                        * benefit from contpte mapping.
-                         */
--                       if (exec_folio_order())
--                               alignment = max(alignment,
--                                       (unsigned long)PAGE_SIZE &lt;&lt; exec_folio_order());
-+                       if (exec_folio_order()) {
-+                               unsigned long folio_sz = PAGE_SIZE &lt;&lt; exec_folio_order();
-+
-+                               for (i = 0; i &lt; elf_ex-&gt;e_phnum; i++) {
-+                                       if (elf_phdata[i].p_type != PT_LOAD)
-+                                               continue;
-+                                       if (elf_phdata[i].p_filesz &lt; folio_sz)
-+                                               continue;
-+                                       if (!IS_ALIGNED(elf_phdata[i].p_vaddr, folio_sz))
-+                                               continue;
-+                                       if (!IS_ALIGNED(elf_phdata[i].p_offset, folio_sz))
-+                                               continue;
-+                                       alignment = max(alignment, folio_sz);
-+                                       break;
-+                               }
-+                       }
- 
-                        /**
-                         * DOC: PIE handling
-
-&gt; [1] https://sourceware.org/pipermail/libc-alpha/2026-March/175776.html
-&gt; [2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-&gt; 
-&gt; Thanks,
-&gt; Rui
-
----
-
-On 13/03/2026 16:20, David Hildenbrand (Arm) wrote:
-&gt; On 3/10/26 15:51, Usama Arif wrote:
-&gt;&gt; On arm64, the contpte hardware feature coalesces multiple contiguous PTEs
-&gt;&gt; into a single iTLB entry, reducing iTLB pressure for large executable
-&gt;&gt; mappings.
-&gt;&gt;
-&gt;&gt; exec_folio_order() was introduced [1] to request readahead at an
-&gt;&gt; arch-preferred folio order for executable memory, enabling contpte
-&gt;&gt; mapping on the fault path.
-&gt;&gt;
-&gt;&gt; However, several things prevent this from working optimally on 16K and
-&gt;&gt; 64K page configurations:
-&gt;&gt;
-&gt;&gt; 1. exec_folio_order() returns ilog2(SZ_64K &gt;&gt; PAGE_SHIFT), which only
-&gt;&gt;    produces the optimal contpte order for 4K pages. For 16K pages it
-&gt;&gt;    returns order 2 (64K) instead of order 7 (2M), and for 64K pages it
-&gt;&gt;    returns order 0 (64K) instead of order 5 (2M). Patch 1 fixes this by
-&gt;&gt;    using ilog2(CONT_PTES) which evaluates to the optimal order for all
-&gt;&gt;    page sizes.
-&gt;&gt;
-&gt;&gt; 2. Even with the optimal order, the mmap_miss heuristic in
-&gt;&gt;    do_sync_mmap_readahead() silently disables exec readahead after 100
-&gt;&gt;    page faults. The mmap_miss counter tracks whether readahead is useful
-&gt;&gt;    for mmap&#x27;d file access:
-&gt;&gt;
-&gt;&gt;    - Incremented by 1 in do_sync_mmap_readahead() on every page cache
-&gt;&gt;      miss (page needed IO).
-&gt;&gt;
-&gt;&gt;    - Decremented by N in filemap_map_pages() for N pages successfully
-&gt;&gt;      mapped via fault-around (pages found in cache without faulting,
-&gt;&gt;      evidence that readahead was useful). Only non-workingset pages
-&gt;&gt;      count and recently evicted and re-read pages don&#x27;t count as hits.
-&gt;&gt;
-&gt;&gt;    - Decremented by 1 in do_async_mmap_readahead() when a PG_readahead
-&gt;&gt;      marker page is found (indicates sequential consumption of readahead
-&gt;&gt;      pages).
-&gt;&gt;
-&gt;&gt;    When mmap_miss exceeds MMAP_LOTSAMISS (100), all readahead is
-&gt;&gt;    disabled. On 64K pages, both decrement paths are inactive:
-&gt;&gt;
-&gt;&gt;    - filemap_map_pages() is never called because fault_around_pages
-&gt;&gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
-&gt;&gt;      requires fault_around_pages &gt; 1. With only 1 page in the
-&gt;&gt;      fault-around window, there is nothing &quot;around&quot; to map.
-&gt;&gt;
-&gt;&gt;    - do_async_mmap_readahead() never fires for exec mappings because
-&gt;&gt;      exec readahead sets async_size = 0, so no PG_readahead markers
-&gt;&gt;      are placed.
-&gt;&gt;
-&gt;&gt;    With no decrements, mmap_miss monotonically increases past
-&gt;&gt;    MMAP_LOTSAMISS after 100 faults, disabling exec readahead
-&gt;&gt;    for the remainder of the mapping.
-&gt;&gt;    Patch 2 fixes this by moving the VM_EXEC readahead block
-&gt;&gt;    above the mmap_miss check, since exec readahead is targeted (one
-&gt;&gt;    folio at the fault location, async_size=0) not speculative prefetch.
-&gt;&gt;
-&gt;&gt; 3. Even with correct folio order and readahead, contpte mapping requires
-&gt;&gt;    the virtual address to be aligned to CONT_PTE_SIZE (2M on 64K pages).
-&gt;&gt;    The readahead path aligns file offsets and the buddy allocator aligns
-&gt;&gt;    physical memory, but the virtual address depends on the VMA start.
-&gt;&gt;    For PIE binaries, ASLR randomizes the load address at PAGE_SIZE (64K)
-&gt;&gt;    granularity, giving only a 1/32 chance of 2M alignment. When
-&gt;&gt;    misaligned, contpte_set_ptes() never sets the contiguous PTE bit for
-&gt;&gt;    any folio in the VMA, resulting in zero iTLB coalescing benefit.
-&gt;&gt;
-&gt;&gt;    Patch 3 fixes this for the main binary by bumping the ELF loader&#x27;s
-&gt;&gt;    alignment to PAGE_SIZE &lt;&lt; exec_folio_order() for ET_DYN binaries.
-&gt;&gt;
-&gt;&gt;    Patch 4 fixes this for shared libraries by adding a contpte-size
-&gt;&gt;    alignment fallback in thp_get_unmapped_area_vmflags(). The existing
-&gt;&gt;    PMD_SIZE alignment (512M on 64K pages) is too large for typical shared
-&gt;&gt;    libraries, so this smaller fallback (2M) succeeds where PMD fails.
-&gt;&gt;
-&gt;&gt; I created a benchmark that mmaps a large executable file and calls
-&gt;&gt; RET-stub functions at PAGE_SIZE offsets across it. &quot;Cold&quot; measures
-&gt;&gt; fault + readahead cost. &quot;Random&quot; first faults in all pages with a
-&gt;&gt; sequential sweep (not measured), then measures time for calling random
-&gt;&gt; offsets, isolating iTLB miss cost for scattered execution.
-&gt;&gt;
-&gt;&gt; The benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,
-&gt;&gt; 512MB executable file on ext4, averaged over 3 runs:
-&gt;&gt;
-&gt;&gt;   Phase      | Baseline     | Patched      | Improvement
-&gt;&gt;   -----------|--------------|--------------|------------------
-&gt;&gt;   Cold fault | 83.4 ms      | 41.3 ms      | 50% faster
-&gt;&gt;   Random     | 76.0 ms      | 58.3 ms      | 23% faster
-&gt; 
-&gt; I&#x27;m curious: is a single order really what we want?
-&gt; 
-&gt; I&#x27;d instead assume that we might want to make decisions based on the
-&gt; mapping size.
-&gt; 
-&gt; Assume you have a 128M mapping, wouldn&#x27;t we want to use a different
-&gt; alignment than, say, for a 1M mapping, a 128K mapping or a 8k mapping?
-&gt; 
-
-So I see 2 benefits from this. Page fault and iTLB coverage. IMHO page
-faults are not that big of a deal? If the text section is hot, it wont
-get flushed after faulting in. So the real benefit comes from improved
-iTLB coverage.
-
-For a 128M mapping, 2M alignment gives 64 contpte entries. Aligning
-to something larger (say 128M) wouldn&#x27;t give any additional TLB
-coalescing, each 2M-aligned region independently qualifies for contpte.
-
-Mappings smaller than 2M can&#x27;t benefit from contpte regardless of
-alignment, so falling back to PAGE_SIZE would be the optimal behaviour.
-Adding intermediate sizes (e.g. 512K, 128K) wouldn&#x27;t map to any
-hardware boundary and adds complexity without TLB benefit?
-
----
-
-On Fri, 13 Mar 2026 16:33:42 +0000 Ryan Roberts &lt;ryan.roberts@arm.com&gt; wrote:
-
-&gt; On 10/03/2026 14:51, Usama Arif wrote:
-&gt; &gt; On arm64, the contpte hardware feature coalesces multiple contiguous PTEs
-&gt; &gt; into a single iTLB entry, reducing iTLB pressure for large executable
-&gt; &gt; mappings.
-&gt; &gt; 
-&gt; &gt; exec_folio_order() was introduced [1] to request readahead at an
-&gt; &gt; arch-preferred folio order for executable memory, enabling contpte
-&gt; &gt; mapping on the fault path.
-&gt; &gt; 
-&gt; &gt; However, several things prevent this from working optimally on 16K and
-&gt; &gt; 64K page configurations:
-&gt; &gt; 
-&gt; &gt; 1. exec_folio_order() returns ilog2(SZ_64K &gt;&gt; PAGE_SHIFT), which only
-&gt; &gt;    produces the optimal contpte order for 4K pages. For 16K pages it
-&gt; &gt;    returns order 2 (64K) instead of order 7 (2M), and for 64K pages it
-&gt; &gt;    returns order 0 (64K) instead of order 5 (2M). 
-&gt; 
-&gt; This was deliberate, although perhaps a bit conservative. I was concerned about
-&gt; the possibility of read amplification; pointlessly reading in a load of memory
-&gt; that never actually gets used. And that is independent of page size.
-&gt; 
-&gt; 2M seems quite big as a default IMHO, I could imagine Android might complain
-&gt; about memory pressure in their 16K config, for example.
-&gt; 
-
-The force_thp_readahead path in do_sync_mmap_readahead() reads at
-HPAGE_PMD_ORDER (2M on x86) and even doubles it to 4M for
-non VM_RAND_READ mappings (ra-&gt;size *= 2), with async readahead
-enabled. exec_folio_order() is more conservative. a single 2M folio
-with async_size=0, no speculative prefetch. So I think the memory
-pressure would not be worse than what x86 has?
-
-For memory pressure on Android 16K: the readahead is clamped to VMA
-boundaries, so a small shared library won&#x27;t read 2M.
-page_cache_ra_order() reduces folio order near EOF and on allocation
-failure, so the 2M order is a preference, not a guarantee with the
-current code?
-
-&gt; Additionally, ELF files are normally only aligned to 64K and you can only get
-&gt; the TLB benefits if the memory is aligned in physical and virtual memory.
-&gt; 
-&gt; &gt; Patch 1 fixes this by
-&gt; &gt;    using ilog2(CONT_PTES) which evaluates to the optimal order for all
-&gt; &gt;    page sizes.
-&gt; &gt; 
-&gt; &gt; 2. Even with the optimal order, the mmap_miss heuristic in
-&gt; &gt;    do_sync_mmap_readahead() silently disables exec readahead after 100
-&gt; &gt;    page faults. The mmap_miss counter tracks whether readahead is useful
-&gt; &gt;    for mmap&#x27;d file access:
-&gt; &gt; 
-&gt; &gt;    - Incremented by 1 in do_sync_mmap_readahead() on every page cache
-&gt; &gt;      miss (page needed IO).
-&gt; &gt; 
-&gt; &gt;    - Decremented by N in filemap_map_pages() for N pages successfully
-&gt; &gt;      mapped via fault-around (pages found in cache without faulting,
-&gt; &gt;      evidence that readahead was useful). Only non-workingset pages
-&gt; &gt;      count and recently evicted and re-read pages don&#x27;t count as hits.
-&gt; &gt; 
-&gt; &gt;    - Decremented by 1 in do_async_mmap_readahead() when a PG_readahead
-&gt; &gt;      marker page is found (indicates sequential consumption of readahead
-&gt; &gt;      pages).
-&gt; &gt; 
-&gt; &gt;    When mmap_miss exceeds MMAP_LOTSAMISS (100), all readahead is
-&gt; &gt;    disabled. On 64K pages, both decrement paths are inactive:
-&gt; &gt; 
-&gt; &gt;    - filemap_map_pages() is never called because fault_around_pages
-&gt; &gt;      (65536 &gt;&gt; PAGE_SHIFT = 1) disables should_fault_around(), which
-&gt; &gt;      requires fault_around_pages &gt; 1. With only 1 page in the
-&gt; &gt;      fault-around window, there is nothing &quot;around&quot; to map.
-&gt; &gt; 
-&gt; &gt;    - do_async_mmap_readahead() never fires for exec mappings because
-&gt; &gt;      exec readahead sets async_size = 0, so no PG_readahead markers
-&gt; &gt;      are placed.
-&gt; &gt; 
-&gt; &gt;    With no decrements, mmap_miss monotonically increases past
-&gt; &gt;    MMAP_LOTSAMISS after 100 faults, disabling exec readahead
-&gt; &gt;    for the remainder of the mapping.
-&gt; &gt;    Patch 2 fixes this by moving the VM_EXEC readahead block
-&gt; &gt;    above the mmap_miss check, since exec readahead is targeted (one
-&gt; &gt;    folio at the fault location, async_size=0) not speculative prefetch.
-&gt; 
-&gt; Interesting!
-&gt; 
-&gt; &gt; 
-&gt; &gt; 3. Even with correct folio order and readahead, contpte mapping requires
-&gt; &gt;    the virtual address to be aligned to CONT_PTE_SIZE (2M on 64K pages).
-&gt; &gt;    The readahead path aligns file offsets and the buddy allocator aligns
-&gt; &gt;    physical memory, but the virtual address depends on the VMA start.
-&gt; &gt;    For PIE binaries, ASLR randomizes the load address at PAGE_SIZE (64K)
-&gt; &gt;    granularity, giving only a 1/32 chance of 2M alignment. When
-&gt; &gt;    misaligned, contpte_set_ptes() never sets the contiguous PTE bit for
-&gt; &gt;    any folio in the VMA, resulting in zero iTLB coalescing benefit.
-&gt; &gt; 
-&gt; &gt;    Patch 3 fixes this for the main binary by bumping the ELF loader&#x27;s
-&gt; &gt;    alignment to PAGE_SIZE &lt;&lt; exec_folio_order() for ET_DYN binaries.
-&gt; &gt; 
-&gt; &gt;    Patch 4 fixes this for shared libraries by adding a contpte-size
-&gt; &gt;    alignment fallback in thp_get_unmapped_area_vmflags(). The existing
-&gt; &gt;    PMD_SIZE alignment (512M on 64K pages) is too large for typical shared
-&gt; &gt;    libraries, so this smaller fallback (2M) succeeds where PMD fails.
-&gt; 
-&gt; I don&#x27;t see how you can reliably influence this from the kernel? The ELF file
-&gt; alignment is, by default, 64K (16K on Android) and there is no guarrantee that
-&gt; the text section is the first section in the file. You need to align the start
-&gt; of the text section to the 2M boundary and to do that, you&#x27;ll need to align the
-&gt; start of the file to some 64K boundary at a specific offset to the 2M boundary,
-&gt; based on the size of any sections before the text section. That&#x27;s a job for the
-&gt; dynamic loader I think? Perhaps I&#x27;ve misunderstood what you&#x27;re doing...
-&gt;
-
-I only started looking into how this works a few days before sending these
-patches, so I could be wrong (please do correct me if thats the case!)
-
-For the main binary (patch 3): load_elf_binary() controls load_bias.
-Each PT_LOAD segment is mapped at load_bias + p_vaddr via elf_map().
-The alignment variable feeds directly into load_bias calculation.
-If p_vaddr=0 and p_offset=0, mapped_addr = load_bias + 0 = load_bias. By
-ensuring load_bias is folio size aligned, the text segment&#x27;s virtual address
-is also folio size aligned.
-
-For shared libraries (patch 4): ld.so loads these via mmap(), and the
-kernel&#x27;s get_unmapped_area callback (thp_get_unmapped_area for ext4,
-xfs, btrfs) picks the virtual address. The existing code tries
-PMD_SIZE alignment first (512M on 64K pages), which is too large for
-typical shared libraries and always fails. Patch 4 adds a fallback
-that tries folio-size alignment (2M), which is small enough to succeed
-for most libraries.
-
-&gt; &gt; 
-&gt; &gt; I created a benchmark that mmaps a large executable file and calls
-&gt; &gt; RET-stub functions at PAGE_SIZE offsets across it. &quot;Cold&quot; measures
-&gt; &gt; fault + readahead cost. &quot;Random&quot; first faults in all pages with a
-&gt; &gt; sequential sweep (not measured), then measures time for calling random
-&gt; &gt; offsets, isolating iTLB miss cost for scattered execution.
-&gt; &gt; 
-&gt; &gt; The benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,
-&gt; &gt; 512MB executable file on ext4, averaged over 3 runs:
-&gt; &gt; 
-&gt; &gt;   Phase      | Baseline     | Patched      | Improvement
-&gt; &gt;   -----------|--------------|--------------|------------------
-&gt; &gt;   Cold fault | 83.4 ms      | 41.3 ms      | 50% faster
-&gt; &gt;   Random     | 76.0 ms      | 58.3 ms      | 23% faster
-&gt; 
-&gt; I think the proper way to do this is to link the text section with 2M alignment
-&gt; and have the dynamic linker mark the region with MADV_HUGEPAGE?
-&gt; 
-
-On arm64 with 64K pages, the force_thp_readahead path triggered by
-MADV_HUGEPAGE reads at HPAGE_PMD_ORDER (512M). Even with file and
-anon khugepaged support aded for khugpaged, the collapse won&#x27;t happen
-form the start.
-
-Yes I think dynamic linker is also a good alternate approach from Wangs
-patches [1]. But doing it in the kernel would be more transparent?
-
-[1] https://sourceware.org/pipermail/libc-alpha/2026-March/175776.html
-
-&gt; Thanks,
-&gt; Ryan
-&gt; 
-&gt; 
-&gt; &gt; 
-&gt; &gt; [1] https://lore.kernel.org/all/20250430145920.3748738-6-ryan.roberts@arm.com/
-&gt; &gt; 
-&gt; &gt; Usama Arif (4):
-&gt; &gt;   arm64: request contpte-sized folios for exec memory
-&gt; &gt;   mm: bypass mmap_miss heuristic for VM_EXEC readahead
-&gt; &gt;   elf: align ET_DYN base to exec folio order for contpte mapping
-&gt; &gt;   mm: align file-backed mmap to exec folio order in
-&gt; &gt;     thp_get_unmapped_area
-&gt; &gt; 
-&gt; &gt;  arch/arm64/include/asm/pgtable.h |  9 ++--
-&gt; &gt;  fs/binfmt_elf.c                  | 15 +++++++
-&gt; &gt;  mm/filemap.c                     | 72 +++++++++++++++++---------------
-&gt; &gt;  mm/huge_memory.c                 | 17 ++++++++
-&gt; &gt;  4 files changed, 75 insertions(+), 38 deletions(-)
-&gt; &gt; 
-&gt; 
-&gt;</pre>
-</details>
-<a href="https://lore.kernel.org/r/d3f60289-3ea1-43ce-9271-58c8b79bf7a0@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: agreement, proposed modification</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-03-14">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">hev</span>
-<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer hev ran benchmarks on RK3399 and observed a significant reduction in iTLB misses after applying the patch, but questioned whether it would be better to align the virtual address to PMD size instead of CONT_PTE_SIZE.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: WANG Rui &lt;r@hev.cc&gt;
-
-Hi,
-
-I ran a quick bench on RK3399:
-
-Binutils: 2.46
-GCC: 15.2.1 (--enable-host-pie)
-
-Workload: building vmlinux from Linux v7.0-rc1 with allnoconfig.
-
-                Base                 Patchset [1]         Patchset [2]
-instructions    3,115,852,636,773    3,194,533,947,809    3,235,417,205,947
-cpu-cycles      8,374,429,970,450    8,457,398,871,141    8,323,881,987,768
-itlb-misses         9,250,336,037        8,033,415,293        2,946,152,935
-                                             ~ -13.16%            ~ -68.15%
-time elapsed             610.51 s             605.12 s             593.83 s
-
-[1] https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev
-[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-
-Should we prefer to PMD aligned here?
-
-Thanks,
-Rui</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/20260313163557.147948-1-git@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">hev</span>
-<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The reviewer suggests moving the logic for determining whether a virtual address needs to be aligned to an exec folio size from the current location in the code to a separate function, maximum_alignment(), or even better, a new helper function should_align_to_exec_folio().</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">I think this logic should live in maximum_alignment(), so we don&#x27;t
-have to walk the segments twice. It might be better to move it into a
-separate helper, something like should_align_to_exec_folio()?</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/CAHirt9g=drGaeNN7C1hbND4=zXQifhQyP4cUaCz27=tYpHYgfQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: suggestion, improvement</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">WANG Rui</span>
-<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer WANG Rui pointed out that the original patch&#x27;s focus was on 64K normal pages, but they were actually referring to AArch64 with 4K normal pages. They provided measurement results showing that aligning code to PMD size (2M) performs slightly better than 64K for 4K pages.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">I only just realized your focus was on 64K normal pages, what I was
-referring to here is AArch64 with 4K normal pages.
-
-Sorry about the earlier numbers. They were a bit low precision.
-RK3399 has pretty limited PMU events, and it looks like it can\u2019t
-collect events from the A53 and A72 clusters at the same time, so
-I reran the measurements on the A53.
-
-Even though the A53 backend isn\u2019t very wide, we can still see the
-impact from iTLB pressure. With 4K pages, aligning the code to PMD
-size (2M) performs slightly better than 64K.
-
-Binutils: 2.46
-GCC: 15.2.1 (--enable-host-pie)
-
-Workload: building vmlinux from Linux v7.0-rc1 with allnoconfig.
-Loop: 5
-
-                Base                 Patchset [1]         Patchset [2]
-instructions    1,994,512,163,037    1,994,528,896,322    1,994,536,148,574
-cpu-cycles      6,890,054,789,351    6,870,685,379,047    6,720,442,248,967
-                                              ~ -0.28%             ~ -2.46%
-itlb-misses           579,692,117          455,848,211           43,814,795
-                                             ~ -21.36%            ~ -92.44%
-time elapsed            1331.15 s            1325.50 s            1296.35 s
-                                              ~ -0.42%             ~ -2.61%
-
-Maybe we could make exec_folio_order() choose differently folio size
-depending on the configuration and conditional in some way, for example
-based on the size of the code segment?
-
-[1] https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev
-[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
-
-Thanks,
-Rui</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/20260314095022.217231-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, suggested alternative approach</div>
-</div>
-</div>
-<div class="thread-node depth-1" id="2026-03-16">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">David (Arm)</span>
-<a class="date-chip" href="../2026-03-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-16">2026-03-16</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer David pointed out that the patch mixes two concepts: minimum folio size (exec_folio_order()) and VMA alignment. He suggested aligning the VMA to 2M if the region is reasonably sized, using a PMD.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">I might be wrong, but I think you are mixing two things here:
-
-(1) &quot;Minimum&quot; folio size (exec_folio_order())
-
-(2) VMA alignment.
-
-
-(2) should certainly be as large as (1), but assume we can get a 2M
-folio on arm64 4k, why shouldn&#x27;t we align it to 2M if the region is
-reasonably sized, and use a PMD?
-
-
--- 
-Cheers,
-
-David</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/be65e710-997c-413c-8455-2d687fc51fc6@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: mixing_concepts, requested_changes</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">WANG Rui</span>
-<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer noted that even when a user-space shared library&#x27;s code segment satisfies PMD_SIZE (32MB), it may not end up at a PMD-aligned virtual address, and suggested skipping the PMD_SIZE == folio_sz case to avoid calling __thp_get_unmapped_area() twice with the same parameters.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">I noticed that even when the code segment of a user-space shared library
-satisfies PMD_SIZE (32MB), it still doesn\u2019t end up at a PMD-aligned virtual
-address. This might be the fallback you mentioned. Adjusting p_align in the
-ld.so ELF loader does work, though it also avoids extremely large PMD_SIZE
-values (capped at \u226432M).
-
-It would probably be better to skip the PMD_SIZE == folio_sz case here,
-so we don\u2019t end up calling __thp_get_unmapped_area() twice with the same
-parameters.
-
-Thanks,
-Rui</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260314034745.168715-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 <div class="thread-node depth-0" id="2026-03-18">
@@ -2030,6 +577,160 @@ Yeah I think introducing Kconfig might be an option.
 </details>
 <a href="https://lore.kernel.org/r/562fb349-c2d2-4fbe-83f9-75c26cc4b7ae@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: author provided evidence to support their approach, no clear resolution or agreement on the issue</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-03-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">hev</span>
+<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer hev ran benchmarks on RK3399 and observed a significant reduction in iTLB misses after applying the patch, but questioned whether it would be better to align the virtual address to PMD size instead of CONT_PTE_SIZE.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">From: WANG Rui &lt;r@hev.cc&gt;
+
+Hi,
+
+I ran a quick bench on RK3399:
+
+Binutils: 2.46
+GCC: 15.2.1 (--enable-host-pie)
+
+Workload: building vmlinux from Linux v7.0-rc1 with allnoconfig.
+
+                Base                 Patchset [1]         Patchset [2]
+instructions    3,115,852,636,773    3,194,533,947,809    3,235,417,205,947
+cpu-cycles      8,374,429,970,450    8,457,398,871,141    8,323,881,987,768
+itlb-misses         9,250,336,037        8,033,415,293        2,946,152,935
+                                             ~ -13.16%            ~ -68.15%
+time elapsed             610.51 s             605.12 s             593.83 s
+
+[1] https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev
+[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
+
+Should we prefer to PMD aligned here?
+
+Thanks,
+Rui</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/20260313163557.147948-1-git@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">hev</span>
+<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer suggests moving the logic for determining whether a virtual address needs to be aligned to an exec folio size from the current location in the code to a separate function, maximum_alignment(), or even better, a new helper function should_align_to_exec_folio().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think this logic should live in maximum_alignment(), so we don&#x27;t
+have to walk the segments twice. It might be better to move it into a
+separate helper, something like should_align_to_exec_folio()?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/CAHirt9g=drGaeNN7C1hbND4=zXQifhQyP4cUaCz27=tYpHYgfQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: suggestion, improvement</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">WANG Rui</span>
+<a class="date-chip" href="../2026-03-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-14">2026-03-14</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer WANG Rui pointed out that the original patch&#x27;s focus was on 64K normal pages, but they were actually referring to AArch64 with 4K normal pages. They provided measurement results showing that aligning code to PMD size (2M) performs slightly better than 64K for 4K pages.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I only just realized your focus was on 64K normal pages, what I was
+referring to here is AArch64 with 4K normal pages.
+
+Sorry about the earlier numbers. They were a bit low precision.
+RK3399 has pretty limited PMU events, and it looks like it can\u2019t
+collect events from the A53 and A72 clusters at the same time, so
+I reran the measurements on the A53.
+
+Even though the A53 backend isn\u2019t very wide, we can still see the
+impact from iTLB pressure. With 4K pages, aligning the code to PMD
+size (2M) performs slightly better than 64K.
+
+Binutils: 2.46
+GCC: 15.2.1 (--enable-host-pie)
+
+Workload: building vmlinux from Linux v7.0-rc1 with allnoconfig.
+Loop: 5
+
+                Base                 Patchset [1]         Patchset [2]
+instructions    1,994,512,163,037    1,994,528,896,322    1,994,536,148,574
+cpu-cycles      6,890,054,789,351    6,870,685,379,047    6,720,442,248,967
+                                              ~ -0.28%             ~ -2.46%
+itlb-misses           579,692,117          455,848,211           43,814,795
+                                             ~ -21.36%            ~ -92.44%
+time elapsed            1331.15 s            1325.50 s            1296.35 s
+                                              ~ -0.42%             ~ -2.61%
+
+Maybe we could make exec_folio_order() choose differently folio size
+depending on the configuration and conditional in some way, for example
+based on the size of the code segment?
+
+[1] https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev
+[2] https://lore.kernel.org/linux-fsdevel/20260313005211.882831-1-r@hev.cc
+
+Thanks,
+Rui</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/20260314095022.217231-1-r@hev.cc" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested alternative approach</div>
+</div>
+</div>
+<div class="thread-node depth-1" id="2026-03-16">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-03-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-16">2026-03-16</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David pointed out that the patch mixes two concepts: minimum folio size (exec_folio_order()) and VMA alignment. He suggested aligning the VMA to 2M if the region is reasonably sized, using a PMD.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I might be wrong, but I think you are mixing two things here:
+
+(1) &quot;Minimum&quot; folio size (exec_folio_order())
+
+(2) VMA alignment.
+
+
+(2) should certainly be as large as (1), but assume we can get a 2M
+folio on arm64 4k, why shouldn&#x27;t we align it to 2M if the region is
+reasonably sized, and use a PMD?
+
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/be65e710-997c-413c-8455-2d687fc51fc6@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: mixing_concepts, requested_changes</div>
+</div>
+</div>
 </div>
 </div>
 <div class="thread-node depth-0">
