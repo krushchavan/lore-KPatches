@@ -2,7 +2,7 @@
   "date": "2026-04-13",
   "report_file": "2026-04-13_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-04-15 16:16 UTC",
+  "last_updated": "2026-04-15 16:19 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -788,6 +788,167 @@
           "analysis_source": "llm",
           "review_comments": [],
           "list_id": "linux-nfs@vger.kernel.org"
+        }
+      ],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Joanne Koong",
+      "primary_email": "joannelkoong@gmail.com",
+      "patches_submitted": [],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH 0/2] fuse: Fix possible memleak at startup with immediate teardown",
+          "message_id": "CAJnrk1ZxijgYVTwzgX3LHoePtyOmOz-1y7swbgquT3_rxrLpvw@mail.gmail.com",
+          "url": "https://lore.kernel.org/all/CAJnrk1ZxijgYVTwzgX3LHoePtyOmOz-1y7swbgquT3_rxrLpvw@mail.gmail.com/",
+          "date": "2026-04-13T23:24:23Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch addresses a potential memory leak and hang issue in the FUSE (Filesystem in Userspace) kernel module. The original fix attempted to address a memory leak by freeing up resources, but it did not resolve a registration vs abort race condition that can cause the umount thread to hang indefinitely. This new patch introduces a preemptive registration check to prevent both the memory leak and the hang issue, providing a more robust solution.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Bernd Schubert",
+              "summary": "Reviewer Bernd Schubert noted that the original patch fixes one issue but doesn't address a registration vs abort race, which causes the umount thread to hang in TASK_UNINTERRUPTIBLE state even if the admin kills the daemon. He suggested adding a check for connection abort after ring->queue_refs was increased and proposed modifying the fuse_uring_create_ring_ent function to include this check.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Hmm, I think you are right for normal umount, for daemon kill\nIO_URING_F_CANCEL handles it with the patch in this discussion - io-uring \nwill send IO_URING_F_CANCEL in a loop until io_uring_cmd_done() done is\ncalled. \nFor plain umount I think it better to check for connection abort after\nring->queue_refs was increased, i.e. up to the last moment when\nfuse_abort_conn() / fuse_wait_aborted() would wait. With the patch you \nsuggested, I think the connection could be aborted after the check and\nthe ring entry might not be in any list yet, when fuse_uring_stop_queues()\ngets called and queue stop would be a no-op.\n\nHow about this\n\ndiff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c\nindex 46812149bb2e..575b1042719c 100644\n--- a/fs/fuse/dev_uring.c\n+++ b/fs/fuse/dev_uring.c\n@@ -1445,6 +1445,7 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,\n                           struct fuse_ring_queue *queue)\n {\n        struct fuse_ring *ring = queue->ring;\n+       struct fuse_conn *fc = ring->fc;\n        struct fuse_ring_ent *ent;\n        size_t payload_size;\n        struct iovec iov[FUSE_URING_IOV_SEGS];\n@@ -1487,6 +1488,19 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,\n        ent->payload = iov[1].iov_base;\n \n        atomic_inc(&ring->queue_refs);\n+\n+       spin_lock(&fc->lock);\n+       atomic_inc(&ring->queue_refs);\n+\n+       /* check if the disconnected while creating the entry */\n+       if (!fc->connected) {\n+               atomic_dec(&ring->queue_refs);\n+               err = -ENOTCONN;\n+               wake_up_all(&ring->stop_waitq);\n+       }\n+       spin_unlock(&fc->lock);\n+       if (err)\n+               goto error;\n        return ent;\n \n error:\n\n\n\nThanks,\nBernd",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-04-13",
+              "message_id": "33b4048c-e940-4cf4-80b4-88bc1adbd4a9@bsbernd.com",
+              "analysis_source": "llm",
+              "email": "bernd@bsbernd.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author acknowledged that the preemptive registration check needs to be modified to correctly handle the connected state, agreeing with the reviewer's suggestion.\n\nAuthor acknowledged that the preemptive registration check is necessary to fix both the leaked ents and the registration vs abort race, but disagreed with reviewer's suggestion to add a wake_up_all() in the original patch.\n\nThe author addressed Bernd's concern about the original patch not fixing the registration vs abort race and hang issue, explaining that the preemptive registration check is a more robust fix. The author acknowledged that the wake_up_all() call in the preemptive checking is not needed as the async teardown work will already take care of it.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "acknowledged",
+                "agreed",
+                "acknowledged technical issue",
+                "disagreed with suggested solution",
+                "clarified"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I had mentioned this in my previous email, \"the preemptive check needs\nto check ring->fc->connected though instead of queue->stopped, because\nthere's the race where abort and stop_queues() may have been triggered\nbefore the register sqe path does queue creation.\"\n\n---\n\nIf the connection is aborted after the check and the ring ent isn't on\nany list yet, I think that's fine. The async teardown worker is\nalready guaranteed to be scheduled (since the ring->fc->connected\ncheck is done after the ent grabs the queue ref).\n\nThe actual problem is that if the register sqe is the first sqe for\nthat queue and will trigger queue creation, then if the abort logic\nruns first before the queue creation, it will skip all the logic in\nfuse_uring_abort_end_requests() since \"queue =\nREAD_ONCE(ring->queues[qid]);\" is a null queue, and consequently\nqueue->stopped will never have been set to true.\n\n---\n\nI don't think it matters if this is within\nfuse_uring_create_ring_ent() instead of fuse_uring_do_register(). I\nput the logic inside of fuse_uring_do_register() because that seemed\nlogically cleaner to me (eg create_ent() is only responsible for ent\nallocation/initialization logic, any race checks to halt rest of sqe\nregistration flow are outside that), though if you have a preference\nto have it inside fuse_uring_create_ring_ent() that's fine by me. This\nis waht I have locally:\n\nSubject: [PATCH] fuse/uring: fix abort races with ring creation and ent\n registration\n\nThis fixes the following races:\nregistration vs. abort:\n  - thread a: io_uring_enter -> register sqe ->\nfuse_uring_create_ring_ent -> allocate ent but doesn't grab queue_ref\nyet\n  - thread b: fuse_conn_destroy() -> fuse_abort_conn() ->\nfuse_uring_abort() -> fuse_uring_stop_queues() ->\nfuse_uring_teardown_entries(), skips scheduling async teardown work\nsince queue_refs == 0, returns\n  - thread a: grabs the queue_ref, queue_ref is now 1, rest of\nfuse_uring_do_register() logic executes, ent is now marked cancelable,\nent state is now available, ent is placed on available queue\n  - thread b: fuse_abort_conn() returns, fuse_wait_aborted() now runs\nand does a \"wait_event(ring->stop_waitq,\natomic_read(&ring->queue_refs) == 0);\" which hangs since the waiter\nnever gets woken\n\nring creation vs abort:\n- thread a: fuse_uring_cmd() gets called, passes fc->aborted check (not\n  set yet)\n- thread b: abort is called, calls fuse_uring_abort(),\nfuse_uring_abort() is a no-op since ring == NULL right now\n- thread a: creates ring, creates queue, creates entry\n- if thread a takes the queue_ref count before the rest of the abort\nlogic, we end up with the same hang as the situation above.\n\nThis additionally addresses the ent memleak in the registration vs\ncancel race in [1].\n\n[1] https://lore.kernel.org/linux-fsdevel/20251021-io-uring-fixes-cancel-mem-leak-v1-0-26b78b2c973c@ddn.com/\n---\n fs/fuse/dev_uring.c | 21 +++++++++++++++++----\n 1 file changed, 17 insertions(+), 4 deletions(-)\n\ndiff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c\nindex f6b12aebb8bb..4bbc71755cb8 100644\n--- a/fs/fuse/dev_uring.c\n+++ b/fs/fuse/dev_uring.c\n@@ -243,6 +243,10 @@ static struct fuse_ring *fuse_uring_create(struct\nfuse_conn *fc)\n        max_payload_size = max(max_payload_size, fc->max_pages * PAGE_SIZE);\n\n        spin_lock(&fc->lock);\n+       if (!fc->connected) {\n+               spin_unlock(&fc->lock);\n+               goto out_err;\n+       }\n        if (fc->ring) {\n                /* race, another thread created the ring in the meantime */\n                spin_unlock(&fc->lock);\n@@ -974,7 +978,7 @@ static bool is_ring_ready(struct fuse_ring *ring,\nint current_qid)\n /*\n  * fuse_uring_req_fetch command handling\n  */\n-static void fuse_uring_do_register(struct fuse_ring_ent *ent,\n+static int fuse_uring_do_register(struct fuse_ring_ent *ent,\n                                   struct io_uring_cmd *cmd,\n                                   unsigned int issue_flags)\n {\n@@ -983,6 +987,16 @@ static void fuse_uring_do_register(struct\nfuse_ring_ent *ent,\n        struct fuse_conn *fc = ring->fc;\n        struct fuse_iqueue *fiq = &fc->iq;\n\n+       spin_lock(&fc->lock);\n+       /* abort teardown path is running or has run */\n+       if (!fc->connected) {\n+               spin_unlock(&fc->lock);\n+               atomic_dec(&ring->queue_refs);\n+               kfree(ent);\n+               return -ECONNABORTED;\n+       }\n+       spin_unlock(&fc->lock);\n+\n        fuse_uring_prepare_cancel(cmd, issue_flags, ent);\n\n        spin_lock(&queue->lock);\n@@ -999,6 +1013,7 @@ static void fuse_uring_do_register(struct\nfuse_ring_ent *ent,\n                        wake_up_all(&fc->blocked_waitq);\n                }\n        }\n+       return 0;\n }\n\n /*\n@@ -1114,9 +1129,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,\n        if (IS_ERR(ent))\n                return PTR_ERR(ent);\n\n-       fuse_uring_do_register(ent, cmd, issue_flags);\n-\n-       return 0;\n+       return fuse_uring_do_register(ent, cmd, issue_flags);\n }\n\n /*\n--\n2.52.0\n\nthough I'll probably end up splitting this into two separate patches\nwhen submitting. I don't think the wake_up_all(&ring->stop_waitq);\ncall is needed in the preemptive checking, as the async teardown work\nwill already take care of that.\n\nThanks,\nJoanne",
+              "reply_to": "Bernd Schubert",
+              "message_date": "2026-04-13",
+              "message_id": "CAJnrk1ZxijgYVTwzgX3LHoePtyOmOz-1y7swbgquT3_rxrLpvw@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            }
+          ],
+          "list_id": "stable@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH 0/2] fuse: Fix possible memleak at startup with immediate teardown",
+          "message_id": "CAJnrk1YPrPXN74fgesg1dbqJJsmjPOJ_My_mYMUevJfSrmrECg@mail.gmail.com",
+          "url": "https://lore.kernel.org/all/CAJnrk1YPrPXN74fgesg1dbqJJsmjPOJ_My_mYMUevJfSrmrECg@mail.gmail.com/",
+          "date": "2026-04-13T15:57:09Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch addresses a potential memory leak and hang issue in the FUSE (Filesystem in Userspace) kernel module. The original fix attempted to address a memory leak by freeing up resources, but it did not resolve a registration vs abort race condition that can cause the umount thread to hang indefinitely. This new patch introduces a preemptive registration check to prevent both the memory leak and the hang issue, providing a more robust solution.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Bernd Schubert",
+              "summary": "Reviewer Bernd Schubert noted that the original patch fixes one issue but doesn't address a registration vs abort race, which causes the umount thread to hang in TASK_UNINTERRUPTIBLE state even if the admin kills the daemon. He suggested adding a check for connection abort after ring->queue_refs was increased and proposed modifying the fuse_uring_create_ring_ent function to include this check.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Hmm, I think you are right for normal umount, for daemon kill\nIO_URING_F_CANCEL handles it with the patch in this discussion - io-uring \nwill send IO_URING_F_CANCEL in a loop until io_uring_cmd_done() done is\ncalled. \nFor plain umount I think it better to check for connection abort after\nring->queue_refs was increased, i.e. up to the last moment when\nfuse_abort_conn() / fuse_wait_aborted() would wait. With the patch you \nsuggested, I think the connection could be aborted after the check and\nthe ring entry might not be in any list yet, when fuse_uring_stop_queues()\ngets called and queue stop would be a no-op.\n\nHow about this\n\ndiff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c\nindex 46812149bb2e..575b1042719c 100644\n--- a/fs/fuse/dev_uring.c\n+++ b/fs/fuse/dev_uring.c\n@@ -1445,6 +1445,7 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,\n                           struct fuse_ring_queue *queue)\n {\n        struct fuse_ring *ring = queue->ring;\n+       struct fuse_conn *fc = ring->fc;\n        struct fuse_ring_ent *ent;\n        size_t payload_size;\n        struct iovec iov[FUSE_URING_IOV_SEGS];\n@@ -1487,6 +1488,19 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,\n        ent->payload = iov[1].iov_base;\n \n        atomic_inc(&ring->queue_refs);\n+\n+       spin_lock(&fc->lock);\n+       atomic_inc(&ring->queue_refs);\n+\n+       /* check if the disconnected while creating the entry */\n+       if (!fc->connected) {\n+               atomic_dec(&ring->queue_refs);\n+               err = -ENOTCONN;\n+               wake_up_all(&ring->stop_waitq);\n+       }\n+       spin_unlock(&fc->lock);\n+       if (err)\n+               goto error;\n        return ent;\n \n error:\n\n\n\nThanks,\nBernd",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-04-13",
+              "message_id": "33b4048c-e940-4cf4-80b4-88bc1adbd4a9@bsbernd.com",
+              "analysis_source": "llm",
+              "email": "bernd@bsbernd.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author acknowledged that the preemptive registration check needs to be modified to correctly handle the connected state, agreeing with the reviewer's suggestion.\n\nAuthor acknowledged that the preemptive registration check is necessary to fix both the leaked ents and the registration vs abort race, but disagreed with reviewer's suggestion to add a wake_up_all() in the original patch.\n\nThe author addressed Bernd's concern about the original patch not fixing the registration vs abort race and hang issue, explaining that the preemptive registration check is a more robust fix. The author acknowledged that the wake_up_all() call in the preemptive checking is not needed as the async teardown work will already take care of it.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "acknowledged",
+                "agreed",
+                "acknowledged technical issue",
+                "disagreed with suggested solution",
+                "clarified"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I had mentioned this in my previous email, \"the preemptive check needs\nto check ring->fc->connected though instead of queue->stopped, because\nthere's the race where abort and stop_queues() may have been triggered\nbefore the register sqe path does queue creation.\"\n\n---\n\nIf the connection is aborted after the check and the ring ent isn't on\nany list yet, I think that's fine. The async teardown worker is\nalready guaranteed to be scheduled (since the ring->fc->connected\ncheck is done after the ent grabs the queue ref).\n\nThe actual problem is that if the register sqe is the first sqe for\nthat queue and will trigger queue creation, then if the abort logic\nruns first before the queue creation, it will skip all the logic in\nfuse_uring_abort_end_requests() since \"queue =\nREAD_ONCE(ring->queues[qid]);\" is a null queue, and consequently\nqueue->stopped will never have been set to true.\n\n---\n\nI don't think it matters if this is within\nfuse_uring_create_ring_ent() instead of fuse_uring_do_register(). I\nput the logic inside of fuse_uring_do_register() because that seemed\nlogically cleaner to me (eg create_ent() is only responsible for ent\nallocation/initialization logic, any race checks to halt rest of sqe\nregistration flow are outside that), though if you have a preference\nto have it inside fuse_uring_create_ring_ent() that's fine by me. This\nis waht I have locally:\n\nSubject: [PATCH] fuse/uring: fix abort races with ring creation and ent\n registration\n\nThis fixes the following races:\nregistration vs. abort:\n  - thread a: io_uring_enter -> register sqe ->\nfuse_uring_create_ring_ent -> allocate ent but doesn't grab queue_ref\nyet\n  - thread b: fuse_conn_destroy() -> fuse_abort_conn() ->\nfuse_uring_abort() -> fuse_uring_stop_queues() ->\nfuse_uring_teardown_entries(), skips scheduling async teardown work\nsince queue_refs == 0, returns\n  - thread a: grabs the queue_ref, queue_ref is now 1, rest of\nfuse_uring_do_register() logic executes, ent is now marked cancelable,\nent state is now available, ent is placed on available queue\n  - thread b: fuse_abort_conn() returns, fuse_wait_aborted() now runs\nand does a \"wait_event(ring->stop_waitq,\natomic_read(&ring->queue_refs) == 0);\" which hangs since the waiter\nnever gets woken\n\nring creation vs abort:\n- thread a: fuse_uring_cmd() gets called, passes fc->aborted check (not\n  set yet)\n- thread b: abort is called, calls fuse_uring_abort(),\nfuse_uring_abort() is a no-op since ring == NULL right now\n- thread a: creates ring, creates queue, creates entry\n- if thread a takes the queue_ref count before the rest of the abort\nlogic, we end up with the same hang as the situation above.\n\nThis additionally addresses the ent memleak in the registration vs\ncancel race in [1].\n\n[1] https://lore.kernel.org/linux-fsdevel/20251021-io-uring-fixes-cancel-mem-leak-v1-0-26b78b2c973c@ddn.com/\n---\n fs/fuse/dev_uring.c | 21 +++++++++++++++++----\n 1 file changed, 17 insertions(+), 4 deletions(-)\n\ndiff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c\nindex f6b12aebb8bb..4bbc71755cb8 100644\n--- a/fs/fuse/dev_uring.c\n+++ b/fs/fuse/dev_uring.c\n@@ -243,6 +243,10 @@ static struct fuse_ring *fuse_uring_create(struct\nfuse_conn *fc)\n        max_payload_size = max(max_payload_size, fc->max_pages * PAGE_SIZE);\n\n        spin_lock(&fc->lock);\n+       if (!fc->connected) {\n+               spin_unlock(&fc->lock);\n+               goto out_err;\n+       }\n        if (fc->ring) {\n                /* race, another thread created the ring in the meantime */\n                spin_unlock(&fc->lock);\n@@ -974,7 +978,7 @@ static bool is_ring_ready(struct fuse_ring *ring,\nint current_qid)\n /*\n  * fuse_uring_req_fetch command handling\n  */\n-static void fuse_uring_do_register(struct fuse_ring_ent *ent,\n+static int fuse_uring_do_register(struct fuse_ring_ent *ent,\n                                   struct io_uring_cmd *cmd,\n                                   unsigned int issue_flags)\n {\n@@ -983,6 +987,16 @@ static void fuse_uring_do_register(struct\nfuse_ring_ent *ent,\n        struct fuse_conn *fc = ring->fc;\n        struct fuse_iqueue *fiq = &fc->iq;\n\n+       spin_lock(&fc->lock);\n+       /* abort teardown path is running or has run */\n+       if (!fc->connected) {\n+               spin_unlock(&fc->lock);\n+               atomic_dec(&ring->queue_refs);\n+               kfree(ent);\n+               return -ECONNABORTED;\n+       }\n+       spin_unlock(&fc->lock);\n+\n        fuse_uring_prepare_cancel(cmd, issue_flags, ent);\n\n        spin_lock(&queue->lock);\n@@ -999,6 +1013,7 @@ static void fuse_uring_do_register(struct\nfuse_ring_ent *ent,\n                        wake_up_all(&fc->blocked_waitq);\n                }\n        }\n+       return 0;\n }\n\n /*\n@@ -1114,9 +1129,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,\n        if (IS_ERR(ent))\n                return PTR_ERR(ent);\n\n-       fuse_uring_do_register(ent, cmd, issue_flags);\n-\n-       return 0;\n+       return fuse_uring_do_register(ent, cmd, issue_flags);\n }\n\n /*\n--\n2.52.0\n\nthough I'll probably end up splitting this into two separate patches\nwhen submitting. I don't think the wake_up_all(&ring->stop_waitq);\ncall is needed in the preemptive checking, as the async teardown work\nwill already take care of that.\n\nThanks,\nJoanne",
+              "reply_to": "Bernd Schubert",
+              "message_date": "2026-04-13",
+              "message_id": "CAJnrk1ZxijgYVTwzgX3LHoePtyOmOz-1y7swbgquT3_rxrLpvw@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Bernd Schubert",
+              "summary": "Reviewer noted that the patch's placement of kfree_ring_ent() in fuse_uring_create() is before the increase of queue_refs, which may not be sufficient to prevent a hang; suggested moving it after the increase\n\nReviewer noted that the original patch does not address a registration vs abort race, which causes the umount thread to hang in TASK_UNINTERRUPTIBLE state even after killing the daemon, and suggested using a preemptive registration check as a more robust fix.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Yeah, that doesn't matter, it just has to be after the increase of \nqueue_refs. I probably missed the complete patch before, but I had\nonly seen the change in fuse_uring_create(), which is before increase\nof queue_refs. \nCode changes in fuse_uring_create_ring_ent() are little bit smaller,\nas it already has the free of ring_ent. In the end I don't care and\neither way works.\n\n---\n\nI have this in my mind\n\n\ncore-A                                                  core-B\n\nfuse_uring_create_ring_ent()\n\n       ent->headers = headers->iov_base;\n       ent->payload = payload->iov_base;\n }\n                                             fuse_conn_destroy()\n                                                fuse_abort_conn()\n                                                  fuse_uring_abort() -> no-op\n                                                fuse_wait_aborted()\n\n        atomic_inc(&ring->queue_refs);\n                                                fuse_uring_wait_stopped_queues()\n\n\n\nThanks,\nBernd",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-04-14",
+              "message_id": "6b62e345-a4d4-4067-b3c4-f773c8fe3036@ddn.com",
+              "analysis_source": "llm",
+              "email": "bschubert@ddn.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author acknowledged that a race condition exists between sqe registration and abort logic, agreeing that the preemptive registration check is necessary to prevent hang\n\nAuthor acknowledged that a wake-up is necessary in the scenario described by Bernd, agreed to modify the patch to include a wake-up when queue_refs hits 0",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledged a technical issue",
+                "agreed with the approach",
+                "acknowledged fix needed",
+                "agreed to restructure"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I think this is necessary else there is the race where this is the\nfirst sqe that is being registered and it will trigger ring creation\nbut the ring hasn't been created yet when the abort logic runs. The\nfuse_uring_abort() will see that the ring is NULL and skip the call to\nfuse_uring_stop_queues() which will skip scheduling the async teardown\nworker. Then when the sqe triggers ring creation and later ent\ncreation and grabs the queue_ref, it can lead to the same hang as the\nregistration vs. abort one where fuse_wait_aborted() sleeps forever\nwaiting in queue_refs == 0, if the fuse_wait_aborted() logic runs\nbetween the ent grabbing the queue ref and decrementing it in the if\n(!fc->connected) logic.\n\n---\n\nAh yeah that's a good point, the wakeup would be necessary for this\nscenario. I think the atomic_dec() should be changed to\n\n if (atomic_dec_and_test(&ring->queue_refs))\n      wake_up_all(&ring->stop_waitq);\n\nThanks,\nJoanne",
+              "reply_to": "Bernd Schubert",
+              "message_date": "2026-04-14",
+              "message_id": "CAJnrk1Y_hYpr=1SkCuqRPtthurWKu67kaFtTisVyVZvdCewXCQ@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            }
+          ],
+          "list_id": "stable@vger.kernel.org"
         }
       ],
       "patches_acked": [],
