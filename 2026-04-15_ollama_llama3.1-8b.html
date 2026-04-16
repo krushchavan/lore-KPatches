@@ -952,10 +952,10 @@
 <body>
     <p class="back-to-index"><a href="index.html">&#8592; Back to Index</a></p>
     <h1>LKML Activity Report <span class="llm-badge">LLM: ollama/llama3.1:8b</span></h1>
-    <h2>2026-04-15 &mdash; Generated 2026-04-16 06:48:30</h2>
+    <h2>2026-04-15 &mdash; Generated 2026-04-16 06:48:34</h2>
     <p class="analysis-mode">Analysis: LLM-enriched (ollama/llama3.1:8b)</p>
+    <p class="log-link"><a href="logs/2026-04-15_ollama_llama3.1-8b.log">View generation log</a></p>
     
-    <div class="progress-banner"><span class="progress-spinner">&#x27F3;</span><span class="progress-count">16 / 16 developers complete</span><span class="refresh-controls">Auto-refresh:<button class="refresh-btn" data-secs="60">1 min</button><button class="refresh-btn" data-secs="300">5 min</button><button class="refresh-btn" data-secs="600">10 min</button><span class="refresh-countdown-wrap">in <span id="refresh-countdown">60s</span></span></span><span class="progress-updated">Updated: 2026-04-16 06:48 UTC</span></div>
 
     
     <div class="stats-grid">
@@ -1324,10 +1324,201 @@
 <p>This patch adds documentation for io-uring buffer management and zero-copy operations in the FUSE (Filesystem in Userspace) driver. It describes how to handle multiple IO size payloads, including preallocating buffers and managing buffer pools. The approach taken is to use a union in the fuse_uring_cmd_req struct to accommodate different payload sizes.</p>
 </div>
 <div class="progress-detail"><span class="progress-icon">&#9654;</span> Joanne Koong applied/merged the patch</div>
-<div class="review-comments-compact">
-<span class="review-comments-header">2 participants</span>
-<span class="reviewer-list"> &mdash; Bernd Schubert (Reviewed-by, Inline Review), Joanne Koong (author)</span>
-<div class="review-detail-link"><a href="reviews/CAJnrk1ZAcbYkewWz-CbxgzkvXnk2-QKLjSk-oA0hywbnVUSM9A-mail-gmail-com.html#2026-04-15">View review comments &rarr;</a></div>
+<div class="review-comments">
+<div class="review-comments-header">2 participants</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Bernd Schubert</span>
+<span class="reply-to-label">↳ replying to Joanne Koong</span>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer questioned the logic of registering multiple entries when each entry must carry data, suggesting a simpler approach
+
+Bernd Schubert noted that the current design maps headers into a large region and does not utilize extra space, but considers this acceptable if multi-size buffer pools are supported.
+
+Reviewer questioned the necessity of using pbuf for dynamic allocation in io-uring, suggesting it&#x27;s not technically required and can be handled by userspace
+
+Reviewer Bernd Schubert suggested a per-queue approach to managing fuse bufring, proposing the use of an order map to dynamically create a pool based on the request size and store it in ring_ent for buffer recycling.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Then don&#x27;t register that many entries? An entry is useless if it cannot
+carry data - why do you need to register that many entries then?
+
+---
+
+Pinning can be done per buffer as well. The part that is harder is
+pinning of the headers - this is why libfuse currently allocates 4K for
+every header - prepares the pinning. From my point of view, we _should_
+make use of that and set at registration time that the header is
+allocated as 4K and then small requests can be inlined into the
+remaining part of those 4K. With that ring bufs become useful, because
+most metadata do not need a new payload buffer anymore.
+However, I think in your current design headers are mapped into a large
+region and there is no way to use extra space. I think that is fine, as
+long as we have the capability to have multi size buf pools.
+
+
+Contiguous buffer allocation can be done for entries as well - userspace
+just needs to assign it to buffers that way. It becomes it a bit harder
+with dynamic entry registration - entries buffers should then allocat in
+sizes of system huge pages.
+
+
+In fact I initially had that in libfuse and had allocated all userspace
+buffers as one big memory. Then &#x27;temporarily&#x27; removed it because I had
+development stability issues - the single buffer needs to be marked with
+ASAN areas in order to catch issues. For initial development that was
+just overkill, but could be added now, in combination with ASAN buf marking.
+For pools it would be good think about ASAN as well.
+
+---
+
+I have to admit that I don&#x27;t see why we need pbuf for dynamic
+allocation. While the io-uring ring has a fixed number of SQEs/CQEs and
+while libfuse currently strongly couples these to fuse buffers, there is
+no technical reason. Initially it was, because I had taken the &#x27;tags&#x27;
+from ublk design, but then Miklos asked to make it lists that just get
+appended whenever a FUSE_IO_URING_CMD_REGISTER is send. Which means
+libfuse _could_ add new entries any time. You could start with 1 entry
+per queue, additionally with the reduce-nr-queue patches you could even
+start with a single queue and a single entry - and then extend that at
+any time to what libfuse or the application believes is needed.
+I.e. except of io-uring setup, adding or even removing ring entries and
+their buffers is mainly a missing userspace issue. In order to remove
+idle entries, we could add another notification type like
+FUSE_NOTIFY_WAKE_RING_ENTRIES and it would then wake a given amount per
+queue and maybe send via a new op code like FUSE_NOOP. All of that seems
+to be easy.
+
+---
+
+Let&#x27;s say we would have per queue
+
+    struct fuse_bufring {
+        bool use_pinned_headers: 1;
+        bool use_zero_copy: 1;
+        unsigned int max_queue_depth; /* headers buffer capacity; frozen
+at first REGISTER */
+
+        union {
+            void __user *headers;
+            struct fuse_bufring_pinned pinned_headers;
+        };
+
+        unsigned int nr_pools;
+        struct fuse_bufring_pool *pools[FUSE_URING_MAX_POOLS];
+
+        /* lookup: order (req size) pool */
+        struct fuse_bufring_pool *order_map[FUSE_URING_NR_ORDERS];
+    };
+
+
+Order map is then dynamically created at buf pool registration time, and
+then we would eventually get to
+
+struct fuse_bufring_pool *pool = order_map[get_order(fuse_len_args())];
+
+(obviously the final code needs to get a check that we don&#x27;t exceed max
+payload size.)
+
+The looked up pool can be stored into ring_ent for buf recycling.
+
+
+
+And then
+
+  struct fuse_uring_cmd_req {
+
+      ...
+      union {
+          struct {
+              __u32 max_queue_depth;      /* (renamed from queue_depth) */
+              __u32 buf_size;
+
+              __u8  pool_idx;
+              __u8  _pad[3];
+
+          } init;
+          ...
+
+      };
+
+  };
+
+
+
+I think pool_idx is needed one way or the other, because the io-uring
+ring owner might have other pools for its own purposes.
+
+
+Thanks,
+Bernd</pre>
+</details>
+<a href="https://lore.kernel.org/r/ff596299-38c1-4c5a-8f1d-14931dd84ef0@bsbernd.com" target="_blank" rel="noopener" class="lore-link">View on lore ↗</a>
+</div>
+<div class="review-comment-signals">Signals: requested changes, considered acceptable, no strong objection</div>
+</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<span class="reply-to-label">↳ replying to Bernd Schubert</span>
+<span class="badge" style="color:#721c24;background:#f8d7da">Contentious</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed Bernd&#x27;s concern about the need for multiple IO size payloads by explaining that buffer rings with incremental buffer consumption can support higher concurrency and reduce memory usage, particularly for metadata-heavy workloads.
+
+Author agreed that having a contiguous array of buf_sizes in the init struct is cleaner and more efficient, no specific plan for changes mentioned.
+
+Author strongly disagreed with reviewer&#x27;s suggestion to pin memory allocation per-header, arguing it is not ideal and has no benefits, and explaining that ringbufs require contiguous headers.
+
+Author acknowledged that bufrings can be beneficial even if ents are dynamically allocated, as they help with memory efficiency through incremental buffer consumption.
+
+Author acknowledged that the buf_size field in struct fuse_uring_cmd_req needs to be last for extension, but did not provide a clear indication of how many different payload sizes they envision needing.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Registering more entries gives higher concurrency (since the number of
+entries determines the max number of in-flight requests). Since not
+all fuse operations require large payload buffers simultaneously,
+buffer rings with incremental buffer consumption will allow servers to
+support higher concurrency with a lot less memory than dedicating a
+buffer per entry especially for metadata-heavy workloads.
+
+---
+
+Yes it could be done per buffer but imo it is much cleaner to do it
+contiguously.
+
+---
+
+I&#x27;m not sure if you are trying to make this point or just describing
+the non-ringbuf &quot;legacy&quot; path, but I strongly disagree that pinning
+should be done per-header. Each struct fuse_uring_req_header is 288
+bytes, and rounding that up to 4K per header is not ideal and I don&#x27;t
+see any benefit from doing that. In the original (eg non-ringbuf) path
+where each header is allocated at 4k, that can&#x27;t be used with ringbufs
+as using ringbufs mandates that the headers are allocated
+contiguously.
+
+---
+
+If the ents are dynamically allocated, bufrings are still useful
+because incremental buffer consumption still helps with memory
+efficiency
+
+---
+
+Thanks,
+Joanne</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAJnrk1bmxYzZEV46-uG3XXaVEu2hciyEWf9K5QNXaXuz0qUWcg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore ↗</a>
+</div>
+<div class="review-comment-signals">Signals: clarification, explanation, agreed</div>
+</div>
 </div>
 </div>
 <div class="activity-item">
@@ -1572,9 +1763,9 @@
 <span class="today-badge">&#128293; TODAY</span>
 <a href="https://lore.kernel.org/all/20260415170001.109723-1-mark@harmstone.com/" target="_blank" class="item-link">[PATCH v4] btrfs: add BTRFS_IOC_GET_CSUMS ioctl</a>
 <span class="version-chain">
-<a href="https://lore.kernel.org/all/20260408174642.136962-1-mark@harmstone.com/" class="version-badge" target="_blank">v2</a>
+<a href="reviews/20260408174642-136962-1-mark-harmstone-com.html" class="version-badge" target="_blank">v2</a>
 <span class="version-arrow">→</span>
-<a href="https://lore.kernel.org/all/20260413171440.116041-1-mark@harmstone.com/" class="version-badge" target="_blank">v3</a>
+<a href="reviews/20260413171440-116041-1-mark-harmstone-com.html" class="version-badge" target="_blank">v3</a>
 <span class="version-arrow">→</span>
 <a href="reviews/20260415170001-109723-1-mark-harmstone-com.html" class="version-badge latest" target="_blank">v4</a>
 </span>
@@ -1763,56 +1954,12 @@
 </div>
 
     <footer>
-        Generated in 0.0s
+        Generated in 2912.4s
         &bull; 16 developers tracked
         &bull; Data from lore.kernel.org
         &bull; LLM: ollama/llama3.1:8b
-        
+        &bull; <a href="logs/2026-04-15_ollama_llama3.1-8b.log">Log</a>
     </footer>
 
-<script>
-(function () {
-    var DEFAULT_SECS = 60;
-    var remaining, timer;
-
-    function stored() {
-        try { return parseInt(localStorage.getItem('lkml_refresh_secs')) || DEFAULT_SECS; }
-        catch (e) { return DEFAULT_SECS; }
-    }
-    function store(s) {
-        try { localStorage.setItem('lkml_refresh_secs', s); } catch (e) {}
-    }
-    function tick() {
-        remaining--;
-        update();
-        if (remaining <= 0) { clearInterval(timer); location.reload(); }
-    }
-    function start(secs) {
-        clearInterval(timer);
-        remaining = secs;
-        update();
-        timer = setInterval(tick, 1000);
-    }
-    function update() {
-        var el = document.getElementById('refresh-countdown');
-        if (el) el.textContent = remaining + 's';
-    }
-    function choose(secs) {
-        store(secs);
-        document.querySelectorAll('.refresh-btn').forEach(function (b) {
-            b.classList.toggle('active', parseInt(b.dataset.secs) === secs);
-        });
-        start(secs);
-    }
-    document.addEventListener('DOMContentLoaded', function () {
-        var secs = stored();
-        document.querySelectorAll('.refresh-btn').forEach(function (b) {
-            b.addEventListener('click', function () { choose(parseInt(b.dataset.secs)); });
-            if (parseInt(b.dataset.secs) === secs) b.classList.add('active');
-        });
-        start(secs);
-    });
-})();
-</script>
 </body>
 </html>
