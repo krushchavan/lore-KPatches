@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH] btrfs: avoid GFP_ATOMIC allocations in qgroup free paths</title>
+    <title>Review Comments: [PATCH V10 00/10] famfs: port into fuse</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,54 +236,125 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH] btrfs: avoid GFP_ATOMIC allocations in qgroup free paths</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/44a36cda2b9cdc4a600c942c051f9e028239308b.1773941507.git.loemra.dev@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-03-23</strong><div class="date-range-nav">Active on: <a href="#2026-03-23">2026-03-23</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a GFP_ATOMIC allocation issue in the btrfs qgroup free paths by introducing a sentinel value to signal that only bytes changed should be tracked, thus avoiding unnecessary allocations and making the BUG_ON unreachable.</div></div>
+    <h1>[PATCH V10 00/10] famfs: port into fuse</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/aeVy2MzucnrLlOQx@gourry-fedora-PF4VCD3F/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-04-20</strong><div class="date-range-nav">Active on: <a href="#2026-04-20">2026-04-20</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch addresses performance issues in iomap_begin() by avoiding unnecessary lookup operations and instead using cached metadata to access DAX devices. It also introduces a new BPF operation, dax_fmap_parse(), which allows filesystems to perform filesystem-specific setup and populate the DAX bitmap. The patch requires no hard-coded OMF structures in the FUSE API and ensures that metadata is accessible with a single pointer dereference.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-03-23">
+<div class="thread-node depth-0" id="2026-04-20">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">David Sterba</span>
-<a class="date-chip" href="../2026-03-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-23">2026-03-23</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="review-author">Joanne Koong</span>
+<a class="date-chip" href="../2026-04-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-20">2026-04-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Added the patch to the for-next branch without any issues or concerns.</div>
+<div class="review-comment-text">Reviewer Joanne Koong noted that Gregory&#x27;s patch does not handle GET_DAXDEV, which is necessary to validate the addressing information for DAX devices, and suggested pairing it with John&#x27;s GET_FMAP/GET_DAXDEV operations.
+
+Reviewer Joanne Koong questioned the necessity of lazy initialization of DAX devices via GET_DAXDEV on file open, suggesting it would be more efficient to validate and acquire devices during iomap configuration at initialization time, potentially simplifying kernel-side logic and improving FUSE_OPEN performance.
+
+Reviewer Joanne Koong suggested integrating the bpf approach with Darrick&#x27;s fuse-iomap work, renaming dax_fmap_parse() to iomap_setup() to make it a generic interface for userspace setup, and noted that the distinction between dax and non-dax should be handled by the fuse iomap plumbing.
+
+Reviewer Joanne Koong suggested repurposing the bpf_dax_fmap_parse() function into a generic kfunc, bpf_fuse_iomap_get_inode_meta(), that returns a bounded pointer to cached inode metadata for both dax and non-dax cases.
+
+Reviewer Joanne Koong suggested removing the `file_size` field from the `fuse_dax_fmap_ops` structure, as it can be derived from `i_size_read(inode)`
+
+Reviewer suggested simplifying GET_DAXDEV and making GET_FMAP generic by introducing FUSE_IOMAP_GETMAP, allowing servers to control fetching of mapping blobs on open.
+
+Reviewer Joanne Koong expressed a preference for a different solution to the problem of accessing metadata in iomap_begin(), suggesting that adding generic stride/offset multi-device support to fs/iomap would be the cleanest approach and could potentially solve multiple issues at once.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Mar 19, 2026 at 04:49:08PM -0700, Leo Martins wrote:
-&gt; When qgroups are enabled, __btrfs_qgroup_release_data() and
-&gt; qgroup_free_reserved_data() pass an extent_changeset to
-&gt; btrfs_clear_record_extent_bits() to track how many bytes had their
-&gt; EXTENT_QGROUP_RESERVED bits cleared. Inside the extent IO tree spinlock,
-&gt; add_extent_changeset() calls ulist_add() with GFP_ATOMIC to record each
-&gt; changed range. If this allocation fails, it hits a BUG_ON and panics the
-&gt; kernel.
-&gt; 
-&gt; However, both of these callers only read changeset.bytes_changed
-&gt; afterwards \u2014 the range_changed ulist is populated and immediately freed
-&gt; without ever being iterated. The GFP_ATOMIC allocation is entirely
-&gt; unnecessary for these paths.
-&gt; 
-&gt; Introduce extent_changeset_init_bytes_only() which uses a sentinel value
-&gt; (EXTENT_CHANGESET_BYTES_ONLY) on the ulist&#x27;s prealloc field to signal
-&gt; that only bytes_changed should be tracked. add_extent_changeset() checks
-&gt; for this sentinel and returns early after updating bytes_changed,
-&gt; skipping the ulist_add() call entirely. This eliminates the GFP_ATOMIC
-&gt; allocation and makes the BUG_ON unreachable for these paths.
-&gt; 
-&gt; Callers that need range tracking (qgroup_reserve_data,
-&gt; qgroup_unreserve_range, btrfs_qgroup_check_reserved_leak) continue to
-&gt; use extent_changeset_init() and are unaffected.
-&gt; 
-&gt; Signed-off-by: Leo Martins &lt;loemra.dev@gmail.com&gt;
+<pre class="raw-body-text">Thanks John for running the benchmarks on your hardware. And thanks
+Gregory for your work on this too.
 
-Added to for-next, thanks.
+---
 
-</pre>
+It handles #3 by removing GET_DAXDEV as a fuse op and having the
+daxdev initialization / setup routed through FUSE_IOMAP_CONFIG at
+iomap initialization time instead, which integrates with the generic
+iomap infrastruture/uapi additions Darrick added in his fuse-iomap
+series [1].
+
+In this series the GET_DAXDEV op gets sent lazily on file opens but
+it&#x27;s still not clear to me why this is necessary. imo device setup
+should happen logically as part of iomap configuration and it seems
+more efficient to have devices validated/acquired before any files are
+opened. I thihnk that makes things a lot simpler on the kernel side in
+other ways (eg we can get rid of famfs_dax_devlist / famfs_daxdev /
+famfs_devlist_sem / famfs_update_daxdev_table() /
+famfs_fuse_get_daxdev() altogether). It also saves the famfs server
+the roundtrip context switching cost if we get rid of GET_DAXDEV and
+move it to iomap initialization time, which will improve FUSE_OPEN
+performance for famfs. Maybe there&#x27;s something I&#x27;m missing here as to
+why the daxdev initialization has to be done lazily on open?
+
+I think Darrick had also mentioned something earlier about how he
+thinks GET_DAXDEV should be another application of backing files [2] -
+I like this idea too, as it gets rid of the GET_DAXDEV op and reuses
+fuse&#x27;s existing infrastructure.
+
+[1] https://lore.kernel.org/linux-fsdevel/177188734695.3935739.8198854011004837207.stgit@frogsfrogsfrogs/
+[2] https://lore.kernel.org/linux-fsdevel/20260416224331.GD114184@frogsfrogsfrogs/
+
+---
+
+Just a note for later, if the bpf approach gets pursued further:
+instead of making this a dax specific ops, I think this needs to be
+integrated interface-wise with Darrick&#x27;s fuse-iomap work since he does
+the same thing. I think dax_fmap_parse() could be renamed to something
+like iomap_setup(), where userspace can use this to do any sort of
+generic setup, whether that&#x27;s mapping related or dax related or not.
+In my mind, the dax vs non dax distinction is handled by the fuse
+iomap plumbing that chooses which iomap entry points to call,  but
+beyond that,  the callbacks and struct ops themselves should be
+generic enough to be shared between the two.
+
+---
+
+another note for later, if the benchmarks prove promising and after
+the LSF discussions we decide to go with this approach: imo we
+could/should repurpose this into a generic
+bpf_fuse_iomap_get_inode_meta() that returns a bounded pointer into
+whatever opaque blob was cached on the inode during iomap_setup(),
+where it&#x27;d be a generic kfunc serving both the dax and non-dax case
+for any kind of mapping layout
+
+---
+
+I don&#x27;t think file_size is needed here? seems like we could just
+derive this from i_size_read(inode)?
+
+---
+
+I think we could kill GET_DAXDEV and for GET_FMAP, we could make this
+a generic FUSE_IOMAP_GETMAP where the server can set a flag on open to
+indicate whether the mapping blob should be fetched or not.
+
+---
+
+I don&#x27;t have a NACK on what you wrote above, thank you for your work
+on this and bridging it into John&#x27;s famfs server.
+
+As I understand it, Amir also scheduled a cross-track FS+MM+IO session
+at LSF to discuss famfs and dax iomap. Christoph had posted a
+suggestion in another message about solving this problem with adding
+generic stride/offset multi-device support to fs/iomap, and I&#x27;m hoping
+the LSF session will shed more light on this, as that to me seems the
+cleanest solution and would pretty much give everyone what they want
+(including getting famfs unblocked, as I think with this approach we
+would just need to figure out the generic stride/offset format for the
+fuse iomap uapi, and could have the interleaving logic living in fuse
+initially with fs/iomap migrations done post-merge). In the meantime,
+I think it&#x27;s really helpful getting the data points on how bpf
+performs, thank you for running the benchmarks on your setup, John.
+
+Thanks,
+Joanne</pre>
 </details>
-<div class="review-comment-signals">Signals: Added to for-next</div>
+<div class="reply-to-label">&#8627; replying to Gregory Price</div>
+<a href="https://lore.kernel.org/r/CAJnrk1ZpPS9rOoBqOBRsqTu0Zgk=aoYzpYZ0mAVDCoeewtLhcg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, NEEDS_WORK, NEUTRAL</div>
 </div>
 </div>
 </div>

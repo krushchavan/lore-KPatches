@@ -1,0 +1,40 @@
+{
+  "thread_id": "aeVy2MzucnrLlOQx@gourry-fedora-PF4VCD3F",
+  "subject": "[PATCH V10 00/10] famfs: port into fuse",
+  "url": "https://lore.kernel.org/all/aeVy2MzucnrLlOQx@gourry-fedora-PF4VCD3F/",
+  "dates": {
+    "2026-04-20": {
+      "report_file": "2026-04-20_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Joanne Koong",
+          "summary": "Reviewer Joanne Koong noted that Gregory's patch does not handle GET_DAXDEV, which is necessary to validate the addressing information for DAX devices, and suggested pairing it with John's GET_FMAP/GET_DAXDEV operations.\n\nReviewer Joanne Koong questioned the necessity of lazy initialization of DAX devices via GET_DAXDEV on file open, suggesting it would be more efficient to validate and acquire devices during iomap configuration at initialization time, potentially simplifying kernel-side logic and improving FUSE_OPEN performance.\n\nReviewer Joanne Koong suggested integrating the bpf approach with Darrick's fuse-iomap work, renaming dax_fmap_parse() to iomap_setup() to make it a generic interface for userspace setup, and noted that the distinction between dax and non-dax should be handled by the fuse iomap plumbing.\n\nReviewer Joanne Koong suggested repurposing the bpf_dax_fmap_parse() function into a generic kfunc, bpf_fuse_iomap_get_inode_meta(), that returns a bounded pointer to cached inode metadata for both dax and non-dax cases.\n\nReviewer Joanne Koong suggested removing the `file_size` field from the `fuse_dax_fmap_ops` structure, as it can be derived from `i_size_read(inode)`\n\nReviewer suggested simplifying GET_DAXDEV and making GET_FMAP generic by introducing FUSE_IOMAP_GETMAP, allowing servers to control fetching of mapping blobs on open.\n\nReviewer Joanne Koong expressed a preference for a different solution to the problem of accessing metadata in iomap_begin(), suggesting that adding generic stride/offset multi-device support to fs/iomap would be the cleanest approach and could potentially solve multiple issues at once.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "NEEDS_WORK",
+            "NEUTRAL",
+            "requested change",
+            "suggested changes",
+            "requested modification",
+            "alternative solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Thanks John for running the benchmarks on your hardware. And thanks\nGregory for your work on this too.\n\n---\n\nIt handles #3 by removing GET_DAXDEV as a fuse op and having the\ndaxdev initialization / setup routed through FUSE_IOMAP_CONFIG at\niomap initialization time instead, which integrates with the generic\niomap infrastruture/uapi additions Darrick added in his fuse-iomap\nseries [1].\n\nIn this series the GET_DAXDEV op gets sent lazily on file opens but\nit's still not clear to me why this is necessary. imo device setup\nshould happen logically as part of iomap configuration and it seems\nmore efficient to have devices validated/acquired before any files are\nopened. I thihnk that makes things a lot simpler on the kernel side in\nother ways (eg we can get rid of famfs_dax_devlist / famfs_daxdev /\nfamfs_devlist_sem / famfs_update_daxdev_table() /\nfamfs_fuse_get_daxdev() altogether). It also saves the famfs server\nthe roundtrip context switching cost if we get rid of GET_DAXDEV and\nmove it to iomap initialization time, which will improve FUSE_OPEN\nperformance for famfs. Maybe there's something I'm missing here as to\nwhy the daxdev initialization has to be done lazily on open?\n\nI think Darrick had also mentioned something earlier about how he\nthinks GET_DAXDEV should be another application of backing files [2] -\nI like this idea too, as it gets rid of the GET_DAXDEV op and reuses\nfuse's existing infrastructure.\n\n[1] https://lore.kernel.org/linux-fsdevel/177188734695.3935739.8198854011004837207.stgit@frogsfrogsfrogs/\n[2] https://lore.kernel.org/linux-fsdevel/20260416224331.GD114184@frogsfrogsfrogs/\n\n---\n\nJust a note for later, if the bpf approach gets pursued further:\ninstead of making this a dax specific ops, I think this needs to be\nintegrated interface-wise with Darrick's fuse-iomap work since he does\nthe same thing. I think dax_fmap_parse() could be renamed to something\nlike iomap_setup(), where userspace can use this to do any sort of\ngeneric setup, whether that's mapping related or dax related or not.\nIn my mind, the dax vs non dax distinction is handled by the fuse\niomap plumbing that chooses which iomap entry points to call,  but\nbeyond that,  the callbacks and struct ops themselves should be\ngeneric enough to be shared between the two.\n\n---\n\nanother note for later, if the benchmarks prove promising and after\nthe LSF discussions we decide to go with this approach: imo we\ncould/should repurpose this into a generic\nbpf_fuse_iomap_get_inode_meta() that returns a bounded pointer into\nwhatever opaque blob was cached on the inode during iomap_setup(),\nwhere it'd be a generic kfunc serving both the dax and non-dax case\nfor any kind of mapping layout\n\n---\n\nI don't think file_size is needed here? seems like we could just\nderive this from i_size_read(inode)?\n\n---\n\nI think we could kill GET_DAXDEV and for GET_FMAP, we could make this\na generic FUSE_IOMAP_GETMAP where the server can set a flag on open to\nindicate whether the mapping blob should be fetched or not.\n\n---\n\nI don't have a NACK on what you wrote above, thank you for your work\non this and bridging it into John's famfs server.\n\nAs I understand it, Amir also scheduled a cross-track FS+MM+IO session\nat LSF to discuss famfs and dax iomap. Christoph had posted a\nsuggestion in another message about solving this problem with adding\ngeneric stride/offset multi-device support to fs/iomap, and I'm hoping\nthe LSF session will shed more light on this, as that to me seems the\ncleanest solution and would pretty much give everyone what they want\n(including getting famfs unblocked, as I think with this approach we\nwould just need to figure out the generic stride/offset format for the\nfuse iomap uapi, and could have the interleaving logic living in fuse\ninitially with fs/iomap migrations done post-merge). In the meantime,\nI think it's really helpful getting the data points on how bpf\nperforms, thank you for running the benchmarks on your setup, John.\n\nThanks,\nJoanne",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-04-20",
+          "message_id": "CAJnrk1ZpPS9rOoBqOBRsqTu0Zgk=aoYzpYZ0mAVDCoeewtLhcg@mail.gmail.com",
+          "email": "joannelkoong@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "The patch addresses performance issues in iomap_begin() by avoiding unnecessary lookup operations and instead using cached metadata to access DAX devices. It also introduces a new BPF operation, dax_fmap_parse(), which allows filesystems to perform filesystem-specific setup and populate the DAX bitmap. The patch requires no hard-coded OMF structures in the FUSE API and ensures that metadata is accessible with a single pointer dereference."
+    }
+  }
+}
