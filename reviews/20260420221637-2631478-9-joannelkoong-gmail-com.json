@@ -4,11 +4,51 @@
   "url": "https://lore.kernel.org/all/20260420221637.2631478-9-joannelkoong@gmail.com/",
   "dates": {
     "2026-04-20": {
-      "report_file": "2026-04-20_ollama_llama3.1-8b.html",
+      "report_file": "2026-04-21_ollama_llama3.1-8b.html",
       "developer": "Joanne Koong",
-      "reviews": [],
-      "analysis_source": "llm-chunked-no-replies",
-      "patch_summary": "This patch adds passthrough operation gating to the FUSE (Filesystem in Userspace) kernel module. It introduces a check to verify whether passthrough operations can be called for a specific file or not, based on the FUSE_PASSTHROUGH_INO mode being enabled. This preserves backwards compatibility with prior passthrough behavior and ensures that the correct path is taken when accessing files. The patch modifies several existing callers in the FUSE codebase to route through this new check, allowing for more controlled and secure handling of passthrough operations."
+      "reviews": [
+        {
+          "author": "Amir Goldstein",
+          "summary": "Reviewer Amir Goldstein noted that the patch introduces a private case of passthrough opt-out per operation instead of per file, and requested documentation to clarify the relationship between FOPEN_PASSTHROUGH and FUSE_PASSTHROUGH_RW_OPS. He also pointed out that if the fuse inode has a backing inode, fallback should not occur to fuse_cache_ operations but rather to fuse_direct_ operations.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "clarification needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Please document the relationship between  FOPEN_PASSTHROUGH\nand FUSE_PASSTHROUGH_RW_OPS.\n\nDoes a server need to opt-in both for the read/write operations passthrough\nand the specific file (I guess so)?\n\nThe concept behind the inode iomodes is that it is not allowed to mix cached\nwith passthrough ops on the same inode, because there be dragons.\n\nIf the server wants to opt-out of passthrough for a specific opened file,\nwhich already has a backing inode, it must explicitly request the combination\nFOPEN_DIRECT_IO | FOPEN_PASSTHROUGH\nand then direct io will be performed, despite the inode having a backing inode.\n\nWhat you have done here is a private case of passthrough opt-out\nnot per file, but per operation.\n\nThe bottom line is if the fuse inode has a backing inode, then you must not\nfallback to the fuse_cache_ operations in case the op is not in the mask,\nbut you may fallback to the fuse_direct_ operations.\n\nI hope this does not complicate things for you too much,\nbut I also don't know (yet) what you intend this gating for.\n\nOtherwise, this looks ok.\n\nThanks,\nAmir.",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-04-21",
+          "message_id": "CAOQ4uxh0E6BtxRVsJdvebybnvU5+n-bur-+SPySNAbKzdY59vw@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Joanne Koong (author)",
+          "summary": "Author clarified the behavior of FOPEN_PASSTHROUGH under FUSE_PASSTHROUGH_INO, explaining that it does not imply both passthrough read and write operations are enabled, but rather allows for individual operation enablement. Author asked for feedback on whether this clarification makes sense or if they are overcomplicating things.\n\nAuthor acknowledged that the server needs to set read/write ops in ops_mask when registering the backing file and FOPEN_PASSTHROUGH when opening the specific file, confirming the expected behavior.\n\nAuthor acknowledged a concern about inconsistent direct operation handling and proposed a new enforcement mechanism at the kernel level, outlining specific rules for passthrough behavior based on server options.\n\nThe author acknowledged the need to check ops_mask in cases where the server sets only read or write passthrough, but not both, and agreed that this is a useful feature for other servers.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "clarification",
+            "request_for_feedback",
+            "acknowledged",
+            "confirmed",
+            "explanation",
+            "acknowledged need for fix",
+            "agreed with usefulness of feature"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I will add a part about this to the documentation patch. In this\ncurrent series, FOPEN_PASSTHROUGH under FUSE_PASSTHROUGH_INO does not\nimply FUSE_PASSTHROUGH_RW_OPS. FOPEN_PASSTHROUGH can be set with just\nFUSE_PASSTHROUGH_OP_READ or FUSE_PASSTHROUGH_OP_WRITE and does not\nrequire both (eg server wants to intercept writes for logging or\nencryption but reads can be passed through). For mmap, it would only\nbe passed through if both passthrough read and passthrough write are\nset. In the non-FUSE_PASSTHROUGH_INO model, FOPEN_PASSTHROUGH implies\nboth passthrough read and passthrough write.\n\nDo you think this makes sense or am I overcomplicating things?\n\n---\n\nYes, in this current series, to use passthrough read/write, the server\nis expected to set read/write ops in ops_mask when registering the\nbacking file (inode level) and set FOPEN_PASSTHROUGH when opening the\nspecific file (file level).\n\nI left a comment [1] on your other comment about dropping the\nexpectation that the server needs to set FOPEN_PASSTHROUGH in the\nFUSE_PASSTHROUGH_INO case if it provided a backing id in the lookup\nand set passthrough read / write in the ops mask - I'm not sure if\nthat was what you were hinting at or not.\n\n[1] https://lore.kernel.org/fuse-devel/CAJnrk1b=5vRgm1otKAiaeFJr9_J-aLnoVTp4MHAz2mBKtcE2dw@mail.gmail.com/\n\n---\n\nThanks for pointing this out. I will add this enforcement at the\nkernel level for calling back to direct operations.\n\nThis is what I have in my head for how it'll work:\n- server opts into passthrough for both reads and writes\n* server sets FOPEN_DIRECT_IO: reads/writes will be forwarded to the\nserver, but mmap will be passed through to the backing file\n* server does not set FOPEN_DIRECT_IO: reads/writes/mmap are passed\nthrough to backing file\nThis is the same behavior as the non-FUSE_PASSTHROUGH_INO case\n\n- server opts into passthrough for reads but not writes (or vice versa)\n* mmap is never passed through, mmap will always go to the server\n* no data caching will be done whatsoever\n* server does not set FOPEN_DIRECT_IO: reads are passed through,\nwrites are forwarded to the server\n* server sets FOPEN_DIRECT_IO: no-op (same behavior as if server did\nnot set FOPEN_DIRECT_IO)\n\nDo you think this makes sense?\n\n---\n\nThank you for your feedback, it was all very helpful!\n\nThe intention of this patch was to support cases where the server sets\nonly read passthrough or write passthrough but not both. In this\nscenario we cannot rely on \"ff->passthrough != NULL\" to know whether\nto pass through the read or the write, so we need to check the\nops_mask. My intended use case doesn't really need this, but imo I\nthink it's overall a useful feature that other servers will want, but\nif you disagree with this, please let me know.\n\nThanks,\nJoanne",
+          "reply_to": "Amir Goldstein",
+          "message_date": "2026-04-21",
+          "message_id": "CAJnrk1YWpAZR5bck27s2P-Zm1s9O0VMMHNztEOMYutVgQ=CwGQ@mail.gmail.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds passthrough operation gating to the FUSE (Filesystem in Userspace) code. It introduces a check for whether passthrough operations can be called based on the current file's mode and the FUSE_PASSTHROUGH_INO flag. The check is only performed when this flag is enabled, preserving backwards compatibility with previous passthrough behavior. The patch modifies several existing callers to use this new gating mechanism, ensuring that passthrough operations are only attempted when permitted. This change aims to improve security and maintainability of the FUSE codebase by providing a more controlled approach to handling passthrough operations."
     }
   }
 }

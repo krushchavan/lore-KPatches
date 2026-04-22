@@ -1,0 +1,106 @@
+{
+  "thread_id": "CAKEwX=M5YpR0cQrryX_y4pm_BuxyUWZ_8MbhWodwbf1Fe=gzew@mail.gmail.com",
+  "subject": "[RFC PATCH v2 0/4] mm/zsmalloc: reduce zs_free() latency on swap release path",
+  "url": "https://lore.kernel.org/all/CAKEwX=M5YpR0cQrryX_y4pm_BuxyUWZ_8MbhWodwbf1Fe=gzew@mail.gmail.com/",
+  "dates": {
+    "2026-04-22": {
+      "report_file": "2026-04-21_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Kairui Song",
+          "summary": "Reviewer Kairui Song noted that zs_free() acquires pool->lock while compaction writes-acquires the same lock, causing contention between compaction and zs free-ers, and requested a perf trace on process teardown to determine if async zs-freeing is necessary or if zsmalloc's poor scalability in the free path can be addressed.\n\nReviewer Kairui Song noted that freeing a swap entry also releases the backing compression data, which can lead to slower memory pressure reduction due to fragmentation and the need to free many swap entries for each folio.\n\nReviewer Kairui Song suggested implementing a bulk zs_free() operation to reduce the number of individual frees and potentially improve performance. They also expressed concerns about the potential drawbacks of asynchronous freeing, including increased worker overhead and delayed memory pressure.\n\nReviewer suggested optimizing zs_free() by using a percpu queue and attempting to free the whole queue under a read lock if successful",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "perf trace needed",
+            "suggested improvements",
+            "expressed concerns",
+            "optimization suggestion"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Thanks for adding me to the Cc list :), Barry started this idea with\nZRAM, which looks very interesting to me.\n\n---\n\nIt's not about decompression. I think what Wenchao means here is that:\nfreeing the swap entry also releases the backing compression data, but\ncompared to freeing an actual folio (which bring back a free folio to\nreduce memory pressure), you may need to free a lot of swap entries to\nfree one whole folio, because the compressed data could be much\nsmaller than folio and with fragmentation. And swap entry freeing is\nstill not fast enough to be ignored.\n\n---\n\nThat's a very nice insight. I had an idea previously that can we have\nsomething like a zs free bulk? Freeing handles one by one does seem\nexpensive.\nhttps://lore.kernel.org/linux-mm/adt3Q_SRToF6fb3W@KASONG-MC4/\n\nIt might be tricky to do so though.\n\nIt will be best if we can speed up everything, doing things async\ndoesn't reduce the total amount of work, and might cause more trouble\nlike worker overhead or delayed freeing causing more memory pressure,\nif the workqueue didn't run in time. Or maybe a process is almost\ncompletely swapped out, then this won't help at all.\n\nI'm not against the async idea, they might combine well.\n\n---\n\nThat's interesting, when I mentioned zs free bulk I was thinking that,\nif we have a percpu queue, at least we may try read lock that on every\nenqueue, free the whole queue if successful, then release the lock.\nI'm sure there are more ways to optimize that, just a random idea :)",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-04-22",
+          "message_id": "CAMgjq7Ae_VH6mLQito5MFnxmp7ScZvF9xw4P-yU-yUBkPZ9_YQ@mail.gmail.com",
+          "email": "ryncsn@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Xueyuan Chen",
+          "summary": "Reviewer Xueyuan Chen noted that the current implementation of zsmalloc free operations may not be optimized for contiguous ranges of swap slots to be freed, suggesting batching opportunities to reduce overhead.\n\nThe reviewer noted that free_zspage() acquires the class->lock while holding the zone->lock, creating a nested lock dependency and significantly extending the hold time of the class->lock, which causes other CPUs to wait longer.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "nested lock dependency",
+            "significantly extends the hold time"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Apr 21, 2026 at 11:25:17AM -0700, Nhat Pham wrote:\n\n[...]\n\n---\n\nHi Nhat,\n\nCurrently, free_zspage() is called while holding the class->lock. \nHowever, free_zspage() eventually invokes folio_put(), which may acquire\nthe zone->lock.\n\nThis creates a nested lock dependency. If multiple CPUs contend for the\nsame class->lock and the current holder is stalled waiting for the\nzone->lock, it significantly extends the hold time of the class->lock.\nThis causes other CPUs to wait much longer.\n\nHere is the ftrace data showing the severe contention on class->lock.\nUnder contention, the time spent in queued_spin_lock_slowpath() jumps \nfrom ~1.3us to over 30us, significantly increasing the total latency\nof zs_free().\n\n  7)               |  zs_free() {\n  7)   0.220 us    |    _raw_read_lock();\n  7)               |    _raw_spin_lock() {\n  7)   1.320 us    |      queued_spin_lock_slowpath();\n  7)   1.820 us    |    }\n  7)   0.170 us    |    _raw_read_unlock();\n  7)   0.170 us    |    obj_free();\n  7)   0.190 us    |    fix_fullness_group();\n  7)   0.150 us    |    _raw_spin_unlock();\n  7)   0.170 us    |    kmem_cache_free();\n  7)   4.610 us    |  }\n\n---------------------------------------------------------\n\n  7)               |  zs_free() {\n  7)   0.230 us    |    _raw_read_lock();\n  7)               |    _raw_spin_lock() {\n  7) + 30.100 us   |      queued_spin_lock_slowpath();\n  7) + 30.600 us   |    }\n  7)   0.200 us    |    _raw_read_unlock();\n  7)   0.170 us    |    obj_free();\n  7)   0.170 us    |    fix_fullness_group();\n  7)   0.170 us    |    _raw_spin_unlock();\n  7)   0.210 us    |    kmem_cache_free();\n  7) + 33.850 us   |  }\n\nBest regards,\nXueyuan",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-04-22",
+          "message_id": "20260422003412.11678-1-xueyuan.chen21@gmail.com",
+          "email": "xueyuan.chen21@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces a new function zs_free_deferred() for asynchronous handle freeing in zsmalloc. The original implementation of locking, grabbing a handle, and unlocking one at a time is inefficient and can be improved by using a workqueue or per-cpu-fying the batches/queues to reduce concurrency issues. An alternative approach suggested is to use two arrays of handles, swapping them under a lock when the defer worker is woken up, and then freeing the handles in the old array."
+    },
+    "2026-04-21": {
+      "report_file": "2026-04-21_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Nhat Pham (author)",
+          "summary": "Author acknowledged that zsmalloc freeing might not be worth optimizing compared to anon folio freeing, but agreed with the reviewer's point about contention between compaction and zs_free.\n\nAuthor agrees that batching zsmalloc free operations could reduce latency, but notes potential complexity due to pool and class lock dance in zs_free().\n\nAuthor acknowledged that pool lock contention overhead is significant (3% of free phase), and would be nice to have a perf trace to pinpoint where the overhead is.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a valid concern",
+            "agreed with the reviewer",
+            "acknowledges a fix is needed",
+            "acknowledged a performance issue",
+            "promised to investigate further"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ah I see yeah. That's the not \"as much bang-for-your-buck\" as folio\nfreeing category. I agree on this point.\n\n---\n\nCompletely agree! I was thinking about batching the free operations\nfor zsmalloc. Right now seems like even if we have a contiguous range\nof swap slots to be freed, we call one\nzram_slot_free_notify/zswap_invalidate at a time, which then call\nzs_free one at a time? I wonder if there's any batching opportunity\nhere. Might be complicated with the pool lock and class lock dance in\nzs_free() though :)\n\nAnd yeah the async stuff is orthogonal too.\n\n---\n\nYep! Would be nice to have some perf trace to pinpoint where the overhead is.\n\nOn my end, I perfed the free phase of usemem. It varies a bit based on\nexact build config, kernel version, or even between runs, but the\ncheapest I've seen for the pool lock contention overhead is about 3%\nof the free phase (this is on baseline, not vswap kernel). That's\npretty big (bigger than vswap overhead even on the kernels with vswap,\nwhich is kinda silly). Obviously the host was very overcommitted, so\ncompaction was running in the background at the same time, but\nstill...",
+          "reply_to": "Kairui Song",
+          "message_date": "2026-04-21",
+          "message_id": "CAKEwX=PkFiP+u+ThrzjTKBi+usQf2uuhTZcfB2BNNA8RboOFDQ@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Nhat Pham (author)",
+          "summary": "Author acknowledged that free_zspage() and kmem_cache_free() are not the main contributors to zs_free latency, but expressed uncertainty about optimizing free_zspage(), suggesting deferring might be the only option.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "uncertainty",
+            "exploration of options"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ah OK - I found this thread now:\n\nhttps://lore.kernel.org/linux-mm/20260414054930.225853-1-xueyuan.chen21@gmail.com/\n\nHmm, free_zspage() and kmem_cache_free().\n\n* kmem_cache_free() is just handle freeing. Bulk-freeing?\n\n* free_zspage() looks like just ordinary teardown work :( Seems like\nwe're not spinning any lock here - we just try lock the backing pages,\nand the rest is normal work. Not sure how to optimize this - perhaps\ndeferring is the only way.",
+          "reply_to": "",
+          "message_date": "2026-04-21",
+          "message_id": "CAKEwX=P6L=CeJCXkC+cKbZKYk_ORho3pLy476c8=BbDianx=vg@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces a new function zs_free_deferred() for asynchronous handle freeing in zsmalloc. The original implementation of locking, grabbing a handle, and unlocking one at a time is inefficient and can be improved by using a workqueue or per-cpu-fying the batches/queues to reduce concurrency issues. An alternative approach suggested is to use two arrays of handles, swapping them under a lock when the defer worker is woken up, and then freeing the handles in the old array."
+    }
+  }
+}
