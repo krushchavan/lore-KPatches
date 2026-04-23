@@ -240,7 +240,228 @@
     <div class="lore-link"><a href="https://lore.kernel.org/all/ad-r7hwIdnvKsrh9@gourry-fedora-PF4VCD3F/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-04-15</strong><div class="date-range-nav">Active on: <a href="#2026-04-15">2026-04-15</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces Private Memory Nodes (PMNs) as a new interface for device memory management. The current implementation is informed by ZONE_DEVICE patterns, but the design has been simplified and contracted due to existing friction points. The patch aims to provide a flexible and efficient way for devices to manage their own memory, with features such as compressed RAM support. However, there are still open questions about the interface&#x27;s complexity, compatibility, and userland implications.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price (author)</span>
+<a class="date-chip" href="../2026-04-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-15">2026-04-15</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledges that ZONEs are an imperfect abstraction due to conflicting requirements, such as memory allocation reliability and migration ease, which suggests they may be the wrong choice for this use case.
+
+Author acknowledges that the patch has issues with memory migration and locking, agrees to revisit the design, but is unsure about implementing move_pages(), mbind(), and set_mempolicy() for all devices.
+
+Author acknowledges that guest_memfd use case needs further examination, thanks reviewer for insight and looks forward to their feedback.
+
+The author is addressing concerns about the interaction between node attributes and various kernel hooks, particularly init_on_alloc, init_on_free, and kernel_poison_pages. They acknowledge that these hooks would break if a page was not in the direct map but in the buddy, and propose using a node attribute to skip them. However, they express concern about adding more hooks as the number of attributes increases, and suggest that an NP_OPS_NOMAP attribute would need to be mutually exclusive with other node attributes. They also discuss potential issues with zeroing out pages after allocation and the coexistence of OPS_MEMPOLICY and OPS_NOMAP.
+
+Author acknowledges that per-node page sizes may be too complex to implement, but suggests limiting guest_memfd allocations on a private node to a single order (or minimum order) as a feasible option to address fragmentation concerns.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I have made this observation as well.  ZONEs in particular are a bit
+odd because they&#x27;re somehow simultaneously too broad and too narrow in
+terms of what they control and what they&#x27;re used for.
+
+1GB ZONE_MOVABLE HugeTLBFS Pages is an example weird carve-out, because
+the memory is in ZONE_MOVABLE to help make 1GB allocations more
+reliable, but 1GB movable pages were removed from the kernel because
+they&#x27;re not easily migrated (and therefore may block hot-unplug).
+
+(Thankfully they&#x27;re back now, so VMs can live on this memory :P)
+
+So you have competing requirements, which suggests zone is the wrong
+abstraction at some level - but it&#x27;s what we&#x27;ve got.
+
+---
+
+This is an interesting observation that should be solvable.
+
+For example - i&#x27;m pretty sure mlock&#x27;d pages are on an unevictable LRU
+for exactly this reason (to just skip scanning them during reclaim).
+
+Which is a different pain point I have - since they&#x27;re still migratable,
+they could be demoted to make room for local hot pages.
+
+---
+
+I have wondered about this use case, but I haven&#x27;t really played with
+guest_memfd to know what the implications are here, so it&#x27;s nice to hear
+someone is looking at this.  It will be nice to hear your input on where
+the abstraction could be better.
+
+---
+
+Presuming a page was not in the direct map and it was in the buddy
+(strong assumption here), there&#x27;s a handful of things that would
+straight up break:
+
+  - init_on_alloc (post_alloc_hook) / __GFP_ZERO (clear_highpage)
+  - init_on_free (free_pages_prepare)
+  - kernel_poison_pages (accesses the page contents)
+  - CONFIG_DEBUG_PAGEALLOC
+
+But... these things seem eminently skippable based on a node attribute.
+
+I think this could be done, but there is added concern about spewing
+an ever increasing numbers of hooks throughout mm/ as the number of
+attributes increase.
+
+But in this case I think the contract would require that an NP_OPS_NOMAP
+would have to be mutually exclusive with all other node attributes (too
+many places that touch the mapping, it would be too fragile).
+
+There&#x27;s a few catches here though
+
+  1) you lose the ability to zero out the page after allocation, so
+     whatever is in the memory already is going into the guest.
+
+     That seems problematic for a variety of reasons.
+
+     I guess you can use kmap_local_page?
+     But then why not just unmap after allocation?
+
+     If never mapping is a hard requirement, if that memory lives on
+     a device with a sanitize function, you maybe could massage kernel
+     free-page-reporting to offload the zeroing without having the
+     kernel map it - as long as you can take a delay after free before
+     the page becomes available again.
+
+  2) the current mempolicy guest_memfd patches would not apply because
+     I can&#x27;t see how OPS_MEMPOLICY &amp; OPS_NOMAP co-exist.  A user program
+     could call mbind(nomap_node) on a random VMA - and there would be
+     kernel OOPS everywhere.
+
+     That would just mean pre-setting the node backing for all
+     guest_memfd VMAs, rather than using mbind().
+
+Something like (cribbing from the memfd code with absolutely no
+context, so there&#x27;s a pile of assumptions being made here)
+
+  struct kvm_create_guest_memfd {
+        __u64 size;
+        __u64 flags;
+        __s32 numa_node;  /* Set at creation */
+        __u32 pad;
+        __u64 reserved[5];
+  };
+
+  #define GUEST_MEMFD_FLAG_NUMA_NODE    (1ULL &lt;&lt; 2)
+
+  if (gmem-&gt;flags &amp; GUEST_MEMFD_FLAG_NUMA_NODE)
+      folio = __folio_alloc(gfp | __GFP_PRIVATE, order,
+                            gmem-&gt;numa_node, NULL);
+  else
+      /* existing mempolicy / default path */
+      folio = __filemap_get_folio_mpol(...);
+
+Which may even be preferable to the recently upstreamed pattern.
+
+---
+
+Per-node page sizes are probably a bridge too far, that&#x27;s seems like
+a change that would echo through most of the buddy infrastructure, not
+just a few hooks to prevent certain interactions.
+
+However, I also don&#x27;t think this is a requirement.
+
+I know there is some work to try to raise the max page order to allow
+THP to support 1GB huge pages - if max size is a concern, there&#x27;s hope.
+
+On fragmentation though...
+
+If the consumer of a private node only ever allocates a specific order
+(order-9) - the buddy never fragments smaller than that (it maybe
+spends time coalescing for no value, but it&#x27;ll never fragment smaller).
+
+So is the concern here that you want to guarantee a minimum page size
+to deal with the fragmentation problem on normal general-purpose nodes,
+or do you want to guarantee a minimum page size because you can&#x27;t limit
+the allocations to be of a base order?
+
+i.e.: is limiting guest_memfd allocations on a private node to a single
+order (or a minimum order? 2MB?) a feasible option?  (Pretend i know
+very little about the guest_memfd specific memory management code).
+
+~Gregory</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Frank Linden</div>
+<a href="https://lore.kernel.org/r/aeA6aNDpQ-U5UJCs@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a design issue, suggests alternative abstractions, acknowledges issues</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-04-15">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Frank Linden</span>
+<a class="date-chip" href="../2026-04-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-15">2026-04-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Frank Linden noted that having properties set at the node level makes sense for non-device cases and proposed enabling guest_memfd allocation from private nodes, suggesting two specific features: configurable direct map inclusion and per-node default page size.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This has been a really great discussion. I just wanted to add a few
+points that I think I have mentioned in other forums, but not here.
+
+In essence, this is a discussion about memory properties and the level
+at which they should be dealt with. Right now there are basically 3
+levels: pageblocks, zones and nodes. While these levels exist for good
+reasons, they also sometimes lead to issues. There&#x27;s duplication of
+functionality. MIGRATE_CMA and ZONE_MOVABLE both implement the same
+basic property, but at different levels (attempts have been made to
+merge them, but it didn&#x27;t work out). There&#x27;s also memory with clashing
+properties inhabiting the same data structure: LRUs. Having strictly
+movable memory on the same LRU as unmovable memory is a mismatch. It
+leads to the well known problem of reclaim done in the name of an
+unmovable allocation attempt can be entirely pointless in the face of
+large amounts of ZONE_MOVABLE or MIGRATE_CMA memory: the anon LRU will
+be chock full of movable-only pages. Reclaiming them is useless for
+your allocation, and skipping them leads to locking up the system
+because you&#x27;re holding on to the LRU lock a long time.
+
+So, looking at having some properties set at the node level makes
+sense to me even in the non-device case. But perhaps that is out of
+scope for the initial discussion.
+
+One use case that seems like a good match for private nodes is guest
+memory. Guest memory is special enough to want to allocate / maintain
+it separately, which is acknowledged by the introduction of
+guest_memfd.
+
+I&#x27;m interested in enabling guest_memfd allocation from private nodes.
+I&#x27;ve been playing around with setting aside memory at boot, and
+assigning it to private nodes (one private node per physical NUMA
+node), and making it available to guest_memfd only. There are issues
+to be solved there, but the private node abstraction seems to fit
+well, and provides for useful hooks to manage guest memory.
+
+Some properties that I&#x27;m interested in for this use case:
+
+1) is the memory in the direct map or not? Should that be configurable
+for a private node? I know there are patches right now to remove
+memory from the direct map for guest_memfd, but what if there was a
+private node whose memory is not in the direct map by default?
+2) Default page size. devdax, a ZONE_DEVICE user, allows for memory
+setup on hotplug that initializes things with HVO-ed large pages.
+Could the page size be a property of the node? That would make it easy
+to hand out larger pages to guests.  Of course, if you use anything
+but 4k, the argument of &#x27;we can use the general buddy allocator&#x27; goes
+out the window, unless it&#x27;s made to deal with a per-node base page
+size.
+
+- Frank</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Gregory Price</div>
+<a href="https://lore.kernel.org/r/CAPTztWajm_JLpp9BjRcX=h72r25ELrXeGkOXVachybBxLJGS=g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: request_for_feature, proposed_solution</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

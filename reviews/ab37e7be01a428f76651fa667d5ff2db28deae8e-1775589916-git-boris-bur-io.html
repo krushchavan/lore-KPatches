@@ -240,7 +240,108 @@
     <div class="lore-link"><a href="https://lore.kernel.org/all/ab37e7be01a428f76651fa667d5ff2db28deae8e.1775589916.git.boris@bur.io/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-04-08</strong><div class="date-range-nav">Active on: <a href="#2026-04-08">2026-04-08</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a problem in the Btrfs file system where space is not reserved for delayed references (delayed_refs) during delalloc operations, leading to incorrect assessments of available metadata space and poor decision making in reclaim logic. The patch adds a reservation for delayed_refs to the per-inode block_rsv, ensuring that enough space is allocated for these references. This fix aims to prevent issues such as erroneous preemptive reclaims and blocking start_transaction() calls due to insufficient reserved space.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Boris Burkov (author)</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author Boris Burkov was addressing concerns about accurately reserving space for delayed refs in delalloc, specifically whether to count the number of cows caused by each delayed ref. He acknowledged that he might have been confused and proposed shifting the goal from counting add_delayed_ref calls to predicting metadata reservation due to delayed refs, agreeing with the reviewer&#x27;s approach.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think I might be getting confused now :)
+
+I&#x27;ll try to work it out &quot;out loud&quot; and hopefully I can reach a good
+conclusion.
+
+I have been trying to reserve for the calls to add_delayed_ref in the
+transaction handle context. And tracing each cow in that context yields
+2 delayed refs each while tracing the data extent insertion only creates
+one. The reason I care particularly about this context is the
+trans_handle delayed_refs rsv accounting in
+btrfs_update_delayed_refs_rsv(), as described in the patch. Ultimately,
+all the reservations get sunk into the global reserve from
+trans-&gt;delayed_rsv at btrfs_end_transaction(). Does this all sound right
+to you so far?
+
+Cows that we clearly do from finish_one_ordered() are the ones to:
+raid stripe tree, subvol tree, and csum tree. Notably, the free space
+tree *does not* happen in this context, it happens when we run the
+delayed ref, so I think I was not consistent to include that. In that
+context we cow the extent and free space tree for the data extent.
+
+But the point of reserving for a delayed ref is to account for the cows
+that it will ultimately cause and reserve ahead for them. So I think it
+does make sense to reserve for the fst and extent tree. On the other
+hand, I think we actively *don&#x27;t* want to account for the potential
+infinite regress where each metadata delayed_ref run &quot;unluckily&quot; results
+in cow-ing the extent tree again and again since it doesn&#x27;t actually
+happen in practice (especially with Leo&#x27;s writeback inhibition and
+hopefully eb overwriting soon). That series diverges so it would require
+an infinite reservation anyway.
+
+In conclusion, I think I am agreeing and proposing that I shift the goal
+from &quot;count add_delayed_ref calls under the trans handle&quot; to &quot;predict
+metadata reservation due to delayed refs&quot; and in that world, it should
+be 2 for the data extent in the extent tree.
+
+The other principled option is to count 1 for the data delayed ref now
+and not account for the fst or the extent tree cows that happen at
+delayed_refs time, but I think that makes less sense.
+
+Sorry if that was a lot of text to just agree with you, but I want to be
+careful since it&#x27;s easy to go astray and &quot;get away with it&quot; cause of the
+reservations being conservative and getting sloshed into the global
+reserves.
+
+One final note / question:
+the &quot;normal&quot; start_transaction() reservation which computes the space
+for the cow itself and then the delayed_refs cows does *not* seem to
+count 2 per cow for delayed refs in btrfs_calc_delayed_ref_bytes().
+But in theory the same reasoning applies that we will touch two metadata
+items for each cow.  I assume this is OK in practice because the depth
+is generally not 8 anyway, but do you think that is something I should
+clean up as well?
+
+Thanks again,
+Boris</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Filipe Manana</div>
+<a href="https://lore.kernel.org/r/20260408173425.GA2076825@zen.localdomain" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreed, proposed</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-04-08">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Filipe Manana</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that inserting an extent item in the extent tree requires COWing an extent tree leaf, creating a delayed tree ref for deletion, and requested additional consideration of this issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Running the delayed data ref to insert the extent item in the extent
+tree requires COWing an extent tree leaf, which creates a delayed tree
+ref for deletion too.
+So, 2.
+
+Otherwise it looks good, thanks.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Boris Burkov</div>
+<a href="https://lore.kernel.org/r/CAL3q7H7X6eFwrVXW6p21nuxawE8+O1dyXV-Yyg_uS4ipf1O5+w@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: additional consideration needed</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

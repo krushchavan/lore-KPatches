@@ -240,7 +240,179 @@
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260331102704.921355-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-03-31</strong><div class="date-range-nav">Active on: <a href="#2026-03-31">2026-03-31</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">Patch adds a contended_release tracepoint to sleepable locks, but there is disagreement about the scope of the change.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-03-31_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-31">2026-03-31</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Clarified that the waiter variable is declared in an if block on a specific branch, and suggested that this might be related to changes in locking/tracing.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">
+
+On 31/03/2026 15:16, Dmitry Ilvokhin wrote:
+&gt; On Tue, Mar 31, 2026 at 03:34:50AM -0700, Usama Arif wrote:
+&gt;&gt; On Thu, 26 Mar 2026 15:10:02 +0000 Dmitry Ilvokhin &lt;d@ilvokhin.com&gt; wrote:
+&gt;&gt;
+&gt;&gt;&gt; Add the contended_release trace event. This tracepoint fires on the
+&gt;&gt;&gt; holder side when a contended lock is released, complementing the
+&gt;&gt;&gt; existing contention_begin/contention_end tracepoints which fire on the
+&gt;&gt;&gt; waiter side.
+&gt;&gt;&gt;
+&gt;&gt;&gt; This enables correlating lock hold time under contention with waiter
+&gt;&gt;&gt; events by lock address.
+&gt;&gt;&gt;
+&gt;&gt;&gt; Add trace_contended_release() calls to the slowpath unlock paths of
+&gt;&gt;&gt; sleepable locks: mutex, rtmutex, semaphore, rwsem, percpu-rwsem, and
+&gt;&gt;&gt; RT-specific rwbase locks.
+&gt;&gt;&gt;
+&gt;&gt;&gt; Where possible, trace_contended_release() fires before the lock is
+&gt;&gt;&gt; released and before the waiter is woken. For some lock types, the
+&gt;&gt;&gt; tracepoint fires after the release but before the wake. Making the
+&gt;&gt;&gt; placement consistent across all lock types is not worth the added
+&gt;&gt;&gt; complexity.
+&gt;&gt;&gt;
+&gt;&gt;&gt; For reader/writer locks, the tracepoint fires for every reader releasing
+&gt;&gt;&gt; while a writer is waiting, not only for the last reader.
+&gt;&gt;&gt;
+&gt;&gt;&gt; Signed-off-by: Dmitry Ilvokhin &lt;d@ilvokhin.com&gt;
+&gt;&gt;&gt; ---
+&gt;&gt;&gt;  include/trace/events/lock.h   | 17 +++++++++++++++++
+&gt;&gt;&gt;  kernel/locking/mutex.c        |  4 ++++
+&gt;&gt;&gt;  kernel/locking/percpu-rwsem.c | 11 +++++++++++
+&gt;&gt;&gt;  kernel/locking/rtmutex.c      |  1 +
+&gt;&gt;&gt;  kernel/locking/rwbase_rt.c    |  6 ++++++
+&gt;&gt;&gt;  kernel/locking/rwsem.c        | 10 ++++++++--
+&gt;&gt;&gt;  kernel/locking/semaphore.c    |  4 ++++
+&gt;&gt;&gt;  7 files changed, 51 insertions(+), 2 deletions(-)
+&gt;&gt;&gt;
+&gt;&gt;&gt; diff --git a/include/trace/events/lock.h b/include/trace/events/lock.h
+&gt;&gt;&gt; index da978f2afb45..1ded869cd619 100644
+&gt;&gt;&gt; --- a/include/trace/events/lock.h
+&gt;&gt;&gt; +++ b/include/trace/events/lock.h
+&gt;&gt;&gt; @@ -137,6 +137,23 @@ TRACE_EVENT(contention_end,
+&gt;&gt;&gt;  	TP_printk(&quot;%p (ret=%d)&quot;, __entry-&gt;lock_addr, __entry-&gt;ret)
+&gt;&gt;&gt;  );
+&gt;&gt;&gt;  
+&gt;&gt;&gt; +TRACE_EVENT(contended_release,
+&gt;&gt;&gt; +
+&gt;&gt;&gt; +	TP_PROTO(void *lock),
+&gt;&gt;&gt; +
+&gt;&gt;&gt; +	TP_ARGS(lock),
+&gt;&gt;&gt; +
+&gt;&gt;&gt; +	TP_STRUCT__entry(
+&gt;&gt;&gt; +		__field(void *, lock_addr)
+&gt;&gt;&gt; +	),
+&gt;&gt;&gt; +
+&gt;&gt;&gt; +	TP_fast_assign(
+&gt;&gt;&gt; +		__entry-&gt;lock_addr = lock;
+&gt;&gt;&gt; +	),
+&gt;&gt;&gt; +
+&gt;&gt;&gt; +	TP_printk(&quot;%p&quot;, __entry-&gt;lock_addr)
+&gt;&gt;&gt; +);
+&gt;&gt;&gt; +
+&gt;&gt;&gt;  #endif /* _TRACE_LOCK_H */
+&gt;&gt;&gt;  
+&gt;&gt;&gt;  /* This part must be outside protection */
+&gt;&gt;&gt; diff --git a/kernel/locking/mutex.c b/kernel/locking/mutex.c
+&gt;&gt;&gt; index 427187ff02db..6c2c9312eb8f 100644
+&gt;&gt;&gt; --- a/kernel/locking/mutex.c
+&gt;&gt;&gt; +++ b/kernel/locking/mutex.c
+&gt;&gt;&gt; @@ -997,6 +997,9 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
+&gt;&gt;&gt;  		wake_q_add(&amp;wake_q, next);
+&gt;&gt;&gt;  	}
+&gt;&gt;&gt;  
+&gt;&gt;&gt; +	if (trace_contended_release_enabled() &amp;&amp; waiter)
+&gt;&gt;&gt; +		trace_contended_release(lock);
+&gt;&gt;&gt; +
+&gt;&gt;
+&gt;&gt; This won&#x27;t compile? waiter is declared in the if block, so you are using
+&gt;&gt; it outside scope here.
+&gt;&gt;
+&gt; 
+&gt; Thanks for the feedback, Usama.
+&gt; 
+&gt; waiter is declared at function scope, right on top. It&#x27;s also assigned
+&gt; before the if block, so it&#x27;s still in scope at the tracepoint.
+
+Ah ok, I was reviewing on top of mm-new branch from today where waiter
+is declared in the if block. Probably something changed related to
+locking/tracing and its not in mm-new yet.
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Dmitry Ilvokhin</div>
+<div class="review-comment-signals">Signals: CLARIFICATION_PROVIDED</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-03-31">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin</span>
+<a class="date-chip" href="../2026-03-31_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-31">2026-03-31</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Identified that the waiter variable is in scope at the tracepoint, but noted that this might be a result of changes on a specific branch.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Mar 31, 2026 at 03:27:03AM -0700, Usama Arif wrote:
+&gt; On Thu, 26 Mar 2026 15:09:59 +0000 Dmitry Ilvokhin &lt;d@ilvokhin.com&gt; wrote:
+&gt; 
+&gt; &gt; The existing contention_begin/contention_end tracepoints fire on the
+&gt; &gt; waiter side. The lock holder&#x27;s identity and stack can be captured at
+&gt; &gt; contention_begin time (e.g. perf lock contention --lock-owner), but
+&gt; &gt; this reflects the holder&#x27;s state when a waiter arrives, not when the
+&gt; &gt; lock is actually released.
+&gt; &gt; 
+&gt; &gt; This series adds a contended_release tracepoint that fires on the
+&gt; &gt; holder side when a lock with waiters is released. This provides:
+&gt; &gt; 
+&gt; &gt; - Hold time estimation: when the holder&#x27;s own acquisition was
+&gt; &gt;   contended, its contention_end (acquisition) and contended_release
+&gt; &gt;   can be correlated to measure how long the lock was held under
+&gt; &gt;   contention.
+&gt; &gt; 
+&gt; &gt; - The holder&#x27;s stack at release time, which may differ from what perf lock
+&gt; &gt;   contention --lock-owner captures if the holder does significant work between
+&gt; &gt;   the waiter&#x27;s arrival and the unlock.
+&gt; &gt; 
+&gt; &gt; Note: for reader/writer locks, the tracepoint fires for every reader
+&gt; &gt; releasing while a writer is waiting, not only for the last reader.
+&gt; &gt; 
+&gt; 
+&gt; Would it be better to reorder the patches? It would help with git
+&gt; bisectability as well. Move the refractoring work in patch 4 and
+&gt; 5 (excluding adding the tracepoints ofcourse) earlier, and then add
+&gt; all the tracepoints in the same commit at the end? It would help
+&gt; in the future with git blame to see where all the tracepoints
+&gt; were added as well.
+
+Thanks for the suggestion, Usama.
+
+I&#x27;d prefer to keep the current ordering: each refactoring commit is
+immediately followed by the commit that uses it. For example,
+queued_spin_release() is factored out right before the commit that adds
+the tracepoint to spinning locks. This makes the motivation for the
+refactoring clear and should also ease the review since the context is
+still fresh.
+
+Bisectability should be fine as-is, each commit compiles and works
+independently, since the refactoring patches do not introduce behavioral
+changes on their own.
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<div class="review-comment-signals">Signals: CLARIFICATION_REQUESTED</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

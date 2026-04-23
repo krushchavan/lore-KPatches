@@ -240,7 +240,145 @@
     <div class="lore-link"><a href="https://lore.kernel.org/all/41cfd0f95b7fde411c0d59463dce979be89cb8ef.camel@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-04-09</strong><div class="date-range-nav">Active on: <a href="#2026-04-09">2026-04-09</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch aims to eliminate busy-waiting in the shrink_dcache_parent function, which is responsible for shrinking dentry lists when processes exit. The current implementation can lead to stalls and crashes due to a use-after-free (UAF) bug. The patch likely addresses this issue by modifying the code path that handles submounts and namespace locking, ensuring that detach_mounts() and namespace_unlock() are not involved in the crash. The problem is related to a complex scenario involving multiple threads, list heads, and dentry traversal, making it difficult to reproduce and debug. The patch is part of an ongoing effort to improve kernel stability and performance.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-04-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-09">2026-04-09</a>
+<span class="badge" style="color:#721c24;background:#f8d7da">Contentious</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author disputes Al Viro&#x27;s analysis, stating that Claude&#x27;s earlier findings were misleading due to a duplicate entry in the list walk.
+
+The author is addressing Al Viro&#x27;s concern that the dispose list was a proper ring, but instead found self-loops and cycles in the list. The author confirms this observation and clarifies that the list was not a valid ring.
+
+The author addresses Al Viro&#x27;s concern that the UAF (use-after-free) bug is likely due to a different cause than the busy-wait patch, and suggests that the dentry being freed is actually from the global LRU. The author provides comparative analysis across three vmcores, highlighting consistent findings such as had_submounts being False in every case, no mounts under /proc/&lt;pid&gt;/... in any mount namespace, and the UAF&#x27;d dentry being in a non-dentry slab in every case.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think the above is BS. Claude says:
+
+In the earlier analysis I walked the list both forward from 
+head_B (the stack entry) and backward from head_A  That was misleading
+— there&#x27;s only one mountinfo node. The ring passes through it once. The
+duplicate in my listing was an artifact of walking the ring from two
+entry points and not  deduplicating.
+
+---
+
+No:
+
+The list was NOT a proper ring:
+
+  - FWD (head.next): LOOP at entry 1 — immediately hits a self-loop (the processed &quot;status&quot; dentry)
+  - BWD (head.prev): LOOP at entry 55 — walks 55 entries then hits a cycle
+
+---
+
+Definitely not legitimately. I suspect some other sort of mem
+corruption. /proc/1/mountinfo is on the list though:
+
+mountinfo dentries on dispose list: 1                                 
+                                                                                                    
+    /proc/1/mountinfo (dentry 0xffff88823deef800)                     
+      d_parent: 0xffff891373c06a80 &quot;1&quot; -&gt; &quot;/&quot; (root)                  
+      hashed: yes (d_hash.pprev=0xffff893d337264d0)                   
+      PROC_I-&gt;pid nr: 3217077                                         
+      d_inode: 0xffff88ea55a44508                                     
+
+Claude&#x27;s theory (maybe garbage):
+
+PID 1&#x27;s mountinfo being on the list is actually a strong clue — it&#x27;s
+a dentry that would be on the global LRU (negative or zero-count
+after someone closed /proc/1/mountinfo), and drop_caches would pull
+it off the LRU via prune_dcache_sb. That&#x27;s likely how it ended up on
+Thread B&#x27;s dispose list.
+
+Here&#x27;s a cursory comparitive analysis across the 3 vmcores I have so
+far:
+
+  Comparative analysis across three vmcores                                                      
+  =========================================                                                      
+                                                                                                 
+  Kernel                  6.13.2-0_fbk5-hf2   6.13.2-0_fbk12-hf1      6.13.2-0_fbk5-hf2          
+  Date                    Mar 31               Apr 9                    Apr 2                    
+  Process                 SREventBase61        tokio-runtime-w          TTLSFWorkerU151          
+  d_invalidate target     /task/5964           /task/3555587            /task/1102               
+  had_submounts           False                False                    False                    
+  UAF slab                kmalloc-96           kmalloc-64               kmalloc-96               
+  UAF d_flags             0x0                  0x81e73ce0               0x0                      
+  UAF d_sb                0x0                  0x0                      0x0                      
+  UAF d_lockref.count     0                    -14080                   -771573072               
+
+  Consistent findings across all three cores:                                                    
+                        
+    - had_submounts is False in every case.  detach_mounts() and                                 
+      namespace_unlock() are not involved in any of these crashes.                               
+
+    - No mounts under /proc/&lt;pid&gt;/... in any mount namespace (checked                            
+      on the od0103 core across 49 namespaces, zero proc submounts).                             
+
+    - All three are in the same call path:                                                       
+        release_task -&gt; proc_flush_pid -&gt; d_invalidate -&gt;                                        
+        shrink_dcache_parent -&gt; shrink_dentry_list -&gt; spin_lock (UAF)                            
+                                                
+    - The UAF&#x27;d dentry is in a non-dentry slab in every case (kmalloc-64                         
+      or kmalloc-96), confirming the dentry was freed and its page reused                        
+      by a different slab cache before shrink_dentry_list tried to lock it.                      
+                                                                                                 
+    - Different applications triggered the crash (Rust async runtime,                            
+      C++ worker, Java-like worker) -- not application-specific.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Al Viro</div>
+<a href="https://lore.kernel.org/r/a8fc5dfa19cf704c3f668f91443fdd1b2e01e612.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: disputes, strongly disagrees, clarification</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-04-09">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Al Viro</span>
+<a class="date-chip" href="../2026-04-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-09">2026-04-09</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Al Viro questioned the consistency of a cyclic list in the dispose list, specifically asking if the links between two UAF and mountinfo entries are correct, and requested information about the dentries&#x27; parent pointers.
+
+Reviewer Al Viro noted that the dispose list contains entries from multiple threads and mount namespaces, indicating a potential UAF issue due to inconsistent -&gt;prev and -&gt;next pointers. He suggested verifying that these entries are from shrink lists by checking -&gt;d_flags on the entries.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Wait a bloody minute; *two* UAF and two mountinfo there?  Are the links
+in that cyclic list consistent?  -&gt;next and -&gt;prev, I mean.
+If I understand the notation correctly... are there two different
+dentries, both with &quot;mountinfo&quot; for name and PROC_I(_-&gt;d_inode)-&gt;pid
+being PID 1?  What are their -&gt;d_parent pointing to?  Are they hashed?
+
+---
+
+Not at all obvious; there&#x27;s a list from another thread mixed into that,
+and we&#x27;ve no idea what had the root been for that one.  For that matter,
+I&#x27;d check -&gt;d_flags on the entries, just to verify that those are
+from shrink lists and not from LRU - the fact that these UAF still
+have pointers to plausible dentries does not mean they are from the
+same moment in time; if dentry in question had been on a different
+list before getting freed...  That&#x27;s why the question about -&gt;prev
+and -&gt;next consistncy.
+
+And seeing that procfs has zero callers of d_splice_alias() or d_move(),
+I would expect -&gt;d_parent on all dentries in there to be constant over
+the entire lifetime; would be rather hard for d_walk() to escape in
+such conditions...</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/20260409215733.GS3836593@ZenIV" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: question, request for clarification, UAF</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

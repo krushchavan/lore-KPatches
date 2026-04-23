@@ -240,7 +240,302 @@
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260326162611.693539-1-gourry@gourry.net/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-03-26</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-03-27</strong><div class="date-range-nav">Active on: <a href="#2026-03-27">2026-03-27</a> &bull; <a href="#2026-03-26">2026-03-26</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a race condition in the shmem (shared memory) module that can cause &#x27;still mapped when deleted&#x27; errors and guest kernel panics. The issue occurs when inflating a VM&#x27;s balloon while a helper process forks and executes, triggering two races: one around fault handling and another due to TOCTOU (time-of-check-to-time-of-use). To fix these issues, the patch introduces the use of invalidate_lock, which is shared under mmap_lock in fault handlers. This approach matches existing patterns used by other modules and requires removing an unnecessary rcu_read_lock from do_fault_around().</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price (author)</span>
+<a class="date-chip" href="../2026-03-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-26">2026-03-26</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges Pedro Falcato&#x27;s feedback about the patch potentially introducing contention issues on unmaps and agrees to investigate further.
+
+Author acknowledges Pedro&#x27;s concern about the patch not addressing all possible races and expresses a willingness to consider additional fixes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">hm, i think you&#x27;re right, i have this inverted.
+
+But this patch objectively fixed my issue, I no longer see this BUG(),
+I don&#x27;t get softlocks, and I don&#x27;t get the guest corruption I was seeing
+previously. It could simply be that the contention added makes the race
+less likely.
+
+Let me dig into this and just smoke test your suggestion - but I think
+your patch would cause some contention issues on unmaps.
+
+It&#x27;s been difficult to generate a reproducer for this without running
+hundreds of VMs, whatever race is going on here is extremely narrow.
+
+---
+
+Me too, but i never rule anything out.
+
+~Gregory</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
+<a href="https://lore.kernel.org/r/acWNn1sewTJhnA2f@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges potential issue, agrees to investigate, acknowledges concern</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pedro Falcato</span>
+<a class="date-chip" href="../2026-03-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-26">2026-03-26</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Pedro Falcato questioned whether a child-parent relationship can occur when traversing the i_mmap tree, citing the vma_interval_tree_insert_after() function&#x27;s behavior and its in-order traversal guarantee.
+
+Reviewer Pedro Falcato noted that the races described in the patch are actually not broken, as the parent and child processes hold the corresponding PTE locks in order of traversal, preventing re-installation of PTEs for a folio being removed from page cache. He suggested adding protection against concurrent rmap by unlocking i_mmap_write before calling copy_page_range.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Sure, but can child - parent happen when traversing the i_mmap tree? I don&#x27;t
+think so? (in mm/mmap.c)
+	/* insert tmp into the share list, just after mpnt */
+	vma_interval_tree_insert_after(tmp, mpnt,
+			&amp;mapping-&gt;i_mmap);
+
+The function itself is somewhat straightforward - find the leftmost node at the
+right of &#x27;prev&#x27; (our parent) and link ourselves. So an in-order traversal should
+always go parent - child. Unless there&#x27;s some awful tree rotation that can
+happen and screw us in the meanwhile.
+
+---
+
+If we observe everything parent - child, there is no way this is broken - if
+fork observes the parent pte set, zap will have to observe parent *and* child,
+since they hold the corresponding pte locks, and traversal is done in order.
+If fork observes the parent pte as none, zap will have already traversed the
+parent, and as such there will be no additional mapping of the folio.
+
+If this is broken, then every filesystem out there using filemap_fault() and
+filemap_fault_around() has to be broken, and I hope that&#x27;s not true :p
+
+_If_ there is indeed breakage here regarding tree rotations, I would suggest:
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 5754d1c36462..7b4e39063d67 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1833,12 +1833,12 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
+                        vma_interval_tree_insert_after(tmp, mpnt,
+                                        &amp;mapping-&gt;i_mmap);
+                        flush_dcache_mmap_unlock(mapping);
+-                       i_mmap_unlock_write(mapping);
+                }
+ 
+                if (!(tmp-&gt;vm_flags &amp; VM_WIPEONFORK))
+                        retval = copy_page_range(tmp, mpnt);
+-
++               if (file)
++                       i_mmap_unlock_write(mapping);
+                if (retval) {
+                        mpnt = vma_next(&amp;vmi);
+                        goto loop_out;
+
+
+which should protect against concurrent rmap.
+
+-- 
+Pedro</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Gregory Price</div>
+<a href="https://lore.kernel.org/r/bnukmnuxxuhdfeasjz33miemgr7w35c4aa6pqdmgupx7oxmeeb@gozgc3yxhcdd" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: question, uncertainty, requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price (author)</span>
+<a class="date-chip" href="../2026-03-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-26">2026-03-26</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that Race 2 also involves a fork, and plans to simplify the patch by treating both races as variations of the same issue.
+
+The author addressed Pedro Falcato&#x27;s concern about a potential race condition in the child VMA handling by explaining that the iterator will not revisit the child, thus avoiding the issue.
+
+The author addresses Pedro Falcato&#x27;s concern that in the copy_page_range() function, the parent PTE is zapped after a child PTE has been installed, leading to a bug. The author explains that at this point, the unmap_mapping_folio function only processed the child VMA and the parent PTE had not yet been zapped.
+
+Author explained that the race is between truncate&#x27;s unmap walk and fork&#x27;s copy_page_range, which doesn&#x27;t take the folio lock, and suggested preventing fork-inserted PTEs from existing instead of making copy_page_range aware of truncation.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">after looking at your comments below i realized race 2 actually requires
+the fork as well, which means they&#x27;re both essentially variations of the
+same race, so hopefully i can simplify the change log.
+
+---
+
+^^^ child VMA done, iterator moves on
+		        it will not re-visit the child.
+
+---
+
+At this point, unmap_mapping_folio only processed the child VMA
+(no PTE, skip). The parent PTE *has not* been zapped.
+
+copy_page_range() acquires src_ptl (parent) and reads a present PTE,
+and boom copies it to child.
+
+When it reaches the parent VMA next, it zaps the parent PTE,
+but the child PTE (just installed) survives.
+
+---
+
+The folio lock serializes map_pages/fault against truncate - but the
+race isn&#x27;t between those two. It&#x27;s between truncate&#x27;s unmap walk and
+fork&#x27;s copy_page_range - and copy_page_range doesn&#x27;t take folio lock.
+
+The easiest way to deal with this is to prevent these fork-inserted PTEs
+from existing rather than try to make copy_page_range aware of
+truncation (it already holds the PTL when it finds the PTE, so you can&#x27;t
+take the folio lock unless you drop/reacquire the PTL).
+
+~Gregory</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
+<a href="https://lore.kernel.org/r/acV83cdc9ZfNk8Xh@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, clarification, explanation</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3" id="2026-03-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pedro Falcato</span>
+<a class="date-chip" href="../2026-03-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-26">2026-03-26</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that the patch does not address the issue of PTEs being re-installed for a folio that fallocate is about to remove from page cache, and specifically pointed out that unmap_mapping_folio() may find two mappings instead of one.
+
+The reviewer pointed out that truncate_inode_folio() sets the mapcount to 0, indicating that PTEs have been zapped, but the shmem folio is still locked by both truncate and shmem_fault(), creating a potential deadlock.
+
+Reviewer Pedro Falcato questioned the necessity of using invalidate_lock, pointing out that both map_pages and fault() already take the folio lock to prevent truncate, suggesting a potential redundancy in the proposed fix.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">spin_lock(dst_ptl);
+					       spin_lock(src_ptl);
+						/* does not copy PTE. either
+						 * we find a zapped PTE, or unmap_mapping_folio()
+						 * finds two mappings instead of one. */
+
+---
+
+truncate_inode_folio() zaps the PTEs, thus mapcount = 0.
+	shmem folio is locked by both truncate and shmem_fault().
+
+---
+
+I don&#x27;t see what you&#x27;re seeing? Note that both map_pages and fault()
+take the folio lock (map_pages does a trylock) to exclude against truncate
+as well.
+
+-- 
+Pedro</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Gregory Price</div>
+<a href="https://lore.kernel.org/r/jm5rmcwiauy2fn6fvj6cjowiu2dudjndhhlcd2tm275ibmos5i@dwxwchbs24ko" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, potential deadlock, locking issue</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-03-27">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price (author)</span>
+<a class="date-chip" href="../2026-03-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-27">2026-03-27</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges that their original patch does not resolve the BUG() they are observing, indicating a need for further investigation and potentially a revised patch.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">fwiw this does not resolve the BUG() i&#x27;m observing.
+
+I&#x27;m still trying to find a good reproducer that doesn&#x27;t require
+launching ~100s of VMs and ballooning them, but the condition here seems
+extremely narrow.
+
+~Gregory</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
+<a href="https://lore.kernel.org/r/acYI-gqDOBbZ-bEn@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges issue, need for further investigation</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Matthew Wilcox</span>
+<a class="date-chip" href="../2026-03-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-26">2026-03-26</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Matthew Wilcox NACKed the patch, citing that -&gt;map_pages() is called under RCU lock and must not block; he suggested that if a page cannot be reached without blocking, the filesystem should skip it and use set_pte_range() to setup the page table entry.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">NACK.
+
+-&gt;map_pages() is called when VM asks to map easy accessible pages.
+Filesystem should find and map pages associated with offsets from &quot;start_pgoff&quot;
+till &quot;end_pgoff&quot;. -&gt;map_pages() is called with the RCU lock held and must
+not block.  If it&#x27;s not possible to reach a page without blocking,
+filesystem should skip it. Filesystem should use set_pte_range() to setup
+page table entry. Pointer to entry associated with the page is passed in
+&quot;pte&quot; field in vm_fault structure. Pointers to entries for other offsets
+should be calculated relative to &quot;pte&quot;.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Gregory Price</div>
+<a href="https://lore.kernel.org/r/acWHMQ2MPFjOSq5T@casper.infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NACK</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price (author)</span>
+<a class="date-chip" href="../2026-03-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-03-26">2026-03-26</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges that the issue is not just a scoping problem and agrees to use trylock/fallback to fault if the invalidate lock is needed, but needs to test further.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hm, I follow. I was originally thinking this was scoping issue given
+we take the rcu_read_lock shortly after the call anyway, but I see.
+
+If the invalidate lock ends up being needed then i could leave rcu
+and just use trylock/fallback to fault.
+
+But I need to test a few things, nothing else protects filemap_map_pages
+with the invalidate lock at the moment but only shmem appears broken.
+
+~Gregory</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Matthew Wilcox</div>
+<a href="https://lore.kernel.org/r/acWSZZ1MPGZi6PH8@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges additional complexity, requests further testing</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

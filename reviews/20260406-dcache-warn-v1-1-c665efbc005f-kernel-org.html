@@ -240,7 +240,234 @@
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260406-dcache-warn-v1-1-c665efbc005f@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-04-07</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-08</strong><div class="date-range-nav">Active on: <a href="#2026-04-08">2026-04-08</a> &bull; <a href="#2026-04-07">2026-04-07</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch warns when a dentry (directory entry) is freed while it still has entries in its -&gt;d_lru list, which can indicate a racing condition or other issue.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Al Viro</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Al Viro pointed out that select_collect2() must hold -&gt;d_lock on the dentry and that lock_for_kill() is used to acquire -&gt;i_lock on its inode if necessary, but noted that there&#x27;s a busy-wait case when the refcount is negative and suggested modifying the logic to handle this case by adding a completion to the dentry-&gt;waiters list and waiting for it to be completed.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">OK...  FWIW, on the trees up to 7.0-rc7:
+	* dentry passed to select_collect2() must be still attached to
+the tree (no DCACHE_DENTRY_KILLED on it)
+	* caller holds -&gt;d_lock on that dentry.
+	* in case when its -&gt;d_lockref.count is positive, it&#x27;s busy (at least
+at the moment) and there&#x27;s nothing to be done; move on.
+	* in case when its -&gt;d_lockref.count is negative, it&#x27;s getting killed
+right now.  That&#x27;s a busy-wait case - we ignore it on this pass, but remember
+that we&#x27;ll need to rescan.
+	* in case when its -&gt;d_lockref.count is 0 and it&#x27;s not on a shrink list:
+it&#x27;s evictable, move it to data.dispose, no problem.
+	* in case when its -&gt;d_lockref.count is 0 and it *is* on a shrink list:
+try to steal it.  We can&#x27;t do that from the d_walk() callback itself - it&#x27;s
+a non-blocking environment, to start with, so no evictions are possible there.
+What we can do is to have it returned to shrink_dcache_tree() - grab rcu_read_lock()
+to make sure it won&#x27;t get freed (it hasn&#x27;t reached dentry_unlist(), let alone
+dentry_free(), so the grace period for freeing hasn&#x27;t started yet) and tell d_walk()
+to stop and return to caller immediately.
+	Note that we deliberately return without rcu_read_unlock() - that&#x27;s what
+protects the victim from getting freed under us.  Other thread might or might not
+get around to starting the eviction of the victim, but whether it does that or not,
+it won&#x27;t get around to freeing it.
+	In shrink_dcache_tree() we grab -&gt;d_lock on the victim again (it had been
+dropped by d_walk() when the callback returned).  Then we call lock_for_kill(),
+which starts with checking that -&gt;d_lockref.count is 0.  If it isn&#x27;t, there&#x27;s
+nothing to be done to that sucker; it either went busy (in which case we should
+ignore it and move on) or somebody (likely the owner of the shrink list it had
+been on) got around to evicting it; in the latter case we need to wait until
+the damn thing is killed.  *IF* refcount is still 0, we carefully acquire the
+-&gt;i_lock on its inode (if any).  Note that we are still holding rcu_read_lock(),
+so it can&#x27;t get freed under us even if we have to drop and regain -&gt;d_lock.
+We do need to recheck that refcount is still zero if we do that, obviously.
+	Failing lock_for_kill() is either due to dentry becoming busy (and thus
+to be skipped) or due to dentry having been passed to __dentry_kill().  In
+the latter case we busy-wait, same as we&#x27;d do if we saw negative -&gt;d_lockref.count
+in select_collect2().
+	Successful lock_for_kill() is followed by evicting the sucker;
+we do *not* remove it (or its ancestors, if it had been the only thing
+holding them busy) from whatever shrink list they&#x27;d been on.  Anything on
+shrink lists gets reduced to the state of passive chunk of memory no
+longer connected to filesystem objects, marked with DCACHE_DENTRY_KILLED
+and left for the owner of shrink list to free once it gets around to that.
+There&#x27;s no urgency anymore -
+		rcu_read_lock();
+		if (!lock_for_kill(dentry)) {
+			bool can_free;
+			rcu_read_unlock();
+			d_shrink_del(dentry);
+			can_free = dentry-&gt;d_flags &amp; DCACHE_DENTRY_KILLED;
+			spin_unlock(&amp;dentry-&gt;d_lock);
+			if (can_free)
+				dentry_free(dentry);
+			continue;
+		}
+on the shrink_dentry_list() side will have lock_for_kill() return false
+(-&gt;d_lockref.count already negative), remove the sucker from the list,
+see DCACHE_DENTRY_KILLED on it, unlock the sucker and free it.  Note that
+nothing in that sequence touches any fs objects - it&#x27;s just a disposal of
+inert chunk of memory now.
+	Note that we can&#x27;t be stealing from ourselves - if anything had
+been added to data.dispose, d_walk() sees D_WALK_QUIT or D_WALK_NORETRY
+and either buggers off immediately or sets retry to false.  It won&#x27;t
+restart walking the tree in either case, so there&#x27;s no way for the same
+dentry to be revisited by it.
+
+	Having one shrink_dentry_tree() steal from another is OK - see
+the conditions when shrink_dentry_list() and __dentry_kill() are calling
+dentry_free() (called &#x27;can_free&#x27; in both).
+
+	Getting rid of busy-wait is handled with fairly small modification
+to that: select_collect2() treats negative refcount same as it would
+treat 0-and-on-shrink-list case and shrink_dcache_tree() checks if the
+victim has negative refcount and no DCACHE_DENTRY_KILLED yet.  In that
+case it adds a local object (struct completion_list node) to a list hanging
+off dentry-&gt;waiters, evicts whatever else it might&#x27;ve collected, then waits
+for dentry_unlist() on the victim to have called complete() on the
+node.completion for everything on -&gt;waiters.
+	The rest of the logics is unchanged - if victim is not in the
+middle of eviction, we try to steal it, etc., same as in the mainline.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/20260408224319.GJ3836593@ZenIV" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested modifications</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges a fix is needed to address a livelock in shrink_dcache_parent() caused by a race between concurrent proc dentry invalidation and the global dentry shrinker, which leads to use-after-free crashes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks for taking a look, Al. We&#x27;ll keep looking at this thing and see
+if we can collect more info, and come up with a better theory of the
+crash. I&#x27;ll dig deeper into the vmcore tomorrow.
+
+FWIW, I&#x27;ve been running a bpftrace script across a swath of machines
+that emulates the WARN_ON_ONCE() in the original patch I proposed.
+We&#x27;ve had a few crashes while it&#x27;s running and haven&#x27;t yet collected
+any stack traces.
+
+The script only runs about 80% of the time though, so it&#x27;s possible
+we&#x27;re just getting unlucky, but I sort of doubt it. It seems more
+likely that these dentries are racing onto the list after we&#x27;ve passed
+the check.
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Al Viro</div>
+<a href="https://lore.kernel.org/r/10d8499d60824f319e32f52fd6a196b3645f6652.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-04-07">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Jan Kara</span>
+<a class="date-chip" href="../2026-04-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-07">2026-04-07</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the WARN_ON_ONCE() in dentry_free() should be a WARN_ON() instead, as it&#x27;s not an occasional issue but rather a regular occurrence.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, looks like a sensible assert. Feel free to add:
+
+Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
+
+								Honza</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/qdwhhwyiw46ues2wuua7gru42y5z5xuhwm7clog6pfvwqfwbbf@puxlyyglwov5" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested change</div>
+</div>
+</div>
+<div class="thread-node depth-2" id="2026-04-08">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> Al Viro</span>
+<a class="date-chip" href="../2026-04-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Al Viro responded sarcastically to the patch description, questioning its relevance and usefulness.
+
+Reviewer Al Viro questioned how a parent dentry can be freed and reused before its reference is dropped, which would allow select_collect2() to see the victim still locked and attached to the tree, leading to a livelock.
+
+Reviewer Al Viro noted that the livelock in shrink_dcache_parent() is a known issue, but questioned how it leads to use-after-free (UAF) crashes.
+
+Reviewer Al Viro pointed out that the patch incorrectly frees dentries on another process&#x27;s shrink list and suggested they should be handled by shrink_kill() instead.
+
+Reviewer Al Viro noted that the patch does not address a potential livelock caused by concurrent dentry invalidation and global dcache shrinker, which can lead to use-after-free crashes. He suggested considering calls from shrink_dcache_for_umount() where another thread&#x27;s shrink list may contain dentries from a filesystem being shut down.
+
+Reviewer Al Viro criticized the patch&#x27;s explanation of a use-after-free bug, stating that it lacks clear analysis and contains incorrect information about the path to the bug.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Other than rather uncharitable ones about the usefulness of the Turing Test,
+you mean?
+
+---
+
+Livelock is real and known, all right, but do explain what does &quot;resolves
+through specific timing that allows a parent dentry to be freed&quot; mean.
+Especially since the reference to parent is *not* dropped until after
+having child detached from the tree and DCACHE_DENTRY_KILLED on it,
+with -&gt;d_lock on child held over that.  So select_collect2() seeing
+the victim still locked and attached to the tree has to happen before
+the grace period for parent has a chance to begin.  And rcu_read_lock()
+grabbed there prevents that grace period from completing until we
+do the matching rcu_read_unlock() in shrink_dcache_parent().
+
+---
+
+Yes.  And?  That&#x27;s the livelock, all right, and it needs fixing,
+but how does busy-wait here lead to UAF on anything?
+
+---
+
+They have no business going into data.dispose; for fuck sake, dentries
+on somebody else&#x27;s shrink list are explicitly fed to shrink_kill().
+
+---
+
+... and since they keep their parents busy, we should not leave until
+they are gone.  For real fun, consider calls from shrink_dcache_for_umount() -
+and yes, it *is* possible for another thread&#x27;s shrink list to contain
+dentries from filesystem being shut down.  Legitimately so.
+
+---
+
+... and it still offers zero explanation of the path from livelock to
+UAF.  It may or may not be real, but there&#x27;s nothing in all that verbiage
+even suggesting what it might be.  And proposed analysis is flat-out
+wrong.
+
+As for the livelock, see viro/vfs.git #work.dcache-busy-wait (in -next
+as of today).</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/20260408192620.GI3836593@ZenIV" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: sarcastic tone, questioning usefulness, requested clarification</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
