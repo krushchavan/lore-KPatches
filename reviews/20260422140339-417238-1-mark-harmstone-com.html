@@ -238,41 +238,134 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] btrfs: don&#x27;t force DIO writes to be serialized</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260422140339.417238-1-mark@harmstone.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-04-22</strong><div class="date-range-nav">Active on: <a href="#2026-04-22">2026-04-22</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a performance issue in Btrfs where DIO (Direct I/O) writes are being serialized due to the inode lock being held exclusively. The problem arises from the fact that IS_NOSEC always returns false for btrfs inodes, causing the VFS to optimize away security xattrs. The patch proposes setting SB_NOSEC in btrfs_mount_root() to enable optimizations and improve DIO throughput.</div></div>
+    <div class="date-range">Submitted: <strong>2026-04-22</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-23</strong><div class="date-range-nav">Active on: <a href="#2026-04-23">2026-04-23</a> &bull; <a href="#2026-04-22">2026-04-22</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses an issue in the Btrfs file system where Direct I/O (DIO) writes are being serialized due to a missing flag that was set before the transition to the new mount API in 2023. The flag, SB_NOSEC, tells the VFS that the filesystem may have files without security xattrs, allowing optimizations. Without this flag, DIO writes to the same file will be locked exclusively, leading to reduced performance. This patch removes the serialization by not forcing DIO writes to be exclusive locks, resulting in a significant improvement in DIO throughput, as demonstrated by fio benchmark results showing a 59% increase.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-04-22">
+<div class="thread-node depth-0" id="2026-04-23">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> David Sterba</span>
+<span class="review-author">Mark Harmstone (author)</span>
+<a class="date-chip" href="../2026-04-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-23">2026-04-23</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledges a significant drop in DIO write performance in Linux 6.8, which was not recovered from, and plans to investigate automated performance testing to prevent similar issues.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">It is. There&#x27;s a big dropoff in DIO write performance in 6.8 that we 
+never recovered from. I&#x27;m going to look into some sort of automated 
+performance so this kind of thing can&#x27;t happen casually.
+
+This was on a VM with 8 cores and 8GB of RAM, with a real NVMe exposed 
+through PCI passthrough. The figures for XFS and ext4 in comparison are 
+both about ~3GB/s.
+
+# cat go
+#!/bin/bash
+mkfs.btrfs -f /dev/nvme0n1
+mount /dev/nvme0n1 /mnt/test
+mkdir /mnt/test/nocow
+chattr +C /mnt/test/nocow
+fio /root/test.fio
+
+# cat /root/test.fio
+[global]
+rw=randwrite
+ioengine=io_uring
+iodepth=64
+size=1g
+direct=1
+startdelay=20
+force_async=4
+ramp_time=5
+runtime=60
+group_reporting=1
+numjobs=32
+time_based
+disk_util=0
+clat_percentiles=0
+disable_lat=1
+disable_clat=1
+disable_slat=1
+filename=/mnt/test/nocow/fiofile
+[test]
+name=test
+bs=4k
+stonewall</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to David Sterba</div>
+<a href="https://lore.kernel.org/r/850c7c2d-ed97-424f-8ede-4491bacb02ac@harmstone.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a problem, plans to fix it</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-04-22">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David Sterba</span>
 <a class="date-chip" href="../2026-04-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-22">2026-04-22</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Asked for more information about the fio script used and the block group profile settings to better understand the performance improvements.</div>
+<div class="review-comment-text">Reviewer David Sterba requested more information about the fio script and the block group profile used for DIO writes, indicating a need for additional context before fully evaluating the patch.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Wed, Apr 22, 2026 at 03:03:35PM +0100, Mark Harmstone wrote:
-&gt; Before btrfs switched to the new mount API in 2023, we were setting
-&gt; SB_NOSEC in btrfs_mount_root(). This flag tells the VFS that the
-&gt; filesystem may have files which don&#x27;t have security xattrs, enabling it
-&gt; to do some optimizations.
-&gt; 
-&gt; Unfortunately this was missed in the transition, meaning that IS_NOSEC
-&gt; will always return false for a btrfs inode. This means that
-&gt; btrfs_direct_write() calls will always get the inode lock exclusively,
-&gt; meaning that DIO writes to the same file will be serialized.
-&gt; 
-&gt; On my machine, this one-line change results in a ~59% improvement in DIO
-&gt; throughput:
-
-That&#x27;s quite an improvement. What&#x27;s the actual fio script you&#x27;ve used?
+<pre class="raw-body-text">That&#x27;s quite an improvement. What&#x27;s the actual fio script you&#x27;ve used?
 Also the DIO depends on the block group profile wrt the buffered
-fallback so that would be good to know too.
-
-</pre>
+fallback so that would be good to know too.</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Mark Harmstone</div>
+<a href="https://lore.kernel.org/r/20260422205728.GI12792@twin.jikos.cz" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: request_for_additional_context</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Qu Wenruo</span>
+<a class="date-chip" href="../2026-04-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-23">2026-04-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Qu Wenruo noted that there is an existing solution in iomap to handle bounded pages, which would eliminate the need for btrfs&#x27; specific fallback checks and potentially improve performance.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">There is the bounded page solution from iomap already, which will no 
+longer fallback to buffered IO but to use extra page copy to make sure 
+the final bio won&#x27;t change its content halfway.
+
+IIRC it&#x27;s one extra flag and remove the btrfs&#x27; specific fallback checks, 
+but I haven&#x27;t yet verified the behavior/code.
+
+Thanks,
+Qu</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Mark Harmstone</div>
+<a href="https://lore.kernel.org/r/5a405a46-d210-453e-ae72-7730172cfe71@suse.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Mark Harmstone (author)</span>
+<a class="date-chip" href="../2026-04-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-23">2026-04-23</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author responded to Qu Wenruo&#x27;s feedback by clarifying that the patch only addresses taking the inode rwsem exclusively, and is not related to serialization of DIO writes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">That sounds like a different thing - this is just making it so that
+we&#x27;re not forced to take the inode rwsem exclusively for each write.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Qu Wenruo</div>
+<a href="https://lore.kernel.org/r/e3efca03-c57a-4c55-abfb-81b767cb41e5@harmstone.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, different issue</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
