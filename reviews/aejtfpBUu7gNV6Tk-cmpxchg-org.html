@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH v1 09/17] fuse: prepare to cache statx attributes from entry replies</title>
+    <title>Review Comments: [RFC PATCH v2] mm: Improve pgdat_balanced() to avoid over-reclamation for higher-order allocation</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,23 +236,108 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH v1 09/17] fuse: prepare to cache statx attributes from entry replies</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260420221637.2631478-10-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-04-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-21</strong><div class="date-range-nav">Active on: <a href="#2026-04-20">2026-04-20</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch prepares the FUSE (Filesystem in Userspace) kernel module to cache statx attributes from entry replies by adding a new argument to the fuse_iget() function and passing it through to fuse_change_attributes_i(). This change is a prerequisite for a future patch that will add a new struct fuse_entry2_out outarg containing filled-out statx information. The existing callers of fuse_iget() pass NULL as the new argument, but this will be updated in subsequent patches.</div></div>
+    <h1>[RFC PATCH v2] mm: Improve pgdat_balanced() to avoid over-reclamation for higher-order allocation</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/aejtfpBUu7gNV6Tk@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-04-22</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-23</strong><div class="date-range-nav">Active on: <a href="#2026-04-23">2026-04-23</a> &bull; <a href="#2026-04-22">2026-04-22</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch aims to improve the pgdat_balanced() function, which is responsible for balancing memory allocation and deallocation in the Linux kernel. The current implementation can lead to over-reclamation of memory, particularly during high-order allocations, resulting in poor allocation success rates and increased system overhead. To address this issue, the patch proposes a new approach that takes into account the shared resource nature of kswapd/kcompactd, allowing for more efficient compaction and reducing the likelihood of overshooting the progress buffer.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-04-20">
+<div class="thread-node depth-0" id="2026-04-23">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Amir Goldstein</span>
-<a class="date-chip" href="../2026-04-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-20">2026-04-20</a>
+<span class="review-author">Barry Song</span>
+<a class="date-chip" href="../2026-04-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-23">2026-04-23</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Gave Reviewed-by</div>
-<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
-<a href="https://lore.kernel.org/r/CAOQ4uxiHf7YMqeAfMXPDDZKWJjC3eXBdeOrBHSTQJDOtyv2OiA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-text">Barry Song noted that when over-reclamation occurs, the actual amount of free memory is higher than what compaction_suitable() indicates, and requested to present data supporting this claim
+
+Reviewer Barry Song suggested checking if the compaction gap is much larger than compaction_gap() to ensure there are sufficient gaps, but also noted that ongoing unsatisfied demand may not always make sense and could be mitigated by network code falling back to order-0 allocations.
+
+Reviewer Barry Song suspects that the large nr_to_reclaim value is causing over-reclamation due to assuming it wants to reach the high watermark, but the system may already be above it in kswapd_shrink_node(). He suggests setting sc-&gt;nr_to_reclaim to min(sc-&gt;nr_to_reclaim, 2 * compact_gap(sc-&gt;order)) when above the high watermark and short of high-order pages.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I previously worked for a company that had some data. I’m no
+longer engaged with them, but I’m trying to recollect the data
+on a new platform I recently moved to. My impression is that
+when over-reclamation occurs, the amount of free memory is
+actually much higher than what compaction_suitable() would
+indicate.
+
+Will present the data once recollection is complete with the
+help from Wenchao.
+
+---
+
+I guess one possibility is to check whether the gap is much
+larger than compaction_gap(), to ensure there are sufficient
+gaps.
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 4f9668aa8eef..428ec7266aab 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -6969,6 +6969,7 @@ static bool pgdat_balanced(pg_data_t *pgdat, int
+order, int highest_zoneidx)
+                 * higher-order pages are unavailable, kswapd may still
+                 * trigger excessive reclamation.
+                 */
++               mark += 2 * num_possible_cpus() * compact_gap(order);
+                if (order &amp;&amp; compaction_suitable(zone, order, mark,
+highest_zoneidx))
+                        return true;
+        }
+
+On the other hand, “ongoing unsatisfied demand” may not always
+make sense. For example, network code may first try higher
+orders with the kswapd flag but without the direct reclamation
+flag, and then quickly fall back to order-0 allocations if the
+higher-order allocation fails. In many cases, higher orders do
+not improve network performance, while kswapd performs
+unnecessary reclamation and may further trigger more refaults.
+
+---
+
+I could investigate this further, but I suspect it is mainly
+because we set a very large nr_to_reclaim, assuming we want to
+reach the high watermark, while we may already have been above
+the high watermark in kswapd_shrink_node()?
+
+        /* Reclaim a number of pages proportional to the number of zones */
+        sc-&gt;nr_to_reclaim = 0;
+        for_each_managed_zone_pgdat(zone, pgdat, z, sc-&gt;reclaim_idx) {
+                sc-&gt;nr_to_reclaim += max(high_wmark_pages(zone),
+SWAP_CLUSTER_MAX);
+        }
+
+A rough look suggests another place where high-order may affect
+scanning is here:
+
+static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
+{
+        int i;
+        enum zone_watermarks mark;
+
+        if (sc-&gt;nr_reclaimed &gt;= max(sc-&gt;nr_to_reclaim, compact_gap(sc-&gt;order)))
+                return true;
+       ...
+}
+
+So maybe we set something like the following instead, if we are
+actually above the high watermark and are only short of
+high-order pages?
+
+sc-&gt;nr_to_reclaim = min(sc-&gt;nr_to_reclaim, 2 * compact_gap(sc-&gt;order))
+
+Anyway, let me take a closer look.
+
+Thanks
+Barry</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
+<a href="https://lore.kernel.org/r/CAGsJ_4x9vkv2G7d-gANf8kqUJVxQh_P9=AJxr98LFUgQeOTqow@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, requested data, alternative perspective</div>
 </div>
 </div>
 </div>
