@@ -1,0 +1,154 @@
+{
+  "thread_id": "aemglPlcwFFHNj1A@gourry-fedora-PF4VCD3F",
+  "subject": "[PATCH RFC v3 01/19] mm: thread user_addr through page allocator for cache-friendly zeroing",
+  "url": "https://lore.kernel.org/all/aemglPlcwFFHNj1A@gourry-fedora-PF4VCD3F/",
+  "dates": {
+    "2026-04-23": {
+      "report_file": "2026-04-23_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) suggested simplifying the patch by making post_alloc_hook() a wrapper around a variant that consumes an address, rather than changing all callers to pass USER_ADDR_NONE, and requested keeping changes mostly within mm/page_alloc.c to minimize churn outside of this file.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "In v2 I commented [1]\n\n\"\nFor example, instead of changing all callers of post_alloc_hook() to\npass USER_ADDR_NONE, can we make post_alloc_hook() a simple wrapper\naround a variant that consumes an address.\n\nSo isn't there a way we can just keep the changes mostly to mm/page_alloc.c?\n\"\n\nThat should avoid most of the churn outside of page_alloc, no?\n\n[1] https://lore.kernel.org/r/4bdc66f2-1469-4b91-9935-74c3d3ca0ed9@kernel.org\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-04-23",
+          "message_id": "c165d6af-4a35-4a41-9086-ee307640c044@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Michael Tsirkin",
+          "summary": "Reviewer Tsirkin expressed concerns about the proposed patch, citing increased complexity and potential performance issues due to longer function names and additional boilerplate code. He also noted that the changes would be harder to review and might lead to subtle slowdowns or corruption on non-x86 architectures.\n\nReviewer noted that adding a wrapper to pass __GFP_ZERO and post_alloc_hook() would simplify the interface but increase surface area in the buddy, and questioned whether the added complexity is worth it.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "increased complexity",
+            "potential performance issues",
+            "tradeoff",
+            "added complexity"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes I'm sorry I missed that one and didn't answer it. My bad.\n\nTo answer the question, no, definitely not *most*. Here are some numbers:\n\nWhat we save: 11 one-line changes adding , USER_ADDR_NONE in callers\nthat don't care about user_addr (compaction, filemap, khugepaged,\nmigrate, page_frag_cache, shmem, slub, swap_state).\n\nChanges we have to add: 8 changes\nRename 4 existing APIs adding _user: __alloc_pages,\n__folio_alloc, folio_alloc_mpol, __alloc_frozen_pages + add\n4 wrapper macros/inlines in gfp.h that forward to the _user variants with\nUSER_ADDR_NONE. Roughly 6-8 lines of boilerplate per API.\n\n \nWhat stays the same, but now has to call the new APIs:\n\nall internal plumbing (page_alloc.c, mempolicy.c, internal.h, hugetlb.c,\nthe actual user-page callers in memory.c/huge_memory.c/highmem.h):\n38 calls, of these 21 in page_alloc.c, 17 outside it.\n\n\nThe changes would be less trivial to review, too. And I would not call\nthe resulting very long names \"elegant\".\n\nMore importantly, it makes it harder to review: instead of\ncompiler checking we did not forget a parameter, it compiles fine,\nbut we get a subtle slowdown or corruption on non x86.\n\nAnd I thought you agreed with this sentiment when you said\n\"yea something that is harder to mess up would be nice\":\nhttps://lore.kernel.org/all/20260414062524-mutt-send-email-mst@kernel.org/\n\n---\n\nwrapper APIs, for no benefit.\n\nBut then, I'm not the maintainer here. And adding extra wrappers\nis easy for me. So, let me know. Thanks!\n\n\n-- \nMST",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-04-23",
+          "message_id": "20260423074433-mutt-send-email-mst@kernel.org",
+          "email": "mst@redhat.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges that adding two paths into the buddy would increase surface area, but believes the performance gain is worth it and sees no elegant fix to avoid this.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges a tradeoff",
+            "sees no alternative"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "This is essentially what i was proposing.\n\nThe result would be more external surface to the buddy (at least 2 maybe\nmore functions, plus all the _noprof stuff and a bunch of other things).\n\nAnd then all the callers have to be updated anywhere, and not make it\nany harder to mess up.  You either have\n\n    old_interface(..., user_addr);\n    /* Churn everything using the old interface */\n\nor\n\n    __internal(..., user_addr) { }\n\n    old_interface(...) {\n       __internal(..., NO_USER_ADDR);\n    }\n\n    new_interface(..., user_addr) {\n       __internal(..., user_addr);\n    }\n\n    /* \n     * Update some callsites to use new_interface()\n     * mostly a bunch of _mpol() functions but some others\n     */\n\nbut someone could still just as easily do\n\n    old_interface();\n    /* don't fall folio_zero_user() - Bug! */\n\nSo it's not like this makes things any harder to mess up.\n\nThere is no elegant fix here if we want to do this all inside the buddy.\n\nIf the performance increase weren't so blatantly dramatic we could also\nconsider just not doing this at all.\n\nThere's maybe an alternative here in considering a change to the way the\nbuddy manages zeroed pages - but there's no guarantees we find a pattern\nthere either.\n\n~Gregory",
+          "reply_to": "Michael Tsirkin",
+          "message_date": "2026-04-23",
+          "message_id": "aeohzbmhQAoOODPm@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer noted that the patch's approach to zeroing and cache alignment could be simplified by leveraging existing functionality in post_alloc_hook(), but expressed concern about added complexity to the buddy allocator\n\nReviewer David (Arm) noted that the patch could simplify the interface by adding wrappers to existing functions such as folio_alloc_mpol(), __alloc_frozen_pages_noprof(), and __alloc_pages() instead of introducing new code, but suggested leaving the hugetlb code untouched for a v1 release.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "tradeoff",
+            "churn",
+            "suggested simplification",
+            "recommended deferring hugetlb changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "We probably wouldn't need prof stuff if all we care about is vma_alloc_folio()\nthat will only be calling _noprof internally.\n\n---\n\nRight.\n\nLooking at the patch, there would already be less churn if\n\nfolio_alloc_mpol()\n__alloc_frozen_pages_noprof()\n__alloc_pages()\npost_alloc_hook()\n\nWould have simple wrappers.\n\nhugetlb calls  __alloc_frozen_pages(). That's rather nasty, given that\nit wants to allocate a frozen folio.\n\nalloc_hugetlb_folio() already consumes vma+addr.\nalloc_buddy_hugetlb_folio_with_mpol() already consumes vma+addr.\n\nMaybe we could forward the vma+addr here and call a vma_alloc_froze_folio() if\nwe have a VMA+addr to have a clean interface.\n\nBut really, that hugetlb code is rather messy. I'd vote for leaving hugetlb\nalone on a v1, and focusing on non-hugetlb first.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-04-23",
+          "message_id": "88b0765f-7cfc-4e44-83d2-c01a1755c842@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Michael Tsirkin",
+          "summary": "Reviewer Michael Tsirkin expressed concern that the patch introduces non-orthogonal behavior by providing an optimization only for THP (Transparent Huge Pages), whereas users expect similar performance and predictability from hugetlb, which is harder to use but uses more resources.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "non-orthogonal behavior",
+            "optimization not applied uniformly"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I just dislike it when things are non orthogonal.\nPeople are used to: hugetlb = same perf as THP but more predictable at the cost\nof being harder to use and using more resources.\nHere, suddenly, we have an optimization but only for THP.\n\nBut sure, we can merge a part of it first.\n\n-- \nMST",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-04-23",
+          "message_id": "20260423104120-mutt-send-email-mst@kernel.org",
+          "email": "mst@redhat.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges that increasing the buddy surface might not be worth it and suggests a compromise: updating only the interfaces needed by MST in an initial set of patches, while considering alternatives to increase the surface.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "considering_alternatives",
+            "suggesting_compromise"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "If we're ok increasing the buddy surface this way, then I'd vote for\nonly updating the exact interfaces that MST needs to update for his use\ncase in a base set of patches, and then have each additional updated\nlocation (or logical set of locations) updated in follow-ups.\n\nMy initial go around with this - the patch was hard to read at best.\n\nBut I also think we should also seriously consider not increasing the\nsurface of the buddy.  We already have two patterns (either you need to\ncall folio_zero_user() or you don't) and adding the wrappers to handle\nthis internally means we have 3.\n\nIt's a nice to have, but i'm not sure it decreases maintenance issues.\n\nJust my 2-cents for what it's worth.\n\n~Gregory",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-04-23",
+          "message_id": "aeozRZ9AvW2jTQkX@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer noted that user_alloc_needs_zeroing() is not used with hugetlb, and suggested addressing this issue separately to clean up the hugetlb part more cleanly.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "more work needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Note that we also didn't care about user_alloc_needs_zeroing() with hugetlb so far.\n\nIt's not that it cannot be done with hugetlb, it's just a question about how it\ncan be done more cleanly; and that requires more work to clean the hugetlb part up.\n\nBest done separately.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Michael Tsirkin",
+          "message_date": "2026-04-23",
+          "message_id": "1ab6e58f-d984-4bae-a343-1b0d3c973ad0@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch proposes a change to how the page allocator handles zeroing of memory, specifically for cache-friendly zeroing. It involves passing user addresses through the page allocator and using a wrapper function to handle cacheline alignment on the way out. However, after exploring this approach, it was deemed that the increased complexity may not be worth the benefits."
+    }
+  }
+}
