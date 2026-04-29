@@ -241,26 +241,164 @@
     <div class="date-range">Submitted: <strong>2026-04-26</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-28</strong><div class="date-range-nav">Active on: <a href="#2026-04-28">2026-04-28</a> &bull; <a href="#2026-04-27">2026-04-27</a> &bull; <a href="#2026-04-26">2026-04-26</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses performance issues in the IOCB_DONTCACHE writeback path by moving writeback submission off the writer&#x27;s hot path and into a background flusher. The patch introduces a new WB_start_dontcache bit that uses targeted dirty tracking to limit the scope of expedited writeback, preserving I/O batching while reducing latency. The patch also adds a new writeback reason for tracing visibility and targets the correct cgroup writeback domain. Performance results show significant improvements in sequential write throughput and latency, as well as random write throughput and latency.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-04-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Andrew Morton</span>
+<a class="date-chip" href="../2026-04-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Andrew Morton questioned whether replacing inline filemap_flush_range() calls with a flusher kick would lead to a buildup of dirty, unreclaimable pagecache due to delayed writeback, and asked if there are mechanisms in place to limit this buildup.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Naive questions...
+
+On Sun, 26 Apr 2026 07:56:08 -0400 Jeff Layton &lt;jlayton@kernel.org&gt; wrote:
+
+&gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
+&gt; filemap_flush_range() on every write, submitting writeback inline in
+&gt; the writer&#x27;s context.  Perf lock contention profiling shows the
+&gt; performance problem is not lock contention but the writeback submission
+&gt; work itself \u2014 walking the page tree and submitting I/O blocks the writer
+&gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
+&gt; (dontcache).
+
+So in the current case, when generic_write_sync() returns, all that
+memory is written back and clean&amp;reclaimable (or freed?), yes?
+
+&gt; Replace the inline filemap_flush_range() call with a flusher kick that
+&gt; drains dirty pages in the background.  This moves writeback submission
+&gt; completely off the writer&#x27;s hot path.
+
+Whereas after this change, that pagecache is probably still dirty,
+unreclaimable, waiting for the flusher to do its thing?
+
+So is there potential that the system will get all gummed up with
+dirty, to-be-written-soon pagecache?  Is there something which limits
+this buildup?
+
+&gt; ...
+&gt;
+&gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt; 
+&gt;   Single-client sequential write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              1449.8     1440.1      -0.7%
+&gt;   dontcache             1347.9     1461.5      +8.4%
+&gt;   direct                1450.0     1440.1      -0.7%
+&gt; 
+&gt;   Single-client sequential write latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt; 
+&gt;   Single-client random write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   dontcache              284.2      295.4      +3.9%
+&gt; 
+&gt;   Single-client random write p99.9 latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache             2277.4      872.4     -61.7%
+&gt; 
+&gt;   Multi-writer aggregate throughput (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              1619.5     1611.2      -0.5%
+&gt;   dontcache             1281.1     1629.4     +27.2%
+&gt;   direct                1545.4     1609.4      +4.1%
+&gt; 
+&gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+
+These results look ambiguous.  Sometimes better, sometimes worse?
+
+&gt; nfsd-io-bench results on same hardware (XFS on NVMe, NFSv3 via fio
+&gt; NFS engine with libnfs, 1024 NFSD threads, pool_mode=pernode,
+&gt; file size ~502 GB, compared to v6.19-ish baseline):
+&gt; 
+&gt;   Single-client sequential write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              4844.2     4653.4      -3.9%
+&gt;   dontcache             3028.3     3723.1     +22.9%
+&gt;   direct                 957.6      987.8      +3.2%
+&gt; 
+&gt;   Single-client sequential write p99.9 latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache            759169.0   175112.2     -76.9%
+&gt; 
+&gt;   Single-client random write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   dontcache              590.0     1561.0    +164.6%
+&gt; 
+&gt;   Multi-writer aggregate throughput (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              9636.3     9422.9      -2.2%
+&gt;   dontcache             1894.9     9442.6    +398.3%
+&gt;   direct                 809.6      975.1     +20.4%
+&gt; 
+&gt;   Noisy neighbor (dontcache writer + random readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1854.5     4063.6    +119.1%
+&gt;   readers avg (MB/s)     131.2      101.6     -22.5%
+
+Ditto but less so.
+
+&gt; The NFS results show even larger improvements than the local benchmarks.
+&gt; Multi-writer dontcache throughput improves nearly 5x, matching buffered
+&gt; I/O. Dirty page footprint drops 85-95% in sequential workloads vs.
+&gt; buffered.
+
+It sounds that you like the results, so OK ;)</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260426052854.8372fb9d4c616f16a8aa0a0f@linux-foundation.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: potential for system slowdown, concern about delayed writeback</div>
+</div>
+</div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Jeff Layton (author)</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
+<a class="date-chip" href="../2026-04-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author addressed Andrew Morton&#x27;s concern about the IO submission timing in the writeback path, explaining that the current implementation submits I/Os before returning but doesn&#x27;t wait for completion.
-
-The author acknowledges that the current DONTCACHE I/Os do not wait for completion, but notes that this patch defers I/O submission to a flusher thread, which should eventually take care of business. The author does not indicate a need for further revision.
-
-The author addressed Andrew Morton&#x27;s concern about the patch potentially causing writers to be limited by traditional VM limits instead of the backing device throughput, explaining that this is actually a desired outcome and that the peak pagecache usage was higher but still less than with normal buffered I/O. The author suggests considering going back to submitting writes inline when the number of dirty pages is high, but notes that this could have negative performance effects.</div>
+<div class="review-comment-text">Author addressed Andrew Morton&#x27;s concern that the patch could lead to a buildup of dirty, unreclaimable pagecache by deferring I/O submission to the flusher thread. The author explained that in this situation, writers are limited by backing device throughput and that peak pagecache with DONTCACHE writes was higher than with the unpatched version but still less than with normal buffered I/O. They also mentioned considering going back to submitting writes inline when the number of dirty pages is high, which could have a detrimental effect on performance.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">No. Before returning, it submits the I/Os for the portion that it wrote
+<pre class="raw-body-text">On Sun, 2026-04-26 at 05:28 -0700, Andrew Morton wrote:
+&gt; Naive questions...
+&gt; 
+&gt; On Sun, 26 Apr 2026 07:56:08 -0400 Jeff Layton &lt;jlayton@kernel.org&gt; wrote:
+&gt; 
+&gt; &gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
+&gt; &gt; filemap_flush_range() on every write, submitting writeback inline in
+&gt; &gt; the writer&#x27;s context.  Perf lock contention profiling shows the
+&gt; &gt; performance problem is not lock contention but the writeback submission
+&gt; &gt; work itself — walking the page tree and submitting I/O blocks the writer
+&gt; &gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
+&gt; &gt; (dontcache).
+&gt; 
+&gt; So in the current case, when generic_write_sync() returns, all that
+&gt; memory is written back and clean&amp;reclaimable (or freed?), yes?
+&gt; 
+
+No. Before returning, it submits the I/Os for the portion that it wrote
 rather than leaving it to the flusher to take care of things, but it
 doesn&#x27;t wait for the I/Os to complete.
 
----
+&gt; &gt; Replace the inline filemap_flush_range() call with a flusher kick that
+&gt; &gt; drains dirty pages in the background.  This moves writeback submission
+&gt; &gt; completely off the writer&#x27;s hot path.
+&gt; 
+&gt; Whereas after this change, that pagecache is probably still dirty,
+&gt; unreclaimable, waiting for the flusher to do its thing?
+&gt; 
 
 Correct, but that&#x27;s sort of the case today too since DONTCACHE I/Os
 don&#x27;t wait for the completion. With this change we&#x27;re just deferring
@@ -269,7 +407,10 @@ wake and take care of business). If the flusher thread can&#x27;t keep up,
 then eventually balance_dirty_pages() will kick in and start slowing
 things down.
 
----
+&gt; So is there potential that the system will get all gummed up with
+&gt; dirty, to-be-written-soon pagecache?  Is there something which limits
+&gt; this buildup?
+&gt; 
 
 Today in this situation, the writers are limited by the backing device
 throughput. Once the I/O submission queues are full, then the DONTCACHE
@@ -283,66 +424,158 @@ submission to the flusher.
 
 One thing we could consider is going back to submitting the writes
 inline when the number of dirty pages is high. But, that could have a
-detrimental effect on performance too.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Andrew Morton</div>
-<a href="https://lore.kernel.org/r/2a2d77bb3caf096781b1a4a6000a1c1318d52840.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: clarification, explanation, acknowledgment</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-04-26">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Andrew Morton</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Andrew Morton asked naive questions about the patch&#x27;s implementation, specifically whether the WB_start_dontcache bit is properly cleared when a writeback flusher is kicked and whether the wb_check_start_dontcache() handler correctly handles the case where there are no dirty pages to write back.
+detrimental effect on performance too.
 
-Reviewer Andrew Morton questioned whether memory is properly cleaned up after generic_write_sync() returns, ensuring it&#x27;s not still dirty or reclaimable.
+&gt; &gt; ...
+&gt; &gt; 
+&gt; &gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt; &gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt; &gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              1449.8     1440.1      -0.7%
+&gt; &gt;   dontcache             1347.9     1461.5      +8.4%
+&gt; &gt;   direct                1450.0     1440.1      -0.7%
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt; &gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt; &gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache              284.2      295.4      +3.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write p99.9 latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache             2277.4      872.4     -61.7%
+&gt; &gt; 
+&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              1619.5     1611.2      -0.5%
+&gt; &gt;   dontcache             1281.1     1629.4     +27.2%
+&gt; &gt;   direct                1545.4     1609.4      +4.1%
+&gt; &gt; 
+&gt; &gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt; &gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+&gt; 
+&gt; These results look ambiguous.  Sometimes better, sometimes worse?
+&gt; 
+&gt; &gt; nfsd-io-bench results on same hardware (XFS on NVMe, NFSv3 via fio
+&gt; &gt; NFS engine with libnfs, 1024 NFSD threads, pool_mode=pernode,
+&gt; &gt; file size ~502 GB, compared to v6.19-ish baseline):
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              4844.2     4653.4      -3.9%
+&gt; &gt;   dontcache             3028.3     3723.1     +22.9%
+&gt; &gt;   direct                 957.6      987.8      +3.2%
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write p99.9 latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache            759169.0   175112.2     -76.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache              590.0     1561.0    +164.6%
+&gt; &gt; 
+&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              9636.3     9422.9      -2.2%
+&gt; &gt;   dontcache             1894.9     9442.6    +398.3%
+&gt; &gt;   direct                 809.6      975.1     +20.4%
+&gt; &gt; 
+&gt; &gt;   Noisy neighbor (dontcache writer + random readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1854.5     4063.6    +119.1%
+&gt; &gt;   readers avg (MB/s)     131.2      101.6     -22.5%
+&gt; 
+&gt; Ditto but less so.
+&gt; 
+&gt; &gt; The NFS results show even larger improvements than the local benchmarks.
+&gt; &gt; Multi-writer dontcache throughput improves nearly 5x, matching buffered
+&gt; &gt; I/O. Dirty page footprint drops 85-95% in sequential workloads vs.
+&gt; &gt; buffered.
+&gt; 
+&gt; It sounds that you like the results, so OK ;)
 
-The reviewer questioned whether the patch&#x27;s change would prevent a buildup of dirty, unreclaimable pagecache, and asked if there is any mechanism to limit this buildup.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Naive questions...
-
-On Sun, 26 Apr 2026 07:56:08 -0400 Jeff Layton &lt;jlayton@kernel.org&gt; wrote:
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;
 
 ---
 
-So in the current case, when generic_write_sync() returns, all that
-memory is written back and clean&amp;reclaimable (or freed?), yes?
+On Sun, 2026-04-26 at 05:28 -0700, Andrew Morton wrote:
+&gt; Naive questions...
+&gt; 
+&gt; On Sun, 26 Apr 2026 07:56:08 -0400 Jeff Layton &lt;jlayton@kernel.org&gt; wrote:
+&gt; 
+&gt; &gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
+&gt; &gt; filemap_flush_range() on every write, submitting writeback inline in
+&gt; &gt; the writer&#x27;s context.  Perf lock contention profiling shows the
+&gt; &gt; performance problem is not lock contention but the writeback submission
+&gt; &gt; work itself — walking the page tree and submitting I/O blocks the writer
+&gt; &gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
+&gt; &gt; (dontcache).
+&gt; 
+&gt; So in the current case, when generic_write_sync() returns, all that
+&gt; memory is written back and clean&amp;reclaimable (or freed?), yes?
+&gt; 
+&gt; &gt; Replace the inline filemap_flush_range() call with a flusher kick that
+&gt; &gt; drains dirty pages in the background.  This moves writeback submission
+&gt; &gt; completely off the writer&#x27;s hot path.
+&gt; 
+&gt; Whereas after this change, that pagecache is probably still dirty,
+&gt; unreclaimable, waiting for the flusher to do its thing?
+&gt; 
+&gt; So is there potential that the system will get all gummed up with
+&gt; dirty, to-be-written-soon pagecache?  Is there something which limits
+&gt; this buildup?
+&gt; 
+&gt; &gt; ...
+&gt; &gt; 
+&gt; &gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt; &gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt; &gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              1449.8     1440.1      -0.7%
+&gt; &gt;   dontcache             1347.9     1461.5      +8.4%
+&gt; &gt;   direct                1450.0     1440.1      -0.7%
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt; &gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt; &gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache              284.2      295.4      +3.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write p99.9 latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache             2277.4      872.4     -61.7%
+&gt; &gt; 
+&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              1619.5     1611.2      -0.5%
+&gt; &gt;   dontcache             1281.1     1629.4     +27.2%
+&gt; &gt;   direct                1545.4     1609.4      +4.1%
+&gt; &gt; 
+&gt; &gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt; &gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+&gt; 
+&gt; These results look ambiguous.  Sometimes better, sometimes worse?
+&gt; 
 
----
-
-Whereas after this change, that pagecache is probably still dirty,
-unreclaimable, waiting for the flusher to do its thing?
-
-So is there potential that the system will get all gummed up with
-dirty, to-be-written-soon pagecache?  Is there something which limits
-this buildup?</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
-<a href="https://lore.kernel.org/r/20260426052854.8372fb9d4c616f16a8aa0a0f@linux-foundation.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: naive questions, lack of clear objection or suggestion, uncertainty</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Jeff Layton (author)</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author acknowledges that the mixed-mode benchmark results show decreased read throughput due to increased write throughput, and suggests there are multiple possible solutions to address this issue.
-
-The author acknowledges that the patch introduces tradeoffs, but believes it&#x27;s a win overall due to DONTCACHE being relatively new and having a small blast radius. They suggest considering kicking off writeback earlier in the normal buffered case as well.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Forgot to comment on this part earlier...
+Forgot to comment on this part earlier...
 
 This is the &quot;mixed-mode&quot; (dontcache writes + buffered reads). I played
 with a bunch of different settings under nfsd, and those settings
@@ -353,7 +586,46 @@ from writing via the flusher thread is crowding out reads. So, read
 throughput suffers in this test from that. There are a number of ways
 we could probably make that more fair.
 
----
+&gt; &gt; nfsd-io-bench results on same hardware (XFS on NVMe, NFSv3 via fio
+&gt; &gt; NFS engine with libnfs, 1024 NFSD threads, pool_mode=pernode,
+&gt; &gt; file size ~502 GB, compared to v6.19-ish baseline):
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              4844.2     4653.4      -3.9%
+&gt; &gt;   dontcache             3028.3     3723.1     +22.9%
+&gt; &gt;   direct                 957.6      987.8      +3.2%
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write p99.9 latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache            759169.0   175112.2     -76.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache              590.0     1561.0    +164.6%
+&gt; &gt; 
+&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              9636.3     9422.9      -2.2%
+&gt; &gt;   dontcache             1894.9     9442.6    +398.3%
+&gt; &gt;   direct                 809.6      975.1     +20.4%
+&gt; &gt; 
+&gt; &gt;   Noisy neighbor (dontcache writer + random readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1854.5     4063.6    +119.1%
+&gt; &gt;   readers avg (MB/s)     131.2      101.6     -22.5%
+&gt; 
+&gt; Ditto but less so.
+&gt; 
+
+Same reason for the drop, I think.
+
+&gt; &gt; The NFS results show even larger improvements than the local benchmarks.
+&gt; &gt; Multi-writer dontcache throughput improves nearly 5x, matching buffered
+&gt; &gt; I/O. Dirty page footprint drops 85-95% in sequential workloads vs.
+&gt; &gt; buffered.
+&gt; 
+&gt; It sounds that you like the results, so OK ;)
 
 I think it&#x27;s a win overall. As with anything writeback-related, it&#x27;s a
 game of tradeoffs. The good news is that DONTCACHE is still fairly new
@@ -366,96 +638,63 @@ memory sizes. DONTCACHE gives us a place to experiment with this
 scheme, but we may want to think about kicking off writeback earlier in
 the normal buffered case too.
 -- 
-Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Andrew Morton</div>
-<a href="https://lore.kernel.org/r/c40b691f76e6d397b889b4ee27e43490320660f1.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledges a problem, suggests multiple possible solutions, acknowledged tradeoffs</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Matthew Wilcox</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Matthew Wilcox expressed surprise that the patch&#x27;s solution for &#x27;noisy neighbour&#x27; problem doesn&#x27;t address his initial expectation of concurrent DONTCACHE and buffered writes, suggesting a different scenario than what the patch aims to solve.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">hm.  This wasn&#x27;t what I thought of when I thought of &quot;noisy neighbour&quot;.
-I&#x27;d have process A doing DONTCACHE writes to file A and process B doing
-normal buffered writes to file B.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
-<a href="https://lore.kernel.org/r/ae55M8xBIVYZXPFN@casper.infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: surprise, different scenario</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Jeff Layton (author)</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-27">2026-04-27</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing Matthew Wilcox&#x27;s concern about the patch&#x27;s benchmarking methodology, specifically that it was only tested on NFS and not a local file system. The author explains that they initially tested both reads and writes to the same setting but later experimented with different modes for better performance.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Originally, I was benchmarking this via nfsd and only later did I add
-the suite for local benchmarks. With nfsd, setting the iomode affects
-all reads or writes.
-
-So initially, I had it testing them with both reads and writes set to
-the same setting, but then later I decided to play with different modes
-for reads and writes. The best performing one was buffered reads +
-dontcache writes. It&#x27;s possible a mix of different modes will be better
-on a local fs.
-
-I can&#x27;t easily do a benchmark like you&#x27;re suggesting with nfsd, but it
-should be possible on a local benchmark. I&#x27;ll see what I can come up
-with.
-
-Thanks,
--- 
-Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Matthew Wilcox</div>
-<a href="https://lore.kernel.org/r/ca981318a1d114c5d0e4f428e32f429e187d4ed2.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: clarification, explaining</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Jeff Layton (author)</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-27">2026-04-27</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author confirms that the feedback from Jan and HCH about using a flusher kick is being addressed, as it was their suggested approach.
-
-The author is addressing a concern about the documentation of IOCB_DONTCACHE in the preadv/writev manpage, stating that the current description accurately reflects the behavior and does not need to be updated after this change.
-
-Author clarified that the patch only affects DONTCACHE writes, not normal buffered writes, and asked for clarification on what specific test is being requested.
-
-The author acknowledged that the fio testsuite needs to be reworked and agreed to take a closer look at it, indicating a fix is planned.
-
-The author is addressing a concern about the patch&#x27;s impact on NFS writes, suggesting that the scattered nature of these writes causes performance issues due to competing threads submitting jobs to the queue.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Correct. This was the approach that Jan and HCH suggested in the
-responses to the last posting.
+Jeff Layton &lt;jlayton@kernel.org&gt;
 
 ---
+
+On Mon, 2026-04-27 at 04:01 +0530, Ritesh Harjani wrote:
+&gt; Jeff Layton &lt;jlayton@kernel.org&gt; writes:
+&gt; 
+&gt; &gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
+&gt; &gt; filemap_flush_range() on every write, submitting writeback inline in
+&gt; &gt; the writer&#x27;s context.  Perf lock contention profiling shows the
+&gt; &gt; performance problem is not lock contention but the writeback submission
+&gt; &gt; work itself — walking the page tree and submitting I/O blocks the writer
+&gt; &gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
+&gt; &gt; (dontcache).
+&gt; &gt; 
+&gt; &gt; Replace the inline filemap_flush_range() call with a flusher kick that
+&gt; &gt; drains dirty pages in the background.  This moves writeback submission
+&gt; &gt; completely off the writer&#x27;s hot path.
+&gt; &gt; 
+&gt; &gt; To avoid flushing unrelated buffered dirty data, add a dedicated
+&gt; &gt; WB_start_dontcache bit and wb_check_start_dontcache() handler that uses
+&gt; &gt; the new NR_DONTCACHE_DIRTY counter to determine how many pages to write
+&gt; &gt; back.  The flusher writes back that many pages from the oldest dirty
+&gt; &gt; inodes (not restricted to dontcache-specific inodes). This helps
+&gt; &gt; preserve I/O batching while limiting the scope of expedited writeback.
+&gt; &gt; 
+&gt; 
+&gt; Yup, so, we wakeup the writeback flusher, which will write those many
+&gt; &quot;number&quot; of dirty pages. Those dirty pages written by writeback, can be
+&gt; of any type though, can be DONTCACHE or normal (non-dontcache) dirty
+&gt; pages. IIUC, writeback doesn&#x27;t distinguish between them while writing.
+&gt; 
+
+Correct. This was the approach that Jan and HCH suggested in the
+responses to the last posting.
+
+&gt; 
+&gt; IMO, what we could also include in the commit msg is why is this above
+&gt; approach taken? IIUC, that is because, by writing NR_DONTCACHE_DIRTY
+&gt; pages, it still reduces the page cache pressure and still reduces the
+&gt; amount of work that the reclaim has to do, even though some of those
+&gt; pages maybe non-dontcache pages, in case if there was a parallel
+&gt; buffered write in the system.
+&gt; 
+
+Good suggestion. I&#x27;ll add that.
+
+&gt; 
+&gt; Also should the following change be documented somewhere? Like in Man
+&gt; page maybe? i.e.
+&gt; Earlier RWF_DONTCACHE writes made sure that those dirty pages are
+&gt; immediately submitted for writeback and completion would release those
+&gt; pages. But now, in certain cases when there is a mixed buffered write in
+&gt; the system, those dontcache dirty pages might be written back after a
+&gt; delay (whenever the next time writeback kicks in).
+&gt; However for RWF_DONTCACHE reads, it should not affect anything.
+&gt; 
 
 Looks like DONTCACHE is documented in the preadv/writev manpage. Here&#x27;s
 the current blurb about writes:
@@ -472,7 +711,24 @@ writeback is still just a hint, like it was before. We could mention
 about how that I/O can compete with regular buffered I/O, but it seems
 a bit like we&#x27;re adding info that will just be confusing for users.
 
----
+&gt; &gt; Like WB_start_all, the WB_start_dontcache bit coalesces multiple
+&gt; &gt; DONTCACHE writes into a single flusher wakeup without per-write
+&gt; &gt; allocations.
+&gt; &gt; 
+&gt; &gt; Also add WB_REASON_DONTCACHE as a new writeback reason for tracing
+&gt; &gt; visibility, and target the correct cgroup writeback domain via
+&gt; &gt; unlocked_inode_to_wb_begin().
+&gt; &gt; 
+&gt; &gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt; &gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt; &gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt; &gt; 
+&gt; 
+&gt; Can we please also test parallel buffered writes and dontcache writes? 
+&gt; Since this patch series definitely affects that.
+&gt;
+&gt; BTW - adding these numbers in the commit msg itself is much helpful.
+&gt; 
 
 To be clear, this only affects DONTCACHE, not normal buffered writes,
 but I guess you&#x27;re referring to the fact that DONTCACHE and buffered
@@ -485,13 +741,97 @@ same time (i.e. make them compete?).
 I should be able to do that for the local benchmarks, but nfsd&#x27;s iomode
 settings are global and that won&#x27;t be possible there.
 
----
+&gt; &gt;   Single-client sequential write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              1449.8     1440.1      -0.7%
+&gt; &gt;   dontcache             1347.9     1461.5      +8.4%
+&gt; &gt;   direct                1450.0     1440.1      -0.7%
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt; &gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt; &gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache              284.2      295.4      +3.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write p99.9 latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache             2277.4      872.4     -61.7%
+&gt; &gt; 
+&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt; 
+&gt; Can you please help describe this test scenario if possible.. In above
+&gt; you mentioned we are writing file_size as 2x RAM_SIZE. But your
+&gt; multi-client tests says something else..
+&gt; 
+&gt; local num_clients=4
+&gt; +	mem_kb=$(awk &#x27;/MemTotal/ {print $2}&#x27; /proc/meminfo)
+&gt; +	client_size=&quot;$(( mem_kb / 1024 / num_clients ))M&quot;
+&gt; 
+&gt; Also the multi-writer case is spawning parallel fio jobs, and then
+&gt; parsing and aggregating the bandwidth results instead of using fio to
+&gt; spawn multiple parallel threads... which is ok, but a bit wierd.
+&gt; Why not let fio do the aggregate bandwidth, and latency calculation
+&gt; instead?
+&gt; 
 
 That&#x27;s what I get for asking Claude to roll a testsuite. I&#x27;m not that
 well-versed in fio, but that makes sense. I&#x27;ll have a look at reworking
 it along those lines.
 
----
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              1619.5     1611.2      -0.5%
+&gt; &gt;   dontcache             1281.1     1629.4     +27.2%
+&gt; &gt;   direct                1545.4     1609.4      +4.1%
+&gt; &gt; 
+&gt; &gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt; &gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+&gt; &gt; 
+&gt; &gt; nfsd-io-bench results on same hardware (XFS on NVMe, NFSv3 via fio
+&gt; &gt; NFS engine with libnfs, 1024 NFSD threads, pool_mode=pernode,
+&gt; &gt; file size ~502 GB, compared to v6.19-ish baseline):
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              4844.2     4653.4      -3.9%
+&gt; &gt;   dontcache             3028.3     3723.1     +22.9%
+&gt; &gt;   direct                 957.6      987.8      +3.2%
+&gt; &gt; 
+&gt; &gt;   Single-client sequential write p99.9 latency (us):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache            759169.0   175112.2     -76.9%
+&gt; &gt; 
+&gt; &gt;   Single-client random write (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   dontcache              590.0     1561.0    +164.6%
+&gt; &gt; 
+&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   buffered              9636.3     9422.9      -2.2%
+&gt; &gt;   dontcache             1894.9     9442.6    +398.3%
+&gt; &gt;   direct                 809.6      975.1     +20.4%
+&gt; &gt; 
+&gt; &gt;   Noisy neighbor (dontcache writer + random readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1854.5     4063.6    +119.1%
+&gt; &gt;   readers avg (MB/s)     131.2      101.6     -22.5%
+&gt; &gt; 
+&gt; &gt; The NFS results show even larger improvements than the local benchmarks.
+&gt; &gt; Multi-writer dontcache throughput improves nearly 5x, matching buffered
+&gt; &gt; I/O. Dirty page footprint drops 85-95% in sequential workloads vs.
+&gt; &gt; buffered.
+&gt; &gt; 
+&gt; 
+&gt; Nice :)
+&gt; Some explaination here of why 5x improvement with NFS compared to local
+&gt; filesystems please?
+&gt; (I am not much aware of NFS side, but a possible reasoning would help)
+&gt; 
 
 I suspect that it&#x27;s because of the &quot;scattered&quot; nature of nfsd writes.
 When the client sends a write to nfsd, we wake a nfsd thread to service
@@ -505,128 +845,87 @@ queue and that causes the performance to fall off sharply.
 
 Thanks for the review!
 -- 
+Jeff Layton &lt;jlayton@kernel.org&gt;
+
+---
+
+On Sun, 2026-04-26 at 21:44 +0100, Matthew Wilcox wrote:
+&gt; On Sun, Apr 26, 2026 at 07:56:08AM -0400, Jeff Layton wrote:
+&gt; &gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt; &gt;                        baseline    patched     change
+&gt; &gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt; &gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+&gt; 
+&gt; hm.  This wasn&#x27;t what I thought of when I thought of &quot;noisy neighbour&quot;.
+&gt; I&#x27;d have process A doing DONTCACHE writes to file A and process B doing
+&gt; normal buffered writes to file B.
+
+Originally, I was benchmarking this via nfsd and only later did I add
+the suite for local benchmarks. With nfsd, setting the iomode affects
+all reads or writes.
+
+So initially, I had it testing them with both reads and writes set to
+the same setting, but then later I decided to play with different modes
+for reads and writes. The best performing one was buffered reads +
+dontcache writes. It&#x27;s possible a mix of different modes will be better
+on a local fs.
+
+I can&#x27;t easily do a benchmark like you&#x27;re suggesting with nfsd, but it
+should be possible on a local benchmark. I&#x27;ll see what I can come up
+with.
+
+Thanks,
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;
+
+---
+
+On Tue, 2026-04-28 at 04:56 +0530, Ritesh Harjani wrote:
+&gt; &gt; 
+&gt; 
+&gt; I guess you missed answering this. The reason why I was asking about this is....
+&gt; 
+
+Oops, sorry...
+
+&gt; &gt; &gt; &gt;                        baseline    patched     change
+&gt; &gt; &gt; &gt;   buffered              1619.5     1611.2      -0.5%
+&gt; &gt; &gt; &gt;   dontcache             1281.1     1629.4     +27.2%
+&gt; &gt; &gt; &gt;   direct                1545.4     1609.4      +4.1%
+&gt; &gt; &gt; &gt; 
+&gt; 
+&gt; ... If we see the performace of buffered and dontcache in baseline case,
+&gt; then we don&#x27;t see dontcache doing any good. Even the patched version is
+&gt; just slightly better compared to buffered case.
+&gt; 
+&gt; But IIUC, dontcache should really shine in cases where we have buffered
+&gt; writers dirtying the page cache pages which can overflow the RAM size
+&gt; [1]. The reason why dontcache should show benefit there is, because we
+&gt; don&#x27;t see any page cache pressure, since after writeback the pages gets
+&gt; evicted. Also earlier in the unpatched version, the I/O submission
+&gt; happens immediately in the same context.
+&gt; 
+&gt; So, I guess, isn&#x27;t it better to evaluate those scenarios as well with
+&gt; the patched version - since this series affects those code paths now?
+&gt; 
+&gt; [1]: https://lore.kernel.org/all/20241110152906.1747545-11-axboe@kernel.dk/
+&gt; 
+&gt; &gt; 
+
+Ok, that&#x27;s a good point. I&#x27;ll have Claude recreate a benchmark that
+mirrors what Jens did in the original posting and make sure the
+behavior of that test doesn&#x27;t regress (at least not significantly).
+
+I&#x27;ll try to get this done before LSF/MM, but we&#x27;ll see.
+
+Cheers,
+-- 
 Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Ritesh (IBM)</div>
-<a href="https://lore.kernel.org/r/bb418f9a7bfcabc3070b412c745c5b6456d592b9.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged prior suggestions, acknowledged, no hard guarantees</div>
+<a href="https://lore.kernel.org/r/2a2d77bb3caf096781b1a4a6000a1c1318d52840.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1" id="2026-04-27">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Ritesh (IBM)</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-27">2026-04-27</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The reviewer noted that the writeback flusher writes back all dirty pages, regardless of type, and suggested documenting this change in the commit message or man page to clarify the behavior for RWF_DONTCACHE writes.
-
-Reviewer requested testing of parallel buffered and don&#x27;t cache writes, noting that the patch series impacts this scenario.
-
-Reviewer Ritesh (IBM) requested clarification on test scenario details, specifically pointing out inconsistencies in file size used for single-client tests versus multi-client tests, and suggested using fio&#x27;s built-in aggregation capabilities instead of parsing results manually.
-
-Reviewer Ritesh requested an explanation for the significant performance improvement (5x) observed on NFS compared to local filesystems, indicating that he is not familiar with the NFS side and would appreciate a clarification.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Yup, so, we wakeup the writeback flusher, which will write those many
-&quot;number&quot; of dirty pages. Those dirty pages written by writeback, can be
-of any type though, can be DONTCACHE or normal (non-dontcache) dirty
-pages. IIUC, writeback doesn&#x27;t distinguish between them while writing.
-
-
-IMO, what we could also include in the commit msg is why is this above
-approach taken? IIUC, that is because, by writing NR_DONTCACHE_DIRTY
-pages, it still reduces the page cache pressure and still reduces the
-amount of work that the reclaim has to do, even though some of those
-pages maybe non-dontcache pages, in case if there was a parallel
-buffered write in the system.
-
-
-Also should the following change be documented somewhere? Like in Man
-page maybe? i.e.
-Earlier RWF_DONTCACHE writes made sure that those dirty pages are
-immediately submitted for writeback and completion would release those
-pages. But now, in certain cases when there is a mixed buffered write in
-the system, those dontcache dirty pages might be written back after a
-delay (whenever the next time writeback kicks in).
-However for RWF_DONTCACHE reads, it should not affect anything.
-
----
-
-Can we please also test parallel buffered writes and dontcache writes? 
-Since this patch series definitely affects that.
-
-BTW - adding these numbers in the commit msg itself is much helpful.
-
----
-
-Can you please help describe this test scenario if possible.. In above
-you mentioned we are writing file_size as 2x RAM_SIZE. But your
-multi-client tests says something else..
-
-local num_clients=4
-+	mem_kb=$(awk &#x27;/MemTotal/ {print $2}&#x27; /proc/meminfo)
-+	client_size=&quot;$(( mem_kb / 1024 / num_clients ))M&quot;
-
-Also the multi-writer case is spawning parallel fio jobs, and then
-parsing and aggregating the bandwidth results instead of using fio to
-spawn multiple parallel threads... which is ok, but a bit wierd.
-Why not let fio do the aggregate bandwidth, and latency calculation
-instead?
-
----
-
-Nice :)
-Some explaination here of why 5x improvement with NFS compared to local
-filesystems please?
-(I am not much aware of NFS side, but a possible reasoning would help)
-
--ritesh</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
-<a href="https://lore.kernel.org/r/qzo1s6a4.ritesh.list@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, documentation suggestion, requested additional testing</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Jan Kara</span>
-<a class="date-chip" href="../2026-04-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-27">2026-04-27</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Jan Kara noted that using a per-node stat (NR_DONTCACHE_DIRTY) to determine the amount of dirty folios for writeback may not accurately reflect the actual bandwidth, especially when different cgroups have varying amounts of DONTCACHE writes and normal writes. He suggested changing the stat to be per-bdi_writeback instead.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">So this will end up splitting NR_DONTCACHE_DIRTY folios among per-cgroup wb
-structures based on their writeback bandwidth. This is a reasonable thing
-for global writeback where the bandwidth more or less corresponds to the
-amount of dirty folios. However with DONTCACHE I expect big differences in
-among NR_DONTCACHE_DIRTY among different cgroups not necessarily
-corresponding to wb throughput. In particular if you do DONTCACHE writes
-from one cgroup and normal writes from another cgroup this will
-systematically underestimate the amount needed to write by a factor of
-about two.
-
-So I think the stat should be a per bdi_writeback one (instead of a per node
-one) which would avoid the need to split the value to wb here.
-
-								Honza
-
-
--- 
-Jan Kara &lt;jack@suse.com&gt;
-SUSE Labs, CR</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
-<a href="https://lore.kernel.org/r/7567kwydg2x7lp77xloxk5hjaar3k2xvbqqaro3k4hu4fncww5@yo2rmkrxlhkv" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
 <div class="thread-node depth-1" id="2026-04-28">
 <div class="review-comment">
 <div class="review-comment-header">
@@ -683,6 +982,505 @@ Thanks!
 <div class="review-comment-signals">Signals: potential performance impact, workload consideration, requested evaluation of specific scenarios</div>
 </div>
 </div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Matthew Wilcox</span>
+<a class="date-chip" href="../2026-04-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-26">2026-04-26</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer notes that the original interpretation of &#x27;noisy neighbor&#x27; was incorrect, suggesting a different scenario where one process does DONTCACHE writes to file A and another process does buffered writes to file B.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Sun, Apr 26, 2026 at 07:56:08AM -0400, Jeff Layton wrote:
+&gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+
+hm.  This wasn&#x27;t what I thought of when I thought of &quot;noisy neighbour&quot;.
+I&#x27;d have process A doing DONTCACHE writes to file A and process B doing
+normal buffered writes to file B.</pre>
+</details>
+<a href="https://lore.kernel.org/r/ae55M8xBIVYZXPFN@casper.infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification request</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-04-27">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Ritesh (IBM)</span>
+<a class="date-chip" href="../2026-04-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-27">2026-04-27</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Ritesh pointed out that the writeback flusher does not distinguish between DONTCACHE and non-DONTCACHE dirty pages, which may lead to unexpected behavior in certain cases. He suggested documenting this change in a man page or elsewhere, as it affects how RWF_DONTCACHE writes are handled.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Jeff Layton &lt;jlayton@kernel.org&gt; writes:
+
+&gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
+&gt; filemap_flush_range() on every write, submitting writeback inline in
+&gt; the writer&#x27;s context.  Perf lock contention profiling shows the
+&gt; performance problem is not lock contention but the writeback submission
+&gt; work itself — walking the page tree and submitting I/O blocks the writer
+&gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
+&gt; (dontcache).
+&gt;
+&gt; Replace the inline filemap_flush_range() call with a flusher kick that
+&gt; drains dirty pages in the background.  This moves writeback submission
+&gt; completely off the writer&#x27;s hot path.
+&gt;
+&gt; To avoid flushing unrelated buffered dirty data, add a dedicated
+&gt; WB_start_dontcache bit and wb_check_start_dontcache() handler that uses
+&gt; the new NR_DONTCACHE_DIRTY counter to determine how many pages to write
+&gt; back.  The flusher writes back that many pages from the oldest dirty
+&gt; inodes (not restricted to dontcache-specific inodes). This helps
+&gt; preserve I/O batching while limiting the scope of expedited writeback.
+&gt;
+
+Yup, so, we wakeup the writeback flusher, which will write those many
+&quot;number&quot; of dirty pages. Those dirty pages written by writeback, can be
+of any type though, can be DONTCACHE or normal (non-dontcache) dirty
+pages. IIUC, writeback doesn&#x27;t distinguish between them while writing.
+
+
+IMO, what we could also include in the commit msg is why is this above
+approach taken? IIUC, that is because, by writing NR_DONTCACHE_DIRTY
+pages, it still reduces the page cache pressure and still reduces the
+amount of work that the reclaim has to do, even though some of those
+pages maybe non-dontcache pages, in case if there was a parallel
+buffered write in the system.
+
+
+Also should the following change be documented somewhere? Like in Man
+page maybe? i.e.
+Earlier RWF_DONTCACHE writes made sure that those dirty pages are
+immediately submitted for writeback and completion would release those
+pages. But now, in certain cases when there is a mixed buffered write in
+the system, those dontcache dirty pages might be written back after a
+delay (whenever the next time writeback kicks in).
+However for RWF_DONTCACHE reads, it should not affect anything.
+
+&gt; Like WB_start_all, the WB_start_dontcache bit coalesces multiple
+&gt; DONTCACHE writes into a single flusher wakeup without per-write
+&gt; allocations.
+&gt;
+&gt; Also add WB_REASON_DONTCACHE as a new writeback reason for tracing
+&gt; visibility, and target the correct cgroup writeback domain via
+&gt; unlocked_inode_to_wb_begin().
+&gt;
+&gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt;
+
+Can we please also test parallel buffered writes and dontcache writes? 
+Since this patch series definitely affects that.
+
+BTW - adding these numbers in the commit msg itself is much helpful.
+
+&gt;   Single-client sequential write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              1449.8     1440.1      -0.7%
+&gt;   dontcache             1347.9     1461.5      +8.4%
+&gt;   direct                1450.0     1440.1      -0.7%
+&gt;
+&gt;   Single-client sequential write latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt;
+&gt;   Single-client random write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   dontcache              284.2      295.4      +3.9%
+&gt;
+&gt;   Single-client random write p99.9 latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache             2277.4      872.4     -61.7%
+&gt;
+&gt;   Multi-writer aggregate throughput (MB/s):
+
+Can you please help describe this test scenario if possible.. In above
+you mentioned we are writing file_size as 2x RAM_SIZE. But your
+multi-client tests says something else..
+
+local num_clients=4
++	mem_kb=$(awk &#x27;/MemTotal/ {print $2}&#x27; /proc/meminfo)
++	client_size=&quot;$(( mem_kb / 1024 / num_clients ))M&quot;
+
+Also the multi-writer case is spawning parallel fio jobs, and then
+parsing and aggregating the bandwidth results instead of using fio to
+spawn multiple parallel threads... which is ok, but a bit wierd.
+Why not let fio do the aggregate bandwidth, and latency calculation
+instead?
+
+&gt;                        baseline    patched     change
+&gt;   buffered              1619.5     1611.2      -0.5%
+&gt;   dontcache             1281.1     1629.4     +27.2%
+&gt;   direct                1545.4     1609.4      +4.1%
+&gt;
+&gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+&gt;
+&gt; nfsd-io-bench results on same hardware (XFS on NVMe, NFSv3 via fio
+&gt; NFS engine with libnfs, 1024 NFSD threads, pool_mode=pernode,
+&gt; file size ~502 GB, compared to v6.19-ish baseline):
+&gt;
+&gt;   Single-client sequential write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              4844.2     4653.4      -3.9%
+&gt;   dontcache             3028.3     3723.1     +22.9%
+&gt;   direct                 957.6      987.8      +3.2%
+&gt;
+&gt;   Single-client sequential write p99.9 latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache            759169.0   175112.2     -76.9%
+&gt;
+&gt;   Single-client random write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   dontcache              590.0     1561.0    +164.6%
+&gt;
+&gt;   Multi-writer aggregate throughput (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              9636.3     9422.9      -2.2%
+&gt;   dontcache             1894.9     9442.6    +398.3%
+&gt;   direct                 809.6      975.1     +20.4%
+&gt;
+&gt;   Noisy neighbor (dontcache writer + random readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1854.5     4063.6    +119.1%
+&gt;   readers avg (MB/s)     131.2      101.6     -22.5%
+&gt;
+&gt; The NFS results show even larger improvements than the local benchmarks.
+&gt; Multi-writer dontcache throughput improves nearly 5x, matching buffered
+&gt; I/O. Dirty page footprint drops 85-95% in sequential workloads vs.
+&gt; buffered.
+&gt;
+
+Nice :)
+Some explaination here of why 5x improvement with NFS compared to local
+filesystems please?
+(I am not much aware of NFS side, but a possible reasoning would help)
+
+-ritesh
+
+---
+
+Jeff Layton &lt;jlayton@kernel.org&gt; writes:
+
+&gt;&gt; 
+&gt;&gt; Also should the following change be documented somewhere? Like in Man
+&gt;&gt; page maybe? i.e.
+&gt;&gt; Earlier RWF_DONTCACHE writes made sure that those dirty pages are
+&gt;&gt; immediately submitted for writeback and completion would release those
+&gt;&gt; pages. But now, in certain cases when there is a mixed buffered write in
+&gt;&gt; the system, those dontcache dirty pages might be written back after a
+&gt;&gt; delay (whenever the next time writeback kicks in).
+&gt;&gt; However for RWF_DONTCACHE reads, it should not affect anything.
+&gt;&gt; 
+&gt;
+&gt; Looks like DONTCACHE is documented in the preadv/writev manpage. Here&#x27;s
+&gt; the current blurb about writes:
+&gt;
+&gt;     Additionally, any range dirtied by a write operation with RWF_DONT\u2010
+&gt;     CACHE  set  will  get kicked off for writeback.  This is similar to
+&gt;     calling  sync_file_range(2)  with  SYNC_FILE_RANGE_WRITE  to  start
+&gt;     writeback on the given range.  RWF_DONTCACHE is a hint, or best ef\u2010
+&gt;     fort,  where  no hard guarantees are given on the state of the page
+&gt;     cache once the operation completes.
+&gt;
+&gt; I don&#x27;t think this verbiage is invalid after this change. Kicking off
+&gt; writeback is still just a hint, like it was before. We could mention
+&gt; about how that I/O can compete with regular buffered I/O, but it seems
+&gt; a bit like we&#x27;re adding info that will just be confusing for users.
+&gt;
+
+Make sense.
+
+&gt;&gt; &gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt;&gt; &gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt;&gt; &gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt;&gt; &gt; 
+&gt;&gt; 
+&gt;&gt; Can we please also test parallel buffered writes and dontcache writes? 
+&gt;&gt; Since this patch series definitely affects that.
+&gt;&gt;
+&gt;&gt; BTW - adding these numbers in the commit msg itself is much helpful.
+&gt;&gt; 
+&gt;
+&gt; To be clear, this only affects DONTCACHE, not normal buffered writes,
+&gt; but I guess you&#x27;re referring to the fact that DONTCACHE and buffered
+&gt; writes can compete now.
+&gt;
+&gt; Can you clarify specifically what you&#x27;d like me to test here? Are you
+&gt; saying you want me to test parallel and buffered writes together at the
+&gt; same time (i.e. make them compete?).
+&gt;
+&gt; I should be able to do that for the local benchmarks, but nfsd&#x27;s iomode
+&gt; settings are global and that won&#x27;t be possible there.
+&gt;
+
+The reason I am thinking of this is: dontcache marked pages, gets
+evicted from page cache after they are written back. But this patch
+series can now delay that from happening when there is a parallel
+buffered writer dirtying page cache pages. Because of the reasons we
+already discussed...
+
+Note that, this may not be a workload which matters in the real world,
+but I was thinking, it will be good to know the impact if any, of such
+workload with this patch series (parallel buffered and dontcache
+writers).
+
+
+&gt;&gt; &gt;   Single-client sequential write (MB/s):
+&gt;&gt; &gt;                        baseline    patched     change
+&gt;&gt; &gt;   buffered              1449.8     1440.1      -0.7%
+&gt;&gt; &gt;   dontcache             1347.9     1461.5      +8.4%
+&gt;&gt; &gt;   direct                1450.0     1440.1      -0.7%
+&gt;&gt; &gt; 
+&gt;&gt; &gt;   Single-client sequential write latency (us):
+&gt;&gt; &gt;                        baseline    patched     change
+&gt;&gt; &gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt;&gt; &gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt;&gt; &gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt;&gt; &gt; 
+&gt;&gt; &gt;   Single-client random write (MB/s):
+&gt;&gt; &gt;                        baseline    patched     change
+&gt;&gt; &gt;   dontcache              284.2      295.4      +3.9%
+&gt;&gt; &gt; 
+&gt;&gt; &gt;   Single-client random write p99.9 latency (us):
+&gt;&gt; &gt;                        baseline    patched     change
+&gt;&gt; &gt;   dontcache             2277.4      872.4     -61.7%
+&gt;&gt; &gt; 
+&gt;&gt; &gt;   Multi-writer aggregate throughput (MB/s):
+&gt;&gt; 
+&gt;&gt; Can you please help describe this test scenario if possible.. In above
+&gt;&gt; you mentioned we are writing file_size as 2x RAM_SIZE. But your
+&gt;&gt; multi-client tests says something else..
+&gt;&gt; 
+&gt;&gt; local num_clients=4
+&gt;&gt; +	mem_kb=$(awk &#x27;/MemTotal/ {print $2}&#x27; /proc/meminfo)
+&gt;&gt; +	client_size=&quot;$(( mem_kb / 1024 / num_clients ))M&quot;
+&gt;&gt; 
+
+I guess you missed answering this. The reason why I was asking about this is....
+
+&gt;&gt; &gt;                        baseline    patched     change
+&gt;&gt; &gt;   buffered              1619.5     1611.2      -0.5%
+&gt;&gt; &gt;   dontcache             1281.1     1629.4     +27.2%
+&gt;&gt; &gt;   direct                1545.4     1609.4      +4.1%
+&gt;&gt; &gt; 
+
+... If we see the performace of buffered and dontcache in baseline case,
+then we don&#x27;t see dontcache doing any good. Even the patched version is
+just slightly better compared to buffered case.
+
+But IIUC, dontcache should really shine in cases where we have buffered
+writers dirtying the page cache pages which can overflow the RAM size
+[1]. The reason why dontcache should show benefit there is, because we
+don&#x27;t see any page cache pressure, since after writeback the pages gets
+evicted. Also earlier in the unpatched version, the I/O submission
+happens immediately in the same context.
+
+So, I guess, isn&#x27;t it better to evaluate those scenarios as well with
+the patched version - since this series affects those code paths now?
+
+[1]: https://lore.kernel.org/all/20241110152906.1747545-11-axboe@kernel.dk/
+
+&gt;&gt; 
+&gt;&gt; Nice :)
+&gt;&gt; Some explaination here of why 5x improvement with NFS compared to local
+&gt;&gt; filesystems please?
+&gt;&gt; (I am not much aware of NFS side, but a possible reasoning would help)
+&gt;&gt; 
+&gt;
+&gt; I suspect that it&#x27;s because of the &quot;scattered&quot; nature of nfsd writes.
+&gt; When the client sends a write to nfsd, we wake a nfsd thread to service
+&gt; it. So, if there are a lot of writes operating in parallel, they all
+&gt; get done in the context of different tasks.
+&gt;
+&gt; My hunch is that this I/O pattern (writing to same file from a bunch of
+&gt; different threads), particularly suffers from the DONTCACHE inline
+&gt; write behavior. The threads all end up competing to submit jobs to the
+&gt; queue and that causes the performance to fall off sharply.
+&gt;
+
+Thanks!
+
+-ritesh</pre>
+</details>
+<a href="https://lore.kernel.org/r/qzo1s6a4.ritesh.list@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested documentation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jan Kara</span>
+<a class="date-chip" href="../2026-04-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-27">2026-04-27</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Jan Kara noted that the wb_check_start_dontcache() function does not handle the case where NR_DONTCACHE_DIRTY is zero, and suggested adding a check to return -ENODATA in this scenario.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Sun 26-04-26 07:56:08, Jeff Layton wrote:
+&gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
+&gt; filemap_flush_range() on every write, submitting writeback inline in
+&gt; the writer&#x27;s context.  Perf lock contention profiling shows the
+&gt; performance problem is not lock contention but the writeback submission
+&gt; work itself \u2014 walking the page tree and submitting I/O blocks the writer
+&gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
+&gt; (dontcache).
+&gt; 
+&gt; Replace the inline filemap_flush_range() call with a flusher kick that
+&gt; drains dirty pages in the background.  This moves writeback submission
+&gt; completely off the writer&#x27;s hot path.
+&gt; 
+&gt; To avoid flushing unrelated buffered dirty data, add a dedicated
+&gt; WB_start_dontcache bit and wb_check_start_dontcache() handler that uses
+&gt; the new NR_DONTCACHE_DIRTY counter to determine how many pages to write
+&gt; back.  The flusher writes back that many pages from the oldest dirty
+&gt; inodes (not restricted to dontcache-specific inodes). This helps
+&gt; preserve I/O batching while limiting the scope of expedited writeback.
+&gt; 
+&gt; Like WB_start_all, the WB_start_dontcache bit coalesces multiple
+&gt; DONTCACHE writes into a single flusher wakeup without per-write
+&gt; allocations.
+&gt; 
+&gt; Also add WB_REASON_DONTCACHE as a new writeback reason for tracing
+&gt; visibility, and target the correct cgroup writeback domain via
+&gt; unlocked_inode_to_wb_begin().
+&gt; 
+&gt; dontcache-bench results on dual-socket Xeon Gold 6138 (80 CPUs, 256 GB
+&gt; RAM, Samsung MZ1LB1T9HALS 1.7 TB NVMe, local XFS, io_uring, file size
+&gt; ~503 GB, compared to a v6.19-ish baseline):
+&gt; 
+&gt;   Single-client sequential write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              1449.8     1440.1      -0.7%
+&gt;   dontcache             1347.9     1461.5      +8.4%
+&gt;   direct                1450.0     1440.1      -0.7%
+&gt; 
+&gt;   Single-client sequential write latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache p50         3031.0    10551.3    +248.1%
+&gt;   dontcache p99        74973.2    21626.9     -71.2%
+&gt;   dontcache p99.9      85459.0    23199.7     -72.9%
+&gt; 
+&gt;   Single-client random write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   dontcache              284.2      295.4      +3.9%
+&gt; 
+&gt;   Single-client random write p99.9 latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache             2277.4      872.4     -61.7%
+&gt; 
+&gt;   Multi-writer aggregate throughput (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              1619.5     1611.2      -0.5%
+&gt;   dontcache             1281.1     1629.4     +27.2%
+&gt;   direct                1545.4     1609.4      +4.1%
+&gt; 
+&gt;   Mixed-mode noisy neighbor (dontcache writer + buffered readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1297.6     1471.1     +13.4%
+&gt;   readers avg (MB/s)     855.0      462.4     -45.9%
+&gt; 
+&gt; nfsd-io-bench results on same hardware (XFS on NVMe, NFSv3 via fio
+&gt; NFS engine with libnfs, 1024 NFSD threads, pool_mode=pernode,
+&gt; file size ~502 GB, compared to v6.19-ish baseline):
+&gt; 
+&gt;   Single-client sequential write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              4844.2     4653.4      -3.9%
+&gt;   dontcache             3028.3     3723.1     +22.9%
+&gt;   direct                 957.6      987.8      +3.2%
+&gt; 
+&gt;   Single-client sequential write p99.9 latency (us):
+&gt;                        baseline    patched     change
+&gt;   dontcache            759169.0   175112.2     -76.9%
+&gt; 
+&gt;   Single-client random write (MB/s):
+&gt;                        baseline    patched     change
+&gt;   dontcache              590.0     1561.0    +164.6%
+&gt; 
+&gt;   Multi-writer aggregate throughput (MB/s):
+&gt;                        baseline    patched     change
+&gt;   buffered              9636.3     9422.9      -2.2%
+&gt;   dontcache             1894.9     9442.6    +398.3%
+&gt;   direct                 809.6      975.1     +20.4%
+&gt; 
+&gt;   Noisy neighbor (dontcache writer + random readers):
+&gt;                        baseline    patched     change
+&gt;   writer (MB/s)         1854.5     4063.6    +119.1%
+&gt;   readers avg (MB/s)     131.2      101.6     -22.5%
+&gt; 
+&gt; The NFS results show even larger improvements than the local benchmarks.
+&gt; Multi-writer dontcache throughput improves nearly 5x, matching buffered
+&gt; I/O. Dirty page footprint drops 85-95% in sequential workloads vs.
+&gt; buffered.
+&gt; 
+&gt; Assisted-by: Claude:claude-opus-4-6
+&gt; Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+
+One comment regarding how the writeback is started:
+
+&gt; +static long wb_check_start_dontcache(struct bdi_writeback *wb)
+&gt; +{
+&gt; +	long nr_pages;
+&gt; +
+&gt; +	if (!test_bit(WB_start_dontcache, &amp;wb-&gt;state))
+&gt; +		return 0;
+&gt; +
+&gt; +	nr_pages = global_node_page_state(NR_DONTCACHE_DIRTY);
+&gt; +	if (nr_pages) {
+&gt; +		struct wb_writeback_work work = {
+&gt; +			.nr_pages	= wb_split_bdi_pages(wb, nr_pages),
+&gt; +			.sync_mode	= WB_SYNC_NONE,
+&gt; +			.range_cyclic	= 1,
+&gt; +			.reason		= WB_REASON_DONTCACHE,
+&gt; +		};
+&gt; +
+&gt; +		nr_pages = wb_writeback(wb, &amp;work);
+&gt; +	}
+&gt; +
+&gt; +	clear_bit(WB_start_dontcache, &amp;wb-&gt;state);
+&gt; +	return nr_pages;
+&gt; +}
+
+So this will end up splitting NR_DONTCACHE_DIRTY folios among per-cgroup wb
+structures based on their writeback bandwidth. This is a reasonable thing
+for global writeback where the bandwidth more or less corresponds to the
+amount of dirty folios. However with DONTCACHE I expect big differences in
+among NR_DONTCACHE_DIRTY among different cgroups not necessarily
+corresponding to wb throughput. In particular if you do DONTCACHE writes
+from one cgroup and normal writes from another cgroup this will
+systematically underestimate the amount needed to write by a factor of
+about two.
+
+So I think the stat should be a per bdi_writeback one (instead of a per node
+one) which would avoid the need to split the value to wb here.
+
+								Honza
+
+
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR</pre>
+</details>
+<a href="https://lore.kernel.org/r/7567kwydg2x7lp77xloxk5hjaar3k2xvbqqaro3k4hu4fncww5@yo2rmkrxlhkv" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>
