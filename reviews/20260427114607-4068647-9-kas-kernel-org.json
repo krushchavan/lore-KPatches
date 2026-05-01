@@ -9,6 +9,44 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch adds a new feature to the userfaultfd interface, allowing userspace to track read-write protection (RWP) on registered memory ranges. The feature includes two new ioctls: UFFDIO_REGISTER_MODE_RWP and UFFDIO_RWPROTECT, which enable RWP tracking and allow installing or removing RWP on a range. The patch also introduces a capability bit, UFFD_FEATURE_RWP, to advertise the feature. The implementation ensures that re-registering a range does not drop existing per-PTE markers, preventing stale markers from causing write-faults. The feature is not yet advertised and will be exposed in a follow-up patch."
+    },
+    "2026-04-30": {
+      "report_file": "2026-04-30_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Confirmed a bug in the RWP registration logic, where it does not require VM_WRITE. Suggested adding a flag to handle this case correctly.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "bug confirmed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "sashiko.dev -- https://sashiko.dev/#/patchset/20260427114607.4068647-1-kas@kernel.org -- wrote:\n> +    if (enable_rwp)\n> +        mm_cp_flags = MM_CP_UFFD_RWP;\n> +    else\n> +        mm_cp_flags = MM_CP_UFFD_RWP_RESOLVE | MM_CP_TRY_CHANGE_WRITABLE;\n>\n> Does this unconditionally apply MM_CP_TRY_CHANGE_WRITABLE to the entire range?\n\nConfirmed bug. RWP registration does not require VM_WRITE, so\n\n  mmap(PROT_READ)\n  UFFDIO_REGISTER(MODE_RWP)\n  UFFDIO_RWPROTECT(<range>, disable)\n\ntrips WARN_ON_ONCE(!(vma->vm_flags & VM_WRITE)) inside\nmaybe_change_pte_writable() on resolve.\n\nThe flag belongs inside the iteration, gated on\nvma_wants_manual_pte_write_upgrade(vma), matching mwriteprotect_range()\n(mm/userfaultfd.c:1003) and userfaultfd_clear_vma() (mm/userfaultfd.c:2182):\n\n        for_each_vma_range(vmi, dst_vma, end) {\n                unsigned long vma_start = max(dst_vma->vm_start, start);\n                unsigned long vma_end = min(dst_vma->vm_end, end);\n                unsigned int flags = mm_cp_flags;\n\n                if (!enable_rwp && vma_wants_manual_pte_write_upgrade(dst_vma))\n                        flags |= MM_CP_TRY_CHANGE_WRITABLE;\n\n                change_protection(&tlb, dst_vma, vma_start, vma_end, flags);\n        }\n\nWill fold for v2.\n\n> Since change_protection() walks and modifies page tables here, does this\n> need to call vma_start_write(vma) first?\n\nNo.\n\nThis is the same locking pattern as the pre-existing uffd_wp_range() call\nthat the hunk replaces -- mmap_write_lock without vma_start_write(), which\nremains safe for the same reasons:\n\n  - mmap_write_lock excludes anything taking mmap_read_lock, including\n    MADV_DONTNEED and the other PTE-page-freeing paths (try_to_free_pte()\n    runs under mmap_read_lock + per-VMA locking, never standalone).\n\n  - The remaining concurrent reader is the per-VMA-locked page fault\n    (lock_vma_under_rcu()), which walks PTEs under the PTE lock.\n    change_protection() also takes the PTE lock when updating, so the\n    two serialise. A fault that observes a transient pre-resolve PTE\n    just produces a normal fault delivery and resolves correctly.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n",
+          "reply_to": "",
+          "message_date": "2026-04-30",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Addressed the locking concerns raised by the reviewer, explaining that the existing locking pattern is safe and serializes with other concurrent readers.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "locking concern addressed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "sashiko.dev -- https://sashiko.dev/#/patchset/20260427114607.4068647-1-kas@kernel.org -- wrote:\n> +    if (enable_rwp)\n> +        mm_cp_flags = MM_CP_UFFD_RWP;\n> +    else\n> +        mm_cp_flags = MM_CP_UFFD_RWP_RESOLVE | MM_CP_TRY_CHANGE_WRITABLE;\n>\n> Does this unconditionally apply MM_CP_TRY_CHANGE_WRITABLE to the entire range?\n\nConfirmed bug. RWP registration does not require VM_WRITE, so\n\n  mmap(PROT_READ)\n  UFFDIO_REGISTER(MODE_RWP)\n  UFFDIO_RWPROTECT(<range>, disable)\n\ntrips WARN_ON_ONCE(!(vma->vm_flags & VM_WRITE)) inside\nmaybe_change_pte_writable() on resolve.\n\nThe flag belongs inside the iteration, gated on\nvma_wants_manual_pte_write_upgrade(vma), matching mwriteprotect_range()\n(mm/userfaultfd.c:1003) and userfaultfd_clear_vma() (mm/userfaultfd.c:2182):\n\n        for_each_vma_range(vmi, dst_vma, end) {\n                unsigned long vma_start = max(dst_vma->vm_start, start);\n                unsigned long vma_end = min(dst_vma->vm_end, end);\n                unsigned int flags = mm_cp_flags;\n\n                if (!enable_rwp && vma_wants_manual_pte_write_upgrade(dst_vma))\n                        flags |= MM_CP_TRY_CHANGE_WRITABLE;\n\n                change_protection(&tlb, dst_vma, vma_start, vma_end, flags);\n        }\n\nWill fold for v2.\n\n> Since change_protection() walks and modifies page tables here, does this\n> need to call vma_start_write(vma) first?\n\nNo.\n\nThis is the same locking pattern as the pre-existing uffd_wp_range() call\nthat the hunk replaces -- mmap_write_lock without vma_start_write(), which\nremains safe for the same reasons:\n\n  - mmap_write_lock excludes anything taking mmap_read_lock, including\n    MADV_DONTNEED and the other PTE-page-freeing paths (try_to_free_pte()\n    runs under mmap_read_lock + per-VMA locking, never standalone).\n\n  - The remaining concurrent reader is the per-VMA-locked page fault\n    (lock_vma_under_rcu()), which walks PTEs under the PTE lock.\n    change_protection() also takes the PTE lock when updating, so the\n    two serialise. A fault that observes a transient pre-resolve PTE\n    just produces a normal fault delivery and resolves correctly.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n",
+          "reply_to": "sashiko.dev",
+          "message_date": "2026-04-30",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series adds read-write protection (RWP) tracking to the userfaultfd interface, allowing userspace to track and manage RWP on a per-range basis. The patch introduces new ioctls for registering and unregistering RWP ranges, as well as new capability bits and flags. It also updates various kernel functions to handle RWP correctly."
     }
   }
 }
