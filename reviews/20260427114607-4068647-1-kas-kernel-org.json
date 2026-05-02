@@ -289,6 +289,70 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series adds support for tracking the working set of VM guest memory using userfaultfd (UFFD). It introduces a new registration mode, UFFDIO_REGISTER_MODE_RWP, which allows a VMM to identify cold pages and evict them to slower storage. The kernel uses a combination of PTE bits and uffd PTE bit to mark pages as 'userfaultfd-tracked' and keep them resident while inaccessible. In sync mode, the kernel delivers a UFFD_PAGEFAULT_FLAG_RWP message to the registered handler, while in async mode, the fault is auto-resolved in-place. Userspace can then learn which pages were touched by reading PAGE_IS_ACCESSED out of PAGEMAP_SCAN. The series also includes preparatory patches to decouple protnone helpers from CONFIG_NUMA_BALANCING and rename _PAGE_BIT_UFFD_WP-related functions."
+    },
+    "2026-05-01": {
+      "report_file": "2026-05-01_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author acknowledged that the silent-skip on PM_SCAN_WP_MATCHING + RWP VMA was not intended and agreed to fold in a fixup, but only for WP marker, leaving room for adding similar operation for RWP later if needed.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged",
+            "agreed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "PM_SCAN_WP_MATCHING is the atomic read-and-reset flavour and is\nimplemented for the WP marker only.\n\nThe silent-skip on PM_SCAN_WP_MATCHING + RWP VMA is not intended\nWill fold this fixup\n\n        if (userfaultfd_rwp(vma) && (p->arg.flags & PM_SCAN_WP_MATCHING))\n                return -EINVAL;\n\nWe can add similar operation for RWP later if there's a use-case.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "",
+          "message_date": "2026-05-01",
+          "message_id": "afSC1NHWzrtA-vmA@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author responded to concerns about the lack of pte_mkdirty() in the patch by explaining that it mirrors a similar pattern used in do_numa_page() and numa_rebuild_single_mapping(), which has been in the kernel for years. They pointed out that the 'writable' decision is fenced by can_change_pte_writable() to keep the result safe, and that there is no 'clean + writable' PTE/PMD escaping either branch.\n\nThe author addressed a concern about the 'writable PTEs must be dirty' invariant, explaining that it's not a kernel-wide rule and depends on architecture and code path. They argue that do_uffd_rwp() is correct because it inherits its correctness arguments from do_numa_page().",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "The pattern intentionally mirrors do_numa_page() / numa_rebuild_single_mapping()\nwhich has been in the kernel for years using the same sequence:\n\n  pte = pte_modify(old_pte, vma->vm_page_prot);\n  pte = pte_mkyoung(pte);\n  if (writable)\n          pte = pte_mkwrite(pte, vma);\n\nwith no pte_mkdirty(). The \"writable\" decision is fenced by\ncan_change_pte_writable(), which keeps the result safe in both the\nshared and private cases:\n\n  - Private (can_change_private_pte_writable): only allows the upgrade\n    for PageAnonExclusive pages.\n\n  - Shared (can_change_shared_pte_writable): returns true only when\n    pte_dirty(pte). The dirty bit lives in _PAGE_CHG_MASK, so the\n    earlier pte_modify(pte, vma->vm_page_prot) preserves it; the final\n    PTE is writable + dirty.\n\nThe same applies to the PMD path through can_change_pmd_writable().\nThere is no \"clean + writable\" PTE/PMD escaping either branch.\n\n---\n\nThe \"writable PTEs must be dirty\" invariant is not a kernel-wide rule;\nit depends on the architecture and the code path. Where the kernel\nrelies on pte_mkdirty() being called explicitly, can_change_pte_writable()\nreturns false and this path is not taken. do_uffd_rwp() is the same\nshape as do_numa_page() and inherits its correctness arguments.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "",
+          "message_date": "2026-05-01",
+          "message_id": "afSErJo82o1qUMqe@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author explained that userfaultfd_register() and userfaultfd_unregister() follow a similar locking pattern, acquiring mmap_write_lock(mm) after mmget_not_zero(), which excludes the OOM reaper from interfering.\n\nThe author acknowledged a potential KCSAN issue in userfaultfd_is_initialized() and agreed to add READ_ONCE pairing, which will be folded into patch 12/14.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "clarification",
+            "explanation",
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "This is the same pattern as userfaultfd_register() and\nuserfaultfd_unregister(), which acquire mmap_write_lock(mm) after a\nsuccessful mmget_not_zero() and walk the VMA tree without\ncheck_stable_address_space().\n\nThe OOM reaper takes mmap_read_lock, so it is excluded once we hold the\nwrite lock; failed dup_mmap() unwinds its partial tree before returning.\n\n---\n\nConfirmed. userfaultfd_is_initialized() is reached from\nuserfaultfd_poll(), userfaultfd_read_iter(), and userfaultfd_ioctl()\nwith no mm lock held, so SET_MODE's mmap_write_lock + vma_start_write()\ndrain does not exclude them. The INITIALIZED bit is never modified by\nSET_MODE so the value is functionally stable, but READ_ONCE pairing is\nstill the right thing for KCSAN.\n\nWill fold into 12/14 a small helper plus conversions:\n\n        static unsigned int userfaultfd_features(struct userfaultfd_ctx *ctx)\n        {\n                return READ_ONCE(ctx->features);\n        }\n\nwith userfaultfd_is_initialized(), userfaultfd_wp_async_ctx(),\nuserfaultfd_rwp_async_ctx(), userfaultfd_wp_unpopulated(), and the\nfdinfo printer reading through the helper. Hot-path reads inside\nhandle_userfault() and friends stay plain -- they run under the\nper-VMA lock or mmap_read_lock that SET_MODE drains before the RMW.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "",
+          "message_date": "2026-05-01",
+          "message_id": "afSmJ4LLuLJWdI4A@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series adds support for tracking the working set of VM guest memory using userfaultfd (UFFD). It introduces a new registration mode, UFFDIO_REGISTER_MODE_RWP, which allows a VMM to identify cold pages and evict them to slower storage. The kernel uses a combination of PTE bits and uffd PTE bit to mark pages as 'userfaultfd-tracked' and keep them resident while inaccessible. In sync mode, the kernel delivers a UFFD_PAGEFAULT_FLAG_RWP message to the registered handler, while in async mode, the fault is auto-resolved in-place. Userspace can then learn which pages were touched by reading PAGE_IS_ACCESSED out of PAGEMAP_SCAN. The series also includes preparatory patches to decouple protnone helpers from CONFIG_NUMA_BALANCING and rename _PAGE_BIT_UFFD_WP-related functions."
     }
   }
 }

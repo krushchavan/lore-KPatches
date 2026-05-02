@@ -239,17 +239,17 @@
     <h1>[PATCH 08/14] userfaultfd: add UFFDIO_REGISTER_MODE_RWP and UFFDIO_RWPROTECT plumbing</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260427114607.4068647-9-kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-04-27</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-04-30</strong><div class="date-range-nav">Active on: <a href="#2026-04-30">2026-04-30</a> &bull; <a href="#2026-04-27">2026-04-27</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds read-write protection (RWP) tracking to the userfaultfd interface, allowing userspace to track and manage RWP on a per-range basis. The patch introduces new ioctls for registering and unregistering RWP ranges, as well as new capability bits and flags. It also updates various kernel functions to handle RWP correctly.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds support for read-write protection tracking to the userfaultfd interface. It introduces two new ioctls, UFFDIO_REGISTER_MODE_RWP and UFFDIO_RWPROTECT, which allow userspace to register ranges for RWP tracking and install/remove RWP on those ranges. The feature is not yet advertised and requires a follow-up patch to expose the UAPI.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-04-30">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Kiryl Shutsemau</span>
-<a class="date-chip" href="../2026-04-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-30">2026-04-30</a>
+<a class="date-chip" href="../2026-05-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-30">2026-04-30</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Confirmed a bug in the RWP registration logic, where it does not require VM_WRITE. Suggested adding a flag to handle this case correctly.</div>
+<div class="review-comment-text">Confirmed a bug in RWP registration that requires VM_WRITE, and suggested adding a flag to the iteration to fix it. Also discussed the locking pattern used by change_protection().</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">sashiko.dev -- https://sashiko.dev/#/patchset/20260427114607.4068647-1-kas@kernel.org -- wrote:
@@ -309,79 +309,7 @@ remains safe for the same reasons:
   Kiryl Shutsemau / Kirill A. Shutemov
 </pre>
 </details>
-<div class="review-comment-signals">Signals: bug confirmed</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau</span>
-<a class="date-chip" href="../2026-04-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-30">2026-04-30</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Addressed the locking concerns raised by the reviewer, explaining that the existing locking pattern is safe and serializes with other concurrent readers.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">sashiko.dev -- https://sashiko.dev/#/patchset/20260427114607.4068647-1-kas@kernel.org -- wrote:
-&gt; +    if (enable_rwp)
-&gt; +        mm_cp_flags = MM_CP_UFFD_RWP;
-&gt; +    else
-&gt; +        mm_cp_flags = MM_CP_UFFD_RWP_RESOLVE | MM_CP_TRY_CHANGE_WRITABLE;
-&gt;
-&gt; Does this unconditionally apply MM_CP_TRY_CHANGE_WRITABLE to the entire range?
-
-Confirmed bug. RWP registration does not require VM_WRITE, so
-
-  mmap(PROT_READ)
-  UFFDIO_REGISTER(MODE_RWP)
-  UFFDIO_RWPROTECT(&lt;range&gt;, disable)
-
-trips WARN_ON_ONCE(!(vma-&gt;vm_flags &amp; VM_WRITE)) inside
-maybe_change_pte_writable() on resolve.
-
-The flag belongs inside the iteration, gated on
-vma_wants_manual_pte_write_upgrade(vma), matching mwriteprotect_range()
-(mm/userfaultfd.c:1003) and userfaultfd_clear_vma() (mm/userfaultfd.c:2182):
-
-        for_each_vma_range(vmi, dst_vma, end) {
-                unsigned long vma_start = max(dst_vma-&gt;vm_start, start);
-                unsigned long vma_end = min(dst_vma-&gt;vm_end, end);
-                unsigned int flags = mm_cp_flags;
-
-                if (!enable_rwp &amp;&amp; vma_wants_manual_pte_write_upgrade(dst_vma))
-                        flags |= MM_CP_TRY_CHANGE_WRITABLE;
-
-                change_protection(&amp;tlb, dst_vma, vma_start, vma_end, flags);
-        }
-
-Will fold for v2.
-
-&gt; Since change_protection() walks and modifies page tables here, does this
-&gt; need to call vma_start_write(vma) first?
-
-No.
-
-This is the same locking pattern as the pre-existing uffd_wp_range() call
-that the hunk replaces -- mmap_write_lock without vma_start_write(), which
-remains safe for the same reasons:
-
-  - mmap_write_lock excludes anything taking mmap_read_lock, including
-    MADV_DONTNEED and the other PTE-page-freeing paths (try_to_free_pte()
-    runs under mmap_read_lock + per-VMA locking, never standalone).
-
-  - The remaining concurrent reader is the per-VMA-locked page fault
-    (lock_vma_under_rcu()), which walks PTEs under the PTE lock.
-    change_protection() also takes the PTE lock when updating, so the
-    two serialise. A fault that observes a transient pre-resolve PTE
-    just produces a normal fault delivery and resolves correctly.
-
--- 
-  Kiryl Shutsemau / Kirill A. Shutemov
-</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to sashiko.dev</div>
-<div class="review-comment-signals">Signals: locking concern addressed</div>
+<div class="review-comment-signals">Signals: bug confirmed, locking pattern discussed</div>
 </div>
 </div>
 </div>
