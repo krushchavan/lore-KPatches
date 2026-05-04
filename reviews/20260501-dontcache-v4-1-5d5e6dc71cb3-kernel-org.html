@@ -238,9 +238,133 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 1/4] mm: track DONTCACHE dirty pages per bdi_writeback</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260501-dontcache-v4-1-5d5e6dc71cb3@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-01</strong><div class="date-range-nav">Active on: <a href="#2026-05-01">2026-05-01</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a new counter, WB_DONTCACHE_DIRTY, to track the number of dirty pages that have been dirtied via RWF_DONTCACHE writes (i.e., pages with the dropbehind flag set). The counter is incremented when a folio is dirtied and decremented when it&#x27;s cleaned or cleared. This allows the writeback flusher to expedite writeback for IOCB_DONTCACHE writes without flushing the entire BDI&#x27;s dirty pages. The patch modifies several kernel functions, including folio_account_dirtied(), folio_clear_dirty_for_io(), and __filemap_get_folio_mpol().</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-05-01</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-03</strong><div class="date-range-nav">Active on: <a href="#2026-05-03">2026-05-03</a> &bull; <a href="#2026-05-01">2026-05-01</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new per-writeback-domain (bdi) counter to track the number of dirty pages that have been dirtied via RWF_DONTCACHE writes, also known as &#x27;DONTCACHE&#x27; dirty pages. The counter is used by the writeback flusher to determine how many pages to write back when expediting writeback for IOCB_DONTCACHE writes. This approach aims to optimize writeback performance for specific use cases.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-05-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jan Kara</span>
+<a class="date-chip" href="../2026-05-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-03">2026-05-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The patch looks good and the author is welcome to add a Reviewed-by tag from Jan Kara.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri 01-05-26 10:49:35, Jeff Layton wrote:
+&gt; Add a per-wb WB_DONTCACHE_DIRTY counter that tracks the number of dirty
+&gt; pages with the dropbehind flag set (i.e., pages dirtied via RWF_DONTCACHE
+&gt; writes).
+&gt; 
+&gt; Increment the counter alongside WB_RECLAIMABLE in folio_account_dirtied()
+&gt; when the folio has the dropbehind flag set, and decrement it in
+&gt; folio_clear_dirty_for_io() and folio_account_cleaned(). Also decrement it
+&gt; when a non-DONTCACHE lookup clears the dropbehind flag on a dirty folio in
+&gt; __filemap_get_folio_mpol(), using proper writeback domain locking.
+&gt; 
+&gt; The counter will be used by the writeback flusher to determine how many
+&gt; pages to write back when expediting writeback for IOCB_DONTCACHE writes,
+&gt; without flushing the entire BDI&#x27;s dirty pages.
+&gt; 
+&gt; Suggested-by: Jan Kara &lt;jack@suse.cz&gt;
+&gt; Assisted-by: Claude:claude-opus-4-6
+&gt; Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+
+Looks good. Feel free to add:
+
+Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
+
+								Honza
+
+&gt; ---
+&gt;  include/linux/backing-dev-defs.h |  1 +
+&gt;  mm/filemap.c                     | 13 ++++++++++++-
+&gt;  mm/page-writeback.c              |  6 ++++++
+&gt;  3 files changed, 19 insertions(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+&gt; index a06b93446d10..cb660dd37286 100644
+&gt; --- a/include/linux/backing-dev-defs.h
+&gt; +++ b/include/linux/backing-dev-defs.h
+&gt; @@ -33,6 +33,7 @@ enum wb_stat_item {
+&gt;  	WB_WRITEBACK,
+&gt;  	WB_DIRTIED,
+&gt;  	WB_WRITTEN,
+&gt; +	WB_DONTCACHE_DIRTY,
+&gt;  	NR_WB_STAT_ITEMS
+&gt;  };
+&gt;  
+&gt; diff --git a/mm/filemap.c b/mm/filemap.c
+&gt; index 4e636647100c..1c9c0d5f495f 100644
+&gt; --- a/mm/filemap.c
+&gt; +++ b/mm/filemap.c
+&gt; @@ -2052,8 +2052,19 @@ struct folio *__filemap_get_folio_mpol(struct address_space *mapping,
+&gt;  	if (!folio)
+&gt;  		return ERR_PTR(-ENOENT);
+&gt;  	/* not an uncached lookup, clear uncached if set */
+&gt; -	if (folio_test_dropbehind(folio) &amp;&amp; !(fgp_flags &amp; FGP_DONTCACHE))
+&gt; +	if (folio_test_dropbehind(folio) &amp;&amp; !(fgp_flags &amp; FGP_DONTCACHE)) {
+&gt; +		if (folio_test_dirty(folio)) {
+&gt; +			struct inode *inode = mapping-&gt;host;
+&gt; +			struct bdi_writeback *wb;
+&gt; +			struct wb_lock_cookie cookie = {};
+&gt; +
+&gt; +			wb = unlocked_inode_to_wb_begin(inode, &amp;cookie);
+&gt; +			wb_stat_mod(wb, WB_DONTCACHE_DIRTY,
+&gt; +				    -folio_nr_pages(folio));
+&gt; +			unlocked_inode_to_wb_end(inode, &amp;cookie);
+&gt; +		}
+&gt;  		folio_clear_dropbehind(folio);
+&gt; +	}
+&gt;  	return folio;
+&gt;  }
+&gt;  EXPORT_SYMBOL(__filemap_get_folio_mpol);
+&gt; diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+&gt; index 88cd53d4ba09..8e520717d1f6 100644
+&gt; --- a/mm/page-writeback.c
+&gt; +++ b/mm/page-writeback.c
+&gt; @@ -2630,6 +2630,8 @@ static void folio_account_dirtied(struct folio *folio,
+&gt;  		wb = inode_to_wb(inode);
+&gt;  
+&gt;  		lruvec_stat_mod_folio(folio, NR_FILE_DIRTY, nr);
+&gt; +		if (folio_test_dropbehind(folio))
+&gt; +			wb_stat_mod(wb, WB_DONTCACHE_DIRTY, nr);
+&gt;  		__zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, nr);
+&gt;  		__node_stat_mod_folio(folio, NR_DIRTIED, nr);
+&gt;  		wb_stat_mod(wb, WB_RECLAIMABLE, nr);
+&gt; @@ -2651,6 +2653,8 @@ void folio_account_cleaned(struct folio *folio, struct bdi_writeback *wb)
+&gt;  	long nr = folio_nr_pages(folio);
+&gt;  
+&gt;  	lruvec_stat_mod_folio(folio, NR_FILE_DIRTY, -nr);
+&gt; +	if (folio_test_dropbehind(folio))
+&gt; +		wb_stat_mod(wb, WB_DONTCACHE_DIRTY, -nr);
+&gt;  	zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, -nr);
+&gt;  	wb_stat_mod(wb, WB_RECLAIMABLE, -nr);
+&gt;  	task_io_account_cancelled_write(nr * PAGE_SIZE);
+&gt; @@ -2920,6 +2924,8 @@ bool folio_clear_dirty_for_io(struct folio *folio)
+&gt;  		if (folio_test_clear_dirty(folio)) {
+&gt;  			long nr = folio_nr_pages(folio);
+&gt;  			lruvec_stat_mod_folio(folio, NR_FILE_DIRTY, -nr);
+&gt; +			if (folio_test_dropbehind(folio))
+&gt; +				wb_stat_mod(wb, WB_DONTCACHE_DIRTY, -nr);
+&gt;  			zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, -nr);
+&gt;  			wb_stat_mod(wb, WB_RECLAIMABLE, -nr);
+&gt;  			ret = true;
+&gt; 
+&gt; -- 
+&gt; 2.54.0
+&gt; 
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR
+</pre>
+</details>
+<div class="review-comment-signals">Signals: positive response</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

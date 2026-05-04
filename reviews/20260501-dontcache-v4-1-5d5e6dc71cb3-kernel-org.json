@@ -9,6 +9,31 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch adds a new counter, WB_DONTCACHE_DIRTY, to track the number of dirty pages that have been dirtied via RWF_DONTCACHE writes (i.e., pages with the dropbehind flag set). The counter is incremented when a folio is dirtied and decremented when it's cleaned or cleared. This allows the writeback flusher to expedite writeback for IOCB_DONTCACHE writes without flushing the entire BDI's dirty pages. The patch modifies several kernel functions, including folio_account_dirtied(), folio_clear_dirty_for_io(), and __filemap_get_folio_mpol()."
+    },
+    "2026-05-03": {
+      "report_file": "2026-05-03_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Jan Kara",
+          "summary": "The patch looks good and the author is welcome to add a Reviewed-by tag from Jan Kara.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "positive response"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Fri 01-05-26 10:49:35, Jeff Layton wrote:\n> Add a per-wb WB_DONTCACHE_DIRTY counter that tracks the number of dirty\n> pages with the dropbehind flag set (i.e., pages dirtied via RWF_DONTCACHE\n> writes).\n> \n> Increment the counter alongside WB_RECLAIMABLE in folio_account_dirtied()\n> when the folio has the dropbehind flag set, and decrement it in\n> folio_clear_dirty_for_io() and folio_account_cleaned(). Also decrement it\n> when a non-DONTCACHE lookup clears the dropbehind flag on a dirty folio in\n> __filemap_get_folio_mpol(), using proper writeback domain locking.\n> \n> The counter will be used by the writeback flusher to determine how many\n> pages to write back when expediting writeback for IOCB_DONTCACHE writes,\n> without flushing the entire BDI's dirty pages.\n> \n> Suggested-by: Jan Kara <jack@suse.cz>\n> Assisted-by: Claude:claude-opus-4-6\n> Signed-off-by: Jeff Layton <jlayton@kernel.org>\n\nLooks good. Feel free to add:\n\nReviewed-by: Jan Kara <jack@suse.cz>\n\n\t\t\t\t\t\t\t\tHonza\n\n> ---\n>  include/linux/backing-dev-defs.h |  1 +\n>  mm/filemap.c                     | 13 ++++++++++++-\n>  mm/page-writeback.c              |  6 ++++++\n>  3 files changed, 19 insertions(+), 1 deletion(-)\n> \n> diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h\n> index a06b93446d10..cb660dd37286 100644\n> --- a/include/linux/backing-dev-defs.h\n> +++ b/include/linux/backing-dev-defs.h\n> @@ -33,6 +33,7 @@ enum wb_stat_item {\n>  \tWB_WRITEBACK,\n>  \tWB_DIRTIED,\n>  \tWB_WRITTEN,\n> +\tWB_DONTCACHE_DIRTY,\n>  \tNR_WB_STAT_ITEMS\n>  };\n>  \n> diff --git a/mm/filemap.c b/mm/filemap.c\n> index 4e636647100c..1c9c0d5f495f 100644\n> --- a/mm/filemap.c\n> +++ b/mm/filemap.c\n> @@ -2052,8 +2052,19 @@ struct folio *__filemap_get_folio_mpol(struct address_space *mapping,\n>  \tif (!folio)\n>  \t\treturn ERR_PTR(-ENOENT);\n>  \t/* not an uncached lookup, clear uncached if set */\n> -\tif (folio_test_dropbehind(folio) && !(fgp_flags & FGP_DONTCACHE))\n> +\tif (folio_test_dropbehind(folio) && !(fgp_flags & FGP_DONTCACHE)) {\n> +\t\tif (folio_test_dirty(folio)) {\n> +\t\t\tstruct inode *inode = mapping->host;\n> +\t\t\tstruct bdi_writeback *wb;\n> +\t\t\tstruct wb_lock_cookie cookie = {};\n> +\n> +\t\t\twb = unlocked_inode_to_wb_begin(inode, &cookie);\n> +\t\t\twb_stat_mod(wb, WB_DONTCACHE_DIRTY,\n> +\t\t\t\t    -folio_nr_pages(folio));\n> +\t\t\tunlocked_inode_to_wb_end(inode, &cookie);\n> +\t\t}\n>  \t\tfolio_clear_dropbehind(folio);\n> +\t}\n>  \treturn folio;\n>  }\n>  EXPORT_SYMBOL(__filemap_get_folio_mpol);\n> diff --git a/mm/page-writeback.c b/mm/page-writeback.c\n> index 88cd53d4ba09..8e520717d1f6 100644\n> --- a/mm/page-writeback.c\n> +++ b/mm/page-writeback.c\n> @@ -2630,6 +2630,8 @@ static void folio_account_dirtied(struct folio *folio,\n>  \t\twb = inode_to_wb(inode);\n>  \n>  \t\tlruvec_stat_mod_folio(folio, NR_FILE_DIRTY, nr);\n> +\t\tif (folio_test_dropbehind(folio))\n> +\t\t\twb_stat_mod(wb, WB_DONTCACHE_DIRTY, nr);\n>  \t\t__zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, nr);\n>  \t\t__node_stat_mod_folio(folio, NR_DIRTIED, nr);\n>  \t\twb_stat_mod(wb, WB_RECLAIMABLE, nr);\n> @@ -2651,6 +2653,8 @@ void folio_account_cleaned(struct folio *folio, struct bdi_writeback *wb)\n>  \tlong nr = folio_nr_pages(folio);\n>  \n>  \tlruvec_stat_mod_folio(folio, NR_FILE_DIRTY, -nr);\n> +\tif (folio_test_dropbehind(folio))\n> +\t\twb_stat_mod(wb, WB_DONTCACHE_DIRTY, -nr);\n>  \tzone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, -nr);\n>  \twb_stat_mod(wb, WB_RECLAIMABLE, -nr);\n>  \ttask_io_account_cancelled_write(nr * PAGE_SIZE);\n> @@ -2920,6 +2924,8 @@ bool folio_clear_dirty_for_io(struct folio *folio)\n>  \t\tif (folio_test_clear_dirty(folio)) {\n>  \t\t\tlong nr = folio_nr_pages(folio);\n>  \t\t\tlruvec_stat_mod_folio(folio, NR_FILE_DIRTY, -nr);\n> +\t\t\tif (folio_test_dropbehind(folio))\n> +\t\t\t\twb_stat_mod(wb, WB_DONTCACHE_DIRTY, -nr);\n>  \t\t\tzone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, -nr);\n>  \t\t\twb_stat_mod(wb, WB_RECLAIMABLE, -nr);\n>  \t\t\tret = true;\n> \n> -- \n> 2.54.0\n> \n-- \nJan Kara <jack@suse.com>\nSUSE Labs, CR\n",
+          "reply_to": "",
+          "message_date": "2026-05-03",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch introduces a new per-writeback-domain (bdi) counter to track the number of dirty pages that have been dirtied via RWF_DONTCACHE writes, also known as 'DONTCACHE' dirty pages. The counter is used by the writeback flusher to determine how many pages to write back when expediting writeback for IOCB_DONTCACHE writes. This approach aims to optimize writeback performance for specific use cases."
     }
   }
 }

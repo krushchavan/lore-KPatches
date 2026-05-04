@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 0/4] mm: improve write performance with RWF_DONTCACHE</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260501-dontcache-v4-0-5d5e6dc71cb3@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-01</strong><div class="date-range-nav">Active on: <a href="#2026-05-01">2026-05-01</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to improve write performance by implementing a scheme that kicks the flusher thread after a DONTCACHE write, targeting an amount of writeback proportional to the amount written.</div></div>
+    <div class="date-range">Submitted: <strong>2026-05-01</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-03</strong><div class="date-range-nav">Active on: <a href="#2026-05-03">2026-05-03</a> &bull; <a href="#2026-05-01">2026-05-01</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to improve write performance when using the RWF_DONTCACHE flag by implementing a scheme that kicks the flusher thread to do an amount of writeback proportional to the amount written after a DONTCACHE write. The approach was suggested by Jan Kara and Christoph Hellwig during review of earlier versions. The patches track dirty pages per bdi_writeback, kick the flusher thread instead of initiating writeback inline, and add mechanisms for running &#x27;perf lock&#x27; around test cases. Benchmark results show marked improvement in RWF_DONTCACHE write performance across various tests.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-05-01">
 <div class="review-comment">
@@ -248,104 +248,71 @@
 <a class="date-chip" href="../2026-05-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-01">2026-05-01</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Reviewed-by</div>
+<a href="https://lore.kernel.org/r/ec07180c-665a-4e78-94a4-1670a8bf8efd@kernel.dk" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-05-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jan Kara</span>
+<a class="date-chip" href="../2026-05-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-03">2026-05-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Approved the approach of kicking the flusher thread after a DONTCACHE write, considering it a better way to initiate writeback.</div>
+<div class="review-comment-text">Reviewer noted that the patch does not handle the case where a DONTCACHE write is followed by an fsync, which can cause data corruption.
+
+Jan Kara pointed out that the patch description inaccurately states that only dirty dontcache pages are written back, when in fact arbitrary dirty pages are written back, but the amount is influenced by WB_DONTCACHE_DIRTY. He suggested rephrasing the sentence to clarify this and noted that this heuristic improves performance over other approaches.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On 5/1/26 3:49 AM, Jeff Layton wrote:
-&gt; The IOCB_DONTCACHE writeback path in generic_write_sync() calls
-&gt; filemap_flush_range() on every write, submitting writeback inline in
-&gt; the writer&#x27;s context.  Perf lock contention profiling shows the
-&gt; performance problem is not lock contention but the writeback submission
-&gt; work itself \u2014 walking the page tree and submitting I/O blocks the writer
-&gt; for milliseconds, inflating p99.9 latency from 23ms (buffered) to 93ms
-&gt; (dontcache).
-&gt; 
-&gt; Replace the inline filemap_flush_range() call with a flusher kick that
-&gt; drains dirty pages in the background.  This moves writeback submission
-&gt; completely off the writer&#x27;s hot path.
-&gt; 
-&gt; To avoid flushing unrelated buffered dirty data, add a dedicated
-&gt; WB_start_dontcache bit and wb_check_start_dontcache() handler that uses
-&gt; the per-wb WB_DONTCACHE_DIRTY counter to determine how many pages to
-&gt; write back.  The flusher writes back that many pages from the oldest dirty
-&gt; inodes (not restricted to dontcache-specific inodes). This helps
-&gt; preserve I/O batching while limiting the scope of expedited writeback.
-&gt; 
-&gt; Like WB_start_all, the WB_start_dontcache bit coalesces multiple
-&gt; DONTCACHE writes into a single flusher wakeup without per-write
-&gt; allocations.
-&gt; 
-&gt; Also add WB_REASON_DONTCACHE as a new writeback reason for tracing
-&gt; visibility, and target the correct cgroup writeback domain via
-&gt; unlocked_inode_to_wb_begin().
-&gt; 
-&gt; dontcache-bench results (same host, T6F_SKL_1920GBF, 251 GiB RAM,
-&gt; xfs on NVMe, fio io_uring):
-&gt; 
-&gt; Buffered and direct I/O paths are unaffected by this patchset. All
-&gt; improvements are confined to the dontcache path:
-&gt; 
-&gt; Single-stream throughput (MB/s):
-&gt;                         Before    After    Change
-&gt;   seq-write/dontcache      298      897    +201%
-&gt;   rand-write/dontcache     131      236     +80%
-&gt; 
-&gt; Tail latency improvements (seq-write/dontcache):
-&gt;   p99:    135,266 us  -&gt;  23,986 us   (-82%)
-&gt;   p99.9: 8,925,479 us -&gt;  28,443 us   (-99.7%)
-&gt; 
-&gt; Multi-writer (4 jobs, sequential write):
-&gt;                                 Before    After    Change
-&gt;   dontcache aggregate (MB/s)     2,529    4,532     +79%
-&gt;   dontcache p99 (us)             8,553    1,002     -88%
-&gt;   dontcache p99.9 (us)         109,314    1,057     -99%
-&gt; 
-&gt;   Dontcache multi-writer throughput now matches buffered (4,532 vs
-&gt;   4,616 MB/s).
-&gt; 
-&gt; 32-file write (Axboe test):
-&gt;                                 Before    After    Change
-&gt;   dontcache aggregate (MB/s)     1,548    3,499    +126%
-&gt;   dontcache p99 (us)            10,170      602     -94%
-&gt;   Peak dirty pages (MB)          1,837      213     -88%
-&gt; 
-&gt;   Dontcache now reaches 81% of buffered throughput (was 35%).
-&gt; 
-&gt; Competing writers (dontcache vs buffered, separate files):
-&gt;                                 Before    After
-&gt;   buffered writer                  868      433 MB/s
-&gt;   dontcache writer                 415      433 MB/s
-&gt;   Aggregate                      1,284      866 MB/s
-&gt; 
-&gt;   Previously the buffered writer starved the dontcache writer 2:1.
-&gt;   With per-bdi_writeback tracking, both writers now receive equal
-&gt;   bandwidth. The aggregate matches the buffered-vs-buffered baseline
-&gt;   (863 MB/s), indicating fair sharing regardless of I/O mode.
-&gt; 
-&gt;   The dontcache writer&#x27;s p99.9 latency collapsed from 119 ms to
-&gt;   33 ms (-73%), eliminating the severe periodic stalls seen in the
-&gt;   baseline. Both writers now share identical latency profiles,
-&gt;   matching the buffered-vs-buffered pattern.
-&gt; 
-&gt; The per-bdi_writeback dirty tracking dramatically reduces peak dirty
-&gt; pages in dontcache workloads, with the 32-file test dropping from
-&gt; 1.8 GB to 213 MB. Dontcache sequential write throughput triples and
-&gt; multi-writer throughput reaches parity with buffered I/O, with tail
-&gt; latencies collapsing by 1-2 orders of magnitude.
+<pre class="raw-body-text">Nice and looks good to me now. Feel free to add:
 
-I like this, this is the better way to kick off the writeback.
+Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
 
-Reviewed-by: Jens Axboe &lt;axboe@kernel.dk&gt;
+One nit below:
 
--- 
-Jens Axboe
+---
 
+This comment is a bit confusing as in fact we write arbitrary dirty pages.
+It is only the amount of pages that is influenced by WB_DONTCACHE_DIRTY. So
+I&#x27;d rephrase the last sentence like: We queue writeback for the inode&#x27;s wb
+for as many pages as there are dontcache pages but we don&#x27;t restrict
+writeback to dontcache pages only. This significantly improves performance
+over either writing all wb&#x27;s pages or writing only dontcache pages.
+Although it doesn&#x27;t guarantee quick writeback and reclaim of dontcache
+pages it keeps the amount of dirty pages in check and over longer term
+dontcache pages get written and reclaimed by background writeback even with
+this rough heuristic.
 
-</pre>
+								Honza</pre>
 </details>
-<div class="review-comment-signals">Signals: APPROVED</div>
+<a href="https://lore.kernel.org/r/oykxd436yv47u2yojrwrp3qdtzekq63hanezs6bwlovot6il2a@266nl5oqnnam" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: nit, requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jan Kara</span>
+<a class="date-chip" href="../2026-05-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-03">2026-05-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch series does not include a mechanism to handle concurrent DONTCACHE writes, which could lead to writeback issues and requested the addition of such a mechanism.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Looks good. Feel free to add:
+
+Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
+
+								Honza</pre>
+</details>
+<a href="https://lore.kernel.org/r/7awcgzgxkpav4krxe4qtyfzzlhfpziw56ptfchuai5r4txz4ib@hzycmy5syvjo" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: concurrent writes, writeback issues</div>
 </div>
 </div>
 </div>
