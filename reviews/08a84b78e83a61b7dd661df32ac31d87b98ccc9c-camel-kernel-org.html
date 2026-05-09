@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH] btrfs: add BTRFS_IOC_GET_CSUMS ioctl</title>
+    <title>Review Comments: Increase in XFS journal flushes with (direct_write;fdatasync)+</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,47 +236,82 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH] btrfs: add BTRFS_IOC_GET_CSUMS ioctl</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260407221322.GA1579772@zen.localdomain/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-04-08</strong><div class="date-range-nav">Active on: <a href="#2026-04-08">2026-04-08</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch adds a new ioctl to retrieve checksums for Btrfs, but the discussion revolves around the approach and potential security implications.</div></div>
+    <h1>Increase in XFS journal flushes with (direct_write;fdatasync)+</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/08a84b78e83a61b7dd661df32ac31d87b98ccc9c.camel@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-05-08</strong><div class="date-range-nav">Active on: <a href="#2026-05-08">2026-05-08</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">A patch to optimize XFS journal flushes by only forcing an i_version update when necessary.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-04-08">
+<div class="thread-node depth-0" id="2026-05-08">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Qu Wenruo</span>
-<a class="date-chip" href="../2026-04-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-04-08">2026-04-08</a>
+<span class="review-author">Jeff Layton</span>
+<a class="date-chip" href="../2026-05-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-08">2026-05-08</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Confirmed that the patch logic looks correct, but suggested adding more context to explain why this optimization is necessary.</div>
+<div class="review-comment-signals">Signals: LGTM</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pankaj Raghav</span>
+<a class="date-chip" href="../2026-05-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-08">2026-05-08</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Clarified the approach and addressed some of Boris&#x27; concerns, but still expressed reservations about combining two tree search operations for privilege checks.</div>
+<div class="review-comment-text">Identified a potential issue with the patch and suggested an alternative solution to optimize XFS journal flushes.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">
-
-在 2026/4/8 07:43, Boris Burkov 写道:
-[...]
-&gt;&gt;&gt; We absolutely can&#x27;t give non-root users csums to arbitrary data, that&#x27;s
-&gt;&gt;&gt; definitely a security breach.
+&gt;&gt; The comment needs to explain the why and not the how.   AFAICS the
+&gt;&gt; why is that lazytime is not propagated to the disk at this mount,
+&gt;&gt; so incrementing i_version should not happen, but I&#x27;m adding Jeff
+&gt;&gt; for insights.
 &gt;&gt;
-&gt;&gt; If getting csums for random logical is a security breach, I do not think the
-&gt;&gt; new GET_CSUM ioctl is any better.
 &gt;&gt;
 &gt; 
-&gt; Isn&#x27;t it better because you have to use a file we do permissions checks on?
+&gt; That looks correct to me. I think the logic here is:
 &gt; 
-&gt; So it&#x27;s not an arbitrary logical, it&#x27;s a logical used by a file you have
-&gt; access to? That might still be insecure against some attack, though, what
-&gt; do I know.
+&gt; If we&#x27;re going to disk anyway, then we might as well force an i_version
+&gt; update. In the case where we&#x27;re not (dirty == I_DIRTY_TIME), then we
+&gt; only want to do an i_version update if someone has queried it. If an
+&gt; i_version update does occur, then we need to go to disk by setting
+&gt; I_DIRTY_SYNC.
 
-OK, that makes sense now. Although I&#x27;m still not a huge fan just to 
-combine two different tree search operations into one, just to fulfill 
-the privilege check requirement.
+Does this reflect the why:
+
+diff --git a/fs/inode.c b/fs/inode.c
+index 6a3cbc7dcd28..62c579a0cf7d 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -2124,7 +2124,13 @@ static int inode_update_cmtime(struct inode *inode, unsigned int flags)
+                            inode_iversion_need_inc(inode))
+                                return -EAGAIN;
+                } else {
+-                       if (inode_maybe_inc_iversion(inode, !!dirty))
++                       /*
++                        * Don&#x27;t force iversion increment for pure lazytime
++                        * updates (I_DIRTY_TIME only), let I_VERSION_QUERIED
++                        * dictate whether the increment is needed.
++                        */
++                       if (inode_maybe_inc_iversion(inode,
++                                                    dirty != I_DIRTY_TIME))
+                                dirty |= I_DIRTY_SYNC;
+                }
+        }
+
+
+--
+Pankaj
 
 </pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Boris Burkov</div>
-<div class="review-comment-signals">Signals: approach disagreement</div>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<div class="review-comment-signals">Signals: no clear signal</div>
+</div>
+</div>
 </div>
 </div>
 </div>
