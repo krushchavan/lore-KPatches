@@ -2,7 +2,7 @@
   "date": "2026-05-11",
   "report_file": "2026-05-11_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-05-12 06:07 UTC",
+  "last_updated": "2026-05-12 06:12 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -235,6 +235,214 @@
         }
       ],
       "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Boris Burkov",
+      "primary_email": "boris@bur.io",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v2] btrfs: always drop root->inodes lock before cond_resched()",
+          "message_id": "c02edfd2e71891c095d0b70e530f41ed3d97a874.1778523510.git.boris@bur.io",
+          "url": "https://lore.kernel.org/all/c02edfd2e71891c095d0b70e530f41ed3d97a874.1778523510.git.boris@bur.io/",
+          "date": "2026-05-11T18:20:58Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 2,
+          "series_patch_count": null,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "c02edfd2e71891c095d0b70e530f41ed3d97a874.1778523510.git.boris@bur.io",
+              "url": "https://lore.kernel.org/all/c02edfd2e71891c095d0b70e530f41ed3d97a874.1778523510.git.boris@bur.io/",
+              "subject": "[PATCH v2] btrfs: always drop root->inodes lock before cond_resched()",
+              "date": "2026-05-11T18:20:58Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "The patch addresses a lock contention issue in the btrfs extent map shrinker, which can cause memory pressure due to kswapd getting stuck in inode slab shrinking. The fix involves replacing `cond_resched_lock()` with an unconditional unlock/lock around `cond_resched()` to decouple lock sharing from CPU sharing.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Filipe Manana",
+              "summary": "Identified the issue as a lock contention problem and confirmed that the proposed fix resolves it. Provided a formal Reviewed-by tag.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "LGTM"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Mon, May 11, 2026 at 7:24 PM Boris Burkov <boris@bur.io> wrote:\n>\n> find_first_inode() and find_first_inode_to_shrink() lock root->inodes,\n> then loop over them, occasionally skipping some inodes. When they skip\n> an inode, they attempt to share the cpu/lock with cond_resched_lock().\n>\n> However, that has a subtle problem associated with it.\n> cond_resched_lock() only drops the lock if it needs to actually call\n> schedule(). With CONFIG_PREEMPT_NONE, this means the full timeslice as\n> detected at ticks. With 8+ cpus and default tunables, this is 2.8ms. So\n> regardless of HZ, we will run for at least 2.8ms in this loop without\n> dropping the lock, assuming it finds no suitable inodes. If HZ is\n> small enough, it might be even worse as the tick granularity becomes\n> bigger than the timeslice.\n>\n> The knock-on effect of this is that callers to\n> btrfs_del_inode_from_root() like kswapd trying to shrink the inode slab\n> or userspace threads calling evict() will spin on xa_lock(&root->inodes)\n> for 2.8ms, so the extent map shrinker dominates the lock even though\n> ostensibly it is intending to share it. This produces memory pressure as\n> there is only one kswapd and it runs sequentially so it can get stuck in\n> the inode slab shrinking.\n>\n> To fix it, simply replace cond_resched_lock() with an open coded variant\n> which unconditionally does unlock/lock around cond_resched. Sharing the\n> lock is decoupled from sharing the cpu, and all the users of the lock\n> now share it fairly.\n>\n> I was able to reproduce this on test systems by producing a lot of empty\n> files (to make a big root->inodes xarray), then producing memory\n> pressure by reading large files larger than ram, triggering kswapd and\n> the extent_map shrinker. The lock contention is visible with perf or\n> lockstat. This patch also relieved a user-apparent bottleneck on a\n> production system from the original report.\n>\n> Tested-by: Rik van Riel <riel@surriel.com>\n> Signed-off-by: Boris Burkov <boris@bur.io>\n\nReviewed-by: Filipe Manana <fdmanana@suse.com>\n\nLooks good, thanks.\n\n> ---\n> Changelog:\n> v2:\n> - apply the pattern to btrfs_find_first_inode() as well.\n>\n> ---\n>  fs/btrfs/extent_map.c | 4 +++-\n>  fs/btrfs/inode.c      | 4 +++-\n>  2 files changed, 6 insertions(+), 2 deletions(-)\n>\n> diff --git a/fs/btrfs/extent_map.c b/fs/btrfs/extent_map.c\n> index 514d7b59cbe5..fce9c5cc0122 100644\n> --- a/fs/btrfs/extent_map.c\n> +++ b/fs/btrfs/extent_map.c\n> @@ -1246,7 +1246,9 @@ static struct btrfs_inode *find_first_inode_to_shrink(struct btrfs_root *root,\n>                 write_unlock(&tree->lock);\n>  next:\n>                 from = btrfs_ino(inode) + 1;\n> -               cond_resched_lock(&root->inodes.xa_lock);\n> +               xa_unlock(&root->inodes);\n> +               cond_resched();\n> +               xa_lock(&root->inodes);\n>         }\n>         xa_unlock(&root->inodes);\n>\n> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c\n> index 0e72408c8612..201010ced09d 100644\n> --- a/fs/btrfs/inode.c\n> +++ b/fs/btrfs/inode.c\n> @@ -10540,7 +10540,9 @@ struct btrfs_inode *btrfs_find_first_inode(struct btrfs_root *root, u64 min_ino)\n>                         break;\n>\n>                 from = btrfs_ino(inode) + 1;\n> -               cond_resched_lock(&root->inodes.xa_lock);\n> +               xa_unlock(&root->inodes);\n> +               cond_resched();\n> +               xa_lock(&root->inodes);\n>         }\n>         xa_unlock(&root->inodes);\n>\n> --\n> 2.54.0\n>\n>\n\n",
+              "reply_to": "",
+              "message_date": "2026-05-11",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "fdmanana@kernel.org"
+            }
+          ],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] btrfs: always drop root->inodes lock in find_first_inode_to_shrink()",
+          "message_id": "2c932910eb227ef5e9829fdc86d10a11e3170a99.1778435133.git.boris@bur.io",
+          "url": "https://lore.kernel.org/all/2c932910eb227ef5e9829fdc86d10a11e3170a99.1778435133.git.boris@bur.io/",
+          "date": "2026-05-10T17:46:49Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-05-10",
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "2c932910eb227ef5e9829fdc86d10a11e3170a99.1778435133.git.boris@bur.io",
+              "url": "https://lore.kernel.org/all/2c932910eb227ef5e9829fdc86d10a11e3170a99.1778435133.git.boris@bur.io/",
+              "subject": "[PATCH] btrfs: always drop root->inodes lock in find_first_inode_to_shrink()",
+              "date": "2026-05-10T17:46:49Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch fixes a lock contention issue in the Btrfs extent map shrinker by always dropping the root->inodes lock in the find_first_inode_to_shrink() function. The original code would sometimes spin on the lock for up to 2.8ms, causing memory pressure and performance issues. The patch replaces the cond_resched_lock() call with an unconditional unlock/lock around cond_resched(), ensuring that the lock is shared fairly among users. This fix was tested and verified by the submitter and another developer.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Filipe Manana",
+              "summary": "Reviewer Filipe Manana questioned why the patch's change to use an unconditional unlock/lock around cond_resched is specific to find_first_inode_to_shrink(), pointing out that cond_resched_lock() is used in other places, including btrfs_find_first_inode(), which uses the same lock.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested change",
+                "questioning patch's specificity"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "We call cond_resched_lock() in other places, including\nbtrfs_find_first_inode(), which uses the same lock.\nWhy do that only here?\n\nThanks.",
+              "reply_to": "Boris Burkov",
+              "message_date": "2026-05-11",
+              "message_id": "CAL3q7H7esm_4ATxg=VXqY9HtMFZZZ-Km24SEQJjNK1-o9EunMg@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "fdmanana@kernel.org"
+            },
+            {
+              "author": "Boris Burkov (author)",
+              "summary": "Author acknowledged a concern about lock contention in find_first_inode_to_shrink(), agreed to restructure the function in v2, and asked for feedback on whether to also change other uses of cond_resched_lock()",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledged a concern",
+                "agreed to restructure"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Good point. I was just narrowly following the profile and what I managed\nto reproduce directly.\n\nI did consider whether it made sense to change cond_resched_lock()\nitself but decided to do just this to try out the idea to start.\n\nI will definitely change btrfs_find_first_inode() in v2. Would you like\nme to also get rid of the other uses of cond_resched_lock() from btrfs,\nassuming it makes similar sense at each callsite?",
+              "reply_to": "Filipe Manana",
+              "message_date": "2026-05-11",
+              "message_id": "20260511153323.GA534007@zen.localdomain",
+              "analysis_source": "llm",
+              "email": "boris@bur.io"
+            },
+            {
+              "author": "Filipe Manana",
+              "summary": "Reviewer Filipe Manana suggested that this patch should only address the lock root->inodes.xa_lock and not introduce additional changes, recommending a more targeted approach.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I think this patch should only address the lock root->inodes.xa_lock\n(all the places that call cond_resched_lock() for it).\nAnd then other patches for other locks.\n\nThanks.",
+              "reply_to": "Boris Burkov",
+              "message_date": "2026-05-11",
+              "message_id": "CAL3q7H5EEoxcAddBN1YAnkA88LXDVnC1u1=rZnzjfhKO-nQ2YQ@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "fdmanana@kernel.org"
+            }
+          ],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [bug report] btrfs: periodic block_group reclaim",
+          "message_id": "20260511155615.GB534007@zen.localdomain",
+          "url": "https://lore.kernel.org/all/20260511155615.GB534007@zen.localdomain/",
+          "date": "2026-05-11T15:56:22Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH] btrfs: always drop root->inodes lock in find_first_inode_to_shrink()",
+          "message_id": "20260511153323.GA534007@zen.localdomain",
+          "url": "https://lore.kernel.org/all/20260511153323.GA534007@zen.localdomain/",
+          "date": "2026-05-11T15:33:30Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "Patch aims to drop root->inodes lock in find_first_inode_to_shrink() but raises questions about scope and potential follow-up changes.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Boris Burkov",
+              "summary": "Agreed with the patch's intention but suggested considering broader implications, including potential changes to cond_resched_lock() and other lock holders.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "considering broader implications"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": ""
+            },
+            {
+              "author": "Filipe Manana",
+              "summary": "Clarified that the patch should focus on root->inodes.xa_lock and not address other locks, suggesting a more targeted approach.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "targeted approach"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Mon, May 11, 2026 at 4:33 PM Boris Burkov <boris@bur.io> wrote:\n>\n> On Mon, May 11, 2026 at 01:37:05PM +0100, Filipe Manana wrote:\n> > On Sun, May 10, 2026 at 6:46 PM Boris Burkov <boris@bur.io> wrote:\n> > >\n> > > find_first_inode_to_shrink() locks root->inodes, then loops over them,\n> > > skipping those where it can't lock the extent_tree, or which have no\n> > > extent_maps or it can't igrab. When it doesn't pick an inode, it\n> > > attempts to share the cpu/lock with cond_resched_lock().\n> > >\n> > > However, that has a subtle problem associated with it.\n> > > cond_resched_lock() only drops the lock if it needs to actually call\n> > > schedule(). With CONFIG_PREEMPT_NONE, this means the full timeslice as\n> > > detected at ticks. With 8+ cpus and default tunables, this is 2.8ms. So\n> > > regardless of HZ, we will run for at least 2.8ms in this loop without\n> > > dropping the lock, assuming it finds no suitable inodes. If HZ is\n> > > small enough, it might be even worse as the tick granularity becomes\n> > > bigger than the timeslice.\n> > >\n> > > The knock-on effect of this is that callers to\n> > > btrfs_del_inode_from_root() like kswapd trying to shrink the inode slab\n> > > or userspace threads calling evict() will spin on xa_lock(&root->inodes)\n> > > for 2.8ms, so the extent map shrinker dominates the lock even though\n> > > ostensibly it is intending to share it. This produces memory pressure as\n> > > there is only one kswapd and it runs sequentially so it can get stuck in\n> > > the inode slab shrinking.\n> > >\n> > > To fix it, simply replace cond_resched_lock() with an open coded variant\n> > > which unconditionally does unlock/lock around cond_resched. Sharing the\n> > > lock is decoupled from sharing the cpu, and all the users of the lock\n> > > now share it fairly.\n> > >\n> > > I was able to reproduce this on test systems by producing a lot of empty\n> > > files (to make a big root->inodes xarray), then producing memory\n> > > pressure by reading large files larger than ram, triggering kswapd and\n> > > the extent_map shrinker. The lock contention is visible with perf or\n> > > lockstat. This patch also relieved a user-apparent bottleneck on a\n> > > production system from the original report.\n> > >\n> > > Tested-by: Rik van Riel <riel@surriel.com>\n> > > Signed-off-by: Boris Burkov <boris@bur.io>\n> > > ---\n> > >  fs/btrfs/extent_map.c | 4 +++-\n> > >  1 file changed, 3 insertions(+), 1 deletion(-)\n> > >\n> > > diff --git a/fs/btrfs/extent_map.c b/fs/btrfs/extent_map.c\n> > > index 514d7b59cbe5..fce9c5cc0122 100644\n> > > --- a/fs/btrfs/extent_map.c\n> > > +++ b/fs/btrfs/extent_map.c\n> > > @@ -1246,7 +1246,9 @@ static struct btrfs_inode *find_first_inode_to_shrink(struct btrfs_root *root,\n> > >                 write_unlock(&tree->lock);\n> > >  next:\n> > >                 from = btrfs_ino(inode) + 1;\n> > > -               cond_resched_lock(&root->inodes.xa_lock);\n> > > +               xa_unlock(&root->inodes);\n> > > +               cond_resched();\n> > > +               xa_lock(&root->inodes);\n> >\n> > We call cond_resched_lock() in other places, including\n> > btrfs_find_first_inode(), which uses the same lock.\n> > Why do that only here?\n> >\n> > Thanks.\n>\n> Good point. I was just narrowly following the profile and what I managed\n> to reproduce directly.\n>\n> I did consider whether it made sense to change cond_resched_lock()\n> itself but decided to do just this to try out the idea to start.\n>\n> I will definitely change btrfs_find_first_inode() in v2. Would you like\n> me to also get rid of the other uses of cond_resched_lock() from btrfs,\n> assuming it makes similar sense at each callsite?\n\nI think this patch should only address the lock root->inodes.xa_lock\n(all the places that call cond_resched_lock() for it).\nAnd then other patches for other locks.\n\nThanks.\n\n>\n> >\n> >\n> > >         }\n> > >         xa_unlock(&root->inodes);\n> > >\n> > > --\n> > > 2.54.0\n> > >\n> > >\n\n",
+              "reply_to": "Boris Burkov",
+              "message_date": "2026-05-11",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "fdmanana@kernel.org"
+            }
+          ],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        }
+      ],
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
