@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 0/7] locking: contended_release tracepoint instrumentation</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/cover.1777999826.git.d@ilvokhin.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-13</strong><div class="date-range-nav">Active on: <a href="#2026-05-13">2026-05-13</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-05-13</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-14</strong><div class="date-range-nav">Active on: <a href="#2026-05-14">2026-05-14</a> &bull; <a href="#2026-05-13">2026-05-13</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds a new tracepoint called contended_release that fires on the lock holder&#x27;s side when a lock is released while there are waiters. This provides additional information such as hold time estimation and the holder&#x27;s stack at release time, which can be used to measure how long a lock was held under contention. The patch also updates the behavior of reader/writer locks to fire the tracepoint for every reader releasing while a writer is waiting, not just the last reader.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-05-13">
@@ -392,6 +392,214 @@ I am really not sure this is worth the overhead for qspinlock / rwlock.</pre>
 <div class="reply-to-label">&#8627; replying to Dmitry Ilvokhin</div>
 <a href="https://lore.kernel.org/r/20260513192605.GA2545104@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: uncertainty, overhead</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-05-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<a class="date-chip" href="../2026-05-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-14">2026-05-14</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed Peter&#x27;s concern about the size increase of generated code due to the patch, explaining that while the total size is larger, the executed path only adds a 2-byte NOP instruction, which has a special treatment in CPU and is not entirely free.
+
+Author asks if a single 2-byte NOP is still a concern in this path after their previous changes
+
+Author acknowledged a concern about the UNINLINE_SPIN_UNLOCK characterization being specific to certain architectures and agreed to remove it.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks for the feedback, Peter. This is exactly the kind of feedback I
+was looking for.
+
+I understand your concerns and initially I had exactly the same
+thoughts, and after I looked into the generated code more carefully the
+impact on the executed path is smaller than the total size increase
+suggests.
+
+Generated code of _raw_spin_unlock() for baseline (before the patch) is
+31 bytes in total (x86_64, defconfig, GCC 11).
+
+    3e0:  endbr64                          ; 4 bytes
+    3e4:  movb $0x0,(%rdi)                 ; 3 bytes (unlock)
+    3e7:  decl %gs:__preempt_count         ; 7 bytes
+    3ee:  je   3f5                         ; 2 bytes
+    3f0:  jmp  __x86_return_thunk          ; 5 bytes
+    3f5:  call __SCT__preempt_schedule     ; 5 bytes
+    3fa:  jmp  __x86_return_thunk          ; 5 bytes
+
+Generated code of _raw_spin_unlock() with tracepoint (after the patch
+applied) is 40 bytes in total.
+
+    bc0:  endbr64                          ; 4 bytes
+    bc4:  xchg %ax,%ax                     ; 2 bytes (NOP, static branch)
+    bc6:  movb $0x0,(%rdi)                 ; 3 bytes (unlock)
+    bc9:  decl %gs:__preempt_count         ; 7 bytes
+    bd0:  je   bde                         ; 2 bytes
+    bd2:  jmp  __x86_return_thunk          ; 5 bytes
+    bd7:  call queued_spin_release_traced  ; 5 bytes
+    bdc:  jmp  bc9                         ; 2 bytes
+    bde:  call __SCT__preempt_schedule     ; 5 bytes
+    be3:  jmp  __x86_return_thunk          ; 5 bytes
+
+It is 40 bytes (+9 bytes compared to baseline, 2 bytes for NOP and 7
+bytes for CALL and JMP).
+
+But if we look at the executed path the picture is a bit different.
+
+Baseline, in best case scenario of least number of executed
+instructions.
+
+    3e0:  endbr64                          ; 4 bytes (always executed)
+    3e4:  movb $0x0,(%rdi)                 ; 3 bytes (unlock,
+                                           ; always executed)
+    3e7:  decl %gs:__preempt_count         ; 7 bytes (always executed)
+    3ee:  je   3f5                         ; 2 bytes (always executed)
+    3f0:  jmp  __x86_return_thunk          ; 5 bytes (executed if above
+                                           ; je is not taken)
+                                           ; rest is not executed
+    3f5:  call __SCT__preempt_schedule     ; 5 bytes
+    3fa:  jmp  __x86_return_thunk          ; 5 bytes
+
+Tracepoint (again same case of least number of executed instructions).
+
+    bc0:  endbr64                          ; 4 bytes (always executed)
+    bc4:  xchg %ax,%ax                     ; 2 bytes (always executed, this is an
+                                           ; only addition on the execution path).
+    bc6:  movb $0x0,(%rdi)                 ; 3 bytes (unlock, always executed)
+    bc9:  decl %gs:__preempt_count         ; 7 bytes (always executed)
+    bd0:  je   bde                         ; 2 bytes (always executed)
+    bd2:  jmp  __x86_return_thunk          ; 5 bytes (executed if above
+                                           ; je is not taken)
+                                           ; rest is not executed
+    bd7:  call queued_spin_release_traced  ; 5 bytes
+    bdc:  jmp  bc9                         ; 2 bytes
+    bde:  call __SCT__preempt_schedule     ; 5 bytes
+    be3:  jmp  __x86_return_thunk          ; 5 bytes
+
+On the execution path we are getting 21 byte worth of instructions on
+baseline against 23 bytes. The only addition on any executed path is the
+2-byte NOP, that has a special treatment in CPU, cheap, but not entirely
+free.
+
+---
+
+a single 2-byte NOP.
+
+Does this change the picture for you, or is the NOP still a concern for
+this path?
+
+---
+
+Fair point on the UNINLINE_SPIN_UNLOCK characterization, but
+UNINLINE_SPIN_UNLOCKis always &quot;y&quot; on x86_64. The inlined case only
+applies to s390 (unconditionally), csky and loongarch (when
+!PREEMPTION). I&#x27;ll remove this, thanks.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Peter Zijlstra</div>
+<a href="https://lore.kernel.org/r/agXBb0ga_6HJrrnm@shell.ilvokhin.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged concern, provided explanation, clarifying question</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Steven Rostedt</span>
+<a class="date-chip" href="../2026-05-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-14">2026-05-14</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer noted that the contended_release tracepoint instrumentation may not work correctly for reader/writer locks, as it fires for every reader releasing while a writer is waiting, and requested clarification on this behavior
+
+Reviewer Steven Rostedt expressed concerns about duplicated code in the patch, specifically mentioning that it appears in two tail calls and requested additional comments to ensure consistency if changes are made in one location.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, 14 May 2026 14:13:35 +0000
+Dmitry Ilvokhin &lt;d@ilvokhin.com&gt; wrote:
+
+---
+
+Ah, because the return makes it into two tail calls.
+
+I still don&#x27;t like the duplication, perhaps add some more comments about
+needing to update the other location if anything changes here? And perhaps
+comment that this duplicate code helps the assembly.
+
+-- Steve</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Dmitry Ilvokhin</div>
+<a href="https://lore.kernel.org/r/20260514120348.7a64facc@gandalf.local.home" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested clarification, potential issue with reader/writer lock behavior, duplication</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin (author)</span>
+<a class="date-chip" href="../2026-05-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-14">2026-05-14</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledged a suggestion to add a comment explaining why the contended_release tracepoint fires for every reader releasing while a writer is waiting, not just the last reader.
+
+The author addressed Steven Rostedt&#x27;s concern about the performance impact of using a separate function for the contended_release tracepoint, explaining that three extra instructions on the hot path are wasted when the tracepoint is off and justifying combining the trace and unlock in the same out-of-line function.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks for the suggestion, will do here and in other places.
+
+[...]
+
+---
+
+This is the scenario the comment above the static branch describes.
+Here&#x27;s what it looks like in practice on x86_64 (defconfig, compiled
+with GCC 11).
+
+Current design (trace + unlock combined, with return):
+  
+    endbr64
+    xchg %ax,%ax                     ; NOP (static branch)
+    movb $0x0,(%rdi)                 ; unlock
+    decl %gs:__preempt_count
+    je   preempt
+    jmp  __x86_return_thunk
+    call queued_spin_release_traced  ; cold
+    jmp  preempt_handling            ; cold
+    call __SCT__preempt_schedule
+    jmp  __x86_return_thunk
+
+With the trace-only function (no return, unlock after the call):
+  
+    endbr64
+    push %rbx                        ; saves callee-saved rbx (!)
+    mov  %rdi,%rbx                   ; preserve lock across call (!)
+    xchg %ax,%ax                     ; NOP (static branch)
+    movb $0x0,(%rbx)                 ; unlock
+    decl %gs:__preempt_count
+    je   preempt
+    pop  %rbx                        ; callee-saved restore (!)
+    jmp  __x86_return_thunk
+    call queued_spin_release_traced  ; cold
+    jmp  unlock                      ; cold
+    call __SCT__preempt_schedule
+    pop  %rbx
+    jmp  __x86_return_thunk
+
+Three extra instructions marked by &quot;!&quot; on the hot path (push, mov, pop),
+all wasted when the tracepoint is off. That&#x27;s the main reason for
+combining trace and unlock in the same out-of-line function.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Steven Rostedt</div>
+<a href="https://lore.kernel.org/r/agXYjw3GM15WtC-H@shell.ilvokhin.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged, will do, clarification</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 <div class="thread-node depth-0">

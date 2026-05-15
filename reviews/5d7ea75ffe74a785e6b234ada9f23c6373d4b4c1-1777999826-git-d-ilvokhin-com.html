@@ -238,10 +238,22 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 5/7] locking: Add contended_release tracepoint to qspinlock</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/5d7ea75ffe74a785e6b234ada9f23c6373d4b4c1.1777999826.git.d@ilvokhin.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-13</strong><div class="date-range-nav">Active on: <a href="#2026-05-13">2026-05-13</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a contended_release tracepoint to the qspinlock implementation, allowing for tracing of lock contention and release events. The patch uses an arch-overridable queued_spin_release() function to ensure correct behavior across all architectures, including those with custom unlock implementations. When the tracepoint is disabled, only a single NOP instruction is added to the hot path, minimizing performance impact. When enabled, the contention check, trace call, and unlock are combined in an out-of-line function to further minimize hot path impact. The patch also includes estimates of binary size increases due to this change.</div></div>
+    <div class="date-range">Submitted: <strong>2026-05-13</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-14</strong><div class="date-range-nav">Active on: <a href="#2026-05-14">2026-05-14</a> &bull; <a href="#2026-05-13">2026-05-13</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch adds a contended_release tracepoint to qspinlock, but the current design has duplication and inefficiency.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-05-13">
+<div class="thread-node depth-0" id="2026-05-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dmitry Ilvokhin</span>
+<a class="date-chip" href="../2026-05-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-14">2026-05-14</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Acknowledged a suggestion to combine tracepoint and unlock in the same function, but noted that this introduces duplication and inefficiency.</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-05-13">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Steven Rostedt</span>
@@ -287,7 +299,7 @@ And then remove the duplicate call of &quot;queued_spin_release()&quot; here.
 <div class="review-comment-signals">Signals: requested changes, requested minor edit, requested change</div>
 </div>
 </div>
-<div class="thread-node depth-0">
+<div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Peter Zijlstra</span>
@@ -316,6 +328,83 @@ I really don&#x27;t see how this is worth it.</pre>
 <div class="reply-to-label">&#8627; replying to Dmitry Ilvokhin</div>
 <a href="https://lore.kernel.org/r/20260513193342.GB2545104@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: binary size increase, disagreement about configuration impact</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Steven Rostedt</span>
+<a class="date-chip" href="../2026-05-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-14">2026-05-14</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Agreed that the current design has duplication and suggested adding more comments to explain the need for updating other locations if changes are made here.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, 14 May 2026 14:13:35 +0000
+Dmitry Ilvokhin &lt;d@ilvokhin.com&gt; wrote:
+
+&gt; &gt; &gt; +void __lockfunc queued_spin_release_traced(struct qspinlock *lock)
+&gt; &gt; &gt; +{
+&gt; &gt; &gt; +	if (queued_spin_is_contended(lock))
+&gt; &gt; &gt; +		trace_call__contended_release(lock);
+&gt; &gt; &gt; +	queued_spin_release(lock);  
+&gt; &gt; 
+&gt; &gt; And then remove the duplicate call of &quot;queued_spin_release()&quot; here.  
+&gt; 
+&gt; This is the scenario the comment above the static branch describes.
+&gt; Here&#x27;s what it looks like in practice on x86_64 (defconfig, compiled
+&gt; with GCC 11).
+&gt; 
+&gt; Current design (trace + unlock combined, with return):
+&gt;   
+&gt;     endbr64
+&gt;     xchg %ax,%ax                     ; NOP (static branch)
+&gt;     movb $0x0,(%rdi)                 ; unlock
+&gt;     decl %gs:__preempt_count
+&gt;     je   preempt
+&gt;     jmp  __x86_return_thunk
+&gt;     call queued_spin_release_traced  ; cold
+&gt;     jmp  preempt_handling            ; cold
+&gt;     call __SCT__preempt_schedule
+&gt;     jmp  __x86_return_thunk
+&gt; 
+&gt; With the trace-only function (no return, unlock after the call):
+&gt;   
+&gt;     endbr64
+&gt;     push %rbx                        ; saves callee-saved rbx (!)
+&gt;     mov  %rdi,%rbx                   ; preserve lock across call (!)
+&gt;     xchg %ax,%ax                     ; NOP (static branch)
+&gt;     movb $0x0,(%rbx)                 ; unlock
+&gt;     decl %gs:__preempt_count
+&gt;     je   preempt
+&gt;     pop  %rbx                        ; callee-saved restore (!)
+&gt;     jmp  __x86_return_thunk
+&gt;     call queued_spin_release_traced  ; cold
+&gt;     jmp  unlock                      ; cold
+&gt;     call __SCT__preempt_schedule
+&gt;     pop  %rbx
+&gt;     jmp  __x86_return_thunk
+&gt; 
+&gt; Three extra instructions marked by &quot;!&quot; on the hot path (push, mov, pop),
+&gt; all wasted when the tracepoint is off. That&#x27;s the main reason for
+&gt; combining trace and unlock in the same out-of-line function.
+
+Ah, because the return makes it into two tail calls.
+
+I still don&#x27;t like the duplication, perhaps add some more comments about
+needing to update the other location if anything changes here? And perhaps
+comment that this duplicate code helps the assembly.
+
+-- Steve
+
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Dmitry Ilvokhin</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
 </div>
 </div>
 </div>
