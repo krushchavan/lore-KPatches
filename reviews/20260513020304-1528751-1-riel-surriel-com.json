@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260513020304.1528751-1-riel@surriel.com",
+  "subject": "[PATCH 0/5] iova augmented rbtree O(log n) alloc_iova",
+  "url": "https://lore.kernel.org/all/20260513020304.1528751-1-riel@surriel.com/",
+  "dates": {
+    "2026-05-15": {
+      "report_file": "2026-05-15_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Jason Gunthorpe",
+          "summary": "Provided feedback on the KUnit test suite, suggesting improvements to make it more robust. Identified potential issues with the current implementation and proposed a fixture-based approach.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested_changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, May 12, 2026 at 10:00:22PM -0400, Rik van Riel wrote:\n> From: Rik van Riel <riel@meta.com>\n> \n> Add a kunit suite for the augmented-rbtree IOVA allocator, plus an\n> iova_domain_verify_invariants() helper (compiled only when the test\n> config is enabled) that walks the tree and confirms every node's\n> gap_to_prev, clamped_gap32, __subtree_max_gap, and __subtree_max_gap32\n> match what recomputation from scratch yields.\n> \n> Test cases:\n>   - test_init_destroy: domain lifecycle, no leaks.\n>   - test_basic_alloc_free: single alloc/free roundtrip, top-down reuse.\n>   - test_size_aligned: alignment of size_aligned allocs across orders 0..7.\n>   - test_top_down_preference: sequential allocs decrease in pfn_lo.\n>   - test_limit_pfn_respected: 100 allocs all stay <= limit_pfn.\n>   - test_reserve_iova: allocs avoid the reserved range.\n>   - test_find_iova: lookup by pfn returns the right iova.\n>   - test_32bit_in_64bit_domain: 1000 64-bit allocs followed by a 32-bit\n>     alloc must still find a slot below DMA_BIT_MASK(32) -- exercises\n>     the __subtree_max_gap32 augmentation.\n>   - test_two_phase_alignment: pack size-2 size_aligned allocs, free\n>     every other; subsequent size-2 alloc must succeed via the phase-2\n>     fallback search since phase-1's S+A-1 threshold prunes the size-2\n>     gaps.\n>   - test_pci_32bit_workaround_pattern: alternate 32-bit-first allocation\n>     attempts with 64-bit fallback, mirroring dma-iommu.c.\n>   - test_stress_random: 2048 random alloc/free operations with mixed\n>     sizes, alignments, and 32/64-bit limits, with periodic invariant\n>     checks.\n> \n> Each test verifies the augmented invariants both during and after the\n> test run so that any sequencing bug in insert / erase / rotate /\n> propagate is caught at the operation that introduced it.\n> \n> Tested by: building drivers/iommu/iova.o and drivers/iommu/iova-kunit.o\n> (no warnings); runtime execution requires booting a kernel with\n> CONFIG_IOMMU_IOVA_KUNIT_TEST=y under qemu-system-x86_64 (not available\n> on this devvm).\n    ^^^^^^^^^^^^^^^\n\nHeh, you should still read the patches when using claude :)\n\nCan you add a .kunitconfig please? The tests should run with a command like:\n\n    tools/testing/kunit/kunit.py run --build_dir build_kunit_x86_64 --arch x86_64 --kunitconfig ./drivers/iommu/.kunitconfig\n\nAlso it is worth while to carefully read each test because claude will\nhappily write nonsense tests that avoid actual bugs so they succeed...\n\n> +static struct iova_test_ctx *iova_test_init_ctx(struct kunit *test)\n> +{\n> +\tstruct iova_test_ctx *ctx;\n> +\tint ret;\n> +\n> +\tctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);\n> +\tKUNIT_ASSERT_NOT_NULL(test, ctx);\n> +\n> +\tret = iova_cache_get();\n> +\tKUNIT_ASSERT_EQ(test, ret, 0);\n> +\n> +\tinit_iova_domain(&ctx->iovad, TEST_GRANULE, 1);\n> +\tret = iova_domain_init_rcaches(&ctx->iovad);\n> +\tKUNIT_ASSERT_EQ(test, ret, 0);\n> +\tctx->initialized = true;\n> +\tKUNIT_ASSERT_TRUE(test, iova_domain_verify_invariants(&ctx->iovad));\n> +\treturn ctx;\n> +}\n> +\n> +static void iova_test_cleanup(struct kunit *test, struct iova_test_ctx *ctx)\n> +{\n> +\tif (ctx->initialized) {\n> +\t\tKUNIT_EXPECT_TRUE(test, iova_domain_verify_invariants(&ctx->iovad));\n> +\t\tput_iova_domain(&ctx->iovad);\n> +\t\tiova_cache_put();\n> +\t\tctx->initialized = false;\n> +\t}\n> +}\n> +\n> +static void test_init_destroy(struct kunit *test)\n> +{\n> +\tstruct iova_test_ctx *ctx = iova_test_init_ctx(test);\n> +\n> +\tiova_test_cleanup(test, ctx);\n> +}\n\nThis iova_test_init_ctx()/iova_test_cleanup() stuff is not the right\nway to use kunit. Add a fixture and remove it from every test.\n\n> +bool iova_domain_verify_invariants(struct iova_domain *iovad)\n> +{\n> +\tbool ok = true;\n> +\tunsigned long flags;\n> +\n> +\tspin_lock_irqsave(&iovad->iova_rbtree_lock, flags);\n> +\tiova_walk_verify(iovad->rbroot.rb_node, iovad, &ok);\n> +\tspin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);\n> +\treturn ok;\n> +}\n> +EXPORT_SYMBOL_GPL(iova_domain_verify_invariants);\n\nEXPORT_SYMBOL_IF_KUNIT\n\n>  int iova_domain_init_rcaches(struct iova_domain *iovad);\n>  struct iova *find_iova(struct iova_domain *iovad, unsigned long pfn);\n>  void put_iova_domain(struct iova_domain *iovad);\n> +#if IS_ENABLED(CONFIG_IOMMU_IOVA_KUNIT_TEST)\n> +bool iova_domain_verify_invariants(struct iova_domain *iovad);\n> +#endif\n\nDon't really need this #ifdef\n\nJason\n",
+          "reply_to": "Rik van Riel",
+          "message_date": "2026-05-15",
+          "message_id": "",
+          "email": "jgg@ziepe.ca",
+          "is_maintainer": false
+        },
+        {
+          "author": "Rik van Riel",
+          "summary": "Acknowledged Jason's feedback and promised to address the issues, including those found by Sashiko. Indicated a plan to post an updated version within a week or two.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledgement"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series augments the iova rbtree to allow alloc_iova() to be O(log n), addressing performance issues in production workloads at Meta. The changes also add self-tests for the iova code and modify the KUnit test suite."
+    }
+  }
+}
