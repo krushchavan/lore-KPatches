@@ -238,18 +238,18 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 2/8] mm: percpu: charge obj_exts allocation with __GFP_ACCOUNT</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260511202136.330358-3-alex@ghiti.fr/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-21</strong><div class="date-range-nav">Active on: <a href="#2026-05-21">2026-05-21</a> &bull; <a href="#2026-05-11">2026-05-11</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces per-memcg-per-node kmem accounting for the percpu allocator. The first patch in the series, this one, modifies the obj_exts allocation to charge its metadata and payload separately, allowing for more accurate memory tracking.</div></div>
+    <div class="date-range">Submitted: <strong>2026-05-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-22</strong><div class="date-range-nav">Active on: <a href="#2026-05-22">2026-05-22</a> &bull; <a href="#2026-05-21">2026-05-21</a> &bull; <a href="#2026-05-11">2026-05-11</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces per-memcg-per-node kmem accounting for the percpu allocator, which is a preparatory step for upcoming changes. The first patch in the series modifies the obj_exts allocation to charge metadata and payload separately by passing __GFP_ACCOUNT to the allocation function.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-05-21">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Shakeel Butt</span>
-<a class="date-chip" href="../2026-05-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-21">2026-05-21</a>
+<a class="date-chip" href="../2026-05-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-21">2026-05-21</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Raised questions about whether all entries in obj_exts are for the same memcg, and asked about the allocation behavior of alloc_percpu() and its impact on memory consumption.</div>
+<div class="review-comment-text">Raised questions about charging obj_exts array to a single memcg, highlighting potential overcharging and undercharging of nodes. Asked for clarification on alloc_percpu() allocation behavior and the impact of not charging obj_exts.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Mon, May 11, 2026 at 10:20:37PM +0200, Alexandre Ghiti wrote:
@@ -283,7 +283,98 @@ questions:
 </pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
-<div class="review-comment-signals">Signals: WAITING_FOR_RESPONSE</div>
+<div class="review-comment-signals">Signals: CONTENTIOUS</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-05-22">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Alexandre Ghiti</span>
+<a class="date-chip" href="../2026-05-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-22">2026-05-22</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Acknowledged the oversight in charging metadata and payload separately, estimated the size of obj_exts to be around 64kB. Recognized that dynamically allocated chunk fields are not accounted for, which represents an additional 2.3kB.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Shakeel,
+
+On 5/21/26 19:25, Shakeel Butt wrote:
+&gt; On Mon, May 11, 2026 at 10:20:37PM +0200, Alexandre Ghiti wrote:
+&gt;&gt; This is a preparatory patch for upcoming per-memcg-per-node kmem
+&gt;&gt; accounting.
+&gt;&gt;
+&gt;&gt; pcpu allocations are always fully charged at once using
+&gt;&gt; pcpu_obj_full_size(), which returns the size of the pcpu &quot;metadata&quot; +
+&gt;&gt; pcpu &quot;payload&quot;. But metadata and payload may not be allocated on the
+&gt;&gt; same numa node, so charge the metadata independently from the payload.
+&gt;&gt;
+&gt;&gt; Do this by explicitly passing __GFP_ACCOUNT to the obj_exts allocation
+&gt;&gt; and remove its accounting in pcpu_memcg_pre_alloc_hook().
+&gt; Will all the entries in obj_exts array be for the same memcg? If not then why we
+&gt; are charging the whole array to the one which happen to allocate the array?
+
+
+Hmm, I overlooked the amount allocated, so that&#x27;s my mistake: the 
+chunk-allocating-memcg will be charged for all the metadata, although 
+before the charge was distributed. And according to Claude, the metadata 
+would represent 64kB, so not negligible.
+
+
+&gt;
+&gt; Sorry I don&#x27;t know the details of percpu allocator, so asking some dumb
+&gt; questions:
+&gt;
+&gt; 1. Does the alloc_percpu() (&amp; similar functions) allocate the underlying on a
+&gt;     single node or does it allocate memory for each cpu on their local node?
+&gt;     For slub, it is on the same node, so the situation is easier to handle.
+
+
+To me, chunk metadata and actual pages are allocated differently:
+
+- pcpu_alloc_pages() tries to allocate the pages on the cpu local node 
+https://elixir.bootlin.com/linux/v7.0.9/source/mm/percpu-vm.c#L95. But 
+to me no guarantee it won&#x27;t fallback to any other node. And I don&#x27;t 
+think that __GFP_THISNODE would be a good idea here.
+
+- pcpu_alloc_chunk() uses kmalloc or vmalloc depending on the size, so 
+not attached to specific node, that&#x27;s why I wanted GFP_ACCOUNT to do the 
+job for us in the first place.
+
+
+&gt;
+&gt; 2. On a typical system how much memory is consumed by obj_exts for the percpu
+&gt;     allocator chunks? I am wondering if we don&#x27;t charge it, how much will we
+&gt;     loose?
+
+
+So according to my previous answer, 64kB. I have just noticed that a 
+bunch of dynamically allocated chunk fields are not accounted either, 
+which again according to Claude represent 2.3kB. I don&#x27;t have much 
+experience in accounting but that&#x27;s far from negligible right? Which 
+amount are we keen to lose to make the code simpler (or for other reasons)?
+
+
+&gt;
+&gt; 3. What would be side effect on assuming that obj_exts is on the same node as
+&gt;     the given chunk?
+
+
+Given the size of obj_exts, overcharging one node while undercharging 
+others?
+
+To conclude, you&#x27;re right, I did not dive deep enough into the metadata 
+sizes, I&#x27;ll fix that.
+
+Thanks,
+
+Alex
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+</div>
+</div>
 </div>
 </div>
 </div>

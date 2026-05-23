@@ -1,0 +1,104 @@
+{
+  "thread_id": "20260522205823.1597313-1-joannelkoong@gmail.com",
+  "subject": "[PATCH v3 00/10] fuse: add io-uring buffer pools and zero-copy",
+  "url": "https://lore.kernel.org/all/20260522205823.1597313-1-joannelkoong@gmail.com/",
+  "dates": {
+    "2026-05-22": {
+      "report_file": "2026-05-22_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [
+        {
+          "author": "Bernd Schubert",
+          "summary": "reviewer noted that the patch does not handle the case where a buffer is already in use by another io-uring operation and requested a check to be added to prevent this\n\nReviewer questioned whether header pinning is still necessary, noting that if it's not done, the application cannot write into fuse-server buffers and headers without pre-pinned pages, which would lead to a context switch for all sync requests.\n\nReviewer suggested an alternative design where the payload is registered per ring entry and only the header becomes a buffer ring, allowing for dynamic registration of entries without a payload and reducing memory usage.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "concern about performance impact",
+            "request for clarification",
+            "requested consideration of alternative design"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Joanne,\n\nOn 5/22/26 23:14, Joanne Koong wrote:\n\n---\n\nshort question, I didn't check the code is header pinning still\n*possible*? The problem if we do not pin headers is that\nio_uring_cmd_complete_in_task() cannot be avoided, as the application\ncannot write into fuse-server buffers and headers without pre-pinned\npages. And io_uring_cmd_complete_in_task() basically means a context\nswitch for all sync requests.\n\n---\n\nI will try and right is probably a good time, almost through with\nlibfuse sync-init (remaining are bugs), Darricks series is also almost\nready. Although I don't promise this weekend - reserved for Darrick and\nother libfuse changes.\n\nOne piece I had been pondering a bit about, though did not dive into the\ncode yet.\nWhat is if payload would be registered per ring entry (as without your\nchanges) and just the header would become a buffer ring (so that could\nbe pinned that way without loosing one page per entry)?  For zero-copy\nwe could register entries without a payload? Advantage here would be\nthat that header buffer would determine max number of entries, only\nlittle memory would be needed for over-subscribed entries, but entries\nthemselves could be registered dynamically on demand.\n\n\nThanks,\nBernd\n\nThanks,\nBernd",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-05-22",
+          "message_id": "1c3ef92a-d3b4-47fc-9d34-9c996b8eb0c7@bsbernd.com",
+          "email": "bernd@bsbernd.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joanne Koong (author)",
+          "summary": "Author acknowledged that header pinning was removed from the patchset and is being addressed separately, confirming it's not a concern for this specific series.\n\nAuthor agrees that payload buffers should be decoupled from ring entries to reduce memory usage, but does not provide a clear plan for addressing this issue.\n\nThe author addressed a concern about header pinning by explaining that the headers are stored in a single contiguous region, thus avoiding the need for separate pages per entry.\n\nThe author is addressing a concern about zero-copy functionality in the patch series, specifically that many servers may not be able to use it due to CAP_SYS_ADMIN requirements. The author acknowledges this limitation and suggests minimizing memory consumption for the non-zero-copy path through buffer pools.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged removal of header pinning",
+            "acknowledges a fix is needed",
+            "acknowledged a technical detail",
+            "provided a clear explanation",
+            "acknowledges a limitation",
+            "suggests further optimization"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Hi Bernd,\n\nHeader pinning was dropped from this patchset. I have a separate\nbranch that has header pinning alongside the changes for avoiding the\nfuse io_uring_cmd_complete_in_task() deferral. I moved the header\npinning changes out of this patchset as it doesn't tie in with getting\nperf improvements from using registered buffers, unlike payload buffer\npinning.\n\n---\n\nI think payload buffers must be decoupled from ring entries if we want\nto reduce memory usage in the non-zero-copy path.\n\n---\n\nFor the header pinning changes in my branch, the headers are one\ncontiguous region (not per-entry), which circumvents having to\nallocate one page per entry.\n\n---\n\nFor zero-copy, entries still may have payloads (though the buffers\nwill definitely not need to be as big as the max payload size!),\neither for the non-zero-copyable args or if the request's args aren't\npage-backed. Unfortunately I think many servers may not be able to use\nzero-copy due to the CAP_SYS_ADMIN requirements, so I think it'd be\nideal to minimize the memory consumption needed for the non-zero-copy\npath, through the buffer pool for the payload buffers.\n\nI hope I'm interpreting your question correctly - if not, please let me know!\n\nThanks,\nJoanne",
+          "reply_to": "Bernd Schubert",
+          "message_date": "2026-05-22",
+          "message_id": "CAJnrk1bOyoUD74byw3ZXWzQ3dAiZObE0V46+=rtkPG8-3vqUEg@mail.gmail.com",
+          "email": "joannelkoong@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joanne Koong (author)",
+          "summary": "The author addressed concerns about the buffer pool implementation, explaining that entries can be used for servicing requests even if there are fewer buffers than entries. They also highlighted the benefits of decoupling ents and buffers, including supporting multiple buffer sizes per ring and eliminating the need for payload buffers in certain requests.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Entries may be used for servicing requests even if there are less\nbuffers than the number of entries. Most requests don't use the full\npayload buffer size, so for example with incremental buffer\nconsumption, this would allow multiple entries to use non-overlapping\nregions of the same buffer concurrently. As well, if we want to\nsupport multiple buffer sizes per ring, there shouldn't be a 1:1\nmapping between ents and buffers. There's also some requests that\ndon't need to use payload buffers at all (eg flush, fsync, rmdir,\netc).  As well for registered buffers / buffer pinning, it is more\noptimal for the buffer pool to be allocated contiguously and pinned\ncontiguously rather than passed in one by one as a 1:1 entry:buffer\nmapping.\n\nThanks,\nJoanne",
+          "reply_to": "Bernd Schubert",
+          "message_date": "2026-05-22",
+          "message_id": "CAJnrk1Zby7T4WMShk+d8QdVoqtAFLSotc9_d0RbGKSnP4fXq9A@mail.gmail.com",
+          "email": "joannelkoong@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series adds buffer pools and zero-copy functionality to the fuse io-uring implementation, allowing servers to pass in a managed buffer pool that reduces memory usage requirements and enables future optimizations. It also allows for direct access to client pages or page cache folios without copying data through an intermediary buffer, requiring CAP_SYS_ADMIN privileges. The changes are based on registered buffers and zero-copy, which can provide significant throughput improvements depending on the server's per-request latency and backing I/O characteristics."
+    },
+    "2026-05-23": {
+      "report_file": "2026-05-22_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [
+        {
+          "author": "Bernd Schubert",
+          "summary": "Reviewer Bernd Schubert questioned the need for registering ring entries without buffers and suggested that dynamic registration of ring entries based on demand would be a better approach.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Well, my problem is still why would we need to register ring entries if\nthey don't have buffers - why not just register less ring entries then.\n\nAt least I do not see the use case for ring entries without buffers.\nAnd that is exactly where my question about keeping the possibility for\ndynamic ring entry registration comes from. If ring entries register the\nbuffers themselves, every ring could be set up with a single ring entry\nfirst and only once ring entries start to get used, libfuse could\nregister more based on demand.\n\nThanks,\nBernd",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-05-23",
+          "message_id": "55b80c43-2e84-4a42-b383-108f06254b6a@bsbernd.com",
+          "email": "bernd@bsbernd.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series adds buffer pools and zero-copy functionality to the fuse io-uring implementation, allowing servers to pass in a managed buffer pool that reduces memory usage requirements and enables future optimizations. It also allows for direct access to client pages or page cache folios without copying data through an intermediary buffer, requiring CAP_SYS_ADMIN privileges. The changes are based on registered buffers and zero-copy, which can provide significant throughput improvements depending on the server's per-request latency and backing I/O characteristics."
+    }
+  }
+}
