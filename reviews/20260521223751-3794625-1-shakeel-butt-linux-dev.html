@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] memcg: use round-robin victim selection in refill_stock</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260521223751.3794625-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-21</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-22</strong><div class="date-range-nav">Active on: <a href="#2026-05-22">2026-05-22</a> &bull; <a href="#2026-05-21">2026-05-21</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch replaces get_random_u32_below() in the memcg refill_stock function with a per-cpu round-robin counter to prevent potential NMI-related corruption and reentrancy issues.</div></div>
+    <div class="date-range">Submitted: <strong>2026-05-21</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-25</strong><div class="date-range-nav">Active on: <a href="#2026-05-25">2026-05-25</a> &bull; <a href="#2026-05-22">2026-05-22</a> &bull; <a href="#2026-05-21">2026-05-21</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch replaces the random victim selection in memcg&#x27;s refill_stock function with a round-robin approach, addressing safety concerns related to NMI contexts and reentrancy.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-05-22">
 <div class="review-comment">
@@ -250,7 +250,7 @@
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Acknowledged the fix and suggested adding a Cc to stable@vger.kernel.org due to its impact on v6.18 LTS.</div>
+<div class="review-comment-text">Approved the patch, noting that it fixes a safety issue and affects the latest LTS version.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">
@@ -319,9 +319,86 @@ Thanks a lot for fixing it, Shakeel!
 Cheers,
 Harry / Hyeonggon
 
+</pre>
+</details>
+<div class="review-comment-signals">Signals: Acked-by</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-05-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-05-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-25">2026-05-25</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Approved the patch, thanking Shakeel for fixing a safety issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu 21-05-26 15:37:51, Shakeel Butt wrote:
+&gt; Harry Yoo reported that get_random_u32_below() is not safe to call in
+&gt; the nmi context and memcg charge draining can happen in nmi context.
+&gt; 
+&gt; More specifically get_random_u32_below() is neither reentrant- nor
+&gt; NMI-safe: it acquires a per-cpu local_lock via local_lock_irqsave() on
+&gt; the batched_entropy_u32 state. An NMI that lands on a CPU mid-update of
+&gt; the ChaCha batch state and recurses into the random subsystem would
+&gt; corrupt that state. The memcg_stock local_trylock prevents re-entry
+&gt; on the percpu stock itself, but cannot protect an unrelated
+&gt; subsystem&#x27;s per-cpu lock.
+&gt; 
+&gt; Replace the random pick with a per-cpu round-robin counter stored in
+&gt; memcg_stock_pcp and serialized by the same local_trylock that already
+&gt; guards cached[] and nr_pages[]. No atomics, no random calls, no extra
+&gt; locks needed.
+&gt; 
+&gt; Fixes: f735eebe55f8f (&quot;memcg: multi-memcg percpu charge cache&quot;)
+&gt; Reported-by: Harry Yoo &lt;harry@kernel.org&gt;
+&gt; Closes: https://lore.kernel.org/4e20f643-6983-4b6e-b12d-c6c4eb20ae0c@kernel.org/
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+
+Thanks!
+
+&gt; ---
+&gt;  mm/memcontrol.c | 5 ++++-
+&gt;  1 file changed, 4 insertions(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 0eb50e639f0a..6392a2704441 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2031,6 +2031,7 @@ struct memcg_stock_pcp {
+&gt;  
+&gt;  	struct work_struct work;
+&gt;  	unsigned long flags;
+&gt; +	uint8_t drain_idx;
+&gt;  };
+&gt;  
+&gt;  static DEFINE_PER_CPU_ALIGNED(struct memcg_stock_pcp, memcg_stock) = {
+&gt; @@ -2214,7 +2215,9 @@ static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
+&gt;  	if (!success) {
+&gt;  		i = empty_slot;
+&gt;  		if (i == -1) {
+&gt; -			i = get_random_u32_below(NR_MEMCG_STOCK);
+&gt; +			i = stock-&gt;drain_idx++;
+&gt; +			if (stock-&gt;drain_idx == NR_MEMCG_STOCK)
+&gt; +				stock-&gt;drain_idx = 0;
+&gt;  			drain_stock(stock, i);
+&gt;  		}
+&gt;  		css_get(&amp;memcg-&gt;css);
+&gt; -- 
+&gt; 2.53.0-Meta
+
+-- 
+Michal Hocko
+SUSE Labs
 
 </pre>
 </details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
 <div class="review-comment-signals">Signals: Acked-by</div>
 </div>
 </div>
