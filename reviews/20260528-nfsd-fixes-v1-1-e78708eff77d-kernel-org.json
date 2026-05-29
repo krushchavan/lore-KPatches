@@ -1,0 +1,35 @@
+{
+  "thread_id": "20260528-nfsd-fixes-v1-1-e78708eff77d@kernel.org",
+  "subject": "[PATCH 01/10] nfsd: fix BUG_ON in nfsd4_alloc_layout_stateid on racing delegation revoke",
+  "url": "https://lore.kernel.org/all/20260528-nfsd-fixes-v1-1-e78708eff77d@kernel.org/",
+  "dates": {
+    "2026-05-29": {
+      "report_file": "2026-05-28_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "NeilBrown",
+          "summary": "Raised concerns about the spinlock usage, suggesting it may not be necessary due to the recent commit that added a stability guarantee. Also pointed out a potential issue with rcu_dereference_protected() and suggested adding a comment.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "spinlock concerns"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "On Fri, 29 May 2026, Jeff Layton wrote:\n> nfsd4_alloc_layout_stateid reads fp->fi_deleg_file without holding\n> fi_lock when the parent stateid is a delegation. A concurrent delegation\n> revoke via the laundromat can clear fi_deleg_file under fi_lock, causing\n> nfsd_file_get() to return NULL and triggering the BUG_ON.\n> \n> This race is client-reachable: two NFS clients can trigger it by having\n> one hold a delegation while another opens the same file to force a\n> recall. When the first client doesn't respond to the recall, the\n> laundromat revokes it. A concurrent LAYOUTGET from any client using the\n> delegation stateid hits the race window.\n> \n> Fix this by taking fi_lock around the fi_deleg_file read in the\n> SC_TYPE_DELEG path, and replacing the BUG_ON with a graceful error\n> return that cleans up the partially-initialized layout stateid.\n\nReplacing the BUG_ON with a graceful error is certainly sensible and\nprobably all that is needed to fix the problem.\n\nI cannot see how the spinlock achieves anything.  If ->fi_deleg_file\ncould become NULL at this point, it can become NULL just before we take\nthe spinlock.\n\nWe do need to be sure the file (if there is one) doesn't get freed while\nnfsd_file_get() is incrementing the refcount, but rcu_read_lock() is the\nnormal tool for that.\nIn this case we have\n\n  \t\tls->ls_file = nfsd_file_get(rcu_dereference_protected(fp->fi_deleg_file, 1));\n\nrcu_dereference_protected(...., 1)\nwhich for me is a warning sign.  What does the '1' mean here?\nPresumably something that we cannot easily assert with a C condition, in\nwhich case a comment is called for.\n\nBased on the recent commit which added this I'm guessing \n   fi_delegees > 0 guarantees stability\n\nIf that is right, then why do we also need a spinlock to guarantee\nstability?\n\nConfused.\n\nNeilBrown\n\n> \n> Fixes: c5c707f96fc9 (\"nfsd: implement pNFS layout recalls\")\n> Assisted-by: kres:claude-opus-4-7\n> Signed-off-by: Jeff Layton <jlayton@kernel.org>\n> ---\n>  fs/nfsd/nfs4layouts.c | 12 +++++++++---\n>  1 file changed, 9 insertions(+), 3 deletions(-)\n> \n> diff --git a/fs/nfsd/nfs4layouts.c b/fs/nfsd/nfs4layouts.c\n> index 9ed2e3d65062..5d48c7673fa1 100644\n> --- a/fs/nfsd/nfs4layouts.c\n> +++ b/fs/nfsd/nfs4layouts.c\n> @@ -247,11 +247,17 @@ nfsd4_alloc_layout_stateid(struct nfsd4_compound_state *cstate,\n>  \tnfsd4_init_cb(&ls->ls_recall, clp, &nfsd4_cb_layout_ops,\n>  \t\t\tNFSPROC4_CLNT_CB_LAYOUT);\n>  \n> -\tif (parent->sc_type == SC_TYPE_DELEG)\n> +\tif (parent->sc_type == SC_TYPE_DELEG) {\n> +\t\tspin_lock(&fp->fi_lock);\n>  \t\tls->ls_file = nfsd_file_get(rcu_dereference_protected(fp->fi_deleg_file, 1));\n> -\telse\n> +\t\tspin_unlock(&fp->fi_lock);\n> +\t} else {\n>  \t\tls->ls_file = find_any_file(fp);\n> -\tBUG_ON(!ls->ls_file);\n> +\t}\n> +\tif (!ls->ls_file) {\n> +\t\tnfs4_put_stid(stp);\n> +\t\treturn NULL;\n> +\t}\n>  \n>  \tls->ls_fenced = false;\n>  \tls->ls_fence_delay = 0;\n> \n> -- \n> 2.54.0\n> \n> \n\n",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-05-29",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series addresses a race condition in the NFSv4 server (nfsd) where a concurrent delegation revoke can cause a BUG_ON when trying to read fi_deleg_file without holding the corresponding lock. The fix involves taking the spinlock around the fi_deleg_file read and replacing the BUG_ON with a graceful error return."
+    },
+    "2026-05-28": {
+      "report_file": "2026-05-28_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": []
+    }
+  }
+}

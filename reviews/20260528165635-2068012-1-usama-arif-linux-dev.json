@@ -1,0 +1,52 @@
+{
+  "thread_id": "20260528165635.2068012-1-usama.arif@linux.dev",
+  "subject": "[PATCH v6 0/2] mm: improve large folio readahead for exec memory",
+  "url": "https://lore.kernel.org/all/20260528165635.2068012-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-05-28": {
+      "report_file": "2026-05-28_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author acknowledged a TOCTOU data race issue pointed out by sashiko, agreed to avoid making it worse by introducing the thp_order local variable.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged an issue",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Two checks in do_sync_mmap_readahead() limit large-folio readahead:\n\n  1. The mmap_miss heuristic is meant to throttle wasteful speculative\n     readahead. It is currently also applied to the VM_EXEC readahead\n     path, which is targeted rather than speculative. Once mmap_miss exceeds\n     MMAP_LOTSAMISS, exec readahead - including the large-folio\n     order requested by exec_folio_order() - is disabled. On\n     configurations where the mmap_miss decrement paths are not\n     active (see patch 1) the counter only grows, so exec readahead\n     is permanently disabled after the first 100 faults.\n\n  2. The force_thp_readahead path is gated only on\n     HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER and always drives the\n     readahead at HPAGE_PMD_ORDER. Configurations where\n     HPAGE_PMD_ORDER exceeds MAX_PAGECACHE_ORDER never reach this\n     path, even when the mapping itself supports usefully large\n     folios well below the cap.\n\nBoth issues are most visible on arm64 with a 64K base page size,\nwhere HPAGE_PMD_ORDER is 13 (512MB) -- above MAX_PAGECACHE_ORDER\n(11) -- and where fault_around_pages collapses to 1 disabling\nshould_fault_around() (one of the two mmap_miss decrement sites).\nHowever the fixes are architecture-agnostic: patch 1 reflects the\nnature of VM_EXEC readahead regardless of base page size, and\npatch 2 generalises the gate so any mapping advertising a usefully\nlarge maximum folio order can benefit.\n\nI created a benchmark that mmaps a large executable file madvises it\nas huge and calls RET-stub functions at PAGE_SIZE offsets across it.\n\"Cold\" measures fault + readahead cost. \"Random\" first faults in all\npages with a sequential sweep (not measured), then measures time for\ncalling random offsets, isolating iTLB miss cost for scattered execution.\n\nThe benchmark results on Neoverse V2 (Grace), arm64 with 64K base pages,\n512MB executable file on ext4, averaged over 3 runs:\n\n  Phase      | Baseline     | Patched      | Improvement\n  -----------|--------------|--------------|------------------\n  Cold fault | 83.4 ms      | 41.3 ms      | 50% faster\n  Random     | 76.0 ms      | 58.3 ms      | 23% faster\n\nThe patches are on top of mm-unstable from 28 May\n(8a74e22643189e0ae339afc91110ddb4cab1941b) which include patch [1]\nthat make mmap_miss accounting symmetric for VM_SEQ_READ which was pointed\nout by sashiko in the previous revision.\n\n[1] https://lore.kernel.org/all/20260525145751.2671248-1-usama.arif@linux.dev/ \n\nKiryl and Jan, I have kept your Reviewed-by tags from the previous revision\nfor patch 1 as the concept is still the same, please let me know if that\nis not ok.\n\nv5 -> v6: https://lore.kernel.org/all/20260522162422.3856502-1-usama.arif@linux.dev/\n- Based on top of patch [1] (sashiko)\n- Changes to commit message to make it more accurate for patch 1 and skip\n  mmap_miss decrement as well. (sashiko)\n- Keep old behaviour if large folio mappings is not enabled (sashiko).\n- sashiko pointed to a TOCTOU data race that was pre-existing. My patch\n  could make it worse. Dont make it worse by introducing thp_order local\n  variable.\n\nv3 -> v5: https://lore.kernel.org/all/20260402181326.3107102-1-usama.arif@linux.dev/\n- (Looks like I messed up the versioning here and went directly form\n  v3 to v5.)\n- Drop patches for elf thp unmapped area alignment and deal with them\n  separately. These patches will just bring folios smaller than PMD\n  at the same level as PMD. The 2 patches now should be much easier\n  to merge.\n- Tackle size of THP for exec pages at the same point as PMD instead\n  of tackling using exec_folio_order() (Ryan during LSFMM, Thanks!)\n\nv2 -> v3: https://lore.kernel.org/all/20260320140315.979307-1-usama.arif@linux.dev/\n- Take into account READ_ONLY_THP_FOR_FS for elf alignment by aligning\n  to HPAGE_PMD_SIZE limited to 2M (Rui)\n- Reviewed-by tags for patch 1 from Kiryl and Jan\n- Remove preferred_exec_order() (Jan)\n- Change ra->order to HPAGE_PMD_ORDER if vma_pages(vma) >= HPAGE_PMD_NR\n  otherwise use exec_folio_order() with gfp &= ~__GFP_RECLAIM for\n  do_sync_mmap_readahead().\n- Change exec_folio_order() to return 2M (cont-pte size) for 64K base\n  page size for arm64.\n- remove bprm->file NULL check (Matthew)\n- Change filp to file (Matthew)\n- Improve checking of p_vaddr and p_vaddr (Rui and Matthew)\n\nv1 -> v2: https://lore.kernel.org/all/20260310145406.3073394-1-usama.arif@linux.dev/\n- disable mmap_miss logic for VM_EXEC (Jan Kara)\n- Align in elf only when segment VA and file offset are already aligned (Rui)\n- preferred_exec_order() for VM_EXEC sync mmap_readahead which takes into\n  account zone high watermarks (as an approximation of memory pressure)\n  (David, or atleast my approach to what David suggested in [1] :))\n- Extend max alignment to mapping_max_folio_size() instead of\n  exec_folio_order()\n \nUsama Arif (2):\n  mm: bypass mmap_miss heuristic for VM_EXEC readahead\n  mm: use mapping_max_folio_order() for force_thp_readahead order\n\n mm/filemap.c | 41 ++++++++++++++++++++++++++---------------\n 1 file changed, 26 insertions(+), 15 deletions(-)\n\n-- \n2.52.0",
+          "reply_to": "",
+          "message_date": "2026-05-28",
+          "message_id": "20260528165635.2068012-1-usama.arif@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Andrew Morton",
+          "summary": "Reviewer Andrew Morton approved the patch, stating that he will add it to the review queue due to its potential performance benefits.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "speedups"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "OK, thanks, it's getting late and [2/2] hasn't yet been reviewed.  I'll\nadd it, just, because I'm a sucker for speedups.",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-05-28",
+          "message_id": "20260528132728.c47a38e7506483d587f64eb7@linux-foundation.org",
+          "email": "akpm@linux-foundation.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch improves large folio readahead for exec memory by addressing two issues in the do_sync_mmap_readahead() function. The first issue is that the mmap_miss heuristic, which is meant to throttle speculative readahead, is also applied to the VM_EXEC readahead path, causing it to be disabled prematurely on certain configurations. The second issue is that the force_thp_readahead path is gated only on HPAGE_PMD_ORDER being less than or equal to MAX_PAGECACHE_ORDER, preventing large folios from being used in some cases. The patches address these issues by making the mmap_miss heuristic symmetric for VM_SEQ_READ and generalizing the gate for force_thp_readahead so that any mapping advertising a usefully large maximum folio order can benefit."
+    }
+  }
+}
