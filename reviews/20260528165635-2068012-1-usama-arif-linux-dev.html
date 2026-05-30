@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 0/2] mm: improve large folio readahead for exec memory</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260528165635.2068012-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-28</strong><div class="date-range-nav">Active on: <a href="#2026-05-28">2026-05-28</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-05-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-29</strong><div class="date-range-nav">Active on: <a href="#2026-05-29">2026-05-29</a> &bull; <a href="#2026-05-28">2026-05-28</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch improves large folio readahead for exec memory by addressing two issues in the do_sync_mmap_readahead() function. The first issue is that the mmap_miss heuristic, which is meant to throttle speculative readahead, is also applied to the VM_EXEC readahead path, causing it to be disabled prematurely on certain configurations. The second issue is that the force_thp_readahead path is gated only on HPAGE_PMD_ORDER being less than or equal to MAX_PAGECACHE_ORDER, preventing large folios from being used in some cases. The patches address these issues by making the mmap_miss heuristic symmetric for VM_SEQ_READ and generalizing the gate for force_thp_readahead so that any mapping advertising a usefully large maximum folio order can benefit.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-05-28">
@@ -380,6 +380,322 @@ add it, just, because I&#x27;m a sucker for speedups.</pre>
 <div class="review-comment-signals">Signals: speedups</div>
 </div>
 </div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-05-29">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pedro Falcato</span>
+<a class="date-chip" href="../2026-05-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-29">2026-05-29</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Reviewed-by</div>
+<a href="https://lore.kernel.org/r/ahlgda3xJ587eSCg@pedro-suse.lan" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-05-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-29">2026-05-29</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a minor mistake in the commit message regarding the page size, agreed to correct it, and offered an alternative solution.
+
+Author addressed Pedro Falcato&#x27;s concern about the patch causing high memory pressure due to large file folios. The author explained that the current code is correct and maintains existing behavior, providing large folios to architectures that currently don&#x27;t get them in a controlled way. They argued that raising the cap from 2M to 128M would cause extreme memory pressure and proposed keeping the current code with its conservative behavior.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, should have just said 4K. Messed up when rewriting the commit
+message. Andrew Thanks for merging in mm-new, would it be possible
+to remove &quot;or 16K&quot; from the commit message. I can send a new revision
+as well if that is easier and preferred.
+
+---
+
+So this can result in extreme memory pressure. For example, on 64K base page size,
+with HPAGE_PMD_ORDER = 13 (512M) and MAX_PAGECACHE_ORDER = 11 (128M), this will evaluate
+THP order to 128M. I think Jan mentioned in previous versions that there are already
+reports of high memory pressure due to large file folios, and we are seeing this
+in our fleet as well with xfs.
+
+I chose 2M cap as that is what most (not all) architectures which currently support this
+hugepage code flow are currently used to, and on archs + base page size combination which
+just evaluate this code to base page, for example 64K base page size, it will provide a
+performance uplift without causing excessive memory pressure.
+
+In pagemap.h, we have
+
+#define PREFERRED_MAX_PAGECACHE_ORDER	HPAGE_PMD_ORDER
+#define MAX_PAGECACHE_ORDER	min(MAX_XAS_ORDER, PREFERRED_MAX_PAGECACHE_ORDER)
+
+So MAX_PAGECACHE_ORDER &lt;= HPAGE_PMD_ORDER is always true.
+
+At filesystem/inode setup: mapping_set_folio_order_range() 
+
+	if (max &gt; MAX_PAGECACHE_ORDER)
+		max = MAX_PAGECACHE_ORDER;
+
+so mapping_max_folio_order() &lt;= MAX_PAGECACHE_ORDER is also always true.
+
+which means mapping_max_folio_order(mapping) &lt;= MAX_PAGECACHE_ORDER &lt;= HPAGE_PMD_ORDER is always
+true, and you dont need the min3(..) in your diff.
+
+Now the question is if then why not just do:
+
+	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &amp;&amp; (vm_flags &amp; VM_HUGEPAGE)) {
+		if (mapping_large_folio_support(mapping)) {
+			force_thp_readahead = true;
+			thp_order = min_t(unsigned int,
+					  mapping_max_folio_order(mapping),
+					  get_order(SZ_2M));
+		}
+	}
+
+
+This is because this will regress the 16K ARM case where we already got 32M
+folios. Someone might upgrade the kernel and start getting 2M folios now.
+
+So IMHO the current code is correct, both in maintaining what the
+existing behaviour has been, but also trying to provide large folios to
+architectures that currently dont get them but in a controlled way.
+
+Later on, when we think or evaluate that 2M was too small a cap, it can
+be raised. I think its very easy to raise a cap, but much more difficult
+to make the cap smaller, as we might get reports on kernel upgrades that
+someone was getting a certain size of folio but now its much smaller.
+
+As a summary, what my code in this current form gives is:
+1) 4K x86/ARM (HPAGE_PMD_ORDER=9 &lt;= 9): first branch -&gt; 2M unchanged behaviour
+2) 16K ARM (HPAGE_PMD_ORDER=11 &lt;= 11): first branch -&gt; 32M unchanged behaviour
+3) 64K ARM (HPAGE_PMD_ORDER=13 &lt;= 11): new else-if -&gt; 2M new capability, conservative
+behaviour, which can be increased later if needed.
+I know that 64K base page size having 2M large folios while 16K base page size
+having 32M sounds counterintuitive, but I think 32M on 16K was a mistake and
+we shouldnt repeat that mistake for 64K.
+
+What your change with min3(mapping_max_folio_order(mapping), MAX_PAGECACHE_ORDER, HPAGE_PMD_ORDER)
+will give
+3) 64K ARM -&gt; 128M folios, extremely high memory pressure.
+
+What only having min(mapping_max_folio_order, get_order(SZ_2M)) will give:
+2) 16K ARM -&gt; 2M folios, (regression since we always had 32M on 16K ARM).</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
+<a href="https://lore.kernel.org/r/cc9a1cf7-7b96-439a-b0be-ecdcf27b5da5@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a mistake, agreed to correct, acknowledged fix is needed</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pedro Falcato</span>
+<a class="date-chip" href="../2026-05-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-29">2026-05-29</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer notes that memory pressure is still a problem even on 2MB folios and suggests that the issue may not be as significant in this case because THPs are being requested, but not efficiently used due to their size.
+
+The reviewer notes that the current implementation of large-folio readahead for exec memory may not hold up in the future due to potential changes in page table management, specifically the use of PMD-level cont bits.
+
+Reviewer Pedro Falcato suggested limiting the large-folio readahead to 32MB instead of an arbitrary value, which would simplify logic and ensure that if a system doesn&#x27;t support 32MiB folios, it will clamp the maximum folio order to HPAGE_PMD_ORDER.
+
+Reviewer Pedro Falcato expressed concerns that the proposed changes to large folio readahead may have unintended consequences, such as regressing workloads due to thrashing or TLB thrashing, and pointed out existing reports of similar issues with anonymous THP regressions.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">For what it&#x27;s worth, memory pressure is still a problem even on 2MB folios. But
+yes, I understand.
+
+For what it&#x27;s worth, I don&#x27;t think it&#x27;s such a big issue in this case - you&#x27;re
+asking for THPs, and you&#x27;re getting them - though maybe not efficiently because
+these aren&#x27;t at the PMD level. But this is also true for e.g x86 where an
+an order-3 folio or order-7 folio are completely useless for the hardware, since
+there is no mTHP to speak of (and, with that, you also lose PG_active and
+PG_reference precision as you only keep one of each for each folio, amongst
+other tradeoffs).
+
+---
+
+Right, good point. (well, I suppose it will not be true in the future as
+someone tries to harness PMD-level cont bits)
+
+---
+
+So maybe limit to 32MB? It&#x27;s still arbitrary but at least you get simpler
+logic. If the architecture does not support 32MiB folios, it will clamp
+the maximum folio order to HPAGE_PMD_ORDER, and you get the same result.
+
+Does this sound correct?
+
+---
+
+I don&#x27;t think this is a valid argument. You can also have reports that now
+folios are too large and they&#x27;re regressing workloads because of thrashing/
+compaction/possibly TLB thrashing. And indeed we have several reports of that
+(https://lore.kernel.org/linux-fsdevel/20260403193535.9970-1-dipiets@amazon.it/
+comes to mind, plus all of the anon THP regressions over the years, including
+in $current_year).
+
+Bottom line is that changing things will always affect someone :) Particularly
+since the logic we have is not too careful at deciding what should or should
+not be a THP (both in anon and file cases). And if (once?) we make it smarter,
+it will surely also regress someone!
+
+-- 
+Pedro</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/ahmSolHvUChl-3vM@pedro-suse.lan" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NEUTRAL, NEEDS_WORK, potential future issue</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-05-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-29">2026-05-29</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged the potential benefits of hardware TLB coalescing on AMD CPUs, specifically at a 32kB threshold, and noted it could lead to reduced page faults.
+
+Author agrees that the suggested replacement for SZ_4M is correct but expresses concern about the chosen value of 32M being too large.
+
+Author acknowledges that large folio readahead issues exist on x86 systems, confirming a problem similar to arm64.
+
+Author agrees with Pedro&#x27;s feedback and suggests keeping the cap at 2M initially to avoid thrashing and compaction issues.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">So there is hardware TLB coalescing on almost every new AMD CPU, I believe it is
+at 32kB, and we would benefit from that. On top of that, we would reduce pagefaults.
+
+---
+
+Yes, so if we replace it with SZ_32M, it sounds correct. I just think
+the 32M size is too large. But as you pointed out, even 2M can be too large...
+
+---
+
+Ack, and yes we have seen both thrashing and compaction issues due to xfs
+large folios in the fleet with x86..
+
+---
+
+Yes completely agree on this as well.
+
+So personally I do have a preference of keeping the cap at 2M atleast initially
+while we currently try and solve the issues we see with 2M alone. As we are already
+seeing reports of thrashing and compaction with just 2M, I dont think the logic
+in this patch with just an if else is that complicated.
+
+Matthew, Jan, do you have any thoughts or strong preferences on cap size?
+
+Thanks!</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
+<a href="https://lore.kernel.org/r/185f1caf-b33d-4467-beb5-51bd8520ac78@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledgment, potential benefit, acknowledges feedback</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pedro Falcato</span>
+<a class="date-chip" href="../2026-05-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-29">2026-05-29</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Pedro Falcato questioned the calculation of Physical Memory Page Descriptors (PMDs) for a 16K base page size, pointing out that PMDs should be 32M instead of an unspecified value.
+
+The reviewer suggested an alternative logic for enabling THP readahead based on the presence of hugepage support in the mapping and its maximum folio order, which they consider more natural and correct.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">16K base page size&#x27;s PMDs should be 32M, no? Am I misunderstanding what
+you mean here?
+
+---
+
+This looks somewhat arbitrary to me (as does the old logic). It seems more
+natural (correct?) to do this:
+
+	if (THP_ENABLED &amp;&amp; (vm_flags &amp; VM_HUGEPAGE)) {
+		if (mapping_large_folio_support(mapping)) {
+			force_thp_readahead = true;
+			/*
+			 * Cap THP readahead to either the max folio order the
+			 * mapping supports, or the max order the page cache
+			 * supports (useless to try more), or the hugepage PMD
+			 * order (CPU can&#x27;t benefit from larger).
+			 */
+			thp_order = min3(mapping_max_folio_order(mapping),
+					MAX_PAGECACHE_ORDER, HPAGE_PMD_ORDER);
+		}
+	}</pre>
+</details>
+<a href="https://lore.kernel.org/r/ahlh2vdHEGo6ZSot@pedro-suse.lan" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: questioning technical detail, arbitrary, natural</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-05-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-29">2026-05-29</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author is addressing a concern about the need for additional comments in the patch, specifically explaining the decision behind disabling exec readahead when mmap_miss exceeds MMAP_LOTSAMISS.
+
+The author is addressing a concern about the design decision behind preserving PMD-sized readahead in the filemap code, specifically when mapping_max_folio_order() is high. They added a comment to explain this decision and preserved the existing behavior.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think might be good to include the below comment to explain the decision being made
+here:
+
+---
+
+From: Usama Arif &lt;usama.arif@linux.dev&gt;
+Date: Fri, 29 May 2026 05:31:05 -0700
+Subject: [PATCH] [fixlet] mm/filemap: add comment explaining design decision
+
+Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+---
+ mm/filemap.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index bfb891d9da1f..0a3facf452b3 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3319,6 +3319,14 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 
+ 	/* Use the readahead code, even if readahead is disabled */
+ 	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &amp;&amp; (vm_flags &amp; VM_HUGEPAGE)) {
++		/*
++		 * Preserve PMD-sized readahead where it already fits in
++		 * the page cache. Otherwise cap the new fallback path at
++		 * 2MB: this is the common PMD-sized hugepage size, and it
++		 * avoids memory pressure from very large forced readahead
++		 * when mapping_max_folio_order() is high (for example,
++		 * 128MB with 64K base pages on arm64).
++		 */
+ 		if (HPAGE_PMD_ORDER &lt;= MAX_PAGECACHE_ORDER) {
+ 			force_thp_readahead = true;
+ 			thp_order = HPAGE_PMD_ORDER;
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/fb47629e-6533-4c87-ac0b-e3a48a890ef4@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation, added a comment for clarity</div>
 </div>
 </div>
 </div>

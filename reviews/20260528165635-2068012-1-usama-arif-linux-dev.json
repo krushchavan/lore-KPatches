@@ -47,6 +47,141 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch improves large folio readahead for exec memory by addressing two issues in the do_sync_mmap_readahead() function. The first issue is that the mmap_miss heuristic, which is meant to throttle speculative readahead, is also applied to the VM_EXEC readahead path, causing it to be disabled prematurely on certain configurations. The second issue is that the force_thp_readahead path is gated only on HPAGE_PMD_ORDER being less than or equal to MAX_PAGECACHE_ORDER, preventing large folios from being used in some cases. The patches address these issues by making the mmap_miss heuristic symmetric for VM_SEQ_READ and generalizing the gate for force_thp_readahead so that any mapping advertising a usefully large maximum folio order can benefit."
+    },
+    "2026-05-29": {
+      "report_file": "2026-05-29_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Pedro Falcato",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-05-29",
+          "message_id": "ahlgda3xJ587eSCg@pedro-suse.lan",
+          "email": "pfalcato@suse.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Pedro Falcato",
+          "summary": "Reviewer Pedro Falcato questioned the calculation of Physical Memory Page Descriptors (PMDs) for a 16K base page size, pointing out that PMDs should be 32M instead of an unspecified value.\n\nThe reviewer suggested an alternative logic for enabling THP readahead based on the presence of hugepage support in the mapping and its maximum folio order, which they consider more natural and correct.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "questioning technical detail",
+            "arbitrary",
+            "natural"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "16K base page size's PMDs should be 32M, no? Am I misunderstanding what\nyou mean here?\n\n---\n\nThis looks somewhat arbitrary to me (as does the old logic). It seems more\nnatural (correct?) to do this:\n\n\tif (THP_ENABLED && (vm_flags & VM_HUGEPAGE)) {\n\t\tif (mapping_large_folio_support(mapping)) {\n\t\t\tforce_thp_readahead = true;\n\t\t\t/*\n\t\t\t * Cap THP readahead to either the max folio order the\n\t\t\t * mapping supports, or the max order the page cache\n\t\t\t * supports (useless to try more), or the hugepage PMD\n\t\t\t * order (CPU can't benefit from larger).\n\t\t\t */\n\t\t\tthp_order = min3(mapping_max_folio_order(mapping),\n\t\t\t\t\tMAX_PAGECACHE_ORDER, HPAGE_PMD_ORDER);\n\t\t}\n\t}",
+          "reply_to": "",
+          "message_date": "2026-05-29",
+          "message_id": "ahlh2vdHEGo6ZSot@pedro-suse.lan",
+          "email": "pfalcato@suse.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author acknowledged a minor mistake in the commit message regarding the page size, agreed to correct it, and offered an alternative solution.\n\nAuthor addressed Pedro Falcato's concern about the patch causing high memory pressure due to large file folios. The author explained that the current code is correct and maintains existing behavior, providing large folios to architectures that currently don't get them in a controlled way. They argued that raising the cap from 2M to 128M would cause extreme memory pressure and proposed keeping the current code with its conservative behavior.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a mistake",
+            "agreed to correct",
+            "acknowledged fix is needed",
+            "promised no change"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yes, should have just said 4K. Messed up when rewriting the commit\nmessage. Andrew Thanks for merging in mm-new, would it be possible\nto remove \"or 16K\" from the commit message. I can send a new revision\nas well if that is easier and preferred.\n\n---\n\nSo this can result in extreme memory pressure. For example, on 64K base page size,\nwith HPAGE_PMD_ORDER = 13 (512M) and MAX_PAGECACHE_ORDER = 11 (128M), this will evaluate\nTHP order to 128M. I think Jan mentioned in previous versions that there are already\nreports of high memory pressure due to large file folios, and we are seeing this\nin our fleet as well with xfs.\n\nI chose 2M cap as that is what most (not all) architectures which currently support this\nhugepage code flow are currently used to, and on archs + base page size combination which\njust evaluate this code to base page, for example 64K base page size, it will provide a\nperformance uplift without causing excessive memory pressure.\n\nIn pagemap.h, we have\n\n#define PREFERRED_MAX_PAGECACHE_ORDER\tHPAGE_PMD_ORDER\n#define MAX_PAGECACHE_ORDER\tmin(MAX_XAS_ORDER, PREFERRED_MAX_PAGECACHE_ORDER)\n\nSo MAX_PAGECACHE_ORDER <= HPAGE_PMD_ORDER is always true.\n\nAt filesystem/inode setup: mapping_set_folio_order_range() \n\n\tif (max > MAX_PAGECACHE_ORDER)\n\t\tmax = MAX_PAGECACHE_ORDER;\n\nso mapping_max_folio_order() <= MAX_PAGECACHE_ORDER is also always true.\n\nwhich means mapping_max_folio_order(mapping) <= MAX_PAGECACHE_ORDER <= HPAGE_PMD_ORDER is always\ntrue, and you dont need the min3(..) in your diff.\n\nNow the question is if then why not just do:\n\n\tif (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && (vm_flags & VM_HUGEPAGE)) {\n\t\tif (mapping_large_folio_support(mapping)) {\n\t\t\tforce_thp_readahead = true;\n\t\t\tthp_order = min_t(unsigned int,\n\t\t\t\t\t  mapping_max_folio_order(mapping),\n\t\t\t\t\t  get_order(SZ_2M));\n\t\t}\n\t}\n\n\nThis is because this will regress the 16K ARM case where we already got 32M\nfolios. Someone might upgrade the kernel and start getting 2M folios now.\n\nSo IMHO the current code is correct, both in maintaining what the\nexisting behaviour has been, but also trying to provide large folios to\narchitectures that currently dont get them but in a controlled way.\n\nLater on, when we think or evaluate that 2M was too small a cap, it can\nbe raised. I think its very easy to raise a cap, but much more difficult\nto make the cap smaller, as we might get reports on kernel upgrades that\nsomeone was getting a certain size of folio but now its much smaller.\n\nAs a summary, what my code in this current form gives is:\n1) 4K x86/ARM (HPAGE_PMD_ORDER=9 <= 9): first branch -> 2M unchanged behaviour\n2) 16K ARM (HPAGE_PMD_ORDER=11 <= 11): first branch -> 32M unchanged behaviour\n3) 64K ARM (HPAGE_PMD_ORDER=13 <= 11): new else-if -> 2M new capability, conservative\nbehaviour, which can be increased later if needed.\nI know that 64K base page size having 2M large folios while 16K base page size\nhaving 32M sounds counterintuitive, but I think 32M on 16K was a mistake and\nwe shouldnt repeat that mistake for 64K.\n\nWhat your change with min3(mapping_max_folio_order(mapping), MAX_PAGECACHE_ORDER, HPAGE_PMD_ORDER)\nwill give\n3) 64K ARM -> 128M folios, extremely high memory pressure.\n\nWhat only having min(mapping_max_folio_order, get_order(SZ_2M)) will give:\n2) 16K ARM -> 2M folios, (regression since we always had 32M on 16K ARM).",
+          "reply_to": "Pedro Falcato",
+          "message_date": "2026-05-29",
+          "message_id": "cc9a1cf7-7b96-439a-b0be-ecdcf27b5da5@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author is addressing a concern about the need for additional comments in the patch, specifically explaining the decision behind disabling exec readahead when mmap_miss exceeds MMAP_LOTSAMISS.\n\nThe author is addressing a concern about the design decision behind preserving PMD-sized readahead in the filemap code, specifically when mapping_max_folio_order() is high. They added a comment to explain this decision and preserved the existing behavior.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation",
+            "added a comment for clarity",
+            "preserved original behavior"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I think might be good to include the below comment to explain the decision being made\nhere:\n\n---\n\nFrom: Usama Arif <usama.arif@linux.dev>\nDate: Fri, 29 May 2026 05:31:05 -0700\nSubject: [PATCH] [fixlet] mm/filemap: add comment explaining design decision\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n mm/filemap.c | 8 ++++++++\n 1 file changed, 8 insertions(+)\n\ndiff --git a/mm/filemap.c b/mm/filemap.c\nindex bfb891d9da1f..0a3facf452b3 100644\n--- a/mm/filemap.c\n+++ b/mm/filemap.c\n@@ -3319,6 +3319,14 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)\n \n \t/* Use the readahead code, even if readahead is disabled */\n \tif (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && (vm_flags & VM_HUGEPAGE)) {\n+\t\t/*\n+\t\t * Preserve PMD-sized readahead where it already fits in\n+\t\t * the page cache. Otherwise cap the new fallback path at\n+\t\t * 2MB: this is the common PMD-sized hugepage size, and it\n+\t\t * avoids memory pressure from very large forced readahead\n+\t\t * when mapping_max_folio_order() is high (for example,\n+\t\t * 128MB with 64K base pages on arm64).\n+\t\t */\n \t\tif (HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER) {\n \t\t\tforce_thp_readahead = true;\n \t\t\tthp_order = HPAGE_PMD_ORDER;\n-- \n2.53.0-Meta",
+          "reply_to": "",
+          "message_date": "2026-05-29",
+          "message_id": "fb47629e-6533-4c87-ac0b-e3a48a890ef4@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Pedro Falcato",
+          "summary": "The reviewer notes that memory pressure is still a problem even on 2MB folios and suggests that the issue may not be as significant in this case because THPs are being requested, but not efficiently used due to their size.\n\nThe reviewer notes that the current implementation of large-folio readahead for exec memory may not hold up in the future due to potential changes in page table management, specifically the use of PMD-level cont bits.\n\nReviewer Pedro Falcato suggested limiting the large-folio readahead to 32MB instead of an arbitrary value, which would simplify logic and ensure that if a system doesn't support 32MiB folios, it will clamp the maximum folio order to HPAGE_PMD_ORDER.\n\nReviewer Pedro Falcato expressed concerns that the proposed changes to large folio readahead may have unintended consequences, such as regressing workloads due to thrashing or TLB thrashing, and pointed out existing reports of similar issues with anonymous THP regressions.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "NEUTRAL",
+            "NEEDS_WORK",
+            "potential future issue",
+            "PMd-level cont bits",
+            "requested changes",
+            "concerns about potential regression",
+            "requests for careful consideration"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "For what it's worth, memory pressure is still a problem even on 2MB folios. But\nyes, I understand.\n\nFor what it's worth, I don't think it's such a big issue in this case - you're\nasking for THPs, and you're getting them - though maybe not efficiently because\nthese aren't at the PMD level. But this is also true for e.g x86 where an\nan order-3 folio or order-7 folio are completely useless for the hardware, since\nthere is no mTHP to speak of (and, with that, you also lose PG_active and\nPG_reference precision as you only keep one of each for each folio, amongst\nother tradeoffs).\n\n---\n\nRight, good point. (well, I suppose it will not be true in the future as\nsomeone tries to harness PMD-level cont bits)\n\n---\n\nSo maybe limit to 32MB? It's still arbitrary but at least you get simpler\nlogic. If the architecture does not support 32MiB folios, it will clamp\nthe maximum folio order to HPAGE_PMD_ORDER, and you get the same result.\n\nDoes this sound correct?\n\n---\n\nI don't think this is a valid argument. You can also have reports that now\nfolios are too large and they're regressing workloads because of thrashing/\ncompaction/possibly TLB thrashing. And indeed we have several reports of that\n(https://lore.kernel.org/linux-fsdevel/20260403193535.9970-1-dipiets@amazon.it/\ncomes to mind, plus all of the anon THP regressions over the years, including\nin $current_year).\n\nBottom line is that changing things will always affect someone :) Particularly\nsince the logic we have is not too careful at deciding what should or should\nnot be a THP (both in anon and file cases). And if (once?) we make it smarter,\nit will surely also regress someone!\n\n-- \nPedro",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-05-29",
+          "message_id": "ahmSolHvUChl-3vM@pedro-suse.lan",
+          "email": "pfalcato@suse.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author acknowledged the potential benefits of hardware TLB coalescing on AMD CPUs, specifically at a 32kB threshold, and noted it could lead to reduced page faults.\n\nAuthor agrees that the suggested replacement for SZ_4M is correct but expresses concern about the chosen value of 32M being too large.\n\nAuthor acknowledges that large folio readahead issues exist on x86 systems, confirming a problem similar to arm64.\n\nAuthor agrees with Pedro's feedback and suggests keeping the cap at 2M initially to avoid thrashing and compaction issues.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledgment",
+            "potential benefit",
+            "acknowledges feedback",
+            "expresses disagreement with specific choice",
+            "acknowledged a problem",
+            "confirms a similar issue",
+            "agreement",
+            "preference"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "So there is hardware TLB coalescing on almost every new AMD CPU, I believe it is\nat 32kB, and we would benefit from that. On top of that, we would reduce pagefaults.\n\n---\n\nYes, so if we replace it with SZ_32M, it sounds correct. I just think\nthe 32M size is too large. But as you pointed out, even 2M can be too large...\n\n---\n\nAck, and yes we have seen both thrashing and compaction issues due to xfs\nlarge folios in the fleet with x86..\n\n---\n\nYes completely agree on this as well.\n\nSo personally I do have a preference of keeping the cap at 2M atleast initially\nwhile we currently try and solve the issues we see with 2M alone. As we are already\nseeing reports of thrashing and compaction with just 2M, I dont think the logic\nin this patch with just an if else is that complicated.\n\nMatthew, Jan, do you have any thoughts or strong preferences on cap size?\n\nThanks!",
+          "reply_to": "Pedro Falcato",
+          "message_date": "2026-05-29",
+          "message_id": "185f1caf-b33d-4467-beb5-51bd8520ac78@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch improves large folio readahead for exec memory by addressing two issues in the do_sync_mmap_readahead() function. The first issue is that the mmap_miss heuristic, which is meant to throttle speculative readahead, is also applied to the VM_EXEC readahead path, causing it to be disabled prematurely on certain configurations. The second issue is that the force_thp_readahead path is gated only on HPAGE_PMD_ORDER being less than or equal to MAX_PAGECACHE_ORDER, preventing large folios from being used in some cases. The patches address these issues by making the mmap_miss heuristic symmetric for VM_SEQ_READ and generalizing the gate for force_thp_readahead so that any mapping advertising a usefully large maximum folio order can benefit."
     }
   }
 }
