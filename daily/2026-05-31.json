@@ -2,7 +2,7 @@
   "date": "2026-05-31",
   "report_file": "2026-05-31_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-06-01 06:00 UTC",
+  "last_updated": "2026-06-01 06:10 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -44,6 +44,327 @@
       "patches_submitted": [],
       "patches_reviewed": [],
       "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Jeff Layton",
+      "primary_email": "jlayton@kernel.org",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release",
+          "message_id": "20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org",
+          "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org/",
+          "date": "2026-05-31T22:20:03Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 2,
+          "series_patch_count": 1,
+          "version_history": [
+            {
+              "version": 2,
+              "message_id": "20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v2-1-e13e6355fc07@kernel.org/",
+              "subject": "[PATCH v2] nfsd: release OPEN-decoded posix ACLs via op_release",
+              "date": "2026-05-31T22:20:03Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch fixes a memory leak in the NFS server by releasing posix ACLs allocated during OPEN compound processing. It introduces a new op_release function for OP_OPEN and ensures that resources are properly cleaned up on both the normal path and the v4.0 replay path.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "NeilBrown",
+              "summary": "Suggested moving the ->op_release() call to a more obvious and correct place in nfsd4_encode_operation().",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "NEEDS_WORK"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Mon, 01 Jun 2026, Jeff Layton wrote:\n> nfsd4_decode_createhow4() calls nfsd4_decode_fattr4(), which allocates\n> refcounted struct posix_acl objects via posix_acl_alloc() and stores\n> them in open->op_pacl and open->op_dpacl. These pointers must be\n> released once the OPEN compound finishes.\n> \n> When nfsd4_decode_open_claim4() returns a non-seqid-mutating error,\n> the dispatcher short-circuits before op_func runs:\n> \n>     nfsd4_proc_compound()\n>       opdesc->op_func == nfsd4_open_omfg\n>         if (!seqid_mutating_err(ntohl(op->status)))\n>             return op->status;   /* nfsd4_open() never runs */\n>       opdesc->op_release(&op->u)  /* must still release op_pacl/op_dpacl */\n> \n> Before this change OP_OPEN had no .op_release in nfsd4_ops[], and the\n> release pair lived inside nfsd4_open() at its out_err: label. On the\n> short-circuit path nfsd4_open() is never invoked, so both posix_acl\n> refs leak on every malformed OPEN compound that carries valid POSIX\n> ACL createhow4 attributes.\n> \n> Add nfsd4_open_release() and wire it as .op_release for OP_OPEN.\n> posix_acl_release() is NULL-safe, so the single release site covers\n> both the normal path and the nfsd4_open_omfg short-circuit. Remove\n> the matching posix_acl_release() pair from nfsd4_open()'s out_err:\n> label to avoid double-releasing.\n> \n> The compound loop has two encoding branches: nfsd4_encode_operation()\n> for normal ops, and nfsd4_encode_replay() for v4.0 replayed ops.\n> op_release was only called from nfsd4_encode_operation(), so resources\n> attached to op->u leak on the replay path. Add an op_release call to\n> the replay branch as well to ensure cleanup on every path.\n> \n> Fixes: 5fc51dfc2eb1 (\"NFSD: Add support for XDR decoding POSIX draft ACLs\")\n> Signed-off-by: Chris Mason <clm@meta.com>\n> Reviewed-by: Chuck Lever <chuck.lever@oracle.com>\n> Signed-off-by: Jeff Layton <jlayton@kernel.org>\n> ---\n> Changes in v2:\n> - Ensure that op_release is called in the v4.0 replay case as well\n> - Link to v1: https://lore.kernel.org/r/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org\n> ---\n>  fs/nfsd/nfs4proc.c | 12 ++++++++++--\n>  1 file changed, 10 insertions(+), 2 deletions(-)\n> \n> diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c\n> index 017474cd63b5..51998d7885ae 100644\n> --- a/fs/nfsd/nfs4proc.c\n> +++ b/fs/nfsd/nfs4proc.c\n> @@ -681,8 +681,6 @@ nfsd4_open(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,\n>  \tnfsd4_cleanup_open_state(cstate, open);\n>  \tnfsd4_bump_seqid(cstate, status);\n>  out_err:\n> -\tposix_acl_release(open->op_dpacl);\n> -\tposix_acl_release(open->op_pacl);\n>  \treturn status;\n>  }\n>  \n> @@ -704,6 +702,13 @@ static __be32 nfsd4_open_omfg(struct svc_rqst *rqstp, struct nfsd4_compound_stat\n>  \treturn nfsd4_open(rqstp, cstate, &op->u);\n>  }\n>  \n> +static void\n> +nfsd4_open_release(union nfsd4_op_u *u)\n> +{\n> +\tposix_acl_release(u->open.op_dpacl);\n> +\tposix_acl_release(u->open.op_pacl);\n> +}\n> +\n>  /*\n>   * filehandle-manipulating ops.\n>   */\n> @@ -3214,6 +3219,8 @@ nfsd4_proc_compound(struct svc_rqst *rqstp)\n>  \t\t\top->replay = &cstate->replay_owner->so_replay;\n>  \t\t\tnfsd4_encode_replay(resp->xdr, op);\n>  \t\t\tstatus = op->status = op->replay->rp_status;\n> +\t\t\tif (op->opdesc->op_release)\n> +\t\t\t\top->opdesc->op_release(&op->u);\n>  \t\t} else {\n>  \t\t\tnfsd4_encode_operation(resp, op);\n>  \t\t\tstatus = op->status;\n\nI think this patch is good, but I think it would be even better if the\n->op_release() call were moved out of nfsd4_encode_operation() and\nplaces after this if-else.  Then there would be only one call-site in a\nfairly obviously-correct place.\nBut:\n  Reviewed-by: NeilBrown <neil@brown.name>\nfor if you just want to stick with this version.\n\nThanks,\nNeilBrown\n\n\n> @@ -3718,6 +3725,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {\n>  \t},\n>  \t[OP_OPEN] = {\n>  \t\t.op_func = nfsd4_open,\n> +\t\t.op_release = nfsd4_open_release,\n>  \t\t.op_flags = OP_HANDLES_WRONGSEC | OP_MODIFIES_SOMETHING,\n>  \t\t.op_name = \"OP_OPEN\",\n>  \t\t.op_rsize_bop = nfsd4_open_rsize,\n> \n> ---\n> base-commit: 6c0004650ba248a12937ada16f9ba961b35ce2b5\n> change-id: 20260531-nfsd-testing-9122bf51ce95\n> \n> Best regards,\n> -- \n> Jeff Layton <jlayton@kernel.org>\n> \n> \n\n\n",
+              "reply_to": "Jeff Layton",
+              "message_date": "2026-06-01",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "neilb@ownmail.net"
+            }
+          ],
+          "list_id": "linux-nfs@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH 0/6] nfsd: medium-severity bugfixes",
+          "message_id": "20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org",
+          "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org/",
+          "date": "2026-05-31T12:07:09Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": 6,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-0-7bfa481b0540@kernel.org/",
+              "subject": "[PATCH 0/6] nfsd: medium-severity bugfixes",
+              "date": "2026-05-31T12:07:09Z"
+            }
+          ],
+          "series_items": [
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 1/6] nfsd: size fh_verify server sockaddr slot by xpt_locallen",
+              "message_id": "20260531-nfsd-testing-v1-1-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-1-7bfa481b0540@kernel.org/",
+              "date": "2026-05-31T12:07:10Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch fixes a bug in the NFS daemon's tracepoint handling by sizing the server sockaddr slot correctly when copying from xpt_local. The issue was that the slot was sized by xpt_remotelen, but filled from xpt_local using xpt_locallen, leading to potential buffer overflows or underflows. The fix is to size the server slot with xpt_locallen, matching the copy length. This patch only affects the nfsd_fh_verify and nfsd_fh_verify_err tracepoints, which are now consistent with other NFSD tracepoints that record the server address.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-nfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 2/6] nfsd: release path refs on follow_down() error",
+              "message_id": "20260531-nfsd-testing-v1-2-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-2-7bfa481b0540@kernel.org/",
+              "date": "2026-05-31T12:07:11Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch fixes a memory leak in the NFS daemon by releasing path references when follow_down() fails. The issue occurs because the error handling for follow_down() does not properly release the mntget() and dget() references taken on entry, leading to increased reference counts that can block unmounts and pin dentries against the shrinker. The patch adds a call to path_put(&path) before exiting the error handling branch in nfsd_cross_mnt(), ensuring that these references are properly released even when follow_down() fails.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-nfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 3/6] nfsd: fix nfsd_file leak on inter-server COPY setup failure",
+              "message_id": "20260531-nfsd-testing-v1-3-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-3-7bfa481b0540@kernel.org/",
+              "date": "2026-05-31T12:07:13Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch fixes a memory leak in the NFS server (nfsd) caused by failed inter-server COPY operations. When nfsd4_setup_inter_ssc() fails, it directly returns an error code without releasing the reference to the nf_dst object, leading to a file leak. The fix involves setting the status and jumping to the out label instead of returning directly, ensuring that the reference is properly released.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-nfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 4/6] nfsd: fix dentry ref leak on V4ROOT export filehandle lookup",
+              "message_id": "20260531-nfsd-testing-v1-4-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-4-7bfa481b0540@kernel.org/",
+              "date": "2026-05-31T12:07:14Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch fixes a memory leak in the NFSv3 filehandle handling code. When a V4ROOT export's fsid is targeted, the dentry reference is not properly released, leading to a memory leak on every request. The patch adds a call to dput(dentry) when NFSEXP_V4ROOT is detected, ensuring that the reference count is correctly updated.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-nfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 5/6] nfsd: release OPEN-decoded posix ACLs via op_release",
+              "message_id": "20260531-nfsd-testing-v1-5-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-5-7bfa481b0540@kernel.org/",
+              "date": "2026-05-31T12:07:15Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch series addresses a double-put bug in the NFS server, where POSIX ACLs allocated for OPEN compounds were not being properly released. The fix involves adding an op_release function to the OP_OPEN operation and updating the nfsd4_open_omfg function to release the ACLs on the replay path.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "Chuck Lever",
+                  "summary": "Identified a gap in the original fix that would leak POSIX ACL references on v4.0 replay paths and suggested an additional change to release the ACLs on this path.",
+                  "sentiment": "NEEDS_WORK",
+                  "sentiment_signals": [
+                    "CONTENTIOUS"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [],
+                  "raw_body": "\nOn Sun, May 31, 2026, at 8:07 AM, Jeff Layton wrote:\n> From: Chris Mason <clm@meta.com>\n\n> Remove the matching posix_acl_release() pair from nfsd4_open()'s\n> out_err: label: the compound dispatcher calls op_release\n> unconditionally after every op, [...]\n\nThe double-free fix is right, but op_release is not called\nunconditionally after every op, and that gap leaks the ACLs on the\nv4.0 replay path.\n\nop_release runs only at the release: label inside\nnfsd4_encode_operation().  The compound loop skips that encoder on\na replay:\n\n        if (op->status == nfserr_replay_me) {\n                nfsd4_encode_replay(resp->xdr, op);     /* no op_release */\n                ...\n        } else {\n                nfsd4_encode_operation(resp, op);       /* op_release here */\n        }\n\nSo every ACL-bearing v4.0 OPEN retransmit leaks two posix_acl refs.\n\nPlease release op->u on the replay branch too:\n\n        if (op->status == nfserr_replay_me) {\n                op->replay = &cstate->replay_owner->so_replay;\n                nfsd4_encode_replay(resp->xdr, op);\n                status = op->status = op->replay->rp_status;\n                if (op->opdesc->op_release)\n                        op->opdesc->op_release(&op->u);\n        }\n\nLet's fix the \"unconditionally after every op\" wording too.\n\nI've applied the other 5 in this series, so you can just resend\nthis one.\n\n\n-- \nChuck Lever\n",
+                  "reply_to": "Jeff Layton",
+                  "message_date": "2026-05-31",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "cel@kernel.org"
+                },
+                {
+                  "author": "Jeff Layton",
+                  "summary": "Acknowledged the gap and agreed to make the additional change.",
+                  "sentiment": "NEUTRAL",
+                  "sentiment_signals": [],
+                  "has_inline_review": false,
+                  "tags_given": [],
+                  "raw_body": "On Sun, 2026-05-31 at 11:54 -0400, Chuck Lever wrote:\n> On Sun, May 31, 2026, at 8:07 AM, Jeff Layton wrote:\n> > From: Chris Mason <clm@meta.com>\n> \n> > Remove the matching posix_acl_release() pair from nfsd4_open()'s\n> > out_err: label: the compound dispatcher calls op_release\n> > unconditionally after every op, [...]\n> \n> The double-free fix is right, but op_release is not called\n> unconditionally after every op, and that gap leaks the ACLs on the\n> v4.0 replay path.\n> \n> op_release runs only at the release: label inside\n> nfsd4_encode_operation().  The compound loop skips that encoder on\n> a replay:\n> \n>         if (op->status == nfserr_replay_me) {\n>                 nfsd4_encode_replay(resp->xdr, op);     /* no op_release */\n>                 ...\n>         } else {\n>                 nfsd4_encode_operation(resp, op);       /* op_release here */\n>         }\n> \n> So every ACL-bearing v4.0 OPEN retransmit leaks two posix_acl refs.\n> \n> Please release op->u on the replay branch too:\n> \n>         if (op->status == nfserr_replay_me) {\n>                 op->replay = &cstate->replay_owner->so_replay;\n>                 nfsd4_encode_replay(resp->xdr, op);\n>                 status = op->status = op->replay->rp_status;\n>                 if (op->opdesc->op_release)\n>                         op->opdesc->op_release(&op->u);\n>         }\n> \n> Let's fix the \"unconditionally after every op\" wording too.\n> \n> I've applied the other 5 in this series, so you can just resend\n> this one.\n> \n\nGood catch, will fix.\n\nI initially had hoped that we could rely on the fact that a v4.0 client\ncouldn't issue an OPEN with a POSIX ACL attribute in it, but it turns\nout that knfsd doesn't gate attributes by minorversion.\n\nMaybe it should? That's a separate changeset though if so.\n-- \nJeff Layton <jlayton@kernel.org>\n\n",
+                  "reply_to": "Chuck Lever",
+                  "message_date": "2026-05-31",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "jlayton@kernel.org"
+                }
+              ],
+              "list_id": "linux-nfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 6/6] nfsd: fix layout fence worker double-reference race",
+              "message_id": "20260531-nfsd-testing-v1-6-7bfa481b0540@kernel.org",
+              "url": "https://lore.kernel.org/all/20260531-nfsd-testing-v1-6-7bfa481b0540@kernel.org/",
+              "date": "2026-05-31T12:07:16Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch fixes a double-reference race condition in the NFSd layout fence worker. The issue arises when the workqueue core clears WORK_STRUCT_PENDING before invoking the callback, allowing lm_breaker_timedout() to take a duplicate reference on the layout stateid. To fix this, the patch introduces an ls_fence_inflight boolean flag that is set atomically with refcount_inc_not_zero() under ls_lock and cleared under ls_lock before nfs4_put_stid() on every exit path. This ensures that a fence worker invocation already in progress does not coalesce with a new one, preventing a memory leak of the layout stateid.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-nfs@vger.kernel.org"
+            }
+          ],
+          "patch_summary": "This patch series addresses medium-severity bugs in the NFS daemon, including memory leaks and refcounting issues. The patches fix problems in various files related to file handling, path references, and layout fence workers. Specifically, they address potential buffer overruns in tracepoints and double-reference races.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Chuck Lever",
+              "summary": "Identified a double-free bug in the NFS daemon where ACLs are not properly released on the v4.0 replay path. Suggested adding an extra call to op->opdesc->op_release() to fix the issue.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "double-free bug"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "From: Chuck Lever <chuck.lever@oracle.com>\n\nOn Sun, 31 May 2026 08:06:57 -0400, Jeff Layton wrote:\n> These are classified as medium-severity, remote-triggerable.  Some\n> memory leaks and refcounting bugs, and a potential buffer overrun in a\n> tracepoint.\n\nApplied to nfsd-testing, thanks!\n\n[1/6] nfsd: size fh_verify server sockaddr slot by xpt_locallen\n      commit: bbbc993f3932be9428ebf81009d0d1a4aed26d00\n[2/6] nfsd: release path refs on follow_down() error\n      commit: 41c9073b511fe70d5e3b03f039c409d2060de06b\n[3/6] nfsd: fix nfsd_file leak on inter-server COPY setup failure\n      commit: b55429cfce784ffcbaed2960d66b7c5db90ceec3\n[4/6] nfsd: fix dentry ref leak on V4ROOT export filehandle lookup\n      commit: 657c7e3082589c35695f77821f1dfa31bf4c6a34\n[6/6] nfsd: fix layout fence worker double-reference race\n      commit: 4faa69d7158a4436d340b7324aa34fa672362b5c\n\n--\nChuck Lever <chuck.lever@oracle.com>\n",
+              "reply_to": "",
+              "message_date": "2026-05-31",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "cel@kernel.org"
+            },
+            {
+              "author": "Jeff Layton",
+              "summary": "Acknowledged the double-free issue and agreed to fix it. Mentioned that the problem is due to a gap in the op_release() call on the v4.0 replay path.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Sun, 2026-05-31 at 11:54 -0400, Chuck Lever wrote:\n> On Sun, May 31, 2026, at 8:07 AM, Jeff Layton wrote:\n> > From: Chris Mason <clm@meta.com>\n> \n> > Remove the matching posix_acl_release() pair from nfsd4_open()'s\n> > out_err: label: the compound dispatcher calls op_release\n> > unconditionally after every op, [...]\n> \n> The double-free fix is right, but op_release is not called\n> unconditionally after every op, and that gap leaks the ACLs on the\n> v4.0 replay path.\n> \n> op_release runs only at the release: label inside\n> nfsd4_encode_operation().  The compound loop skips that encoder on\n> a replay:\n> \n>         if (op->status == nfserr_replay_me) {\n>                 nfsd4_encode_replay(resp->xdr, op);     /* no op_release */\n>                 ...\n>         } else {\n>                 nfsd4_encode_operation(resp, op);       /* op_release here */\n>         }\n> \n> So every ACL-bearing v4.0 OPEN retransmit leaks two posix_acl refs.\n> \n> Please release op->u on the replay branch too:\n> \n>         if (op->status == nfserr_replay_me) {\n>                 op->replay = &cstate->replay_owner->so_replay;\n>                 nfsd4_encode_replay(resp->xdr, op);\n>                 status = op->status = op->replay->rp_status;\n>                 if (op->opdesc->op_release)\n>                         op->opdesc->op_release(&op->u);\n>         }\n> \n> Let's fix the \"unconditionally after every op\" wording too.\n> \n> I've applied the other 5 in this series, so you can just resend\n> this one.\n> \n\nGood catch, will fix.\n\nI initially had hoped that we could rely on the fact that a v4.0 client\ncouldn't issue an OPEN with a POSIX ACL attribute in it, but it turns\nout that knfsd doesn't gate attributes by minorversion.\n\nMaybe it should? That's a separate changeset though if so.\n-- \nJeff Layton <jlayton@kernel.org>\n\n",
+              "reply_to": "Chuck Lever",
+              "message_date": "2026-05-31",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "jlayton@kernel.org"
+            }
+          ],
+          "list_id": "linux-nfs@vger.kernel.org"
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH 5/6] nfsd: release OPEN-decoded posix ACLs via op_release",
+          "message_id": "88e604a80e7fcf5721bf0bd0f205c7ce07c011c8.camel@kernel.org",
+          "url": "https://lore.kernel.org/all/88e604a80e7fcf5721bf0bd0f205c7ce07c011c8.camel@kernel.org/",
+          "date": "2026-05-31T18:42:50Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-nfs@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH] vfs: missing inode operation should return a consistent error code",
+          "message_id": "c5e32b78aeaa833d18d9b7a566358a6f71d09f23.camel@kernel.org",
+          "url": "https://lore.kernel.org/all/c5e32b78aeaa833d18d9b7a566358a6f71d09f23.camel@kernel.org/",
+          "date": "2026-05-31T14:08:49Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-arch@vger.kernel.org"
+        }
+      ],
+      "patches_acked": [
+        {
+          "activity_type": "patch_acked",
+          "subject": "Re: [PATCH v2 2/2] SUNRPC: Check svc pool percpu counter allocation",
+          "message_id": "08d21dec0e68a54b2a4a32d22d435ad0b468f743.camel@kernel.org",
+          "url": "https://lore.kernel.org/all/08d21dec0e68a54b2a4a32d22d435ad0b468f743.camel@kernel.org/",
+          "date": "2026-05-31T01:11:06Z",
+          "in_reply_to": null,
+          "ack_type": "Reviewed-by",
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-nfs@vger.kernel.org"
+        }
+      ],
       "discussions_posted": [],
       "errors": []
     }
