@@ -2,7 +2,7 @@
   "date": "2026-06-01",
   "report_file": "2026-06-01_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-06-02 06:57 UTC",
+  "last_updated": "2026-06-02 07:13 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -2290,6 +2290,581 @@
         }
       ],
       "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Kiryl Shutsemau",
+      "primary_email": "kas@kernel.org",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH 0/6] userfaultfd/pagemap: pre-existing fixes",
+          "message_id": "20260529172331.356655-1-kas@kernel.org",
+          "url": "https://lore.kernel.org/all/20260529172331.356655-1-kas@kernel.org/",
+          "date": "2026-05-29T17:23:43Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-05-29",
+          "patch_version": 1,
+          "series_patch_count": 6,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260529172331.356655-1-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-1-kas@kernel.org/",
+              "subject": "[PATCH 0/6] userfaultfd/pagemap: pre-existing fixes",
+              "date": "2026-05-29T17:23:43Z"
+            }
+          ],
+          "series_items": [
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 1/6] fs/proc/task_mmu: fix make_uffd_wp_huge_pte() prot-update race",
+              "message_id": "20260529172331.356655-2-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-2-kas@kernel.org/",
+              "date": "2026-05-29T17:23:50Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-05-29",
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch series addresses a race condition in the make_uffd_wp_huge_pte() function, which can lead to stale PTE updates. The fix involves mirroring the pattern used by its non-hugetlb sibling, ptep_modify_prot_start() and ptep_modify_prot_commit(), to ensure atomicity and consistency.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "Lorenzo Stoakes",
+                  "summary": "Identified a minor formatting issue and suggested adding line breaks for readability. Also expressed uncertainty about whether this patch should be separate from the rest of the series, citing Andrew's concerns.",
+                  "sentiment": "NEUTRAL",
+                  "sentiment_signals": [
+                    "FORMATTING"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "On Fri, May 29, 2026 at 06:23:25PM +0100, Kiryl Shutsemau (Meta) wrote:\n> make_uffd_wp_huge_pte() arms the UFFD_WP bit on a present HugeTLB PTE by\n> calling huge_ptep_modify_prot_commit() with a ptent snapshot that was\n> fetched without the corresponding huge_ptep_modify_prot_start().\n\nThe\n> start helper is what atomically clears the entry so the kernel-owned\n> snapshot stays consistent until the commit; without it, the hardware\n> may set Dirty or Accessed in the live PTE between the original read\n> and the commit, and huge_ptep_modify_prot_commit() (whose generic\n> implementation just calls set_huge_pte_at()) then writes the stale\n> snapshot back over the live hardware bits, losing the update.\n\nVery pedantic nit - this is a mammoth paragraph :P maybe add a linebreak\nwhere I did above?\n\n>\n> The non-hugetlb sibling make_uffd_wp_pte() does this correctly via\n> ptep_modify_prot_start() / ptep_modify_prot_commit(). Mirror that\n> pattern for the present-PTE branch. The migration case stays as-is --\n> migration entries are non-present, so there's no hardware update to\n> race against.\n>\n> Fixes: 52526ca7fdb9 (\"fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs\")\n\nI wonder if better as a separate patch? Not sure what Andrew thinks about\nit, I do recall him complaining about separate-hotfixes-as-part-of-a-series :>)\n\n> Cc: stable@vger.kernel.org\n> Reported-by: Sashiko AI review <sashiko-bot@kernel.org>\n> Signed-off-by: Kiryl Shutsemau <kas@kernel.org>\n\nLGTM, so:\n\nReviewed-by: Lorenzo Stoakes <ljs@kernel.org>\n\n> ---\n>  fs/proc/task_mmu.c | 12 ++++++++----\n>  1 file changed, 8 insertions(+), 4 deletions(-)\n>\n> diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c\n> index 1e3a15bf46f4..e21a38ac745b 100644\n> --- a/fs/proc/task_mmu.c\n> +++ b/fs/proc/task_mmu.c\n> @@ -2610,12 +2610,16 @@ static void make_uffd_wp_huge_pte(struct vm_area_struct *vma,\n>  \tif (softleaf_is_hwpoison(entry) || softleaf_is_marker(entry))\n>  \t\treturn;\n>\n> -\tif (softleaf_is_migration(entry))\n> +\tif (softleaf_is_migration(entry)) {\n>  \t\tset_huge_pte_at(vma->vm_mm, addr, ptep,\n>  \t\t\t\tpte_swp_mkuffd_wp(ptent), psize);\n> -\telse\n> -\t\thuge_ptep_modify_prot_commit(vma, addr, ptep, ptent,\n> -\t\t\t\t\t     huge_pte_mkuffd_wp(ptent));\n> +\t} else {\n> +\t\tpte_t old_pte, new_pte;\n> +\n> +\t\told_pte = huge_ptep_modify_prot_start(vma, addr, ptep);\n> +\t\tnew_pte = huge_pte_mkuffd_wp(old_pte);\n> +\t\thuge_ptep_modify_prot_commit(vma, addr, ptep, old_pte, new_pte);\n> +\t}\n>  }\n>  #endif /* CONFIG_HUGETLB_PAGE */\n>\n> --\n> 2.54.0\n>\n\nCheers, Lorenzo\n",
+                  "reply_to": "",
+                  "message_date": "2026-06-01",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "ljs@kernel.org"
+                },
+                {
+                  "author": "Lorenzo Stoakes",
+                  "summary": "Confirmed that the patch is LGTM and added a Reviewed-by tag.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "On Mon, Jun 01, 2026 at 06:55:43PM +0100, Lorenzo Stoakes wrote:\n> On Fri, May 29, 2026 at 06:23:25PM +0100, Kiryl Shutsemau (Meta) wrote:\n> > Fixes: 52526ca7fdb9 (\"fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs\")\n>\n> I wonder if better as a separate patch? Not sure what Andrew thinks about\n> it, I do recall him complaining about separate-hotfixes-as-part-of-a-series :>)\n\nAhhh it's a series of Fixes: :) ok ignore this then!\n\nCheers, Lorenzo\n",
+                  "reply_to": "",
+                  "message_date": "2026-06-01",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "ljs@kernel.org"
+                },
+                {
+                  "author": "Dev Jain",
+                  "summary": "Confirmed that the patch is LGTM and added a Reviewed-by tag.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "\n\nOn 29/05/26 10:53 pm, Kiryl Shutsemau (Meta) wrote:\n> make_uffd_wp_huge_pte() arms the UFFD_WP bit on a present HugeTLB PTE by\n> calling huge_ptep_modify_prot_commit() with a ptent snapshot that was\n> fetched without the corresponding huge_ptep_modify_prot_start(). The\n> start helper is what atomically clears the entry so the kernel-owned\n> snapshot stays consistent until the commit; without it, the hardware\n> may set Dirty or Accessed in the live PTE between the original read\n> and the commit, and huge_ptep_modify_prot_commit() (whose generic\n> implementation just calls set_huge_pte_at()) then writes the stale\n> snapshot back over the live hardware bits, losing the update.\n> \n> The non-hugetlb sibling make_uffd_wp_pte() does this correctly via\n> ptep_modify_prot_start() / ptep_modify_prot_commit(). Mirror that\n> pattern for the present-PTE branch. The migration case stays as-is --\n> migration entries are non-present, so there's no hardware update to\n> race against.\n> \n> Fixes: 52526ca7fdb9 (\"fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs\")\n> Cc: stable@vger.kernel.org\n> Reported-by: Sashiko AI review <sashiko-bot@kernel.org>\n> Signed-off-by: Kiryl Shutsemau <kas@kernel.org>\n> ---\n\nLGTM\n\nReviewed-by: Dev Jain <dev.jain@arm.com>\n\n\n>  fs/proc/task_mmu.c | 12 ++++++++----\n>  1 file changed, 8 insertions(+), 4 deletions(-)\n> \n> diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c\n> index 1e3a15bf46f4..e21a38ac745b 100644\n> --- a/fs/proc/task_mmu.c\n> +++ b/fs/proc/task_mmu.c\n> @@ -2610,12 +2610,16 @@ static void make_uffd_wp_huge_pte(struct vm_area_struct *vma,\n>  \tif (softleaf_is_hwpoison(entry) || softleaf_is_marker(entry))\n>  \t\treturn;\n>  \n> -\tif (softleaf_is_migration(entry))\n> +\tif (softleaf_is_migration(entry)) {\n>  \t\tset_huge_pte_at(vma->vm_mm, addr, ptep,\n>  \t\t\t\tpte_swp_mkuffd_wp(ptent), psize);\n> -\telse\n> -\t\thuge_ptep_modify_prot_commit(vma, addr, ptep, ptent,\n> -\t\t\t\t\t     huge_pte_mkuffd_wp(ptent));\n> +\t} else {\n> +\t\tpte_t old_pte, new_pte;\n> +\n> +\t\told_pte = huge_ptep_modify_prot_start(vma, addr, ptep);\n> +\t\tnew_pte = huge_pte_mkuffd_wp(old_pte);\n> +\t\thuge_ptep_modify_prot_commit(vma, addr, ptep, old_pte, new_pte);\n> +\t}\n>  }\n>  #endif /* CONFIG_HUGETLB_PAGE */\n>  \n\n",
+                  "reply_to": "",
+                  "message_date": "2026-06-02",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "dev.jain@arm.com"
+                }
+              ],
+              "list_id": "linux-kernel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 2/6] fs/proc/task_mmu: use huge_page_size() in pagemap_scan_hugetlb_entry()",
+              "message_id": "20260529172331.356655-3-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-3-kas@kernel.org/",
+              "date": "2026-05-29T17:23:58Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-05-29",
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "The patch series addresses a bug in the pagemap_scan_hugetlb_entry() function, where it incorrectly checks for partial huge pages by comparing against HPAGE_SIZE instead of the actual page size of the hugetlb hstate. The fix involves using the huge_page_size() function to determine the correct page size.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "Lorenzo Stoakes",
+                  "summary": "Identified the bug in pagemap_scan_hugetlb_entry() where HPAGE_SIZE is used instead of huge_page_size(). Approved the patch.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "LGTM"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "On Fri, May 29, 2026 at 06:23:26PM +0100, Kiryl Shutsemau (Meta) wrote:\n> The partial-page check compares against HPAGE_SIZE (PMD_SIZE), which\n> is wrong for gigantic hugetlb hstates (e.g. 1G). The walker hands the\n> callback a huge_page_size()-sized range, never start + HPAGE_SIZE, so\n> the comparison always declares it partial and aborts the WP. Compare\n> against the actual hstate's page size.\n>\n> Fixes: 52526ca7fdb9 (\"fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs\")\n> Cc: stable@vger.kernel.org\n> Reported-by: Sashiko AI review <sashiko-bot@kernel.org>\n> Signed-off-by: Kiryl Shutsemau <kas@kernel.org>\n\nLGTM, so:\n\nReviewed-by: Lorenzo Stoakes <ljs@kernel.org>\n\n> ---\n>  fs/proc/task_mmu.c | 2 +-\n>  1 file changed, 1 insertion(+), 1 deletion(-)\n>\n> diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c\n> index e21a38ac745b..1489c67e88f7 100644\n> --- a/fs/proc/task_mmu.c\n> +++ b/fs/proc/task_mmu.c\n> @@ -2960,7 +2960,7 @@ static int pagemap_scan_hugetlb_entry(pte_t *ptep, unsigned long hmask,\n>  \tif (~categories & PAGE_IS_WRITTEN)\n>  \t\tgoto out_unlock;\n>\n> -\tif (end != start + HPAGE_SIZE) {\n> +\tif (end != start + huge_page_size(hstate_vma(vma))) {\n>  \t\t/* Partial HugeTLB page WP isn't possible. */\n>  \t\tpagemap_scan_backout_range(p, start, end);\n>  \t\tp->arg.walk_end = start;\n> --\n> 2.54.0\n>\n",
+                  "reply_to": "Kiryl Shutsemau (Meta)",
+                  "message_date": "2026-06-01",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "ljs@kernel.org"
+                },
+                {
+                  "author": "Dev Jain",
+                  "summary": "Approved the patch with a Reviewed-by tag.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "\n\nOn 29/05/26 10:53 pm, Kiryl Shutsemau (Meta) wrote:\n> The partial-page check compares against HPAGE_SIZE (PMD_SIZE), which\n> is wrong for gigantic hugetlb hstates (e.g. 1G). The walker hands the\n> callback a huge_page_size()-sized range, never start + HPAGE_SIZE, so\n> the comparison always declares it partial and aborts the WP. Compare\n> against the actual hstate's page size.\n> \n> Fixes: 52526ca7fdb9 (\"fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs\")\n> Cc: stable@vger.kernel.org\n> Reported-by: Sashiko AI review <sashiko-bot@kernel.org>\n> Signed-off-by: Kiryl Shutsemau <kas@kernel.org>\n> ---\n\nReviewed-by: Dev Jain <dev.jain@arm.com>\n\n\n>  fs/proc/task_mmu.c | 2 +-\n>  1 file changed, 1 insertion(+), 1 deletion(-)\n> \n> diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c\n> index e21a38ac745b..1489c67e88f7 100644\n> --- a/fs/proc/task_mmu.c\n> +++ b/fs/proc/task_mmu.c\n> @@ -2960,7 +2960,7 @@ static int pagemap_scan_hugetlb_entry(pte_t *ptep, unsigned long hmask,\n>  \tif (~categories & PAGE_IS_WRITTEN)\n>  \t\tgoto out_unlock;\n>  \n> -\tif (end != start + HPAGE_SIZE) {\n> +\tif (end != start + huge_page_size(hstate_vma(vma))) {\n>  \t\t/* Partial HugeTLB page WP isn't possible. */\n>  \t\tpagemap_scan_backout_range(p, start, end);\n>  \t\tp->arg.walk_end = start;\n\n\n",
+                  "reply_to": "Kiryl Shutsemau (Meta)",
+                  "message_date": "2026-06-02",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "dev.jain@arm.com"
+                }
+              ],
+              "list_id": "linux-kernel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 3/6] fs/proc/task_mmu: fix hugetlb self-deadlock in pagemap_scan_pte_hole()",
+              "message_id": "20260529172331.356655-4-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-4-kas@kernel.org/",
+              "date": "2026-05-29T17:24:06Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-05-29",
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch fixes a self-deadlock issue in the Linux kernel's procfs task_mmu module when handling huge page (hugetlb) memory mappings. The deadlock occurs because the pagemap_scan_pte_hole function, which is responsible for scanning and write-protecting unpopulated hugetlb entries, takes a read lock on the hugetlb VMA while also trying to take a write lock on the same VMA. This patch avoids this deadlock by directly installing uffd-wp markers under the page-table lock, rather than routing through the uffd_wp_range function. The fix is similar to how populated hugetlb entries are handled in pagemap_scan_hugetlb_entry. The patch also ensures that PMD sharing is disabled on uffd-wp VMAs, making it safe to skip taking the VMA write lock.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-kernel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 4/6] mm/huge_memory: preserve pmd_swp_uffd_wp on device-private PMD downgrade",
+              "message_id": "20260529172331.356655-5-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-5-kas@kernel.org/",
+              "date": "2026-05-29T17:24:14Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-05-29",
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch series addresses issues related to device-private THP support in the mm/huge_memory module, specifically focusing on preserving pmd_swp_uffd_wp during PMD downgrades.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "Balbir Singh",
+                  "summary": "Provided a Reviewed-by tag without raising any specific technical concerns or suggestions.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "On 5/30/26 03:23, Kiryl Shutsemau (Meta) wrote:\n> change_non_present_huge_pmd() rewrites a writable device-private PMD\n> swap entry into a readable one without carrying pmd_swp_uffd_wp()\n> across. The PTE-level change_softleaf_pte() does this correctly;\n> mirror that here, matching what copy_huge_pmd() does for the fork\n> path. Without the carry, a plain mprotect() over a UFFD_WP-marked\n> device-private THP strips the bit and the trap is bypassed on\n> swap-in.\n> \n> Fixes: 368076f52ebe (\"mm/huge_memory: add device-private THP support to PMD operations\")\n> Cc: stable@vger.kernel.org\n> Reported-by: Sashiko AI review <sashiko-bot@kernel.org>\n> Signed-off-by: Kiryl Shutsemau <kas@kernel.org>\n> ---\n>  mm/huge_memory.c | 2 ++\n>  1 file changed, 2 insertions(+)\n> \n> diff --git a/mm/huge_memory.c b/mm/huge_memory.c\n> index 42b86e8ab7c0..b7c895b1d366 100644\n> --- a/mm/huge_memory.c\n> +++ b/mm/huge_memory.c\n> @@ -2663,6 +2663,8 @@ static void change_non_present_huge_pmd(struct mm_struct *mm,\n>  \t} else if (softleaf_is_device_private_write(entry)) {\n>  \t\tentry = make_readable_device_private_entry(swp_offset(entry));\n>  \t\tnewpmd = swp_entry_to_pmd(entry);\n> +\t\tif (pmd_swp_uffd_wp(*pmd))\n> +\t\t\tnewpmd = pmd_swp_mkuffd_wp(newpmd);\n>  \t} else {\n>  \t\tnewpmd = *pmd;\n>  \t}\n\nReviewed-by: Balbir Singh <balbirs@nvidia.com>\n\nBalbir\n",
+                  "reply_to": "Kiryl Shutsemau (Meta)",
+                  "message_date": "2026-06-01",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "balbirs@nvidia.com"
+                }
+              ],
+              "list_id": "linux-kernel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 5/6] userfaultfd: gate must_wait writability check on pte_present()",
+              "message_id": "20260529172331.356655-6-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-6-kas@kernel.org/",
+              "date": "2026-05-29T17:24:17Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-05-29",
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch series addresses issues in the userfaultfd code, specifically related to writability checks and page table lock handling. The current implementation reads PTE bits without taking the page table lock, leading to undefined behavior when encountering swap or migration entries. This patch gates the writability check on pte_present() to ensure that only present PTEs are inspected, preventing incorrect results.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "Lorenzo Stoakes",
+                  "summary": "Identified the need to gate writability checks on pte_present() and suggested adding this check. Approved the patch with minor nit about softleaf, but it's not a concern.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "LGTM"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "On Fri, May 29, 2026 at 06:23:29PM +0100, Kiryl Shutsemau (Meta) wrote:\n> userfaultfd_must_wait() and userfaultfd_huge_must_wait() read the PTE\n> without taking the page table lock and then apply pte_write() /\n> huge_pte_write() to it. Those accessors decode bits from the present\n> encoding only; on a swap or migration entry they read the offset bits\n> that happen to share the same position and return an undefined result.\n>\n> The intent of the check is \"is this fault still WP-blocked?\". A\n> non-marker swap entry means the page is in transit -- the userfault\n> context the original fault delivered against is no longer the same,\n> and the swap-in or migration completion path will re-deliver a fresh\n> fault if userspace still needs to handle it. Worst case under the\n> current code the garbage write bit says \"wait\", and the thread stays\n> asleep until a UFFDIO_WAKE that may never arrive.\n>\n> Gate the writability check on pte_present() so the lockless re-check\n> only inspects present-PTE bits when the entry is actually present.\n> The non-present, non-marker case returns \"don't wait\" and lets the\n> fault path retry.\n>\n> Fixes: 369cd2121be4 (\"userfaultfd: hugetlbfs: userfaultfd_huge_must_wait for hugepmd ranges\")\n> Fixes: 63b2d4174c4a (\"userfaultfd: wp: add the writeprotect API to userfaultfd ioctl\")\n> Cc: stable@vger.kernel.org\n> Reported-by: Sashiko AI review <sashiko-bot@kernel.org>\n> Signed-off-by: Kiryl Shutsemau <kas@kernel.org>\n\nOne tiny nit is maybe could mention softleaf :P but it's not important!\n\nLGTM, so:\n\nReviewed-by: Lorenzo Stoakes <ljs@kernel.org>\n\n> ---\n>  mm/userfaultfd.c | 20 ++++++++++++++++++++\n>  1 file changed, 20 insertions(+)\n>\n> diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c\n> index 35b206cc9aa6..f6d2a1c67019 100644\n> --- a/mm/userfaultfd.c\n> +++ b/mm/userfaultfd.c\n> @@ -2535,6 +2535,15 @@ static inline bool userfaultfd_huge_must_wait(struct userfaultfd_ctx *ctx,\n>  \t/* UFFD PTE markers require userspace to resolve the fault. */\n>  \tif (pte_is_uffd_marker(pte))\n>  \t\treturn true;\n> +\t/*\n> +\t * Concurrent migration may have replaced the present PTE with a\n> +\t * non-marker swap entry between fault delivery and this lockless\n> +\t * re-check. huge_pte_write() on a swap entry decodes random offset\n> +\t * bits, so gate it on pte_present(). The migration completion path\n> +\t * will re-deliver the fault if it still needs userspace.\n> +\t */\n> +\tif (!pte_present(pte))\n> +\t\treturn false;\n>  \t/*\n>  \t * If VMA has UFFD WP faults enabled and WP fault, wait for userspace to\n>  \t * resolve the fault.\n> @@ -2621,6 +2630,17 @@ static inline bool userfaultfd_must_wait(struct userfaultfd_ctx *ctx,\n>  \t/* UFFD PTE markers require userspace to resolve the fault. */\n>  \tif (pte_is_uffd_marker(ptent))\n>  \t\tgoto out;\n> +\t/*\n> +\t * Concurrent swap-out / migration may have replaced the present PTE\n> +\t * with a non-marker swap entry between fault delivery and this\n> +\t * lockless re-check. pte_write() on a swap entry decodes random\n> +\t * offset bits, so gate it on pte_present(). The page-in path will\n> +\t * re-deliver the fault if it still needs userspace.\n> +\t */\n> +\tif (!pte_present(ptent)) {\n> +\t\tret = false;\n> +\t\tgoto out;\n> +\t}\n>  \t/*\n>  \t * If VMA has UFFD WP faults enabled and WP fault, wait for userspace to\n>  \t * resolve the fault.\n> --\n> 2.54.0\n>\n",
+                  "reply_to": "",
+                  "message_date": "2026-06-01",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "ljs@kernel.org"
+                }
+              ],
+              "list_id": "linux-kernel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH 6/6] userfaultfd: build __VMA_UFFD_FLAGS from config-gated masks",
+              "message_id": "20260529172331.356655-7-kas@kernel.org",
+              "url": "https://lore.kernel.org/all/20260529172331.356655-7-kas@kernel.org/",
+              "date": "2026-05-29T17:24:20Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-05-29",
+              "patch_version": 1,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch modifies the userfaultfd feature in the Linux kernel to build __VMA_UFFD_FLAGS from config-gated masks instead of feeding bit numbers that may not exist on the current build to mk_vma_flags(). This change prevents out-of-bounds writes and ensures that the mask is correct regardless of the architecture. The patch introduces new macros VMA_UFFD_MISSING, VMA_UFFD_WP, and VMA_UFFD_MINOR, which are defined based on the availability of the corresponding features. On 32-bit architectures, these macros collapse to EMPTY_VMA_FLAGS when their feature is unavailable.",
+              "analysis_source": "llm-per-reviewer",
+              "review_comments": [
+                {
+                  "author": "Lorenzo Stoakes",
+                  "summary": "The reviewer suggested using a different commit (a06eb2f8279e) to modify __VMA_UFFD_FLAGS, citing it as the original source of this flag.\n\nGave Reviewed-by",
+                  "sentiment": "NEUTRAL",
+                  "sentiment_signals": [
+                    "suggestion",
+                    "alternative"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "Hmm, I think commit a06eb2f8279e (\"mm/vma: convert\nvma_modify_flags[_uffd]() to use vma_flags_t\") is more appropriate isn't\nit?\n\nAs that's the commit that added __VMA_UFFD_FLAGS :)",
+                  "reply_to": "Kiryl (Meta)",
+                  "message_date": "2026-06-01",
+                  "message_id": "ah3LooI6IVQBZ9P1@lucifer",
+                  "analysis_source": "llm",
+                  "email": "ljs@kernel.org"
+                }
+              ],
+              "list_id": "linux-kernel@vger.kernel.org"
+            }
+          ],
+          "patch_summary": "This patch series addresses six pre-existing bugs in the userfaultfd and pagemap code, which were previously carried as part of a larger feature series. The issues include missing updates to hardware Dirty/Accessed bits, incorrect handling of gigantic hugetlb pages, self-deadlocks when scanning unpopulated hugetlb ranges, loss of uffd-wp markers during PMD permission downgrades, and out-of-bounds writes in the vma_flags_t structure. Each bug is fixed independently and applies to the mm-new code directly, with some patches also carrying Cc: stable@ for backporting. The approach taken involves correcting specific functions and data structures to ensure accurate and safe handling of userfaultfd and pagemap operations.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Andrew Morton",
+              "summary": "Reviewer Andrew Morton expressed concern about the frequency of pre-existing issues found by Sashiko, specifically noting that four scans failed and requesting further investigation into what a full scan of mm/ would reveal.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "concern",
+                "request for further investigation"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "And...  this made Sashiko point at other stuff:\n\thttps://sashiko.dev/#/patchset/20260529172331.356655-1-kas@kernel.org\n\nI can't figure out why four of the scans failed - \"View Raw Log\" comes up empty.\n\nIt's concerning how frequently Sashiko is finding pre-existing things.  What\nwould a full scan of mm/ tell us?  Gulp.",
+              "reply_to": "Kiryl (Meta)",
+              "message_date": "2026-05-29",
+              "message_id": "20260529173448.40a37785ecbecb6868fdd6a2@linux-foundation.org",
+              "analysis_source": "llm",
+              "email": "akpm@linux-foundation.org"
+            },
+            {
+              "author": "Balbir Singh",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "2026-06-01",
+              "message_id": "ccdca325-a33c-45ae-aac1-3ac4aea77a42@nvidia.com",
+              "analysis_source": "heuristic",
+              "email": "balbirs@nvidia.com"
+            },
+            {
+              "author": "Kiryl Shutsemau (author)",
+              "summary": "Author acknowledges that they need to address new pre-existing issues, but expresses uncertainty about their ability to handle the workload and asks for guidance on what to do with the main userfaultfd patchset.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledges need for further work",
+                "expresses uncertainty"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Yeah... :/\n\nI will look at the new batch of pre-existing issues when I have spare\ncycles. I am not sure I have the bandwidth to find the bottom of this\nrabbit hole.\n\nWhat do you want me to with the main userfaultfd patchset? Sashiko\nfailed to apply it because it is on top of the pre-existing fixes.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+              "reply_to": "Andrew Morton",
+              "message_date": "2026-06-01",
+              "message_id": "ah2S7MJ2VK6R-NSN@thinkstation",
+              "analysis_source": "llm",
+              "email": "kas@kernel.org"
+            },
+            {
+              "author": "David (Arm)",
+              "summary": "Reviewer David (Arm) suspects a minor conflict between this patch and another incoming fix from Lorenzo, suggesting it be put into mm-unstable early after the next release.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "potential_conflict",
+                "requested_change"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I suspect it might have a minor conflict with another incoming fix from Lorenzo\nas well.\n\nProbably put it into mm-unstable early after the next release? At least I think\nit's not in mm-unstable yet and we are approaching the net release quickly ...\n\n-- \nCheers,\n\nDavid",
+              "reply_to": "Kiryl Shutsemau",
+              "message_date": "2026-06-01",
+              "message_id": "04875b82-6671-4f43-aa59-190fd09c7108@kernel.org",
+              "analysis_source": "llm",
+              "email": "david@kernel.org"
+            },
+            {
+              "author": "Lorenzo Stoakes",
+              "summary": "Reviewer expressed frustration about unrelated patches being submitted in the middle of an existing feature series and suggested that Sashiko AI should have a passive mode to check for existing issues elsewhere before flagging new ones.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "frustration",
+                "suggestion"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Yeah, but I also kinda wish it didn't do this :) It's similar to sending a\nseries, and somebody replying saying 'well this is totally unrelated but <blah\nblah blah>' and expecting a reply :>)\n\nYou'd want that person to just submit a patch for the issue or a [DISCUSSION] or\n[BUG] thread or something, but interrupting, possibly delaying + taking people's\n(usually very limited) time on something unrelated is just unhelpful I think.\n\nI'd prefer Sashiko had a passive mode that checked for existing stuff elsewhere,\nand it saved the tokens doing it for a new series :)\n\nJust my 2 pence!\n\nCheers, Lorenzo",
+              "reply_to": "Andrew Morton",
+              "message_date": "2026-06-01",
+              "message_id": "ah3AkzoaTaytGfrR@lucifer",
+              "analysis_source": "llm",
+              "email": "ljs@kernel.org"
+            },
+            {
+              "author": "Lorenzo Stoakes",
+              "summary": "The reviewer requested the addition of a line break in a long paragraph to improve readability.\n\nReviewer Lorenzo Stoakes questioned whether the six patches should be sent as a single patch series or split into individual patches, referencing Andrew's past complaints about separate hotfixes within a feature series.\n\nGave Reviewed-by",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "uncertainty",
+                "reference to past discussion"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Very pedantic nit - this is a mammoth paragraph :P maybe add a linebreak\nwhere I did above?\n\n---\n\nI wonder if better as a separate patch? Not sure what Andrew thinks about\nit, I do recall him complaining about separate-hotfixes-as-part-of-a-series :>)",
+              "reply_to": "",
+              "message_date": "2026-06-01",
+              "message_id": "ah3EQvQ_Ja6AJqzF@lucifer",
+              "analysis_source": "llm",
+              "email": "ljs@kernel.org"
+            },
+            {
+              "author": "Lorenzo Stoakes",
+              "summary": "Reviewer Lorenzo Stoakes made a lighthearted comment about the patch series being a collection of fixes, and ignored it as such.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Ahhh it's a series of Fixes: :) ok ignore this then!\n\nCheers, Lorenzo",
+              "reply_to": "",
+              "message_date": "2026-06-01",
+              "message_id": "ah3IrXG3aFVgXRpd@lucifer",
+              "analysis_source": "llm",
+              "email": "ljs@kernel.org"
+            },
+            {
+              "author": "Lorenzo Stoakes",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "2026-06-01",
+              "message_id": "ah3J7SHzUajlY5rA@lucifer",
+              "analysis_source": "heuristic",
+              "email": "ljs@kernel.org"
+            },
+            {
+              "author": "Lorenzo Stoakes",
+              "summary": "Reviewer noted that the patch series description does not explicitly mention the softirq context in which some of the fixes are applied, but deemed it a minor issue and approved the patches.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "minor nitpick",
+                "LGTM"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "One tiny nit is maybe could mention softleaf :P but it's not important!\n\nLGTM, so:\n\nReviewed-by: Lorenzo Stoakes <ljs@kernel.org>",
+              "reply_to": "",
+              "message_date": "2026-06-01",
+              "message_id": "ah3KmnfmEeX85M9p@lucifer",
+              "analysis_source": "llm",
+              "email": "ljs@kernel.org"
+            },
+            {
+              "author": "Lorenzo Stoakes",
+              "summary": "Reviewer Lorenzo Stoakes suggested using a different commit (a06eb2f8279e) to address the issue of building __VMA_UFFD_FLAGS, citing that it is the one that added this flag.\n\nGave Reviewed-by",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Hmm, I think commit a06eb2f8279e (\"mm/vma: convert\nvma_modify_flags[_uffd]() to use vma_flags_t\") is more appropriate isn't\nit?\n\nAs that's the commit that added __VMA_UFFD_FLAGS :)",
+              "reply_to": "",
+              "message_date": "2026-06-01",
+              "message_id": "ah3LooI6IVQBZ9P1@lucifer",
+              "analysis_source": "llm",
+              "email": "ljs@kernel.org"
+            },
+            {
+              "author": "Dev Jain",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "2026-06-02",
+              "message_id": "0ab810b9-8644-4562-8218-c9a1d4ddd423@arm.com",
+              "analysis_source": "heuristic",
+              "email": "dev.jain@arm.com"
+            },
+            {
+              "author": "Dev Jain",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "2026-06-02",
+              "message_id": "47959866-1289-41ba-9cb4-dea33fe8b721@arm.com",
+              "analysis_source": "heuristic",
+              "email": "dev.jain@arm.com"
+            }
+          ],
+          "list_id": "linux-kernel@vger.kernel.org"
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH 0/6] userfaultfd/pagemap: pre-existing fixes",
+          "message_id": "ah2S7MJ2VK6R-NSN@thinkstation",
+          "url": "https://lore.kernel.org/all/ah2S7MJ2VK6R-NSN@thinkstation/",
+          "date": "2026-06-01T14:17:33Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "The patchset is being held up due to pre-existing fixes and potential conflicts.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Kiryl Shutsemau",
+              "summary": "The patchset seems to be passed now, but there are concerns about potential conflicts and bandwidth for further review.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "WAITING_FOR_REVIEW"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": ""
+            },
+            {
+              "author": "David Hildenbrand (Arm)",
+              "summary": "Suspects a minor conflict with an incoming fix from Lorenzo and suggests putting the patch into mm-unstable early after the next release.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "WAITING_FOR_REVIEW"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "",
+              "reply_to": "Kiryl Shutsemau",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": ""
+            }
+          ],
+          "list_id": "linux-kernel@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v5 04/18] mm: skip out-of-range bits in mk_vma_flags()",
+          "message_id": "ah2SL2c0nMj0KBtP@thinkstation",
+          "url": "https://lore.kernel.org/all/ah2SL2c0nMj0KBtP@thinkstation/",
+          "date": "2026-06-01T14:08:30Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm",
+          "review_comments": [],
+          "list_id": "kvm@vger.kernel.org"
+        }
+      ],
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
