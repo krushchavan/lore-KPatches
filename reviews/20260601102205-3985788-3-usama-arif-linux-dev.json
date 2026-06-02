@@ -1,0 +1,32 @@
+{
+  "thread_id": "20260601102205.3985788-3-usama.arif@linux.dev",
+  "subject": "[PATCH v7 2/2] mm: use mapping_max_folio_order() for force_thp_readahead order",
+  "url": "https://lore.kernel.org/all/20260601102205.3985788-3-usama.arif@linux.dev/",
+  "dates": {
+    "2026-06-01": {
+      "report_file": "2026-06-01_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Jan Kara",
+          "summary": "Identified the need for the change and expressed agreement with its implementation. Suggested adding a Reviewed-by tag.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "LGTM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Mon 01-06-26 03:21:18, Usama Arif wrote:\n> The force_thp_readahead path in do_sync_mmap_readahead() is gated on\n> HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER and always requests\n> HPAGE_PMD_ORDER / HPAGE_PMD_NR. On configurations where HPAGE_PMD_ORDER\n> exceeds MAX_PAGECACHE_ORDER, notably arm64 with a 64K base page size,\n> VM_HUGEPAGE mappings cannot use this path and fall back to the non-forced\n> mmap readahead path even when the mapping supports useful large folios.\n> \n> Enable forced readahead for mappings that support large folios and request\n> the max folio order supported by the mapping, capped at 2M.\n> 2MB is chosen as the cap because it matches the PMD size on x86_64\n> and on arm64 with 4K base pages, so the size/memory-pressure tradeoff\n> for folios of that size is already well understood. On arm64 with 16K\n> and 64K base page sizes, 2MB is also the contiguous-PTE (contpte)\n> block size, so the resulting folios coalesce into a single TLB entry\n> and reduce TLB pressure on the readahead path. This will result\n> in 32M folios not being faulted in with 16K base page size for arm64,\n> but with contpte, the performance difference should be negligible.\n> \n> The final allocation order may still be clamped by page_cache_ra_order()\n> to the mapping and request geometry, but this gives VM_HUGEPAGE mappings\n> on such configurations a large-folio readahead request instead of\n> dropping back to base-page readahead.\n> \n> Signed-off-by: Usama Arif <usama.arif@linux.dev>\n\nLooks good to me. Feel free to add:\n\nReviewed-by: Jan Kara <jack@suse.cz>\n\n\t\t\t\t\t\t\t\tHonza\n\n> ---\n>  mm/filemap.c | 30 ++++++++++++++++++++++--------\n>  1 file changed, 22 insertions(+), 8 deletions(-)\n> \n> diff --git a/mm/filemap.c b/mm/filemap.c\n> index a16b33e0fc71..9cf89efaf3f1 100644\n> --- a/mm/filemap.c\n> +++ b/mm/filemap.c\n> @@ -3312,14 +3312,26 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)\n>  \tstruct file *fpin = NULL;\n>  \tvm_flags_t vm_flags = vmf->vma->vm_flags;\n>  \tbool force_thp_readahead = false;\n> +\tunsigned int thp_order = 0;\n>  \tunsigned short mmap_miss;\n>  \n>  \tractl._max_index = vmf->vma->vm_pgoff + vma_pages(vmf->vma) - 1;\n>  \n>  \t/* Use the readahead code, even if readahead is disabled */\n> -\tif (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&\n> -\t    (vm_flags & VM_HUGEPAGE) && HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER)\n> -\t\tforce_thp_readahead = true;\n> +\tif (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && (vm_flags & VM_HUGEPAGE)) {\n> +\t\t/*\n> +\t\t * Cap max THP order at 2MB: this is the common PMD-sized\n> +\t\t * hugepage size, and it avoids memory pressure from very\n> +\t\t * large forced readahead when mapping_max_folio_order() is\n> +\t\t * high (for example, 128MB with 64K base pages on arm64).\n> +\t\t */\n> +\t\tif (mapping_large_folio_support(mapping)) {\n> +\t\t\tforce_thp_readahead = true;\n> +\t\t\tthp_order = min_t(unsigned int,\n> +\t\t\t\t\t  mapping_max_folio_order(mapping),\n> +\t\t\t\t\t  get_order(SZ_2M));\n> +\t\t}\n> +\t}\n>  \n>  \tif (!force_thp_readahead) {\n>  \t\t/*\n> @@ -3354,17 +3366,19 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)\n>  \t}\n>  \n>  \tif (force_thp_readahead) {\n> +\t\tunsigned long folio_nr_pages = 1UL << thp_order;\n> +\n>  \t\tfpin = maybe_unlock_mmap_for_io(vmf, fpin);\n> -\t\tractl._index &= ~((unsigned long)HPAGE_PMD_NR - 1);\n> -\t\tra->size = HPAGE_PMD_NR;\n> +\t\tractl._index &= ~(folio_nr_pages - 1);\n> +\t\tra->size = folio_nr_pages;\n>  \t\t/*\n> -\t\t * Fetch two PMD folios, so we get the chance to actually\n> +\t\t * Fetch two folios so we get the chance to actually\n>  \t\t * readahead, unless we've been told not to.\n>  \t\t */\n>  \t\tif (!(vm_flags & VM_RAND_READ))\n>  \t\t\tra->size *= 2;\n> -\t\tra->async_size = HPAGE_PMD_NR;\n> -\t\tra->order = HPAGE_PMD_ORDER;\n> +\t\tra->async_size = folio_nr_pages;\n> +\t\tra->order = thp_order;\n>  \t\tpage_cache_ra_order(&ractl, ra);\n>  \t\treturn fpin;\n>  \t}\n> -- \n> 2.52.0\n> \n-- \nJan Kara <jack@suse.com>\nSUSE Labs, CR\n",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-06-01",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series modifies the force_thp_readahead path in do_sync_mmap_readahead() to use mapping_max_folio_order() for VM_HUGEPAGE mappings, allowing them to request the maximum folio order supported by the mapping. This change is particularly relevant on arm64 configurations with 64K base page sizes, where it enables large-folio readahead requests instead of falling back to base-page readahead."
+    }
+  }
+}

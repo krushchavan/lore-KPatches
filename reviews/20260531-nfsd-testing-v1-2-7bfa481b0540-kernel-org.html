@@ -238,9 +238,207 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 2/6] nfsd: release path refs on follow_down() error</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260531-nfsd-testing-v1-2-7bfa481b0540@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-31</strong><div class="date-range-nav">Active on: <a href="#2026-05-31">2026-05-31</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a memory leak in the NFS daemon by releasing path references when follow_down() fails. The issue occurs because the error handling for follow_down() does not properly release the mntget() and dget() references taken on entry, leading to increased reference counts that can block unmounts and pin dentries against the shrinker. The patch adds a call to path_put(&amp;path) before exiting the error handling branch in nfsd_cross_mnt(), ensuring that these references are properly released even when follow_down() fails.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-05-31</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-01</strong><div class="date-range-nav">Active on: <a href="#2026-06-01">2026-06-01</a> &bull; <a href="#2026-05-31">2026-05-31</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a memory leak in the NFS server by releasing path references when follow_down() fails. The issue occurs because the error handling arm in nfsd_cross_mnt() does not call path_put(&amp;path) to release the references taken on entry, leading to inflated mount and dentry counts that can block umount and pin dentries against the shrinker. The patch adds a call to path_put(&amp;path) before the goto out statement in the err &lt; 0 arm to fix this issue.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Al Viro</span>
+<a class="date-chip" href="../2026-06-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-01">2026-06-01</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Al Viro noted that the patch is untested and suggested a cleanup to move path_put() calls past the point where codepaths join, keeping the ordering between path_put() and exp_put().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Not a problem, but it&#x27;s completely untested.  It compiles, but...
+
+unify cleanups in nfsd_cross_mnt() exits
+
+Instead of having a separate path_put() on each failure exit, as well as
+on the normal path, let&#x27;s move all of those past the point where these
+codepaths join.  We want to keep the ordering between path_put() and
+exp_put(), so move that one as well.
+
+Signed-off-by: Al Viro &lt;viro@zeniv.linux.org.uk&gt;
+---
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 95ce15440492..cfac0cc4207c 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -137,20 +137,19 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
+ 		follow_flags = LOOKUP_AUTOMOUNT;
+ 
+ 	err = follow_down(&amp;path, follow_flags);
+-	if (err &lt; 0) {
+-		path_put(&amp;path);
++	if (err &lt; 0)
+ 		goto out;
+-	}
++
+ 	if (path.mnt == exp-&gt;ex_path.mnt &amp;&amp; path.dentry == dentry &amp;&amp;
+ 	    nfsd_mountpoint(dentry, exp) == 2) {
+ 		/* This is only a mountpoint in some other namespace */
+-		path_put(&amp;path);
+ 		goto out;
+ 	}
+ 
+ 	exp2 = rqst_exp_get_by_name(rqstp, &amp;path);
+ 	if (IS_ERR(exp2)) {
+ 		err = PTR_ERR(exp2);
++		exp2 = NULL;
+ 		/*
+ 		 * We normally allow NFS clients to continue
+ 		 * &quot;underneath&quot; a mountpoint that is not exported.
+@@ -160,10 +159,7 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
+ 		 */
+ 		if (err == -ENOENT &amp;&amp; !(exp-&gt;ex_flags &amp; NFSEXP_V4ROOT))
+ 			err = 0;
+-		path_put(&amp;path);
+-		goto out;
+-	}
+-	if (nfsd_v4client(rqstp) ||
++	} else if (nfsd_v4client(rqstp) ||
+ 		(exp-&gt;ex_flags &amp; NFSEXP_CROSSMOUNT) || EX_NOHIDE(exp2)) {
+ 		/* successfully crossed mount point */
+ 		/*
+@@ -177,9 +173,10 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
+ 		*expp = exp2;
+ 		exp2 = exp;
+ 	}
+-	path_put(&amp;path);
+-	exp_put(exp2);
+ out:
++	path_put(&amp;path);
++	if (exp2)
++		exp_put(exp2);
+ 	return err;
+ }</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/20260601193139.GK2636677@ZenIV" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, cleanup suggestion</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-06-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-01">2026-06-01</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author agrees that the feedback from Al Viro is reasonable and suggests sending a cleanup patch on top of Chuck&#x27;s tree.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Looks reasonable. Chuck has already taken this patch into his tree, but
+we could do a cleanup on top. Want to send us an &quot;official&quot; patch?
+
+Thanks,
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Al Viro</div>
+<a href="https://lore.kernel.org/r/8080069f52abd6d6c6dc199c52e6b14e961f3cc8.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreement, collaboration</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-06-01">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Al Viro</span>
+<a class="date-chip" href="../2026-06-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-01">2026-06-01</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Al Viro suggested unifying the path_put() calls by adding it to a common exit point, rather than duplicating it in multiple error paths.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Might be better to unify all those path_put()...  Something like this,
+perhaps?
+
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index eafdf7b7890f..bdcd78f49112 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -141,13 +141,13 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
+ 	if (path.mnt == exp-&gt;ex_path.mnt &amp;&amp; path.dentry == dentry &amp;&amp;
+ 	    nfsd_mountpoint(dentry, exp) == 2) {
+ 		/* This is only a mountpoint in some other namespace */
+-		path_put(&amp;path);
+ 		goto out;
+ 	}
+ 
+ 	exp2 = rqst_exp_get_by_name(rqstp, &amp;path);
+ 	if (IS_ERR(exp2)) {
+ 		err = PTR_ERR(exp2);
++		exp2 = NULL;
+ 		/*
+ 		 * We normally allow NFS clients to continue
+ 		 * &quot;underneath&quot; a mountpoint that is not exported.
+@@ -157,10 +157,7 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
+ 		 */
+ 		if (err == -ENOENT &amp;&amp; !(exp-&gt;ex_flags &amp; NFSEXP_V4ROOT))
+ 			err = 0;
+-		path_put(&amp;path);
+-		goto out;
+-	}
+-	if (nfsd_v4client(rqstp) ||
++	} else if (nfsd_v4client(rqstp) ||
+ 		(exp-&gt;ex_flags &amp; NFSEXP_CROSSMOUNT) || EX_NOHIDE(exp2)) {
+ 		/* successfully crossed mount point */
+ 		/*
+@@ -174,9 +171,10 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
+ 		*expp = exp2;
+ 		exp2 = exp;
+ 	}
+-	path_put(&amp;path);
+-	exp_put(exp2);
+ out:
++	path_put(&amp;path);
++	if (exp2)
++		exp_put(exp2);
+ 	return err;
+ }</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/20260601184715.GJ2636677@ZenIV" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-06-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-01">2026-06-01</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer suggested replacing the patch with one from an existing nfsd-testing branch, indicating that the current patch is not necessary.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">We can replace any of the patches already in nfsd-testing, it&#x27;s a topic
+branch.
+
+
+-- 
+Chuck Lever</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/ba5047f3-c24f-4005-9468-9c08a9d653e2@oracle.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: no clear signal</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
