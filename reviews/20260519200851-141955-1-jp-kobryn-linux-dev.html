@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] mm/compaction: cap compact_gap() at COMPACT_CLUSTER_MAX</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260519200851.141955-1-jp.kobryn@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-01</strong><div class="date-range-nav">Active on: <a href="#2026-06-01">2026-06-01</a> &bull; <a href="#2026-05-28">2026-05-28</a> &bull; <a href="#2026-05-26">2026-05-26</a> &bull; <a href="#2026-05-25">2026-05-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch limits the value returned by compact_gap() to prevent over-reserving memory for compaction, which can lead to unnecessary reclaim and failed compaction suitability checks. The current implementation returns a gap that scales exponentially with order, but is bounded by COMPACT_CLUSTER_MAX. By capping this value at COMPACT_CLUSTER_MAX, the patch aims to improve compaction success rates and reduce unnecessary reclaim on fragmented production hosts.</div></div>
+    <div class="date-range">Submitted: <strong>2026-05-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-02</strong><div class="date-range-nav">Active on: <a href="#2026-06-02">2026-06-02</a> &bull; <a href="#2026-06-01">2026-06-01</a> &bull; <a href="#2026-05-28">2026-05-28</a> &bull; <a href="#2026-05-26">2026-05-26</a> &bull; <a href="#2026-05-25">2026-05-25</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch caps the compact_gap() function at COMPACT_CLUSTER_MAX to prevent kswapd from getting stuck in high-order reclaim mode when compaction is not suitable, leading to earlier fallback to order-0 balancing and waking up kcompactd for the original high-order request. This change addresses an issue where compaction_suitable() remains false due to the effective threshold being too low, causing kswapd to keep reclaiming in high-order mode. The patch aims to improve system performance by allowing compaction to become suitable sooner and reducing unnecessary high-order reclaim efforts.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-05-25">
 <div class="review-comment">
@@ -498,6 +498,68 @@ COMPACT_CLUSTER_MAX cap.</pre>
 <div class="reply-to-label">&#8627; replying to Vlastimil (SUSE)</div>
 <a href="https://lore.kernel.org/r/b17dd2a3-8ca3-484e-8398-e5423f5df9c4@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: clarification, explanation, acknowledged a specific scenario</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-06-02">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Vlastimil (SUSE)</span>
+<a class="date-chip" href="../2026-06-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-02">2026-06-02</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the current implementation of compact_gap() in kswapd_shrink_node() may not be effective due to a mismatch between various heuristics, specifically that sc-&gt;nr_reclaimed is capped by SWAP_CLUSTER_MAX before reaching the compact_gap threshold. They suggested reducing the sc-&gt;nr_reclaimed threshold to 2*COMPACT_CLUSTER_MAX instead of changing compact_gap() globally.
+
+Reviewer Vlastimil pointed out that the compact_gap() cutoff is not based on a watermark+gap threshold, but instead wants to reclaim at least gap pages regardless of how many pages are already free.
+
+Reviewer Vlastimil suggested addressing the sc-&gt;nr_reclaimed usage before capping compact_gap() at COMPACT_CLUSTER_MAX, to determine if it is sufficient to resolve the issue.
+
+Reviewer Vlastimil (SUSE) initially misunderstood the issue and thought the reclaim-only target was based on watermark+gap, but later realized it&#x27;s actually based on &#x27;reclaim gap worth of pages&#x27;. They suggested relaxing sc-&gt;nr_reclaimed instead.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Oh I see, thanks for explaining. I think it makes sense to target this
+particular part (checking sc-&gt;nr_reclaimed) than change compact_gap()
+globally then? It seems we have some mismatch in the various heuristics? IIUC:
+
+- in shrink_node() we have a should_continue_reclaim() call, which will
+return false as soon as compaction is suitable, but before that, we are
+likely to not accumulate enough sc-&gt;nr_reclaimed, because sc-&gt;nr_to_reclaim
+would be capped by SWAP_CLUSTER_MAX&#x27;s
+
+- thus we won&#x27;t pass the sc-&gt;nr_reclaimed &gt;= compact_gap check in
+kswapd_shrink_node()
+
+- balance_pgdat() will keep looping because we&#x27;re not raising priority
+(kswapd_shrink_node() returned a high order) and pgdat_balanced() is false
+(it checks for high-order page availability)
+
+Maybe only reduce the sc-&gt;nr_reclaimed threshold to 2*COMPACT_CLUSTER_MAX then?
+
+---
+
+And the problem is with the cutoff only which is not based on a
+watermark+gap threshold but wants to reclaim at least gap pages regardless
+of how many pages are already free.
+
+---
+
+Still I&#x27;d try to address the sc-&gt;nr_reclaimed usage first, and see if that&#x27;s
+enough.
+
+---
+
+My question was based on not understanding the underlying issue, and that
+the &quot;reclaim-only target&quot; isn&#x27;t based on watermark+gap but &quot;reclaim gap
+worth of pages&quot;.  Now I think sc-&gt;nr_reclaimed is indeed the check that
+should be relaxed first.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to JP Kobryn</div>
+<a href="https://lore.kernel.org/r/71edb773-d156-49e6-ba6c-8159665a2dbc@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: mismatch in heuristics, suggested alternative solution, oversized gap</div>
+</div>
+</div>
 </div>
 </div>
 </div>
