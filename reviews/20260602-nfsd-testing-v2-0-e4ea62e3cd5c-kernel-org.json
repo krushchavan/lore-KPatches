@@ -1,0 +1,110 @@
+{
+  "thread_id": "20260602-nfsd-testing-v2-0-e4ea62e3cd5c@kernel.org",
+  "subject": "[PATCH v2 0/9] nfsd: fixes for locally-triggerable bugs",
+  "url": "https://lore.kernel.org/all/20260602-nfsd-testing-v2-0-e4ea62e3cd5c@kernel.org/",
+  "dates": {
+    "2026-06-03": {
+      "report_file": "2026-06-03_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Chuck Lever",
+          "summary": "Reviewer noted that multiple LLM reviewers had difficulties with the patch, but did not specify any technical issues or concerns.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "multiple reviewers had difficulty"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "It seems that all of the LLM reviewers have difficulty with this patch.\nThis is a consolidated review of the issue from Claude and Codex:",
+          "reply_to": "",
+          "message_date": "2026-06-03",
+          "message_id": "efb19b50-6535-480d-9630-37f53a8de3cd@app.fastmail.com",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "The author addressed a concern about a potential use-after-free (UAF) bug in the nfsd_file_dispose_list_delayed() function, explaining that the struct net is guaranteed to be live at the point where get_net() is called. The author argues that the placement of get_net() is correct and ensures that nf_net remains valid for an arbitrarily long time.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I had claude review this and it says:\n\n● This is the same concern I just addressed for the previous patch's Finding 3, restated as a\n  critical bug. The answer is the same: this is a false positive.\n\n  The reviewer's scenario requires:\n\n  1. The global shrinker unhashes and isolates an nfsd_file onto a local dispose list\n  2. The net namespace teardown completes and struct net is freed\n  3. The shrinker resumes and calls get_net() on freed memory\n\n  Step 2 cannot happen before step 3. Here's why:\n\n  The net namespace struct net is reference-counted. It isn't freed when nfsd_net_exit() runs --\n  nfsd_net_exit() is a pernet subsys callback that runs during net namespace teardown, but the\n  struct net itself stays alive until its own refcount drops to zero. The struct net outlives all\n  pernet exit callbacks.\n\n  More importantly, nfsd_file_dispose_list_delayed() is called from exactly three places:\n  - nfsd_file_gc() -- the GC delayed work\n  - nfsd_file_lru_scan() -- the shrinker\n  - nfsd_file_close_inode() -- fsnotify\n\n  All three isolate items and call nfsd_file_dispose_list_delayed() in a single, synchronous\n  function call. There's no point where a local dispose list sits around waiting while the net\n  namespace is torn down. The isolation and the get_net() happen in the same execution context.\n\n  The shrinker and GC worker are global and remain registered until nfsd_file_cache_shutdown()\n  (global teardown). Per-net teardown via nfsd_file_cache_shutdown_net() does not unregister them.\n  But the files they process were allocated while the net namespace was alive, and nf->nf_net was\n  set at allocation time in nfsd_file_alloc(). The struct net cannot have a zero refcount while nfsd\n  files referencing it still exist in the LRU -- the nfsd server itself holds net references\n  through its operation.\n\n  The get_net() here is not protecting against the current dereference being unsafe. It's ensuring\n  that nf_net remains valid for the arbitrarily long time the file sits on the per-net dispose list\n  waiting for an nfsd thread to close it. That's exactly the right pattern.\n\n  Verdict: False positive. The get_net() placement is correct and the struct net is guaranteed to be\n  live at this point.\n\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "Chuck Lever",
+          "message_date": "2026-06-03",
+          "message_id": "fc86e230bf1962840c9b045680600f67378f7126.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Chuck Lever",
+          "summary": "The reviewer pointed out two new issues in patch 8/9: (1) after an I/O completion thread executes nfsd_net_put(), there is no guarantee that nfsd_shutdown_net() will not continue through percpu_ref_exit() and nfsd_file_cache_shutdown() before the next line of code, which puts the file ref first; this ordering was removed by the patch without installing a replacement, leaving a potential stale-net hazard. (2) in the dispose_list_delayed() function, get_net(nf->nf_net) touches freed memory if a worker is preempted between isolating a file and calling dispose_list_delayed(), because cleanup_net() has already freed the namespace.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "potential stale-net hazard",
+            "touching freed memory"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "That rebuttal answers a different finding. The three-step scenario it\nrefutes is the one sashiko raised against the get_net() placement in\nnfsd_file_dispose_list_delayed(). The review quoted above is about\nthe put order in nfsd_file_put_local() and does not involve struct\nnet's refcount at any step. Two new issues appear with 8/9:\n\n1. Put order in nfsd_file_put_local()\n  \nThe question is narrow: after an I/O completion thread executes\nnfsd_net_put() -- dropping the last nfsd_net_ref and running\ncomplete(&nn->nfsd_net_free_done) -- what prevents nfsd_shutdown_net()\nfrom continuing through percpu_ref_exit() and nfsd_shutdown_generic()\ninto nfsd_file_cache_shutdown() before that same thread executes the\nnfsd_file_put() on the next line?\n\nIn the current code the answer is the ref itself: the caller holds it\nacross nfsd_file_put(), and percpu_ref runs the release callback only\nafter every ref drops, so global teardown strictly follows the file\nfree and the rcu_barrier() in nfsd_file_cache_shutdown() flushes the\ncall_rcu() that nfsd_file_free() queued. The patch removes that\nordering and installs nothing in its place.\n\nThe nfs_uuid handshake does not cover this path: each pgio holds its\nown nfsd_file + nfsd_net ref pair (fs/nfs/pagelist.c, stored in\niocb->localio), released at I/O completion through\nnfsd_file_put_local(), and an iocb is not on nfs_uuid->files. The\npurge has already unhashed the file but cannot free it\n(nfsd_file_cond_queue() sees the elevated refcount), so the\ncompletion thread's put is the final one and its nfsd_file_free()\nraces kmem_cache_destroy(nfsd_file_slab).\n\nThe stale-net hazard the commit message cites cannot occur on this\npath: NFSD_FILE_NET_HELD is set only via refcount_dec_if_one() in\nnfsd_file_lru_cb(), i.e. at refcount == 1, and a file with an\noutstanding LOCALIO reference has refcount >= 2. So the fix is to\nkeep the void API but put the file ref first, then the net ref.\n\n2. get_net() placement in nfsd_file_dispose_list_delayed()\n\nThe rebuttal's struct-net argument does not hold for the files in\nquestion: they are no longer on the LRU (nfsd_file_lru_cb() unhashed\nand isolated them onto the worker's private list), and an nfsd_file\nholds no net reference -- that absence is what this patch is fixing.\n\nThe commit message itself states the premise: the purge cannot see\nthese files and nf_net can dangle. With a second nfsd-serving netns\nkeeping nfsd_users > 0, nothing quiesces the shrinker or the\nlaundrette during per-net teardown (cancel_delayed_work_sync() and\nshrinker_free() run only in global shutdown).\n\nA worker preempted between isolating a file and calling\ndispose_list_delayed() can resume after cleanup_net() has freed the\nnamespace, at which point get_net(nf->nf_net), net_generic(), and\nthe fcache_dispose_lock all touch freed memory. The get_net() sits\nat the consuming end of the window it is meant to close. v1 took\nthe reference in nfsd_file_alloc(), the one place guaranteed to run\nwhile the net is alive; the v2 plan of taking it at alloc time for\nGC-capable files only would address Al's cacheline concern without\nreopening the window.\n\n\nAs a process note, I'll note that I haven't found any non-pre-\nexisting issues with the other patches on this series.\n\n\n-- \nChuck Lever",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-06-03",
+          "message_id": "0d16e520-3e78-4b2b-b624-4376a1f0e075@app.fastmail.com",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author agreed that a fix is needed for nfsd4_release_compoundargs() ordering issue and will restructure in v2.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "convinced",
+            "fairly straightforward"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ok, I'm convinced, and the fix looks fairly straightforward.\n\nIf you're ok with merging the rest of the set, I'll plan to resend this\none separately.\n\nThanks,\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "Chuck Lever",
+          "message_date": "2026-06-03",
+          "message_id": "a73e18542a62c33954279878a9ca01c0ec182cb9.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Chuck Lever",
+          "summary": "Reviewer noted that the patch does not address a potential deadlock in nfsd_file_net_dispose() due to acquiring the per-vswap spinlock while holding the folio lock, and requested that the lock be dropped before calling try_to_unmap().\n\nReviewer noted that the patch does not address a potential issue where nfsd_file_net_dispose() can dereference nfsd_serv after it has been freed, and requested that the patch be updated to handle this case.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "potential deadlock",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "From: Chuck Lever <chuck.lever@oracle.com>\n\nOn Tue, 02 Jun 2026 12:23:12 -0400, Jeff Layton wrote:\n\n---\n\nApplied to nfsd-testing, thanks!\n\n[1/9] nfsd: defer vfree of compound ops to fix rpc_status UAF\n      commit: 45bdeda0ff0e26e43b5c84ead5a8859696df4a24\n[2/9] nfsd: hold rcu across localio cmpxchg retry\n      commit: 3132933172044d02951470c99c8cbbe54756ae45\n[3/9] nfs/localio: fix ref leak on nfs_uuid_add_file failure\n      (no commit info)\n[4/9] nfsd: guard nfsd_serv deref in nfsd_file_net_dispose\n      commit: a6dfbd5e70527b91d610bd4864d9de725b06c5ba\n[5/9] nfsd: widen nfsd_genl_rqstp address fields to sockaddr_storage\n      commit: a9a83f4a2b3d065f26efb7dd8153fecd55f10622\n[6/9] nfsd: fix refcount leak in nfsd_file_lru_add on insertion failure\n      commit: d72ae7cbbf14e2f0bc4bc5fecc06c12180fd5b66\n[7/9] nfsd: fix fcache_disposal UAF by inlining dispose state into nfsd_net\n      commit: fcafdda0423b27637a27594ec81b9b07ab6069e1\n[9/9] nfsd: unify cleanups in nfsd_cross_mnt() exits\n      commit: 3275806873389963d81e9ddd17d047e7c1812f3b\n\n--\nChuck Lever <chuck.lever@oracle.com>",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-06-03",
+          "message_id": "178051856666.140576.1367986078304916981.b4-ty@b4",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series addresses several bugs in the NFS daemon (nfsd) that can be triggered by a local user, including some that require administrative access. The patches simplify file cache disposal and fix issues related to reference counting, memory management, and cleanup operations. They also unify cleanups in nfsd_cross_mnt() exits and address potential use-after-free bugs. The changes aim to improve the stability and security of the NFS daemon by fixing these locally-triggerable bugs."
+    }
+  }
+}

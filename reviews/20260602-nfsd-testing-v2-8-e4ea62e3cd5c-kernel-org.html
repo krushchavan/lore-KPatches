@@ -238,9 +238,206 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 8/9] nfsd: hold net namespace reference for delayed-dispose nfsd_files</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260602-nfsd-testing-v2-8-e4ea62e3cd5c@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-02</strong><div class="date-range-nav">Active on: <a href="#2026-06-02">2026-06-02</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a use-after-free bug in the NFS server by ensuring that a reference to the network namespace is held until an nfsd_file is fully disposed of. The patch introduces a new flag NFSD_FILE_NET_HELD to track whether an nfsd_file holds a net reference, and modifies the nfsd_file_free function to release this reference before freeing the file. Additionally, it moves the call to put_net in nfsd_file_put_local to ensure that the net reference is released before the file reference, preventing potential stale pointer issues.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-06-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-03</strong><div class="date-range-nav">Active on: <a href="#2026-06-03">2026-06-03</a> &bull; <a href="#2026-06-02">2026-06-02</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a use-after-free issue in the NFS daemon by introducing a new flag, NFSD_FILE_NET_HELD, to track whether an nfsd_file holds a net reference. It takes a net-namespace reference in nfsd_file_dispose_list_delayed() and releases it in nfsd_file_free(). The patch also updates nfsd_file_put_local() to release the net reference before dropping the file reference, ensuring that the returned pointer remains valid.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-06-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-03">2026-06-03</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a concern about potential use-after-free when nfsd_file_dispose_list_delayed() calls net_generic(), agreed to restructure the patch in v2 and will resend it separately.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Ok, I&#x27;m convinced, and the fix looks fairly straightforward.
+
+If you&#x27;re ok with merging the rest of the set, I&#x27;ll plan to resend this
+one separately.
+
+Thanks,
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Chuck Lever</div>
+<a href="https://lore.kernel.org/r/a73e18542a62c33954279878a9ca01c0ec182cb9.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a concern, agreed to restructure</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-06-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-03">2026-06-03</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Chuck Lever raised two concerns: (1) in nfsd_file_put_local(), the patch removes a necessary ordering between file ref and net ref release, potentially causing a stale-net hazard; he suggested putting the file ref first to ensure proper ordering. (2) in nfsd_file_dispose_list_delayed(), the get_net() placement is incorrect because it can lead to touching freed memory if a worker is preempted between isolating a file and calling dispose_list_delayed(); he proposed taking the reference at alloc time for GC-capable files only, as done in v1.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">That rebuttal answers a different finding. The three-step scenario it
+refutes is the one sashiko raised against the get_net() placement in
+nfsd_file_dispose_list_delayed(). The review quoted above is about
+the put order in nfsd_file_put_local() and does not involve struct
+net&#x27;s refcount at any step. Two new issues appear with 8/9:
+
+1. Put order in nfsd_file_put_local()
+  
+The question is narrow: after an I/O completion thread executes
+nfsd_net_put() -- dropping the last nfsd_net_ref and running
+complete(&amp;nn-&gt;nfsd_net_free_done) -- what prevents nfsd_shutdown_net()
+from continuing through percpu_ref_exit() and nfsd_shutdown_generic()
+into nfsd_file_cache_shutdown() before that same thread executes the
+nfsd_file_put() on the next line?
+
+In the current code the answer is the ref itself: the caller holds it
+across nfsd_file_put(), and percpu_ref runs the release callback only
+after every ref drops, so global teardown strictly follows the file
+free and the rcu_barrier() in nfsd_file_cache_shutdown() flushes the
+call_rcu() that nfsd_file_free() queued. The patch removes that
+ordering and installs nothing in its place.
+
+The nfs_uuid handshake does not cover this path: each pgio holds its
+own nfsd_file + nfsd_net ref pair (fs/nfs/pagelist.c, stored in
+iocb-&gt;localio), released at I/O completion through
+nfsd_file_put_local(), and an iocb is not on nfs_uuid-&gt;files. The
+purge has already unhashed the file but cannot free it
+(nfsd_file_cond_queue() sees the elevated refcount), so the
+completion thread&#x27;s put is the final one and its nfsd_file_free()
+races kmem_cache_destroy(nfsd_file_slab).
+
+The stale-net hazard the commit message cites cannot occur on this
+path: NFSD_FILE_NET_HELD is set only via refcount_dec_if_one() in
+nfsd_file_lru_cb(), i.e. at refcount == 1, and a file with an
+outstanding LOCALIO reference has refcount &gt;= 2. So the fix is to
+keep the void API but put the file ref first, then the net ref.
+
+2. get_net() placement in nfsd_file_dispose_list_delayed()
+
+The rebuttal&#x27;s struct-net argument does not hold for the files in
+question: they are no longer on the LRU (nfsd_file_lru_cb() unhashed
+and isolated them onto the worker&#x27;s private list), and an nfsd_file
+holds no net reference -- that absence is what this patch is fixing.
+
+The commit message itself states the premise: the purge cannot see
+these files and nf_net can dangle. With a second nfsd-serving netns
+keeping nfsd_users &gt; 0, nothing quiesces the shrinker or the
+laundrette during per-net teardown (cancel_delayed_work_sync() and
+shrinker_free() run only in global shutdown).
+
+A worker preempted between isolating a file and calling
+dispose_list_delayed() can resume after cleanup_net() has freed the
+namespace, at which point get_net(nf-&gt;nf_net), net_generic(), and
+the fcache_dispose_lock all touch freed memory. The get_net() sits
+at the consuming end of the window it is meant to close. v1 took
+the reference in nfsd_file_alloc(), the one place guaranteed to run
+while the net is alive; the v2 plan of taking it at alloc time for
+GC-capable files only would address Al&#x27;s cacheline concern without
+reopening the window.
+
+
+As a process note, I&#x27;ll note that I haven&#x27;t found any non-pre-
+existing issues with the other patches on this series.
+
+
+-- 
+Chuck Lever</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/0d16e520-3e78-4b2b-b624-4376a1f0e075@app.fastmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: ordering issue, potential stale-net hazard</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-06-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-03">2026-06-03</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addresses a concern about the safety of holding a net namespace reference for delayed-dispose nfsd_files, explaining that the struct net is guaranteed to be live at the point where get_net() is called and that the placement of get_net() is correct. The author asserts that this is not a real bug but rather a false positive.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I had claude review this and it says:
+
+● This is the same concern I just addressed for the previous patch&#x27;s Finding 3, restated as a
+  critical bug. The answer is the same: this is a false positive.
+
+  The reviewer&#x27;s scenario requires:
+
+  1. The global shrinker unhashes and isolates an nfsd_file onto a local dispose list
+  2. The net namespace teardown completes and struct net is freed
+  3. The shrinker resumes and calls get_net() on freed memory
+
+  Step 2 cannot happen before step 3. Here&#x27;s why:
+
+  The net namespace struct net is reference-counted. It isn&#x27;t freed when nfsd_net_exit() runs --
+  nfsd_net_exit() is a pernet subsys callback that runs during net namespace teardown, but the
+  struct net itself stays alive until its own refcount drops to zero. The struct net outlives all
+  pernet exit callbacks.
+
+  More importantly, nfsd_file_dispose_list_delayed() is called from exactly three places:
+  - nfsd_file_gc() -- the GC delayed work
+  - nfsd_file_lru_scan() -- the shrinker
+  - nfsd_file_close_inode() -- fsnotify
+
+  All three isolate items and call nfsd_file_dispose_list_delayed() in a single, synchronous
+  function call. There&#x27;s no point where a local dispose list sits around waiting while the net
+  namespace is torn down. The isolation and the get_net() happen in the same execution context.
+
+  The shrinker and GC worker are global and remain registered until nfsd_file_cache_shutdown()
+  (global teardown). Per-net teardown via nfsd_file_cache_shutdown_net() does not unregister them.
+  But the files they process were allocated while the net namespace was alive, and nf-&gt;nf_net was
+  set at allocation time in nfsd_file_alloc(). The struct net cannot have a zero refcount while nfsd
+  files referencing it still exist in the LRU -- the nfsd server itself holds net references
+  through its operation.
+
+  The get_net() here is not protecting against the current dereference being unsafe. It&#x27;s ensuring
+  that nf_net remains valid for the arbitrarily long time the file sits on the per-net dispose list
+  waiting for an nfsd thread to close it. That&#x27;s exactly the right pattern.
+
+  Verdict: False positive. The get_net() placement is correct and the struct net is guaranteed to be
+  live at this point.
+
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Chuck Lever</div>
+<a href="https://lore.kernel.org/r/fc86e230bf1962840c9b045680600f67378f7126.camel@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: false positive, guaranteed to be live</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3" id="2026-06-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-06-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-03">2026-06-03</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer notes that multiple LLM (Linux Lock Manager) reviewers have expressed difficulties with this patch, but does not specify what those issues are.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">It seems that all of the LLM reviewers have difficulty with this patch.
+This is a consolidated review of the issue from Claude and Codex:</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/efb19b50-6535-480d-9630-37f53a8de3cd@app.fastmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: multiple reviewers had difficulty, no specific concerns mentioned</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
