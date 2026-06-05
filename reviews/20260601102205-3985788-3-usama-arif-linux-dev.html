@@ -238,126 +238,56 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v7 2/2] mm: use mapping_max_folio_order() for force_thp_readahead order</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260601102205.3985788-3-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-01</strong><div class="date-range-nav">Active on: <a href="#2026-06-01">2026-06-01</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the force_thp_readahead path in do_sync_mmap_readahead() to use mapping_max_folio_order() for mappings that support large folios, capping the order at 2M. This change is intended to improve performance on certain configurations by allowing VM_HUGEPAGE mappings to use a larger readahead size.</div></div>
+    <div class="date-range">Submitted: <strong>2026-06-01</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-04</strong><div class="date-range-nav">Active on: <a href="#2026-06-04">2026-06-04</a> &bull; <a href="#2026-06-01">2026-06-01</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the force_thp_readahead path in do_sync_mmap_readahead() to use mapping_max_folio_order() instead of hardcoding HPAGE_PMD_ORDER. This allows VM_HUGEPAGE mappings on certain configurations, such as arm64 with a 64K base page size, to use forced readahead for large folios. The patch caps the maximum THP order at 2M, which is a common PMD-sized hugepage size and avoids memory pressure from very large forced readahead. This change improves performance by reducing TLB pressure on the readahead path.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-06-01">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Jan Kara</span>
-<a class="date-chip" href="../2026-06-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-01">2026-06-01</a>
+<a class="date-chip" href="../2026-06-04_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-01">2026-06-01</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a good solution to improve performance on certain configurations by allowing VM_HUGEPAGE mappings to use a larger readahead size. Suggested adding Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;.</div>
+<div class="review-comment-text">Reviewer noted that the patch looks good and suggested adding a Reviewed-by tag from himself, indicating approval.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Mon 01-06-26 03:21:18, Usama Arif wrote:
-&gt; The force_thp_readahead path in do_sync_mmap_readahead() is gated on
-&gt; HPAGE_PMD_ORDER &lt;= MAX_PAGECACHE_ORDER and always requests
-&gt; HPAGE_PMD_ORDER / HPAGE_PMD_NR. On configurations where HPAGE_PMD_ORDER
-&gt; exceeds MAX_PAGECACHE_ORDER, notably arm64 with a 64K base page size,
-&gt; VM_HUGEPAGE mappings cannot use this path and fall back to the non-forced
-&gt; mmap readahead path even when the mapping supports useful large folios.
-&gt; 
-&gt; Enable forced readahead for mappings that support large folios and request
-&gt; the max folio order supported by the mapping, capped at 2M.
-&gt; 2MB is chosen as the cap because it matches the PMD size on x86_64
-&gt; and on arm64 with 4K base pages, so the size/memory-pressure tradeoff
-&gt; for folios of that size is already well understood. On arm64 with 16K
-&gt; and 64K base page sizes, 2MB is also the contiguous-PTE (contpte)
-&gt; block size, so the resulting folios coalesce into a single TLB entry
-&gt; and reduce TLB pressure on the readahead path. This will result
-&gt; in 32M folios not being faulted in with 16K base page size for arm64,
-&gt; but with contpte, the performance difference should be negligible.
-&gt; 
-&gt; The final allocation order may still be clamped by page_cache_ra_order()
-&gt; to the mapping and request geometry, but this gives VM_HUGEPAGE mappings
-&gt; on such configurations a large-folio readahead request instead of
-&gt; dropping back to base-page readahead.
-&gt; 
-&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
-
-Looks good to me. Feel free to add:
+<pre class="raw-body-text">Looks good to me. Feel free to add:
 
 Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
 
-								Honza
-
-&gt; ---
-&gt;  mm/filemap.c | 30 ++++++++++++++++++++++--------
-&gt;  1 file changed, 22 insertions(+), 8 deletions(-)
-&gt; 
-&gt; diff --git a/mm/filemap.c b/mm/filemap.c
-&gt; index a16b33e0fc71..9cf89efaf3f1 100644
-&gt; --- a/mm/filemap.c
-&gt; +++ b/mm/filemap.c
-&gt; @@ -3312,14 +3312,26 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
-&gt;  	struct file *fpin = NULL;
-&gt;  	vm_flags_t vm_flags = vmf-&gt;vma-&gt;vm_flags;
-&gt;  	bool force_thp_readahead = false;
-&gt; +	unsigned int thp_order = 0;
-&gt;  	unsigned short mmap_miss;
-&gt;  
-&gt;  	ractl._max_index = vmf-&gt;vma-&gt;vm_pgoff + vma_pages(vmf-&gt;vma) - 1;
-&gt;  
-&gt;  	/* Use the readahead code, even if readahead is disabled */
-&gt; -	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &amp;&amp;
-&gt; -	    (vm_flags &amp; VM_HUGEPAGE) &amp;&amp; HPAGE_PMD_ORDER &lt;= MAX_PAGECACHE_ORDER)
-&gt; -		force_thp_readahead = true;
-&gt; +	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &amp;&amp; (vm_flags &amp; VM_HUGEPAGE)) {
-&gt; +		/*
-&gt; +		 * Cap max THP order at 2MB: this is the common PMD-sized
-&gt; +		 * hugepage size, and it avoids memory pressure from very
-&gt; +		 * large forced readahead when mapping_max_folio_order() is
-&gt; +		 * high (for example, 128MB with 64K base pages on arm64).
-&gt; +		 */
-&gt; +		if (mapping_large_folio_support(mapping)) {
-&gt; +			force_thp_readahead = true;
-&gt; +			thp_order = min_t(unsigned int,
-&gt; +					  mapping_max_folio_order(mapping),
-&gt; +					  get_order(SZ_2M));
-&gt; +		}
-&gt; +	}
-&gt;  
-&gt;  	if (!force_thp_readahead) {
-&gt;  		/*
-&gt; @@ -3354,17 +3366,19 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
-&gt;  	}
-&gt;  
-&gt;  	if (force_thp_readahead) {
-&gt; +		unsigned long folio_nr_pages = 1UL &lt;&lt; thp_order;
-&gt; +
-&gt;  		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
-&gt; -		ractl._index &amp;= ~((unsigned long)HPAGE_PMD_NR - 1);
-&gt; -		ra-&gt;size = HPAGE_PMD_NR;
-&gt; +		ractl._index &amp;= ~(folio_nr_pages - 1);
-&gt; +		ra-&gt;size = folio_nr_pages;
-&gt;  		/*
-&gt; -		 * Fetch two PMD folios, so we get the chance to actually
-&gt; +		 * Fetch two folios so we get the chance to actually
-&gt;  		 * readahead, unless we&#x27;ve been told not to.
-&gt;  		 */
-&gt;  		if (!(vm_flags &amp; VM_RAND_READ))
-&gt;  			ra-&gt;size *= 2;
-&gt; -		ra-&gt;async_size = HPAGE_PMD_NR;
-&gt; -		ra-&gt;order = HPAGE_PMD_ORDER;
-&gt; +		ra-&gt;async_size = folio_nr_pages;
-&gt; +		ra-&gt;order = thp_order;
-&gt;  		page_cache_ra_order(&amp;ractl, ra);
-&gt;  		return fpin;
-&gt;  	}
-&gt; -- 
-&gt; 2.52.0
-&gt; 
--- 
-Jan Kara &lt;jack@suse.com&gt;
-SUSE Labs, CR
-</pre>
+								Honza</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<div class="review-comment-signals">Signals: LGTM</div>
+<a href="https://lore.kernel.org/r/yoma5mzdqkkcgjnq3qawaeytjx6cjmk7etzxnmkk53mov46sub@ldzkwojakaxs" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: patch looks good</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-06-04">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Pedro Falcato</span>
+<a class="date-chip" href="../2026-06-04_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-04">2026-06-04</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Pedro Falcato expressed a concern that the patch may introduce performance degradation, but overall approved it (LGTM) and requested further testing to confirm its impact.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Reviewed-by: Pedro Falcato &lt;pfalcato@suse.de&gt;
+
+Overall LGTM. Lets see if performance doesn&#x27;t degrade.
+
+/me hides in cover
+
+-- 
+Pedro</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/aiHSt1uK3ESOU-2O@pedro-suse" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: performance_degradation</div>
 </div>
 </div>
 </div>
