@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH 2/3] fuse: fix data races on ring-&gt;ready</title>
+    <title>Review Comments: [PATCH 1/2] mm/vmpressure: skip tree=true accounting on cgroup v2</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,98 +236,11 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH 2/3] fuse: fix data races on ring-&gt;ready</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260605192708.141921-3-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-05</strong><div class="date-range-nav">Active on: <a href="#2026-06-05">2026-06-05</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses data races in the fuse kernel module by introducing synchronization primitives to ensure that operations on ring-&gt;ready are properly ordered. The first patch fixes a data race on ring-&gt;ready, while the second and third patches address related issues.</div></div>
-    <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-06-05">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Bernd Schubert</span>
-<a class="date-chip" href="../2026-06-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-05">2026-06-05</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Provided a Reviewed-by tag without any specific comments or feedback.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">
-
-On 6/5/26 21:27, Joanne Koong wrote:
-&gt; From: Chris Mason &lt;clm@meta.com&gt;
-&gt; 
-&gt; On weakly-ordered architectures, the store to fiq-&gt;ops can be
-&gt; reordered past the store to ring-&gt;ready, allowing a CPU that sees
-&gt; ring-&gt;ready == true via fuse_uring_ready() to dispatch requests
-&gt; through a stale fiq-&gt;ops pointer. Upgrade the store to
-&gt; smp_store_release() and the load in fuse_uring_ready() to
-&gt; smp_load_acquire() so that the preceding WRITE_ONCE(fiq-&gt;ops, ...)
-&gt; is visible to any CPU that observes ring-&gt;ready == true.
-&gt; 
-&gt; Additionally, fuse_uring_do_register() publishes ring-&gt;ready with
-&gt; WRITE_ONCE() but the fast-path check reads it with a plain load.
-&gt; This is a marked-vs-unmarked access that KCSAN will flag. Wrap it in
-&gt; READ_ONCE() to mark it without adding unnecessary ordering.
-&gt; 
-&gt; Also wrap the fc-&gt;ring load in fuse_uring_ready() in READ_ONCE() to
-&gt; prevent the compiler from reloading it between the NULL check and the
-&gt; dereference.
-&gt; 
-&gt; Fixes: c2c9af9a0b13 (&quot;fuse: Allow to queue fg requests through io-uring&quot;)
-&gt; Cc: stable@vger.kernel.org
-&gt; Reviewed-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
-&gt; Assisted-by: kres (claude-opus-4-7)
-&gt; Signed-off-by: Chris Mason &lt;clm@meta.com&gt;
-&gt; ---
-&gt;  fs/fuse/dev_uring.c   | 4 ++--
-&gt;  fs/fuse/dev_uring_i.h | 4 +++-
-&gt;  2 files changed, 5 insertions(+), 3 deletions(-)
-&gt; 
-&gt; diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
-&gt; index e33847436693..7cd50990b097 100644
-&gt; --- a/fs/fuse/dev_uring.c
-&gt; +++ b/fs/fuse/dev_uring.c
-&gt; @@ -986,12 +986,12 @@ static void fuse_uring_do_register(struct fuse_ring_ent *ent,
-&gt;  	fuse_uring_ent_avail(ent, queue);
-&gt;  	spin_unlock(&amp;queue-&gt;lock);
-&gt;  
-&gt; -	if (!ring-&gt;ready) {
-&gt; +	if (!READ_ONCE(ring-&gt;ready)) {
-&gt;  		bool ready = is_ring_ready(ring, queue-&gt;qid);
-&gt;  
-&gt;  		if (ready) {
-&gt;  			WRITE_ONCE(fiq-&gt;ops, &amp;fuse_io_uring_ops);
-&gt; -			WRITE_ONCE(ring-&gt;ready, true);
-&gt; +			smp_store_release(&amp;ring-&gt;ready, true);
-&gt;  			wake_up_all(&amp;fch-&gt;blocked_waitq);
-&gt;  		}
-&gt;  	}
-&gt; diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
-&gt; index 368f4d0790eb..6af604e17b2d 100644
-&gt; --- a/fs/fuse/dev_uring_i.h
-&gt; +++ b/fs/fuse/dev_uring_i.h
-&gt; @@ -167,7 +167,9 @@ static inline void fuse_uring_wait_stopped_queues(struct fuse_chan *fch)
-&gt;  
-&gt;  static inline bool fuse_uring_ready(struct fuse_chan *fch)
-&gt;  {
-&gt; -	return fch-&gt;ring &amp;&amp; fch-&gt;ring-&gt;ready;
-&gt; +	struct fuse_ring *ring = READ_ONCE(fch-&gt;ring);
-&gt; +
-&gt; +	return ring &amp;&amp; smp_load_acquire(&amp;ring-&gt;ready);
-&gt;  }
-&gt;  
-&gt;  #else /* CONFIG_FUSE_IO_URING */
-
-
-Reviewed-by: Bernd Schubert &lt;bernd@bsbernd.com&gt;
-</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
-</div>
-</div>
-</div>
+    <h1>[PATCH 1/2] mm/vmpressure: skip tree=true accounting on cgroup v2</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/20260606114158.3126210-2-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-06-06</strong><div class="date-range-nav">Active on: <a href="#2026-06-06">2026-06-06</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds an early return to the vmpressure() function when cgroup version 2 is used and tree=true, skipping unnecessary work that can lead to lock contention and high CPU usage. The existing code already handled the case where cgroup version 1 was used with tree=false, but this new change addresses a similar issue for cgroup version 2 with tree=true. This patch aims to improve performance by reducing the number of vmpressure() calls and eliminating unnecessary work in the kernel.</div></div>
+    <div class="no-reviews">No review comments yet.</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
