@@ -1,0 +1,70 @@
+{
+  "thread_id": "aimSzvoJDrpeQsmM@gourry-fedora-PF4VCD3F",
+  "subject": "[LSF/MM/BPF TOPIC][RFC PATCH v4 00/27] Private Memory Nodes (w/ Compressed RAM)",
+  "url": "https://lore.kernel.org/all/aimSzvoJDrpeQsmM@gourry-fedora-PF4VCD3F/",
+  "dates": {
+    "2026-06-10": {
+      "report_file": "2026-06-10_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David requested allowing only folio allocations from private memory nodes, citing that page allocations are written in terms of page allocations and rewriting interfaces would introduce boilerplate code.\n\nReviewer David expressed concerns about the feasibility of disallowing page allocation and limiting it to folios, citing that folio allocations are written in terms of page allocations and would require significant boilerplate changes. He also suggested considering alternative approaches such as providing more context to the allocator or using the memalloc_* interface.\n\nReviewer David (Arm) noted that the current implementation of private memory nodes does not differentiate between folio and page allocations, as both ultimately call __get_pages_from_freelist(), which does not care about the distinction. He suggested adding a flag to allow slab allocations on private nodes with __GFP_THISNODE.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "alternative approaches"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes. Can we only allow folios to be allocated from private memory nodes. So let\nme reply to that one below.\n\n---\n\nAt LSF/MM we talked about how GFP flags are bad and how deriving stuff from the\ncontext might be better. I think there was also talk about how the memalloc_*\ninterface might be a better way forward. Maybe we would start giving the\nallocator more context (\"we are allocating a folio\").\n\nThe following is incomplete (esp. hugetlb stuff I assume), just as some idea:\n\n---\n\nFrom: \"David Hildenbrand (Arm)\" <david@kernel.org>\nDate: Wed, 10 Jun 2026 20:55:49 +0200\nSubject: [PATCH] tmp\n\nSigned-off-by: David Hildenbrand (Arm) <david@kernel.org>\n---\n include/linux/sched.h    |  2 +-\n include/linux/sched/mm.h | 11 +++++++++++\n mm/mempolicy.c           | 14 ++++++++++++--\n mm/page_alloc.c          |  7 ++++++-\n 4 files changed, 30 insertions(+), 4 deletions(-)\n\ndiff --git a/include/linux/sched.h b/include/linux/sched.h\nindex ee06cba5c6f5..9c850b7be6bf 100644\n--- a/include/linux/sched.h\n+++ b/include/linux/sched.h\n@@ -1778,7 +1778,7 @@ extern struct pid *cad_pid;\n \t\t\t\t\t\t * I am cleaning dirty pages from some other bdi. */\n #define PF_KTHREAD\t\t0x00200000\t/* I am a kernel thread */\n #define PF_RANDOMIZE\t\t0x00400000\t/* Randomize virtual address space */\n-#define PF__HOLE__00800000\t0x00800000\n+#define PF__MEMALLOC_FOLIO\t0x00800000\t/* Allocating a folio that can end up on\nprivate memory nodes */\n #define PF__HOLE__01000000\t0x01000000\n #define PF__HOLE__02000000\t0x02000000\n #define PF_NO_SETAFFINITY\t0x04000000\t/* Userland is not allowed to meddle with\ncpus_mask */\ndiff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h\nindex 95d0040df584..2101a447c084 100644\n--- a/include/linux/sched/mm.h\n+++ b/include/linux/sched/mm.h\n@@ -471,6 +471,17 @@ static inline void memalloc_pin_restore(unsigned int flags)\n \tmemalloc_flags_restore(flags);\n }\n\n+static inline unsigned int memalloc_folio_save(void)\n+{\n+\treturn memalloc_flags_save(PF_MEMALLOC_FOLIO);\n+}\n+\n+static inline void memalloc_folio_restore(unsigned int flags)\n+{\n+\tmemalloc_flags_restore(flags);\n+}\n+\n+\n #ifdef CONFIG_MEMCG\n DECLARE_PER_CPU(struct mem_cgroup *, int_active_memcg);\n /**\ndiff --git a/mm/mempolicy.c b/mm/mempolicy.c\nindex 36699fabd3c2..a78b0e5a1fce 100644\n--- a/mm/mempolicy.c\n+++ b/mm/mempolicy.c\n@@ -2506,8 +2506,13 @@ static struct page *alloc_pages_mpol(gfp_t gfp, unsigned\nint order,\n struct folio *folio_alloc_mpol_noprof(gfp_t gfp, unsigned int order,\n \t\tstruct mempolicy *pol, pgoff_t ilx, int nid)\n {\n-\tstruct page *page = alloc_pages_mpol(gfp | __GFP_COMP, order, pol,\n+\tstruct page *page;\n+\tint flags;\n+\n+\tflags = memalloc_folio_save();\n+\tpage = alloc_pages_mpol(gfp | __GFP_COMP, order, pol,\n \t\t\tilx, nid);\n+\tmemalloc_folio_restore(flags);\n \tif (!page)\n \t\treturn NULL;\n\n@@ -2588,7 +2593,12 @@ EXPORT_SYMBOL(alloc_pages_noprof);\n\n struct folio *folio_alloc_noprof(gfp_t gfp, unsigned int order)\n {\n-\treturn page_rmappable_folio(alloc_pages_noprof(gfp | __GFP_COMP, order));\n+\tstruct folio *folio;\n+\tint flags;\n+\n+\tflags = memalloc_folio_save();\n+\tfolio = page_rmappable_folio(alloc_pages_noprof(gfp | __GFP_COMP, order));\n+\tmemalloc_folio_restore(flags);\n+\treturn folio;\n }\n EXPORT_SYMBOL(folio_alloc_noprof);\n\ndiff --git a/mm/page_alloc.c b/mm/page_alloc.c\nindex ee902a468c2f..37434b37f7af 100644\n--- a/mm/page_alloc.c\n+++ b/mm/page_alloc.c\n@@ -5345,8 +5345,13 @@ EXPORT_SYMBOL(__alloc_pages_noprof);\n struct folio *__folio_alloc_noprof(gfp_t gfp, unsigned int order, int\npreferred_nid,\n \t\tnodemask_t *nodemask)\n {\n-\tstruct page *page = __alloc_pages_noprof(gfp | __GFP_COMP, order,\n+\tstruct page *page;\n+\tint flags;\n+\n+\tflags = memalloc_folio_save();\n+\tpage = __alloc_pages_noprof(gfp | __GFP_COMP, order,\n \t\t\t\t\tpreferred_nid, nodemask);\n+\tmemalloc_folio_restore(flags);\n \treturn page_rmappable_folio(page);\n }\n EXPORT_SYMBOL(__folio_alloc_noprof);\n-- \n2.43.0\n\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-06-10",
+          "message_id": "d01fb1ed-2418-42ee-aea2-37f9a5c5729c@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges that implementing a separate allocation path for private memory nodes would be too invasive and instead proposes using the existing __GFP_THISNODE flag to allow slab allocations on the private node, while also providing a new userland driver (anondax) to test the functionality without specialty hardware.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges need for further work",
+            "proposes alternative solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ok, the mental gap I have is not knowing the full context behind\nmemalloc.  I'll take this and do some reading / prototyping, but\nthis looks entirely reasonable.\n\nI will still probably send the next RFC version tomorrow or friday,\nas I want to get some eyes on the __GFP_PRIVATE-less pattern.\n\nAlso, I made a new `anondax` driver which enables userland testing\nof this functionality without any specialty hardware.\n\ntl;dr:\n\nfd = open(\"/dev/anondax0.0\", ....);\nbuf = mmap(fd, ...);\nbuf[0] = 0xDEADBEEF; /* fault to anondax driver */\n\nstatic vm_fault_t anon_dax_fault(struct vm_fault *vmf)\n{\n        struct dev_dax *dev_dax = vmf->vma->vm_file->private_data;\n        vm_fault_t ret;\n        int id;\n\n        id = dax_read_lock();\n        if (!dax_alive(dev_dax->dax_dev))\n                ret = VM_FAULT_SIGBUS;\n        else\n                ret = do_anonymous_page_node(vmf, dev_dax->target_node);\n        dax_read_unlock(id);\n\n        if (ret & VM_FAULT_OOM)\n                return VM_FAULT_SIGBUS;\n        return ret ? ret : VM_FAULT_NOPAGE;\n}\n\nWith:\n  qemu-system-x86_64 -m 5G \\\n    -object memory-backend-ram,id=m0,size=4G -numa node,nodeid=0,memdev=m0 \\\n    -object memory-backend-ram,id=m1,size=1G -numa node,nodeid=1,memdev=m1 \\\n    -append \"... memmap=0x40000000!0x140000000\"\n\nVoila - buddy-managed private anonymous memory (1G region)\n\nNo need to reinvent page_alloc.c or fault handling :]\n\nThis can be used to hammer on reclaim/compaction/whatever support\nwithout needing any particular hardware setup, and in fact it gives\nsome memory devices a path to support in userland while standards\nget worked out.\n\ndo_anonymous_page_node is a bit of a bodge right now but I just haven't\nfleshed it out yet.  The idea is - don't reinvent the fault path, just\nprovide the appropriate context to memory.c to do the right thing.\n\nIf this is acceptable, I imagine whatever interface gets implemented\nwill carry an in-tree driver export only, similar to hotplug/kmem.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-06-10",
+          "message_id": "ainFROZ3WrGioyuY@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "The author addresses David's concern about the inability to prevent hugetlb from spilling into private nodes, explaining that MEMALLOC_PRIVATE is still needed for this purpose and can be repurposed for Brendan's needs as well.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges a fix is needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ok, this was easier to test than I expected, and hugetlb is indeed a\nstickler.  We can't get there 100% with just MEMALLOC_FOLIO, we still\nneed a MEMALLOC_PRIVATE - specifically because of users like hugetlb.\n\nhugetlb uses __GFP_THISNODE to do its allocations, and all hugetlb\nallocations are folio allocations - so the code you shared by itself\ndoes not gate hugetlb from spilling into private nodes.\n\nThat means we still need something like this in hugetlb:\n\n  if (node_is_private(nid))\n      /* fail allocation */\n\nHOWEVER... if you have MEMALLOC_PRIVATE - you make the allocation\nfailure a *page allocator* problem, and it serves exactly the same\npurpose that __GFP_PRIVATE did.\n\nthe resulting code is two lines in my anondax driver:\n\n    unsigned int priv_flags = memalloc_private_save();\n    ret = do_anonymous_page_node(vmf, dev_dax->target_node);\n    memalloc_private_restore(priv_flags);\n\nNo special hugetlb, slab, arch code handling - they all just fail\nto allocate / fall back.  If they fail - it means that code is using\na bad nodemask and we need to go fix it (exactly what we want!)\n\nI think additionally, we might be able to repurpose MEMALLOC_PRIVATE\nflag for Brendan's needs as well [1].\n\nTheir goal (IIRC) was to have a pile of unmapped blocks that could\nbe opportunistically converted to normal memory, but otherwise left\nunmapped and sitting in the buddy.\n\nSame thing - different filter point (blocks vs nodes).\n\nIf you set MEMALLOC_PRIVATE - it makes private node allocations\npossible, and \"private block\" access (without conversion) possible.\n\nOtherwise private nodes are unreachable, and private blocks would be\ntreated like CMA (last-resort stealing, lazy-direct-mapping).\n\nAnd they stack (private blocks on private nodes :V).\n\nI don't have enough time looking at his proposal, but it seems like we\ncan kill two birds with one stone on this.\n\n[1] https://lore.kernel.org/linux-mm/agYJcRgOHho8upVv@gourry-fedora-PF4VCD3F/\n\n~Gregory",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-06-10",
+          "message_id": "ainioCiFo0vI9ohY@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series introduces Private Memory Nodes, which allows for isolation of memory allocation on a per-node basis. The goal is to enable features like compressed RAM and improve system resource management. However, the patch also raises questions about how to limit page allocations to folio allocations or disallow slab allocations on private nodes. It appears that implementing such restrictions would be complex and may not provide significant benefits."
+    }
+  }
+}

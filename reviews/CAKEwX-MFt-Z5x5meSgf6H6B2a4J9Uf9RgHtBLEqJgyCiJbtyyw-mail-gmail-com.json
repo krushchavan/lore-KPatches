@@ -1,0 +1,48 @@
+{
+  "thread_id": "CAKEwX=MFt=Z5x5meSgf6H6B2a4J9Uf9RgHtBLEqJgyCiJbtyyw@mail.gmail.com",
+  "subject": "[zswap?] BUG: sleeping function called from invalid context at kernel/cgroup/rstat.c:421",
+  "url": "https://lore.kernel.org/all/CAKEwX=MFt=Z5x5meSgf6H6B2a4J9Uf9RgHtBLEqJgyCiJbtyyw@mail.gmail.com/",
+  "dates": {
+    "2026-06-10": {
+      "report_file": "2026-06-10_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Nhat Pham",
+          "summary": "Raised concerns about potential double-put bug and suggested removing RCU read to avoid issues with active debugfs file readers.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "WAITING_FOR_REVIEW"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, Jun 10, 2026 at 9:47 AM Nhat Pham <nphamcs@gmail.com> wrote:\n>\n>\n> Also, looking at the code a bit closer - if (!shrinker->flags &\n> SHRINKER_MEMCG_AWARE), we shouldn't be getting into this loop at all\n> and inducing all the memcg-related overhead at all...\n>\n> The code really should be structure as:\n>\n> if (shrinker->flags & SHRINKER_MEMCG_AWARE) {\n\nAs usual, i flip the conditionals :( But you get the idea...\n\n",
+          "reply_to": "",
+          "message_date": "2026-06-10",
+          "message_id": "",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Agreed with Nhat's assessment that RCU or shrinker_try_get() is not necessary, but pointed out a potential issue with parallel debugfs file removal and sleeping within rstat flush.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "WAITING_FOR_REVIEW"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, Jun 10, 2026 at 11:38:29AM -0700, Nhat Pham wrote:\n> On Wed, Jun 10, 2026 at 10:31\\u202fAM Shakeel Butt <shakeel.butt@linux.dev> wrote:\n> >\n> > +Roman, Qi\n> >\n> > On Wed, Jun 10, 2026 at 09:38:03AM -0700, Nhat Pham wrote:\n> > > On Wed, Jun 10, 2026 at 9:05\\u202fAM Zenghui Yu <zenghui.yu@linux.dev> wrote:\n> > >\n> > > Thanks for reporting, Zenghui.\n> > >\n> > >\n> > > >\n> > > > Hi all,\n> > > >\n> > > > The following splat was triggered on the mainline kernel:\n> > > >\n> > > >  BUG: sleeping function called from invalid context at kernel/cgroup/rstat.c:421\n> > > >  in_atomic(): 0, irqs_disabled(): 0, non_block: 0, pid: 1126, name: cat\n> > > >  preempt_count: 0, expected: 0\n> > > >  RCU nest depth: 1, expected: 0\n> > > >  CPU: 7 UID: 0 PID: 1126 Comm: cat Kdump: loaded Not tainted 7.1.0-rc7-00056-gacb7500801e9-dirty #304 PREEMPT\n> > > >  Hardware name: QEMU QEMU Virtual Machine, BIOS edk2-stable202408-prebuilt.qemu.org 08/13/2024\n> > > >  Call trace:\n> > > >   show_stack+0x18/0x24 (C)\n> > > >   dump_stack_lvl+0x78/0x90\n> > > >   dump_stack+0x18/0x24\n> > > >   __might_resched+0x114/0x170\n> > > >   __might_sleep+0x48/0x98\n> > > >   css_rstat_flush+0x54/0x564\n> > > >   mem_cgroup_flush_stats+0x9c/0xb0\n> > > >   zswap_shrinker_count+0xe4/0x1e4\n> > > >   shrinker_debugfs_count_show+0xd8/0x268\n> > >\n> > > Ah, this seems a bit tricky.\n> > >\n> > > Seems like shrinker_debugfs_count_show() is invoking\n> > > zswap_shrinker_count() in rcu_read_section(). zswap_shrinker_count()\n> > > triggers a stats flushing, which might sleep. Not ideal.\n> > >\n> > > Is the rcu_read_section() here to protect memcg or shrinker? For\n> > > memcg, i dont think it's necessary, no? mem_cgroup_iter() pins the\n> > > memcg before returning.\n> > >\n> > > (memcg maintainers please fact check me).\n> >\n> > mem_cgroup_iter() handles the lifetime of memcg, so there is no need for rcu\n> > read section for memcg.\n> >\n> > >\n> > > If this is for the shrinker think this needs to follow shrink_slab()'s pattern.:\n> > >\n> > > rcu_read_lock();\n> > > list_for_each_entry_rcu(shrinker, &shrinker_list, list)\n> > > {\n> > >     if (!shrinker_try_get(shrinker))\n> > >         continue;\n> > >     rcu_read_unlock();\n> > > }\n> > >\n> > > But OTOH, doesn't seem like rcu_read_section() is what keeping it safe:\n> >\n> > Shouldn't the caller already holds the reference to the shrinker which it is\n> > giving to this function? Does debugfs file entry holds a reference to the\n> > shrinker which it is giving.\n> >\n> > After looking at shrinker_free(), it has call_rcu(&shrinker->rcu,\n> > shrinker_free_rcu_cb), so this rcu read section is against that.\n> >\n> > I think we can simply use shrinker_try_get() here as Nhat said.\n> \n> Hmm, so is this unsafe even with the current rcu shennanigans? What's\n> stopping shrinker to be freed by that callback before we enter\n> rcu_read_section()?\n> \n> Seems like this is just implicitly correct - shrinker_debugfs_detach()\n> and shrinker_debugfs_remove() happens before call_rcu(&shrinker->rcu,\n> shrinker_free_rcu_cb);, so if you're reading this file, then it's\n> before shrinker_free_rcu_cb() is even registered?\n> \n> Do we still need rcu or shrinker_try_get() here?\n\nI think you are right that we don't need rcu or shrinker_try_get() but it is\nmore about an active debugfs file reader. Suppose we are sleeping within rstat\nflush from shrinker_debugfs_count_show() and there is a parallel\nshrinker_debugfs_remove() call.\n\nshrinker_debugfs_remove calls debugfs_remove_recursive and deep in the stack\nthere is a call wait_for_completion(&fsd->active_users_drained) which will wait\nfor active users, one of which is sleeping within rstat flush.\n\nSo, let's simply remove rcu read here.\n\n> \n\n\n",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-06-10",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm"
+    }
+  }
+}
