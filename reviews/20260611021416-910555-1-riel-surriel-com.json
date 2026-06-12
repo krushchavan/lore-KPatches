@@ -1,0 +1,93 @@
+{
+  "thread_id": "20260611021416.910555-1-riel@surriel.com",
+  "subject": "[PATCH 0/9] sched: make WARN_ON under rq->lock deadlock-safe (SCHED_WARN_ON)",
+  "url": "https://lore.kernel.org/all/20260611021416.910555-1-riel@surriel.com/",
+  "dates": {
+    "2026-06-11": {
+      "report_file": "2026-06-11_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Rik van Riel",
+          "summary": "Identified a potential deadlock issue in the current implementation of WARN_ON under rq->lock. Suggested introducing an irq_work mechanism to wake up console kthreads and prevent deadlocks.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "CONTROVERSIAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Peter Zijlstra",
+          "summary": "Disagreed with Rik's suggestion, proposing an alternative solution involving a threshold for ERR and above messages to be sent directly to the atomic console.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "CONTROVERSIAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Thu, Jun 11, 2026 at 12:20:27PM -0400, Rik van Riel wrote:\n> On Thu, 2026-06-11 at 09:43 +0200, Peter Zijlstra wrote:\n> > \n> > Sorry, no. I've said it before and I'll stick with it. Just no.\n> > \n> > printk_deferred() is an abomination, it means that if you mess up the\n> > machine properly you'll *NEVER* see the output.\n> > \n> > As per always, printk() is the one that needs fixing, and IIRC they\n> > were\n> > very close to getting there.\n> \n> Printk to certain console types is always deferred,\n> by default, because trying to synchronously print\n> everything to a slow serial console can lead to a\n> system softlockup panic.\n> \n> In fact, this particular lockup is due to the\n> printk being passed off to a worker thread, and\n> the kernel deadlocking when the wakeup code\n> tries to grab the runqueue lock its CPU already\n> holds.\n> \n> You are right that this could be fixed in the\n> printk code, but the solution there will by\n> necessity continue to contain some deferring.\n> \n> \n> I suppose the printk code could use something\n> like an irq work to wake up the printk worker,\n> and avoid the scheduler deadlock that way?\n> \n> I'm not sure that would make things more\n> reliable, though...\n\nThe non-atomic consoles will always need a buffer, but atomic consoles\ncan (and should IMO) push out the messages immediately.\n\nAnyway, the thing that keeps tripping is that console_sem thing, that\nshould just entirely go away. That thing ends up doing a wakeup from\nprintk() call context, which obviously doesn't work when inside the\nscheduler locks.\n\nSo printk should:\n\n - stick msg in buffer (lockless)\n - print to atomic consoles (lockless)\n - use irq_work to wake console kthreads (lockless)\n - each kthread then tries to flush buffer to its own non-atomic console\n   in non-atomic context.\n\n>From what I understand, we're very close to having this work. The only\ndisagreement between printk people an me is about defaults IIRC. I want\nto have the serial console default to atomic, they want it to be an\noption. But whatever, as long as I can specify on the kernel cmdline\nthat my serial should be atomic I'm good.\n\nMyself, I almost exclusively run with earlycon serial and force printk\nto be early_printk() (effectively not using printk at all). This works\nperfectly fine and is the most reliable thing ever. I can push out\ncharacters to the UART from any context.\n\nAnd sure, sometimes its gets a little scrambled, but meh.\n\nI have this working with real actual serial, IPMI/serial-over-lan and\nAMT/serial-over-lan.\n\nAnd if a machine doesn't have serial, its a paperweight ;-)\n\nNow, of course I also use trace_printk() a lot, but for those moments\nwhen the machine goes down hard, nothing beats serial.\n",
+          "reply_to": "Rik van Riel",
+          "message_date": "2026-06-11",
+          "message_id": "",
+          "email": "peterz@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Rik van Riel",
+          "summary": "Acknowledged Peter's point about the potential issue with OOM kills and serial console output, but emphasized the importance of having a deferred mechanism for handling printk messages in production environments.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "Peter Zijlstra",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "The patch aims to make WARN_ON under rq->lock deadlock-safe by introducing a new mechanism for handling printk messages."
+    },
+    "2026-06-12": {
+      "report_file": "2026-06-11_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Peter Zijlstra",
+          "summary": "The reviewer suggested a different approach to handle WARN/BUG messages, proposing to create a threshold and route ERR-level messages directly to the atomic console while lower-priority messages are buffered and spooled out later.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I've not hit OOM in a decade or so; I've no idea how much silly nonsense\nit spouts. The example the printk people have used for a long while is\nbooting with a million block devices, apparently that generates insane\namount of boot noise -- another problem I don't have :-)\n\nAnyway, one solution there is to create a threshold and say ERR and\nabove go directly to atomic console while everything below goes into the\nbuffer and gets spooled out later on the non-atomic variant.\n\nThis way all your WARN/BUG and other useful bits actually hit the wire\nwhen you need them, and the useless verbiage goes into the bin for\nlater.\n\nAnyway, all this is stuff that seems trivially solvable.",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-06-12",
+          "message_id": "20260612065220.GO187714@noisy.programming.kicks-ass.net",
+          "email": "peterz@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series addresses a deadlock issue in the Linux kernel's scheduler, where WARN_ON() calls under rq->lock or ->pi_lock can cause recursive locking and deadlocks. To fix this, new macros SCHED_WARN_ON(), SCHED_WARN_ON_ONCE(), SCHED_WARN(), and SCHED_WARN_ONCE() are introduced, which use printk_deferred to defer console output to irq_work instead of emitting it synchronously. The patch series converts 134 WARN*() calls in the scheduler code to use these new macros, making them deadlock-safe."
+    }
+  }
+}
