@@ -238,9 +238,116 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 11/20] nfsd: apply the notify mask to the delegation when requested</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260611-dir-deleg-v6-11-4c45080e5f3f@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-11</strong><div class="date-range-nav">Active on: <a href="#2026-06-11">2026-06-11</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the NFSv4 server to apply the requested notify mask to directory delegations when notifications are enabled by the client. If the client requests notifications without specifying NOTIFY4_GFLAG_EXTEND, no notifications will be offered as the server does not provide directory offset information required for classic notifications. The patch ensures that the lease acquisition sets the appropriate ignore mask based on the applied notify mask.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-06-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a> &bull; <a href="#2026-06-11">2026-06-11</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses issues in the NFSv4 server implementation, specifically related to delegation and notification handling. The current code does not properly handle notifications for order-aware clients, leading to potential issues with directory cache ordering. This patch aims to correct this by applying the notify mask to the delegation when requested.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-06-12">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Identified a flaw in the patch&#x27;s handling of notifications for order-aware clients, which could lead to issues with directory cache ordering. Noted that this issue is latent when the patch is first applied but will become apparent with future order-aware clients.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">
+
+On Thu, Jun 11, 2026, at 1:50 PM, Jeff Layton wrote:
+&gt; If the client requests a directory delegation with notifications
+&gt; enabled, set the appropriate return mask in gddr_notification[0]. This
+&gt; will ensure the lease acquisition sets the appropriate ignore mask.
+&gt;
+&gt; If the client doesn&#x27;t set NOTIFY4_GFLAG_EXTEND, then don&#x27;t offer any
+&gt; notifications, as nfsd won&#x27;t provide directory offset information, and
+&gt; &quot;classic&quot; notifications require them.
+&gt;
+&gt; Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+&gt; ---
+&gt;  fs/nfsd/nfs4proc.c | 12 ++++++++++++
+&gt;  1 file changed, 12 insertions(+)
+&gt;
+&gt; diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+&gt; index 0c37d7c6d28c..29f7339dc220 100644
+&gt; --- a/fs/nfsd/nfs4proc.c
+&gt; +++ b/fs/nfsd/nfs4proc.c
+&gt; @@ -2530,12 +2530,18 @@ nfsd4_verify(struct svc_rqst *rqstp, struct 
+&gt; nfsd4_compound_state *cstate,
+&gt;  	return status == nfserr_same ? nfs_ok : status;
+&gt;  }
+&gt; 
+&gt; +#define SUPPORTED_NOTIFY_MASK	(BIT(NOTIFY4_REMOVE_ENTRY) |	\
+&gt; +				 BIT(NOTIFY4_ADD_ENTRY) |	\
+&gt; +				 BIT(NOTIFY4_RENAME_ENTRY) |	\
+&gt; +				 BIT(NOTIFY4_GFLAG_EXTEND))
+&gt; +
+&gt;  static __be32
+&gt;  nfsd4_get_dir_delegation(struct svc_rqst *rqstp,
+&gt;  			 struct nfsd4_compound_state *cstate,
+&gt;  			 union nfsd4_op_u *u)
+&gt;  {
+&gt;  	struct nfsd4_get_dir_delegation *gdd = &amp;u-&gt;get_dir_delegation;
+&gt; +	u32 requested = gdd-&gt;gdda_notification_types[0];
+&gt;  	struct nfs4_delegation *dd;
+&gt;  	struct nfsd_file *nf;
+&gt;  	__be32 status;
+&gt; @@ -2544,6 +2550,12 @@ nfsd4_get_dir_delegation(struct svc_rqst *rqstp,
+&gt;  	if (status != nfs_ok)
+&gt;  		return status;
+&gt; 
+&gt; +	/* No notifications if you don&#x27;t set NOTIFY4_GFLAG_EXTEND! */
+&gt; +	if (!(requested &amp; BIT(NOTIFY4_GFLAG_EXTEND)))
+&gt; +		requested = 0;
+&gt; +
+&gt; +	gdd-&gt;gddr_notification[0] = requested &amp; SUPPORTED_NOTIFY_MASK;
+&gt; +
+&gt;  	/*
+&gt;  	 * RFC 8881, section 18.39.3 says:
+&gt;  	 *
+&gt;
+
+When a client requests NOTIFY4_GFLAG_EXTEND | NOTIFY4_CFLAG_ORDER
+plus ADD/REMOVE/RENAME, the assignment still grants the content
+notification bits because it only requires GFLAG_EXTEND. The rest
+of NFSD&#x27;s CB_NOTIFY encoder does not store that order-aware request
+and emits zero/absent cookie and previous-entry information, which
+is only safe for order-unaware clients.
+
+An order-aware client can then keep an ordered directory cache from
+unusable notifications instead of having the delegation recalled.
+
+The bis draft requires order info for order-aware clients, or recall:
+
+   - 27.4.5 (REMOVE): &quot;If the client is order-aware, the server will send
+     the cookie value as part of this.&quot;
+   - 16.2.13: order-aware == NOTIFY4_CFLAG_ORDER set OR NOTIFY4_GFLAG_EXTEND
+     reset.
+   - 16.2.11.3: &quot;If the client is concerned with entry order and these
+     notifications ... cannot be sent for any other reason, then the
+     delegation is recalled.&quot;
+
+This patch&#x27;s own first rule (drop everything when GFLAG_EXTEND is
+reset) is exactly the order-aware -&gt; no-notifications principle
+for legacy RFC8881 clients. It misses the parallel case:
+GFLAG_EXTEND set PLUS CFLAG_ORDER set is also order-aware.
+
+This finding is latent when this patch is first applied, but the
+NFSD&#x27;s negotiation is incorrect for any future order-aware client.
+
+I don&#x27;t see this issue addressed by a subsequent patch in this
+series.
+
+
+-- 
+Chuck Lever
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<div class="review-comment-signals">Signals: issue_not_addressed</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

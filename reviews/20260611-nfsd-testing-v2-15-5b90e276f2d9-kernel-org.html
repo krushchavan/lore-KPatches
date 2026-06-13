@@ -238,9 +238,130 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 15/21] nfsd: validate sockaddr length per family in listener_set</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260611-nfsd-testing-v2-15-5b90e276f2d9@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-11</strong><div class="date-range-nav">Active on: <a href="#2026-06-11">2026-06-11</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a bug in the NFS daemon&#x27;s netlink listener set functionality, where a CAP_NET_ADMIN caller could send an invalid sockaddr structure that would cause out-of-bounds reads across multiple consumers. The patch tightens the policy for the NFSD_A_SOCK_ADDR attribute to require at least 16 bytes and adds per-family length validation in both nlmsg_for_each_attr_type loops. This ensures that only valid sockaddr structures are processed, preventing potential security vulnerabilities.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-06-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a> &bull; <a href="#2026-06-11">2026-06-11</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a bug in the NFS daemon&#x27;s netlink listener set functionality, where an invalid sockaddr length can cause an out-of-bounds read. The fix involves tightening the policy for sockaddr lengths and adding per-family validation to prevent such issues.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-06-12">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Acknowledged a potential issue with invalid sockaddr lengths and is working on an updated patch to return an error instead of ignoring the problem.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, 2026-06-11 at 16:00 -0400, Jeff Layton wrote:
+&gt; nfsd_sock_nl_policy declares NFSD_A_SOCK_ADDR as bare NLA_BINARY
+&gt; with no minimum length. A CAP_NET_ADMIN caller can send a 16-byte
+&gt; NFSD_A_SOCK_ADDR with sa_family=AF_INET6, causing a 12-byte OOB
+&gt; read across three consumers (rpc_cmp_addr_port, svc_find_listener,
+&gt; kernel_bind).
+&gt; 
+&gt; Tighten the policy to NLA_POLICY_MIN_LEN(16) and add per-family
+&gt; length validation in both nlmsg_for_each_attr_type loops.
+&gt; 
+&gt; Fixes: 16a471177496 (&quot;NFSD: add listener-{set,get} netlink command&quot;)
+&gt; Assisted-by: Claude:claude-opus-4-8
+&gt; Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+&gt; ---
+&gt;  Documentation/netlink/specs/nfsd.yaml |  4 ++++
+&gt;  fs/nfsd/netlink.c                     |  2 +-
+&gt;  fs/nfsd/nfsctl.c                      | 30 ++++++++++++++++++++++++++++++
+&gt;  3 files changed, 35 insertions(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/Documentation/netlink/specs/nfsd.yaml b/Documentation/netlink/specs/nfsd.yaml
+&gt; index 8f36fadd68f7..9677ba19ffcd 100644
+&gt; --- a/Documentation/netlink/specs/nfsd.yaml
+&gt; +++ b/Documentation/netlink/specs/nfsd.yaml
+&gt; @@ -156,6 +156,10 @@ attribute-sets:
+&gt;        -
+&gt;          name: addr
+&gt;          type: binary
+&gt; +        # 16 == sizeof(struct sockaddr_in); AF_INET6 callers
+&gt; +        # validate the full sockaddr_in6 length in nfsctl.c.
+&gt; +        checks:
+&gt; +          min-len: 16
+&gt;        -
+&gt;          name: transport-name
+&gt;          type: string
+&gt; diff --git a/fs/nfsd/netlink.c b/fs/nfsd/netlink.c
+&gt; index fbee3676d253..6570960034f1 100644
+&gt; --- a/fs/nfsd/netlink.c
+&gt; +++ b/fs/nfsd/netlink.c
+&gt; @@ -37,7 +37,7 @@ const struct nla_policy nfsd_fslocations_nl_policy[NFSD_A_FSLOCATIONS_LOCATION +
+&gt;  };
+&gt;  
+&gt;  const struct nla_policy nfsd_sock_nl_policy[NFSD_A_SOCK_TRANSPORT_NAME + 1] = {
+&gt; -	[NFSD_A_SOCK_ADDR] = { .type = NLA_BINARY, },
+&gt; +	[NFSD_A_SOCK_ADDR] = NLA_POLICY_MIN_LEN(16),
+&gt;  	[NFSD_A_SOCK_TRANSPORT_NAME] = { .type = NLA_NUL_STRING, },
+&gt;  };
+&gt;  
+&gt; diff --git a/fs/nfsd/nfsctl.c b/fs/nfsd/nfsctl.c
+&gt; index ab10692ee937..f3b3154b16c5 100644
+&gt; --- a/fs/nfsd/nfsctl.c
+&gt; +++ b/fs/nfsd/nfsctl.c
+&gt; @@ -2016,6 +2016,21 @@ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)
+&gt;  		xcl_name = nla_data(tb[NFSD_A_SOCK_TRANSPORT_NAME]);
+&gt;  		sa = nla_data(tb[NFSD_A_SOCK_ADDR]);
+&gt;  
+&gt; +		switch (sa-&gt;sa_family) {
+&gt; +		case AF_INET:
+&gt; +			if (nla_len(tb[NFSD_A_SOCK_ADDR]) &lt;
+&gt; +			    sizeof(struct sockaddr_in))
+&gt; +				continue;
+&gt; +			break;
+&gt; +		case AF_INET6:
+&gt; +			if (nla_len(tb[NFSD_A_SOCK_ADDR]) &lt;
+&gt; +			    sizeof(struct sockaddr_in6))
+&gt; +				continue;
+&gt; +			break;
+&gt; +		default:
+&gt; +			continue;
+&gt; +		}
+&gt; +
+&gt;  		/* Put back any matching sockets */
+&gt;  		list_for_each_entry_safe(xprt, tmp, &amp;permsocks, xpt_list) {
+&gt;  			/* This shouldn&#x27;t be possible */
+&gt; @@ -2077,6 +2092,21 @@ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)
+&gt;  		xcl_name = nla_data(tb[NFSD_A_SOCK_TRANSPORT_NAME]);
+&gt;  		sa = nla_data(tb[NFSD_A_SOCK_ADDR]);
+&gt;  
+&gt; +		switch (sa-&gt;sa_family) {
+&gt; +		case AF_INET:
+&gt; +			if (nla_len(tb[NFSD_A_SOCK_ADDR]) &lt;
+&gt; +			    sizeof(struct sockaddr_in))
+&gt; +				continue;
+&gt; +			break;
+&gt; +		case AF_INET6:
+&gt; +			if (nla_len(tb[NFSD_A_SOCK_ADDR]) &lt;
+&gt; +			    sizeof(struct sockaddr_in6))
+&gt; +				continue;
+&gt; +			break;
+&gt; +		default:
+&gt; +			continue;
+&gt; +		}
+&gt; +
+
+Sashiko flagged a problem above that we should probably fix. If we get
+an invalid address here, we should return an error instead of ignoring
+it. I&#x27;m working on an updated patch now.
+
+&gt;  		xprt = svc_find_listener(serv, xcl_name, net, sa);
+&gt;  		if (xprt) {
+&gt;  			if (delete)
+
+-- 
+Jeff Layton &lt;jlayton@kernel.org&gt;
+
+</pre>
+</details>
+<div class="review-comment-signals">Signals: WAITING_FOR_REVIEW</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

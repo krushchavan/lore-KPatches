@@ -239,18 +239,47 @@
     <h1>[PATCH 0/9] sched: make WARN_ON under rq-&gt;lock deadlock-safe (SCHED_WARN_ON)</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260611021416.910555-1-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-06-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a> &bull; <a href="#2026-06-11">2026-06-11</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a deadlock issue in the Linux kernel&#x27;s scheduler, where WARN_ON() calls under rq-&gt;lock or -&gt;pi_lock can cause recursive locking and deadlocks. To fix this, new macros SCHED_WARN_ON(), SCHED_WARN_ON_ONCE(), SCHED_WARN(), and SCHED_WARN_ONCE() are introduced, which use printk_deferred to defer console output to irq_work instead of emitting it synchronously. The patch series converts 134 WARN*() calls in the scheduler code to use these new macros, making them deadlock-safe.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch aims to make WARN_ON under rq-&gt;lock deadlock-safe, but some reviewers question its impact on production systems and suggest alternative solutions.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-06-11">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Rik van Riel</span>
+<span class="review-author">Rik Riel (author)</span>
 <a class="date-chip" href="../2026-06-11_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-11">2026-06-11</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a potential deadlock issue in the current implementation of WARN_ON under rq-&gt;lock. Suggested introducing an irq_work mechanism to wake up console kthreads and prevent deadlocks.</div>
-<div class="review-comment-signals">Signals: CONTROVERSIAL</div>
+<div class="review-comment-text">The author acknowledges a concern about the impact of deferred console output on system stability and agrees that making it an option could be beneficial for different scenarios.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Great for development, not so good for production.
+
+When something like an OOM kill happens, the amount
+of data printed by the kernel can take a long time
+to get flushed out a serial port.
+
+In fact, it can take long enough to cause things
+like RCU stalls and soft lockups, and break
+workloads that way.
+
+Having the serial console deferred allows those
+systems to survive.
+
+If the system crashes before the messages were sent
+out the serial port, the dmesg buffer will be in
+the vmcore, and get extracted by the crash analysis
+tooling.
+
+It sounds like the printk people may be right with
+making that behavior an option, since different
+scenarios require different behavior.
+
+-- 
+All Rights Reversed.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Peter Zijlstra</div>
+<a href="https://lore.kernel.org/r/91b346ee1dfe88390acb462c9c1a8cb8dc3c2b05.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a concern, agrees with alternative approach</div>
 </div>
 <div class="thread-children">
 <div class="thread-node depth-1">
@@ -258,48 +287,17 @@
 <div class="review-comment-header">
 <span class="review-author">Peter Zijlstra</span>
 <a class="date-chip" href="../2026-06-11_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-11">2026-06-11</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Disagreed with Rik&#x27;s suggestion, proposing an alternative solution involving a threshold for ERR and above messages to be sent directly to the atomic console.</div>
+<div class="review-comment-text">The reviewer, Peter Zijlstra, pointed out that the current implementation of SCHED_WARN_ON() still has a deadlock issue due to the use of console_sem, which wakes up console kthreads from printk() call context while holding scheduler locks. He suggested reworking printk() to handle message buffering and printing in a lockless manner.
+
+The reviewer expressed disagreement over default settings for the serial console and printk, preferring to use earlycon and force printk to be early_printk() instead of relying on the legacy direct path.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Jun 11, 2026 at 12:20:27PM -0400, Rik van Riel wrote:
-&gt; On Thu, 2026-06-11 at 09:43 +0200, Peter Zijlstra wrote:
-&gt; &gt; 
-&gt; &gt; Sorry, no. I&#x27;ve said it before and I&#x27;ll stick with it. Just no.
-&gt; &gt; 
-&gt; &gt; printk_deferred() is an abomination, it means that if you mess up the
-&gt; &gt; machine properly you&#x27;ll *NEVER* see the output.
-&gt; &gt; 
-&gt; &gt; As per always, printk() is the one that needs fixing, and IIRC they
-&gt; &gt; were
-&gt; &gt; very close to getting there.
-&gt; 
-&gt; Printk to certain console types is always deferred,
-&gt; by default, because trying to synchronously print
-&gt; everything to a slow serial console can lead to a
-&gt; system softlockup panic.
-&gt; 
-&gt; In fact, this particular lockup is due to the
-&gt; printk being passed off to a worker thread, and
-&gt; the kernel deadlocking when the wakeup code
-&gt; tries to grab the runqueue lock its CPU already
-&gt; holds.
-&gt; 
-&gt; You are right that this could be fixed in the
-&gt; printk code, but the solution there will by
-&gt; necessity continue to contain some deferring.
-&gt; 
-&gt; 
-&gt; I suppose the printk code could use something
-&gt; like an irq work to wake up the printk worker,
-&gt; and avoid the scheduler deadlock that way?
-&gt; 
-&gt; I&#x27;m not sure that would make things more
-&gt; reliable, though...
-
-The non-atomic consoles will always need a buffer, but atomic consoles
+<pre class="raw-body-text">The non-atomic consoles will always need a buffer, but atomic consoles
 can (and should IMO) push out the messages immediately.
 
 Anyway, the thing that keeps tripping is that console_sem thing, that
@@ -315,7 +313,8 @@ So printk should:
  - each kthread then tries to flush buffer to its own non-atomic console
    in non-atomic context.
 
-&gt;From what I understand, we&#x27;re very close to having this work. The only
+---
+
 disagreement between printk people an me is about defaults IIRC. I want
 to have the serial console default to atomic, they want it to be an
 option. But whatever, as long as I can specify on the kernel cmdline
@@ -334,11 +333,81 @@ AMT/serial-over-lan.
 And if a machine doesn&#x27;t have serial, its a paperweight ;-)
 
 Now, of course I also use trace_printk() a lot, but for those moments
-when the machine goes down hard, nothing beats serial.
-</pre>
+when the machine goes down hard, nothing beats serial.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Rik van Riel</div>
-<div class="review-comment-signals">Signals: CONTROVERSIAL</div>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/20260611191922.GK187714@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: deadlock issue, lockless handling, disagreement</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-06-11_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-11">2026-06-11</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a potential deadlock issue in the printk code when waking up the printk worker thread and holding the runqueue lock, but is unsure if using an irq work to wake up the worker would make things more reliable.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Printk to certain console types is always deferred,
+by default, because trying to synchronously print
+everything to a slow serial console can lead to a
+system softlockup panic.
+
+In fact, this particular lockup is due to the
+printk being passed off to a worker thread, and
+the kernel deadlocking when the wakeup code
+tries to grab the runqueue lock its CPU already
+holds.
+
+You are right that this could be fixed in the
+printk code, but the solution there will by
+necessity continue to contain some deferring.
+
+
+I suppose the printk code could use something
+like an irq work to wake up the printk worker,
+and avoid the scheduler deadlock that way?
+
+I&#x27;m not sure that would make things more
+reliable, though...
+
+-- 
+All Rights Reversed.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Peter Zijlstra</div>
+<a href="https://lore.kernel.org/r/bc61cec71c284361882b5cc19f8520e2e85ec133.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: uncertainty, open-ended question</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3" id="2026-06-11">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Peter Zijlstra</span>
+<a class="date-chip" href="../2026-06-11_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-11">2026-06-11</a>
+<span class="badge" style="color:#721c24;background:#f8d7da">Contentious</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Peter Zijlstra strongly disagrees with using printk_deferred(), arguing it can prevent output from being seen in case of a machine malfunction, and instead suggests fixing printk() itself.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Sorry, no. I&#x27;ve said it before and I&#x27;ll stick with it. Just no.
+
+printk_deferred() is an abomination, it means that if you mess up the
+machine properly you&#x27;ll *NEVER* see the output.
+
+As per always, printk() is the one that needs fixing, and IIRC they were
+very close to getting there.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/20260611074344.GG48970@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: strong disagreement, NACK</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -346,16 +415,59 @@ when the machine goes down hard, nothing beats serial.
 <div class="thread-node depth-0" id="2026-06-12">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Peter Zijlstra</span>
-<a class="date-chip" href="../2026-06-11_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
-<span class="review-tag-badge">Reviewed-by</span>
+<span class="review-author">Rik van Riel</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The reviewer suggested a different approach to handle WARN/BUG messages, proposing to create a threshold and route ERR-level messages directly to the atomic console while lower-priority messages are buffered and spooled out later.</div>
+<div class="review-comment-text">Expressed concerns about the patch&#x27;s impact on production systems, particularly in scenarios where OOM kills occur. Suggested alternative solutions, such as creating a threshold for ERR messages.</div>
+<div class="review-comment-signals">Signals: CONTENTIOUS</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Peter Zijlstra</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Responded to Rik&#x27;s concerns, stating that he has not encountered OOM issues in a decade and suggested an alternative solution involving a threshold for ERR messages.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">I&#x27;ve not hit OOM in a decade or so; I&#x27;ve no idea how much silly nonsense
+<pre class="raw-body-text">On Thu, Jun 11, 2026 at 09:53:45PM -0400, Rik van Riel wrote:
+&gt; On Thu, 2026-06-11 at 21:19 +0200, Peter Zijlstra wrote:
+&gt; &gt; 
+&gt; &gt; Myself, I almost exclusively run with earlycon serial and force
+&gt; &gt; printk
+&gt; &gt; to be early_printk() (effectively not using printk at all). This
+&gt; &gt; works
+&gt; &gt; perfectly fine and is the most reliable thing ever. I can push out
+&gt; &gt; characters to the UART from any context.
+&gt; &gt; 
+&gt; Great for development, not so good for production.
+&gt; 
+&gt; When something like an OOM kill happens, the amount
+&gt; of data printed by the kernel can take a long time
+&gt; to get flushed out a serial port.
+&gt; 
+&gt; In fact, it can take long enough to cause things
+&gt; like RCU stalls and soft lockups, and break
+&gt; workloads that way.
+&gt; 
+&gt; Having the serial console deferred allows those
+&gt; systems to survive.
+&gt; 
+&gt; If the system crashes before the messages were sent
+&gt; out the serial port, the dmesg buffer will be in
+&gt; the vmcore, and get extracted by the crash analysis
+&gt; tooling.
+&gt; 
+&gt; It sounds like the printk people may be right with
+&gt; making that behavior an option, since different
+&gt; scenarios require different behavior.
+
+I&#x27;ve not hit OOM in a decade or so; I&#x27;ve no idea how much silly nonsense
 it spouts. The example the printk people have used for a long while is
 booting with a million block devices, apparently that generates insane
 amount of boot noise -- another problem I don&#x27;t have :-)
@@ -368,24 +480,11 @@ This way all your WARN/BUG and other useful bits actually hit the wire
 when you need them, and the useless verbiage goes into the bin for
 later.
 
-Anyway, all this is stuff that seems trivially solvable.</pre>
+Anyway, all this is stuff that seems trivially solvable.
+
+</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Rik Riel</div>
-<a href="https://lore.kernel.org/r/20260612065220.GO187714@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Rik van Riel</span>
-<a class="date-chip" href="../2026-06-11_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-11">2026-06-11</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Acknowledged Peter&#x27;s point about the potential issue with OOM kills and serial console output, but emphasized the importance of having a deferred mechanism for handling printk messages in production environments.</div>
-<div class="reply-to-label">&#8627; replying to Peter Zijlstra</div>
-<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+<div class="reply-to-label">&#8627; replying to Rik van Riel</div>
 </div>
 </div>
 </div>

@@ -238,9 +238,124 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 17/20] nfsd: add the filehandle to returned attributes in CB_NOTIFY</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260611-dir-deleg-v6-17-4c45080e5f3f@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-11</strong><div class="date-range-nav">Active on: <a href="#2026-06-11">2026-06-11</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a new routine to compose a filehandle for CB_NOTIFY operations, which do not have access to the usual svc_export. The new routine uses only the parent filehandle and nfs4_file to fill out the fhandle field in the nfsd4_fattr_args. This allows the filehandle to be returned as an attribute in CB_NOTIFY responses.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-06-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a> &bull; <a href="#2026-06-11">2026-06-11</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds support for returning the filehandle in CB_NOTIFY operations, which is necessary because nfsd&#x27;s usual fh_compose routine requires a svc_export and fills out a svc_fh, but there is no such export available in the context of a CB_NOTIFY. A new routine is added to compose a filehandle with only a parent filehandle and nfs4_file, and this is used to fill out the fhandle field in the nfsd4_fattr_args.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-06-12">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Identified a potential issue with the constructed filehandle attribute in CB_NOTIFY operations, where it may not be properly signed or MACed. Recommended either signing the constructed handle or suppressing the attribute when the export requires signed filehandles.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">
+
+On Thu, Jun 11, 2026, at 1:50 PM, Jeff Layton wrote:
+&gt; nfsd&#x27;s usual fh_compose routine requires a svc_export and fills out a
+&gt; svc_fh. In the context of a CB_NOTIFY there is no such export to
+&gt; consult.
+&gt;
+&gt; Add a new routine that composes a filehandle with only a parent
+&gt; filehandle and nfs4_file. Use that to fill out the fhandle field in the
+&gt; nfsd4_fattr_args.
+&gt;
+&gt; Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+&gt; ---
+&gt;  fs/nfsd/nfs4xdr.c | 37 +++++++++++++++++++++++++++++++++++++
+&gt;  1 file changed, 37 insertions(+)
+&gt;
+&gt; diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+&gt; index 7b19248b1503..15ccd54ffdb6 100644
+&gt; --- a/fs/nfsd/nfs4xdr.c
+&gt; +++ b/fs/nfsd/nfs4xdr.c
+&gt; @@ -4197,6 +4197,39 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, 
+&gt; struct xdr_stream *xdr,
+&gt;  	goto out;
+&gt;  }
+&gt; 
+&gt; +static bool
+&gt; +setup_notify_fhandle(struct dentry *dentry, struct nfs4_file *fi,
+&gt; +		     struct nfsd_file *nf, struct nfsd4_fattr_args *args)
+&gt; +{
+&gt; +	int fileid_type, fsid_len, maxsize, flags = 0;
+&gt; +	struct knfsd_fh *fhp = &amp;args-&gt;fhandle;
+&gt; +	struct inode *inode = d_inode(dentry);
+&gt; +	struct inode *parent = NULL;
+&gt; +	struct fid *fid;
+&gt; +
+&gt; +	fsid_len = key_len(fi-&gt;fi_fhandle.fh_fsid_type);
+&gt; +	fhp-&gt;fh_size = 4 + fsid_len;
+&gt; +
+&gt; +	/* Copy first 4 bytes + fsid */
+&gt; +	memcpy(&amp;fhp-&gt;fh_raw, &amp;fi-&gt;fi_fhandle.fh_raw, fhp-&gt;fh_size);
+&gt; +
+&gt; +	fid = (struct fid *)(fh_fsid(fhp) + fsid_len/4);
+&gt; +	maxsize = (NFS4_FHSIZE - fhp-&gt;fh_size)/4;
+&gt; +
+&gt; +	if (fi-&gt;fi_connectable &amp;&amp; !S_ISDIR(inode-&gt;i_mode)) {
+&gt; +		parent = d_inode(nf-&gt;nf_file-&gt;f_path.dentry);
+&gt; +		flags = EXPORT_FH_CONNECTABLE;
+&gt; +	}
+&gt; +
+&gt; +	fileid_type = exportfs_encode_inode_fh(inode, fid, &amp;maxsize, parent, 
+&gt; flags);
+&gt; +	if (fileid_type &lt; 0 || fileid_type == FILEID_INVALID)
+&gt; +		return false;
+&gt; +
+&gt; +	fhp-&gt;fh_fileid_type = fileid_type;
+&gt; +	fhp-&gt;fh_size += maxsize * 4;
+&gt; +	return true;
+&gt; +}
+&gt; +
+&gt;  #define CB_NOTIFY_STATX_REQUEST_MASK (STATX_BASIC_STATS   | \
+&gt;  				      STATX_BTIME	  | \
+&gt;  				      STATX_CHANGE_COOKIE)
+&gt; @@ -4206,6 +4239,7 @@ nfsd4_setup_notify_entry4(struct notify_entry4 
+&gt; *ne, struct xdr_stream *xdr,
+&gt;  			  struct dentry *dentry, struct nfs4_delegation *dp,
+&gt;  			  struct nfsd_file *nf, char *name, u32 namelen)
+&gt;  {
+&gt; +	struct nfs4_file *fi = dp-&gt;dl_stid.sc_file;
+&gt;  	struct path path =  { .mnt = nf-&gt;nf_file-&gt;f_path.mnt,
+&gt;  			      .dentry = dentry };
+&gt;  	struct nfsd4_fattr_args args = { };
+&gt; @@ -4244,6 +4278,9 @@ nfsd4_setup_notify_entry4(struct notify_entry4 
+&gt; *ne, struct xdr_stream *xdr,
+&gt;  		      FATTR4_WORD1_TIME_METADATA | FATTR4_WORD1_TIME_MODIFY;
+&gt;  	attrmask[2] = 0;
+&gt; 
+&gt; +	if (setup_notify_fhandle(dentry, fi, nf, &amp;args))
+&gt; +		attrmask[0] |= FATTR4_WORD0_FILEHANDLE;
+&gt; +
+&gt;  	if (args.stat.result_mask &amp; STATX_BTIME)
+&gt;  		attrmask[1] |= FATTR4_WORD1_TIME_CREATE;
+&gt; 
+
+Codex flagged setup_notify_fhandle() for constructing a child FILEHANDLE
+attribute without calling fh_append_mac(): for exports with sign_fh,
+fh_compose() appends a MAC, and nfsd_set_fh_dentry() rejects every
+non-root signed-export handle whose MAC is absent or mismatched, so a
+client using the CB_NOTIFY filehandle gets a stale/bad handle. It
+recommends signing the constructed handle or suppressing the attribute
+when the export requires signed filehandles.
+
+A client that does not receive the FH falls back to a LOOKUP, so
+suppression degrades gracefully.
+
+-- 
+Chuck Lever
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<div class="review-comment-signals">Signals: WAITING_FOR_REVIEW</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

@@ -1,0 +1,39 @@
+{
+  "thread_id": "aiwxWk0gOV4ZlKcT@thinkstation",
+  "subject": "[PATCH v1] kasan: Fix false-positive wild-memory-access on x86 under 5-level paging",
+  "url": "https://lore.kernel.org/all/aiwxWk0gOV4ZlKcT@thinkstation/",
+  "dates": {
+    "2026-06-12": {
+      "report_file": "2026-06-12_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Ihor Solodrai",
+          "summary": "Reviewer Ihor Solodrai expressed uncertainty about the fix proposed by Kiryl Shutsemau, questioning whether disabling IRQs in identify_cpu() is a complete solution and potentially introducing undesirable consequences, such as NMI handling issues.\n\nReviewer Ihor Solodrai expressed doubts about disabling IRQs in identify_cpu() as the solution to prevent a window where boot_cpu_data.x86_capability reads back zero, suggesting that this approach may not be correct because it only protects a portion of the capabilities array and could lead to issues with mcheck_cpu_init() which performs kmalloc(GFP_KERNEL) during this time.\n\nReviewer Ihor Solodrai suggested defining a static key for LA57 feature in KASAN code to avoid performance issues and make the code x86-specific, but noted that this would not address the underlying issue of capabilities being temporarily cleared on boot.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "uncertainty",
+            "concerns about potential side effects",
+            "doubts",
+            "may be a problem",
+            "requested changes",
+            "alternative solution"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Kiryl, thank you for testing.\n\nI thought of disabling IRQs here too, and AI bot flagged this as well [1].\n\nI wasn't sure it'd be a good fix, because I don't know if it has any\nundesirable consequences, and whether it's actually a complete fix.\nFor example, can a NMI hit this?\n\n[1] https://lore.kernel.org/bpf/7b6d449f-c70c-4e8e-bfc4-a2f75517395c@linux.dev/\n\n---\n\nIf we scope this narrowly, then it remains LA57-specific, because we protect\nonly a portion of the capabilities array.\nIIUC to ensure x86_capability is \"ready\", a proper scope should be\nentire identify_cpu(). And this may be a problem, because mcheck_cpu_init()\ndoes kmalloc(GFP_KERNEL) [2], for example.\n\nSo I have doubts disabling IRQ is the right approach.\n\n[2] https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/kernel/cpu/mce/genpool.c?h=v7.1-rc7#n119\n\n---\n\nWhat if we define a static key for LA57 feature for KASAN?\nThis will avoid the performance hit we get with USE_EARLY_PGTABLE_L5.\nAnd KASAN won't care about x86_capability being cleared.\nIs that feasible/acceptable?\n\nThat will be a KASAN-specific LA57-specific fix however.\nThe underlying \"capabilities are temporarily cleared on boot\"\nissue would remain. Although it wasn't a problem until this bug surfaced.\n\nSomething like this:\n\ndiff --git a/arch/x86/include/asm/kasan.h b/arch/x86/include/asm/kasan.h\nindex d7e33c7f096b..6c1ebcb4a417 100644\n--- a/arch/x86/include/asm/kasan.h\n+++ b/arch/x86/include/asm/kasan.h\n@@ -36,6 +36,35 @@ static inline void kasan_populate_shadow_for_vaddr(void *va, size_t size,\n                                                   int nid) { }\n #endif\n \n+#ifdef CONFIG_KASAN_GENERIC\n+#include <linux/jump_label.h>\n+\n+DECLARE_STATIC_KEY_TRUE(kasan_la57_enabled);\n+\n+#define addr_has_metadata addr_has_metadata\n+static __always_inline bool addr_has_metadata(const void *addr)\n+{\n+       unsigned int shift = static_branch_likely(&kasan_la57_enabled) ? 56 : 47;\n+\n+       return (unsigned long)addr >= (-1UL << shift);\n+}\n+#endif /* CONFIG_KASAN_GENERIC */\n+\n #endif\n \n #endif\ndiff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c\nindex a4268c47f2bc..79bad61f4891 100644\n--- a/arch/x86/kernel/cpu/common.c\n+++ b/arch/x86/kernel/cpu/common.c\n@@ -28,6 +28,7 @@\n #include <linux/stackprotector.h>\n #include <linux/utsname.h>\n #include <linux/efi.h>\n+#include <linux/kasan.h>\n \n #include <asm/alternative.h>\n #include <asm/cmdline.h>\n@@ -2581,6 +2582,19 @@ void __init arch_cpu_finalize_init(void)\n {\n        struct cpuinfo_x86 *c = this_cpu_ptr(&cpu_info);\n \n+#ifdef CONFIG_KASAN_GENERIC\n+       if (!__pgtable_l5_enabled)\n+               static_branch_disable(&kasan_la57_enabled);\n+#endif\n+\n        identify_boot_cpu();\n \n        select_idle_routine();\ndiff --git a/arch/x86/mm/kasan_init_64.c b/arch/x86/mm/kasan_init_64.c\nindex 998b6010d6d3..3cb20b4d8799 100644\n--- a/arch/x86/mm/kasan_init_64.c\n+++ b/arch/x86/mm/kasan_init_64.c\n@@ -11,6 +11,7 @@\n #include <linux/sched.h>\n #include <linux/sched/task.h>\n #include <linux/vmalloc.h>\n+#include <linux/jump_label.h>\n \n #include <asm/e820/types.h>\n #include <asm/pgalloc.h>\n@@ -20,6 +21,12 @@\n \n extern struct range pfn_mapped[E820_MAX_ENTRIES];\n \n+DEFINE_STATIC_KEY_TRUE(kasan_la57_enabled);\n+\n static p4d_t tmp_p4d_table[MAX_PTRS_PER_P4D] __initdata __aligned(PAGE_SIZE);\n \n static __init void *early_alloc(size_t size, int nid, bool should_panic)",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-06-12",
+          "message_id": "a9aa8bd7-4b3e-4ded-ba9c-6115bb1a5bc8@linux.dev",
+          "email": "ihor.solodrai@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a false-positive wild-memory-access error in the KASAN (Kernel Address Sanitizer) on x86 systems using 5-level paging. The issue occurs because the `cpu_feature_enabled()` function reads the live bits of CPU features before alternatives are patched, leading to incorrect results in interrupt context. To fix this, the patch modifies the `identify_cpu()` function to save and restore interrupts around the code that populates the `x86_capability` structure, ensuring that the correct values are read even in interrupt context. This change is specific to x86 systems and does not affect other architectures."
+    }
+  }
+}
