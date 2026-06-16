@@ -238,19 +238,178 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 00/10] fuse: add io-uring buffer pools and zero-copy</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260612210513.1516038-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The thread discusses the status of a patchset for fuse and io-uring, specifically the zero-copy feature.</div></div>
+    <div class="date-range">Submitted: <strong>2026-06-12</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-16</strong><div class="date-range-nav">Active on: <a href="#2026-06-16">2026-06-16</a> &bull; <a href="#2026-06-15">2026-06-15</a> &bull; <a href="#2026-06-12">2026-06-12</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds buffer pools and zero-copy to the fuse io-uring implementation, allowing servers to pass in a managed buffer pool that reduces memory usage requirements and enables future optimizations. The decoupling of ents and buffers also eliminates the need for dedicated payload buffers, reducing memory waste. Additionally, the series introduces zero-copy functionality, which allows direct access to client pages or page cache folios without copying data through an intermediary buffer, requiring CAP_SYS_ADMIN privileges and registered buffers.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-06-12">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Joanne Koong</span>
+<span class="review-author">Joanne Koong (author)</span>
 <a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Raised concerns about dependency on bvec patches and suggested coordinating syncing between io-uring and fuse trees. Also requested that refactoring changes be picked up for 7.2.</div>
-<div class="review-comment-signals">Signals: dependency on bvec patches, merge window timing</div>
+<div class="review-comment-text">The author simplified the logic for fetching and sending off the next request by removing duplicated code from fuse_uring_send() and decoupling request fetching from the send operation, making control flow clearer and reducing unnecessary parameter passing.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Simplify the logic for fetching + sending off the next request.
+
+This gets rid of fuse_uring_send_next_to_ring() which contained
+duplicated logic from fuse_uring_send(). This decouples request fetching
+from the send operation, which makes the control flow clearer and
+reduces unnecessary parameter passing.
+
+Reviewed-by: Bernd Schubert &lt;bschubert@ddn.com&gt;
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c | 81 ++++++++++++++++-----------------------------
+ 1 file changed, 29 insertions(+), 52 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 87f5f9eba534..0b66fe3a5da0 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -741,35 +741,6 @@ static void fuse_uring_add_to_pq(struct fuse_ring_ent *ent)
+ 	list_move_tail(&amp;req-&gt;list, &amp;fpq-&gt;processing[hash]);
+ }
+ 
+-/*
+- * Write data to the ring buffer and send the request to userspace,
+- * userspace will read it
+- * This is comparable with classical read(/dev/fuse)
+- */
+-static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
+-					struct fuse_req *req,
+-					unsigned int issue_flags)
+-{
+-	struct fuse_ring_queue *queue = ent-&gt;queue;
+-	int err;
+-	struct io_uring_cmd *cmd;
+-
+-	err = fuse_uring_prepare_send(ent, req);
+-	if (err)
+-		return err;
+-
+-	spin_lock(&amp;queue-&gt;lock);
+-	cmd = ent-&gt;cmd;
+-	ent-&gt;cmd = NULL;
+-	ent-&gt;state = FRRS_USERSPACE;
+-	list_move_tail(&amp;ent-&gt;list, &amp;queue-&gt;ent_in_userspace);
+-	fuse_uring_add_to_pq(ent);
+-	spin_unlock(&amp;queue-&gt;lock);
+-
+-	io_uring_cmd_done(cmd, 0, issue_flags);
+-	return 0;
+-}
+-
+ /*
+  * Make a ring entry available for fuse_req assignment
+  */
+@@ -852,11 +823,13 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ }
+ 
+ /*
+- * Get the next fuse req and send it
++ * Get the next fuse req.
++ *
++ * Returns true if the next fuse request has been assigned to the ent.
++ * Else, there is no next fuse request and this returns false.
+  */
+-static void fuse_uring_next_fuse_req(struct fuse_ring_ent *ent,
+-				     struct fuse_ring_queue *queue,
+-				     unsigned int issue_flags)
++static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
++					 struct fuse_ring_queue *queue)
+ {
+ 	int err;
+ 	struct fuse_req *req;
+@@ -868,10 +841,12 @@ static void fuse_uring_next_fuse_req(struct fuse_ring_ent *ent,
+ 	spin_unlock(&amp;queue-&gt;lock);
+ 
+ 	if (req) {
+-		err = fuse_uring_send_next_to_ring(ent, req, issue_flags);
++		err = fuse_uring_prepare_send(ent, req);
+ 		if (err)
+ 			goto retry;
+ 	}
++
++	return req != NULL;
+ }
+ 
+ static int fuse_ring_ent_set_commit(struct fuse_ring_ent *ent)
+@@ -889,6 +864,21 @@ static int fuse_ring_ent_set_commit(struct fuse_ring_ent *ent)
+ 	return 0;
+ }
+ 
++static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
++			    ssize_t ret, unsigned int issue_flags)
++{
++	struct fuse_ring_queue *queue = ent-&gt;queue;
++
++	spin_lock(&amp;queue-&gt;lock);
++	ent-&gt;state = FRRS_USERSPACE;
++	list_move_tail(&amp;ent-&gt;list, &amp;queue-&gt;ent_in_userspace);
++	ent-&gt;cmd = NULL;
++	fuse_uring_add_to_pq(ent);
++	spin_unlock(&amp;queue-&gt;lock);
++
++	io_uring_cmd_done(cmd, ret, issue_flags);
++}
++
+ /* FUSE_URING_CMD_COMMIT_AND_FETCH handler */
+ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 				   struct fuse_chan *fch)
+@@ -966,7 +956,8 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	 * and fetching is done in one step vs legacy fuse, which has separated
+ 	 * read (fetch request) and write (commit result).
+ 	 */
+-	fuse_uring_next_fuse_req(ent, queue, issue_flags);
++	if (fuse_uring_get_next_fuse_req(ent, queue))
++		fuse_uring_send(ent, cmd, 0, issue_flags);
+ 	return 0;
+ }
+ 
+@@ -1225,21 +1216,6 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
+ 	return -EIOCBQUEUED;
+ }
+ 
+-static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
+-			    ssize_t ret, unsigned int issue_flags)
+-{
+-	struct fuse_ring_queue *queue = ent-&gt;queue;
+-
+-	spin_lock(&amp;queue-&gt;lock);
+-	ent-&gt;state = FRRS_USERSPACE;
+-	list_move_tail(&amp;ent-&gt;list, &amp;queue-&gt;ent_in_userspace);
+-	ent-&gt;cmd = NULL;
+-	fuse_uring_add_to_pq(ent);
+-	spin_unlock(&amp;queue-&gt;lock);
+-
+-	io_uring_cmd_done(cmd, ret, issue_flags);
+-}
+-
+ /*
+  * This prepares and sends the ring request in fuse-uring task context.
+  * User buffers are not mapped yet - the application does not have permission
+@@ -1256,8 +1232,9 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 	if (!tw.cancel) {
+ 		err = fuse_uring_prepare_send(ent, ent-&gt;fuse_req);
+ 		if (err) {
+-			fuse_uring_next_fuse_req(ent, queue, issue_flags);
+-			return;
++			if (!fuse_uring_get_next_fuse_req(ent, queue))
++				return;
++			err = 0;
+ 		}
+ 		fuse_uring_send(ent, cmd, err, issue_flags);
+ 	} else {
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-2-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, agreed to restructure</div>
 </div>
 <div class="thread-children">
 <div class="thread-node depth-1">
@@ -259,59 +418,13 @@
 <span class="review-author">Jens Axboe</span>
 <a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Confirmed that the io-uring prep patches are staged and can be merged for 7.2, but suggested carrying them forward if fuse isn&#x27;t ready yet.</div>
+<div class="review-comment-text">Reviewer Jens Axboe restaged the io_uring prep patches in his for-7.2/io_uring-fuse branch and suggested they can be merged either in the current merge window or carried forward if fuse isn&#x27;t ready yet, noting potential conflicts with other branches.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On 6/12/26 3:46 PM, Joanne Koong wrote:
-&gt; On Fri, Jun 12, 2026 at 2:06?PM Joanne Koong &lt;joannelkoong@gmail.com&gt; wrote:
-&gt;&gt;
-&gt;&gt; This series adds buffer pools (implemented internally as a buffer ring) and
-&gt;&gt; zero-copy to fuse io-uring.
-&gt;&gt;
-&gt;&gt; Prior to this series, ents and buffers are tightly coupled where each entry
-&gt;&gt; has its own dedicated payload buffer, requiring N buffers for N entries where
-&gt;&gt; each buffer must be large enough to accomodate the maximum payload size. This
-&gt;&gt; is suboptimal as most request types require vastly less bytes than the maximum
-&gt;&gt; payload size and some requests do not require payload buffers at all.
-&gt;&gt;
-&gt;&gt; This series allows servers to pass in a buffer pool (internally managed as a
-&gt;&gt; buffer ring) that the kernel will use for servicing ents/requests. This
-&gt;&gt; decoupling reduces the memory usage requirements needed to use fuse-io-uring.
-&gt;&gt; It allows for future optimizations such as incremental buffer consumption and
-&gt;&gt; supporting multiple buffer sizes per ring.
-&gt;&gt;
-&gt;&gt; This series also allows servers to use io-uring registered buffers as the
-&gt;&gt; buffer pool which eliminates the overhead of pinning/unpinning user pages and
-&gt;&gt; translating virtual addreses per i/o request.
-&gt;&gt;
-&gt;&gt; This series additionally adds zero copy to fuse io-uring. The server can
-&gt;&gt; directly access client pages or page cache folios without copying data through
-&gt;&gt; an intermediary buffer. This requires CAP_SYS_ADMIN privileges and using
-&gt;&gt; registered buffers. Zero copy (patch 9) has a dependency on io-uring registered
-&gt;&gt; bvec changes in [1].
-&gt; 
-&gt; Miklos,
-&gt; 
-&gt; The zero-copy patch has a dependency on the bvec patches in Jens&#x27;s
-&gt; io-uring tree. Since the merge window opens Monday, it&#x27;s probably too
-&gt; tight now to cross-coordinate this for 7.2. What do you prefer for
-&gt; syncing between the two trees? If Jens stages the patches in a stable
-&gt; branch, are you fine with pulling that in and then applying the fuse
-&gt; patches on top?
-&gt; 
-&gt; Patches 7 and 8 (bufpools and registered buffers) don&#x27;t have this
-&gt; dependency, but to make the uapi cleaner under one single umbrella
-&gt; flag, it would be better to co-ship them with the zero-copy patch.
-&gt; 
-&gt; Patches 1-6 are refactoring changes that have been out since October
-&gt; and have value on their own, independent of the bufpool and zero-copy
-&gt; work. Could you please pick these up for 7.2 so they don&#x27;t have to be
-&gt; carried and repeatedly rebased?
-
-FWIW, I reviewed the patches again and they still look fine to me. So
+<pre class="raw-body-text">FWIW, I reviewed the patches again and they still look fine to me. So
 the 4 io_uring prep patches are staged, they are in my
 for-7.2/io_uring-fuse branch. They can either go in for this coming
 merge window, or we can carry them forward if fuse isn&#x27;t quite ready
@@ -322,12 +435,2571 @@ branches, the above branch is for-7.2/io_uring + for-7.2/block to avoid
 that.
 
 -- 
-Jens Axboe
-
-</pre>
+Jens Axboe</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Joanne Koong</div>
-<div class="review-comment-signals">Signals: reviewed patches again</div>
+<a href="https://lore.kernel.org/r/04ab6f18-f668-43b4-9e03-f63d45460742@kernel.dk" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: no clear signal</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the copy_to_user() logic in fuse_uring_out_header_has_err(), fuse_uring_args_to_ring(), and fuse_uring_copy_to_ring(). They moved this logic into a new function, copy_header_to_ring(), to make it more clear and centralize error handling. The changes are already implemented in the updated patch.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Move header copying to ring logic into a new copy_header_to_ring()
+function. This makes the copy_to_user() logic more clear and centralizes
+error handling / rate-limited logging.
+
+Reviewed-by: Bernd Schubert &lt;bschubert@ddn.com&gt;
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c | 39 +++++++++++++++++++++------------------
+ 1 file changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 0b66fe3a5da0..1d37a2ee5532 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -578,6 +578,18 @@ static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
+ 	return err;
+ }
+ 
++static __always_inline int copy_header_to_ring(void __user *ring,
++					       const void *header,
++					       size_t header_size)
++{
++	if (copy_to_user(ring, header, header_size)) {
++		pr_info_ratelimited(&quot;Copying header to ring failed.\n&quot;);
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
+ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 				     struct fuse_req *req,
+ 				     struct fuse_ring_ent *ent)
+@@ -640,13 +652,11 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 		 * Some op code have that as zero size.
+ 		 */
+ 		if (args-&gt;in_args[0].size &gt; 0) {
+-			err = copy_to_user(&amp;ent-&gt;headers-&gt;op_in, in_args-&gt;value,
+-					   in_args-&gt;size);
+-			if (err) {
+-				pr_info_ratelimited(
+-					&quot;Copying the header failed.\n&quot;);
+-				return -EFAULT;
+-			}
++			err = copy_header_to_ring(&amp;ent-&gt;headers-&gt;op_in,
++						  in_args-&gt;value,
++						  in_args-&gt;size);
++			if (err)
++				return err;
+ 		}
+ 		in_args++;
+ 		num_args--;
+@@ -662,9 +672,8 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 	}
+ 
+ 	ent_in_out.payload_sz = cs.ring.copied_sz;
+-	err = copy_to_user(&amp;ent-&gt;headers-&gt;ring_ent_in_out, &amp;ent_in_out,
+-			   sizeof(ent_in_out));
+-	return err ? -EFAULT : 0;
++	return copy_header_to_ring(&amp;ent-&gt;headers-&gt;ring_ent_in_out, &amp;ent_in_out,
++				   sizeof(ent_in_out));
+ }
+ 
+ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+@@ -693,14 +702,8 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 	}
+ 
+ 	/* copy fuse_in_header */
+-	err = copy_to_user(&amp;ent-&gt;headers-&gt;in_out, &amp;req-&gt;in.h,
+-			   sizeof(req-&gt;in.h));
+-	if (err) {
+-		err = -EFAULT;
+-		return err;
+-	}
+-
+-	return 0;
++	return copy_header_to_ring(&amp;ent-&gt;headers-&gt;in_out, &amp;req-&gt;in.h,
++				   sizeof(req-&gt;in.h));
+ }
+ 
+ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-3-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, changes already implemented</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the copy_from_user() logic being scattered throughout the code by extracting it into a new function called copy_header_from_ring(). This makes the logic more clear and centralizes error handling and rate-limited logging.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Move header copying from ring logic into a new copy_header_from_ring()
+function. This makes the copy_from_user() logic more clear and
+centralizes error handling / rate-limited logging.
+
+Reviewed-by: Bernd Schubert &lt;bschubert@ddn.com&gt;
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 1d37a2ee5532..42627838cfa6 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -590,6 +590,18 @@ static __always_inline int copy_header_to_ring(void __user *ring,
+ 	return 0;
+ }
+ 
++static __always_inline int copy_header_from_ring(void *header,
++						 const void __user *ring,
++						 size_t header_size)
++{
++	if (copy_from_user(header, ring, header_size)) {
++		pr_info_ratelimited(&quot;Copying header from ring failed.\n&quot;);
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
+ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 				     struct fuse_req *req,
+ 				     struct fuse_ring_ent *ent)
+@@ -600,10 +612,10 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	int err;
+ 	struct fuse_uring_ent_in_out ring_in_out;
+ 
+-	err = copy_from_user(&amp;ring_in_out, &amp;ent-&gt;headers-&gt;ring_ent_in_out,
+-			     sizeof(ring_in_out));
++	err = copy_header_from_ring(&amp;ring_in_out, &amp;ent-&gt;headers-&gt;ring_ent_in_out,
++				    sizeof(ring_in_out));
+ 	if (err)
+-		return -EFAULT;
++		return err;
+ 
+ 	err = import_ubuf(ITER_SOURCE, ent-&gt;payload, ring-&gt;max_payload_sz,
+ 			  &amp;iter);
+@@ -810,8 +822,8 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 	struct fuse_ring *ring = ent-&gt;queue-&gt;ring;
+ 	ssize_t err = -EFAULT;
+ 
+-	if (copy_from_user(&amp;req-&gt;out.h, &amp;ent-&gt;headers-&gt;in_out,
+-			   sizeof(req-&gt;out.h)))
++	if (copy_header_from_ring(&amp;req-&gt;out.h, &amp;ent-&gt;headers-&gt;in_out,
++				  sizeof(req-&gt;out.h)))
+ 		goto out;
+ 
+ 	err = fuse_uring_out_header_has_err(&amp;req-&gt;out.h, req);
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-4-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged feedback, agreed to restructure</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the header copying interface by introducing an enum to identify which part of the header needs to be copied, improving the interface and simplifying both kernel-space and user-space header addresses copying.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Use enum types to identify which part of the header needs to be copied.
+This improves the interface and will simplify both kernel-space and
+user-space header addresses copying when buffer rings are added.
+
+Reviewed-by: Bernd Schubert &lt;bschubert@ddn.com&gt;
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c | 66 ++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 42627838cfa6..58e19e8f537c 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -31,6 +31,15 @@ struct fuse_uring_pdu {
+ 
+ static const struct fuse_iqueue_ops fuse_io_uring_ops;
+ 
++enum fuse_uring_header_type {
++	/* struct fuse_in_header / struct fuse_out_header */
++	FUSE_URING_HEADER_IN_OUT,
++	/* per op code header */
++	FUSE_URING_HEADER_OP,
++	/* struct fuse_uring_ent_in_out header */
++	FUSE_URING_HEADER_RING_ENT,
++};
++
+ static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
+ 				   struct fuse_ring_ent *ring_ent)
+ {
+@@ -578,10 +587,33 @@ static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
+ 	return err;
+ }
+ 
+-static __always_inline int copy_header_to_ring(void __user *ring,
+-					       const void *header,
+-					       size_t header_size)
++static int ring_header_type_offset(enum fuse_uring_header_type type)
+ {
++	switch (type) {
++	case FUSE_URING_HEADER_IN_OUT:
++		return 0;
++	case FUSE_URING_HEADER_OP:
++		return offsetof(struct fuse_uring_req_header, op_in);
++	case FUSE_URING_HEADER_RING_ENT:
++		return offsetof(struct fuse_uring_req_header, ring_ent_in_out);
++	default:
++		WARN_ONCE(1, &quot;Invalid header type: %d\n&quot;, type);
++		return -EINVAL;
++	}
++}
++
++static int copy_header_to_ring(struct fuse_ring_ent *ent,
++			       enum fuse_uring_header_type type,
++			       const void *header, size_t header_size)
++{
++	int offset = ring_header_type_offset(type);
++	void __user *ring;
++
++	if (offset &lt; 0)
++		return offset;
++
++	ring = (void __user *)ent-&gt;headers + offset;
++
+ 	if (copy_to_user(ring, header, header_size)) {
+ 		pr_info_ratelimited(&quot;Copying header to ring failed.\n&quot;);
+ 		return -EFAULT;
+@@ -590,10 +622,18 @@ static __always_inline int copy_header_to_ring(void __user *ring,
+ 	return 0;
+ }
+ 
+-static __always_inline int copy_header_from_ring(void *header,
+-						 const void __user *ring,
+-						 size_t header_size)
++static int copy_header_from_ring(struct fuse_ring_ent *ent,
++				 enum fuse_uring_header_type type, void *header,
++				 size_t header_size)
+ {
++	int offset = ring_header_type_offset(type);
++	const void __user *ring;
++
++	if (offset &lt; 0)
++		return offset;
++
++	ring = (void __user *)ent-&gt;headers + offset;
++
+ 	if (copy_from_user(header, ring, header_size)) {
+ 		pr_info_ratelimited(&quot;Copying header from ring failed.\n&quot;);
+ 		return -EFAULT;
+@@ -612,8 +652,8 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	int err;
+ 	struct fuse_uring_ent_in_out ring_in_out;
+ 
+-	err = copy_header_from_ring(&amp;ring_in_out, &amp;ent-&gt;headers-&gt;ring_ent_in_out,
+-				    sizeof(ring_in_out));
++	err = copy_header_from_ring(ent, FUSE_URING_HEADER_RING_ENT,
++				    &amp;ring_in_out, sizeof(ring_in_out));
+ 	if (err)
+ 		return err;
+ 
+@@ -664,7 +704,7 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 		 * Some op code have that as zero size.
+ 		 */
+ 		if (args-&gt;in_args[0].size &gt; 0) {
+-			err = copy_header_to_ring(&amp;ent-&gt;headers-&gt;op_in,
++			err = copy_header_to_ring(ent, FUSE_URING_HEADER_OP,
+ 						  in_args-&gt;value,
+ 						  in_args-&gt;size);
+ 			if (err)
+@@ -684,8 +724,8 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 	}
+ 
+ 	ent_in_out.payload_sz = cs.ring.copied_sz;
+-	return copy_header_to_ring(&amp;ent-&gt;headers-&gt;ring_ent_in_out, &amp;ent_in_out,
+-				   sizeof(ent_in_out));
++	return copy_header_to_ring(ent, FUSE_URING_HEADER_RING_ENT,
++				   &amp;ent_in_out, sizeof(ent_in_out));
+ }
+ 
+ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+@@ -714,7 +754,7 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 	}
+ 
+ 	/* copy fuse_in_header */
+-	return copy_header_to_ring(&amp;ent-&gt;headers-&gt;in_out, &amp;req-&gt;in.h,
++	return copy_header_to_ring(ent, FUSE_URING_HEADER_IN_OUT, &amp;req-&gt;in.h,
+ 				   sizeof(req-&gt;in.h));
+ }
+ 
+@@ -822,7 +862,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 	struct fuse_ring *ring = ent-&gt;queue-&gt;ring;
+ 	ssize_t err = -EFAULT;
+ 
+-	if (copy_header_from_ring(&amp;req-&gt;out.h, &amp;ent-&gt;headers-&gt;in_out,
++	if (copy_header_from_ring(ent, FUSE_URING_HEADER_IN_OUT, &amp;req-&gt;out.h,
+ 				  sizeof(req-&gt;out.h)))
+ 		goto out;
+ 
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-5-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: introducing an enum, improving the interface</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about payload copying logic, added a new helper function setup_fuse_copy_state() to encapsulate the copy state setup for payload copying, and modified existing code to use this new function.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Add a new helper function setup_fuse_copy_state() to contain the logic
+for setting up the copy state for payload copying.
+
+Reviewed-by: Bernd Schubert &lt;bschubert@ddn.com&gt;
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c | 38 ++++++++++++++++++++++++--------------
+ 1 file changed, 24 insertions(+), 14 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 58e19e8f537c..0867799e1a3f 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -642,6 +642,27 @@ static int copy_header_from_ring(struct fuse_ring_ent *ent,
+ 	return 0;
+ }
+ 
++static int setup_fuse_copy_state(struct fuse_copy_state *cs,
++				 struct fuse_ring *ring, struct fuse_req *req,
++				 struct fuse_ring_ent *ent, int dir,
++				 struct iov_iter *iter)
++{
++	int err;
++
++	err = import_ubuf(dir, ent-&gt;payload, ring-&gt;max_payload_sz, iter);
++	if (err) {
++		pr_info_ratelimited(&quot;fuse: Import of user buffer failed\n&quot;);
++		return err;
++	}
++
++	fuse_copy_init(cs, dir == ITER_DEST, iter);
++
++	cs-&gt;is_uring = true;
++	cs-&gt;req = req;
++
++	return 0;
++}
++
+ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 				     struct fuse_req *req,
+ 				     struct fuse_ring_ent *ent)
+@@ -657,15 +678,10 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	if (err)
+ 		return err;
+ 
+-	err = import_ubuf(ITER_SOURCE, ent-&gt;payload, ring-&gt;max_payload_sz,
+-			  &amp;iter);
++	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_SOURCE, &amp;iter);
+ 	if (err)
+ 		return err;
+ 
+-	fuse_copy_init(&amp;cs, false, &amp;iter);
+-	cs.is_uring = true;
+-	cs.req = req;
+-
+ 	err = fuse_copy_out_args(&amp;cs, args, ring_in_out.payload_sz);
+ 	fuse_copy_finish(&amp;cs);
+ 	return err;
+@@ -688,15 +704,9 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 		.commit_id = req-&gt;in.h.unique,
+ 	};
+ 
+-	err = import_ubuf(ITER_DEST, ent-&gt;payload, ring-&gt;max_payload_sz, &amp;iter);
+-	if (err) {
+-		pr_info_ratelimited(&quot;fuse: Import of user buffer failed\n&quot;);
++	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_DEST, &amp;iter);
++	if (err)
+ 		return err;
+-	}
+-
+-	fuse_copy_init(&amp;cs, true, &amp;iter);
+-	cs.is_uring = true;
+-	cs.req = req;
+ 
+ 	if (num_args &gt; 0) {
+ 		/*
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-6-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: added new function, modified existing code</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about magic indices in the iovec array by replacing them with named constants FUSE_URING_IOV_HEADERS and FUSE_URING_IOV_PAYLOAD, making the code self-documenting and preparing for buffer ring support.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Replace magic indices 0 and 1 for the iovec array with named constants
+FUSE_URING_IOV_HEADERS and FUSE_URING_IOV_PAYLOAD. This makes the usages
+self-documenting and prepares for buffer ring support which will also
+reference these iovec slots by index.
+
+Reviewed-by: Bernd Schubert &lt;bernd@bsbernd.com&gt;
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c | 24 +++++++++++++-----------
+ 1 file changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 0867799e1a3f..ba5edf5d01b3 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -18,7 +18,8 @@ MODULE_PARM_DESC(enable_uring,
+ 		 &quot;Enable userspace communication through io-uring&quot;);
+ 
+ #define FUSE_URING_IOV_SEGS 2 /* header and payload */
+-
++#define FUSE_URING_IOV_HEADERS 0
++#define FUSE_URING_IOV_PAYLOAD 1
+ 
+ bool fuse_uring_enabled(void)
+ {
+@@ -1094,8 +1095,8 @@ static int fuse_uring_do_register(struct fuse_ring_ent *ent,
+ }
+ 
+ /*
+- * sqe-&gt;addr is a ptr to an iovec array, iov[0] has the headers, iov[1]
+- * the payload
++ * sqe-&gt;addr is a ptr to an iovec array, iov[FUSE_URING_IOV_HEADERS] has the
++ * headers, iov[FUSE_URING_IOV_PAYLOAD] the payload
+  */
+ static int fuse_uring_get_iovec_from_sqe(const struct io_uring_sqe *sqe,
+ 					 struct iovec iov[FUSE_URING_IOV_SEGS])
+@@ -1125,8 +1126,8 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ {
+ 	struct fuse_ring *ring = queue-&gt;ring;
+ 	struct fuse_ring_ent *ent;
+-	size_t payload_size;
+ 	struct iovec iov[FUSE_URING_IOV_SEGS];
++	struct iovec *headers, *payload;
+ 	int err;
+ 
+ 	err = fuse_uring_get_iovec_from_sqe(cmd-&gt;sqe, iov);
+@@ -1137,15 +1138,16 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 	}
+ 
+ 	err = -EINVAL;
+-	if (iov[0].iov_len &lt; sizeof(struct fuse_uring_req_header)) {
+-		pr_info_ratelimited(&quot;Invalid header len %zu\n&quot;, iov[0].iov_len);
++	headers = &amp;iov[FUSE_URING_IOV_HEADERS];
++	if (headers-&gt;iov_len &lt; sizeof(struct fuse_uring_req_header)) {
++		pr_info_ratelimited(&quot;Invalid header len %zu\n&quot;, headers-&gt;iov_len);
+ 		return ERR_PTR(err);
+ 	}
+ 
+-	payload_size = iov[1].iov_len;
+-	if (payload_size &lt; ring-&gt;max_payload_sz) {
++	payload = &amp;iov[FUSE_URING_IOV_PAYLOAD];
++	if (payload-&gt;iov_len &lt; ring-&gt;max_payload_sz) {
+ 		pr_info_ratelimited(&quot;Invalid req payload len %zu\n&quot;,
+-				    payload_size);
++				    payload-&gt;iov_len);
+ 		return ERR_PTR(err);
+ 	}
+ 
+@@ -1157,8 +1159,8 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 	INIT_LIST_HEAD(&amp;ent-&gt;list);
+ 
+ 	ent-&gt;queue = queue;
+-	ent-&gt;headers = iov[0].iov_base;
+-	ent-&gt;payload = iov[1].iov_base;
++	ent-&gt;headers = headers-&gt;iov_base;
++	ent-&gt;payload = payload-&gt;iov_base;
+ 
+ 	atomic_inc(&amp;ring-&gt;queue_refs);
+ 	return ent;
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-7-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed, agreed to restructure</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the tight coupling between ents and buffers in fuse io-uring, explaining that they have decoupled them by allowing servers to pass in a buffer pool (a contiguous allocation of buffers) that the kernel will use for servicing ents/requests. The buffer ring logic is used to manage the buffer pool, selecting and recycling buffers on demand. The author provided detailed explanations of how the buffer pool is managed and how it reduces memory usage requirements.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Right now, ents and buffers are tightly coupled in fuse io-uring where
+each entry has its own dedicated payload buffer, requiring N buffers for
+N entries where each buffer must be large enough to accomodate the
+maximum payload size. This is suboptimal as most request types (lookup,
+open, release, getattr, etc) require vastly less bytes than the maximum
+payload size and some requests (unlink, rmdir, fsync, flush, etc) do not
+require payload buffers at all.
+
+Instead of requiring a 1:1 coupling between ents and payload buffers,
+allow the server to pass in a buffer pool (a contiguous allocation of
+buffers) that the kernel will use as it wishes for servicing
+ents/requests. Buffers are now pooled and selected on demand. Entries
+only &quot;reserve&quot; a buffer while actively processing a request that
+requires a payload buffer. This decoupling reduces the memory usage
+requirements needed to use fuse-io-uring. It allows for future
+optimizations such as incremental buffer consumption which will allow
+non-overlapping regions of a single buffer to be used simultaneously
+across multiple ents/requests, and the possibility of multiple buffer
+sizes to be supported per ring in the future.
+
+To use this, the server must set the FUSE_URING_BUFPOOL flag during
+registration and provide the payload buffer pool through the iovec
+payload in the first sqe. The server must set init.buf_size and
+init.nr_bufs in the struct fuse_uring_cmd_req it passes to the kernel to
+describe the buffer pool configuration. Buffer pool usage is set on a
+per-ring basis. All subsequent registration SQEs for the same ring must
+pass in consistent flags.
+
+Internally, a buffer ring data structure is used for managing the buffer
+pool. The kernel manages buffer selection and recycling through this
+ring structure. A payload buffer is selected from the ring on demand if
+the request requires a payload buffer and recycled after the request
+completes if used.
+
+The contiguous buffer pool passed in is partitioned into individual
+buffers according to the buf_size passed in at registration time.
+
+  PAYLOAD BUFFER POOL (contiguous, provided via iov[1] in first sqe):
+    |&lt;-------------- payload_size ------------&gt;|
+    +--------- --+-----------+-----------+-----+
+    |  buf [0]   |  buf [1]  |  buf [2]  | ... |
+    |  buf_size  |  buf_size |  buf_size | ... |
+    +--------- --+-----------+-----------+-----+
+
+The buffer ring logic is as follows:
+select:  buf = bufs[head % nbufs]; head++
+recycle: bufs[tail % nbufs] = buf; tail++
+empty:   tail == head (no buffers available)
+full:    tail - head &gt;= nbufs
+
+Buffer ring request flow
+------------------------
+|  Kernel                                  |  FUSE daemon
+|                                          |
+|  [client request arrives]                |
+|  &gt;fuse_uring_send()                      |
+|    [select payload buf from pool]        |
+|    &gt;fuse_uring_select_buffer()           |
+|    [copy headers to ent]                 |
+|    &gt;copy_header_to_ring()                |
+|    [copy payload to selected buf]        |
+|    &gt;fuse_uring_copy_to_ring()            |
+|    [set buf_id in ent_in_out header]     |
+|    &gt;io_uring_cmd_done()                  |
+|                                          |  [CQE received]
+|                                          |  [read headers]
+|                                          |  [read payload from buf_id]
+|                                          |  [process request]
+|                                          |  [write reply to header]
+|                                          |  [write reply payload to
+|                                          |    buf]
+|                                          |  &gt;io_uring_submit()
+|                                          |   COMMIT_AND_FETCH
+|  &gt;fuse_uring_commit_fetch()              |
+|    &gt;fuse_uring_commit()                  |
+|     [copy reply from ring]               |
+|     &gt;fuse_uring_recycle_buffer()         |
+|    &gt;fuse_uring_get_next_fuse_req()       |
+
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c       | 356 +++++++++++++++++++++++++++++++-------
+ fs/fuse/dev_uring_i.h     |  31 +++-
+ fs/fuse/inode.c           |   2 +-
+ include/uapi/linux/fuse.h |  27 ++-
+ 4 files changed, 349 insertions(+), 67 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index ba5edf5d01b3..1c405ecb110a 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -41,6 +41,11 @@ enum fuse_uring_header_type {
+ 	FUSE_URING_HEADER_RING_ENT,
+ };
+ 
++static inline bool bufpool_enabled(struct fuse_ring_queue *queue)
++{
++	return queue-&gt;bufpool != NULL;
++}
++
+ static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
+ 				   struct fuse_ring_ent *ring_ent)
+ {
+@@ -222,6 +227,7 @@ void fuse_uring_destruct(struct fuse_chan *fch)
+ 		}
+ 
+ 		kfree(queue-&gt;fpq.processing);
++		kfree(queue-&gt;bufpool);
+ 		kfree(queue);
+ 		ring-&gt;queues[qid] = NULL;
+ 	}
+@@ -281,20 +287,113 @@ static struct fuse_ring *fuse_uring_create(struct fuse_chan *fch)
+ 	return res;
+ }
+ 
+-static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
+-						       int qid)
++/*
++ * sqe-&gt;addr is a ptr to an iovec array, iov[FUSE_URING_IOV_HEADERS] has the
++ * headers, iov[FUSE_URING_IOV_PAYLOAD] the payload
++ */
++static int fuse_uring_get_iovec_from_sqe(const struct io_uring_sqe *sqe,
++					 struct iovec iov[FUSE_URING_IOV_SEGS])
+ {
++	struct iovec __user *uiov = u64_to_user_ptr(READ_ONCE(sqe-&gt;addr));
++	struct iov_iter iter;
++	ssize_t ret;
++
++	if (sqe-&gt;len != FUSE_URING_IOV_SEGS)
++		return -EINVAL;
++
++	/*
++	 * Direction for buffer access will actually be READ and WRITE,
++	 * using write for the import should include READ access as well.
++	 */
++	ret = import_iovec(WRITE, uiov, FUSE_URING_IOV_SEGS,
++			   FUSE_URING_IOV_SEGS, &amp;iov, &amp;iter);
++	if (ret &lt; 0)
++		return ret;
++
++	return 0;
++}
++
++static int fuse_uring_bufpool_setup(struct io_uring_cmd *cmd,
++				    struct fuse_ring_queue *queue)
++{
++	const struct fuse_uring_cmd_req *cmd_req =
++		io_uring_sqe128_cmd(cmd-&gt;sqe, struct fuse_uring_cmd_req);
++	unsigned int buf_size = READ_ONCE(cmd_req-&gt;init.buf_size);
++	unsigned int nr_bufs = READ_ONCE(cmd_req-&gt;init.nr_bufs);
++	struct iovec iov[FUSE_URING_IOV_SEGS];
++	uintptr_t payload_addr;
++	size_t payload_size, ring_size;
++	struct fuse_bufpool *pool;
++	unsigned int i;
++	int err;
++
++	if (!buf_size || !nr_bufs)
++		return -EINVAL;
++
++	err = fuse_uring_get_iovec_from_sqe(cmd-&gt;sqe, iov);
++	if (err)
++		return err;
++
++	payload_addr = (uintptr_t)iov[FUSE_URING_IOV_PAYLOAD].iov_base;
++	payload_size = iov[FUSE_URING_IOV_PAYLOAD].iov_len;
++
++	if (payload_size &lt; (uint64_t)buf_size * nr_bufs)
++		return -EINVAL;
++
++	/* create the pool, which is managed as a ring buffer */
++	ring_size = struct_size(pool, bufs, nr_bufs);
++	pool = kzalloc(ring_size, GFP_KERNEL_ACCOUNT);
++	if (!pool)
++		return -ENOMEM;
++
++	/* populate the ring buffer */
++	for (i = 0; i &lt; nr_bufs; i++, payload_addr += buf_size) {
++		struct fuse_bufpool_buf *buf = &amp;pool-&gt;bufs[i];
++
++		buf-&gt;addr = payload_addr;
++		buf-&gt;len = buf_size;
++		buf-&gt;id = i;
++	}
++
++	pool-&gt;nbufs = nr_bufs;
++	pool-&gt;tail = nr_bufs;
++
++	queue-&gt;bufpool = pool;
++
++	return 0;
++}
++
++/*
++ * If the queue is already registered, check that the queue was initialized with
++ * the same init flags set for this FUSE_IO_URING_CMD_REGISTER cmd. all
++ * FUSE_IO_URING_CMD_REGISTER cmds should have the same init fields set on a
++ * per-queue basis.
++ */
++static bool queue_init_flags_consistent(struct fuse_ring_queue *queue,
++					u64 init_flags)
++{
++	bool bufpool = init_flags &amp; FUSE_URING_BUFPOOL;
++
++	return bufpool_enabled(queue) == bufpool;
++}
++
++static struct fuse_ring_queue *
++fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
++			int qid, u64 init_flags)
++{
++	bool use_bufpool = init_flags &amp; FUSE_URING_BUFPOOL;
+ 	struct fuse_chan *fch = ring-&gt;chan;
+ 	struct fuse_ring_queue *queue;
+ 	struct list_head *pq;
++	int err;
+ 
+ 	queue = kzalloc_obj(*queue, GFP_KERNEL_ACCOUNT);
+ 	if (!queue)
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 	pq = fuse_pqueue_alloc();
+ 	if (!pq) {
+ 		kfree(queue);
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+ 	queue-&gt;qid = qid;
+@@ -312,12 +411,27 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
+ 	fuse_pqueue_init(&amp;queue-&gt;fpq);
+ 	queue-&gt;fpq.processing = pq;
+ 
++	if (use_bufpool) {
++		err = fuse_uring_bufpool_setup(cmd, queue);
++		if (err) {
++			kfree(pq);
++			kfree(queue);
++			return ERR_PTR(err);
++		}
++	}
++
+ 	spin_lock(&amp;fch-&gt;lock);
++	/* check if the queue creation raced with another thread */
+ 	if (ring-&gt;queues[qid]) {
+ 		spin_unlock(&amp;fch-&gt;lock);
+ 		kfree(queue-&gt;fpq.processing);
++		kfree(queue-&gt;bufpool);
+ 		kfree(queue);
+-		return ring-&gt;queues[qid];
++
++		queue = ring-&gt;queues[qid];
++		if (!queue_init_flags_consistent(queue, init_flags))
++			return ERR_PTR(-EINVAL);
++		return queue;
+ 	}
+ 
+ 	/*
+@@ -648,12 +762,26 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+ 				 struct fuse_ring_ent *ent, int dir,
+ 				 struct iov_iter *iter)
+ {
++	void __user *payload;
++	size_t len;
+ 	int err;
+ 
+-	err = import_ubuf(dir, ent-&gt;payload, ring-&gt;max_payload_sz, iter);
+-	if (err) {
+-		pr_info_ratelimited(&quot;fuse: Import of user buffer failed\n&quot;);
+-		return err;
++	memset(iter, 0, sizeof(*iter));
++
++	if (bufpool_enabled(ent-&gt;queue)) {
++		payload = (void __user *)ent-&gt;payload_buf.addr;
++		len = ent-&gt;payload_buf.len;
++	} else {
++		payload = ent-&gt;payload;
++		len = ring-&gt;max_payload_sz;
++	}
++
++	if (payload) {
++		err = import_ubuf(dir, payload, len, iter);
++		if (err) {
++			pr_info_ratelimited(&quot;fuse: Import of user buffer failed\n&quot;);
++			return err;
++		}
+ 	}
+ 
+ 	fuse_copy_init(cs, dir == ITER_DEST, iter);
+@@ -705,6 +833,9 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 		.commit_id = req-&gt;in.h.unique,
+ 	};
+ 
++	if (bufpool_enabled(ent-&gt;queue))
++		ent_in_out.buf_id = ent-&gt;payload_buf.id;
++
+ 	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_DEST, &amp;iter);
+ 	if (err)
+ 		return err;
+@@ -769,6 +900,92 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 				   sizeof(req-&gt;in.h));
+ }
+ 
++static bool fuse_uring_req_has_payload(struct fuse_req *req)
++{
++	struct fuse_args *args = req-&gt;args;
++
++	return args-&gt;in_numargs &gt; 1 || args-&gt;out_numargs;
++}
++
++static int fuse_uring_select_buffer(struct fuse_ring_ent *ent)
++{
++	struct fuse_ring_queue *queue = ent-&gt;queue;
++	struct fuse_bufpool *pool = queue-&gt;bufpool;
++	struct fuse_bufpool_buf *buf;
++	unsigned int tail = pool-&gt;tail, head = pool-&gt;head;
++
++	lockdep_assert_held(&amp;queue-&gt;lock);
++
++	if (tail == head)
++		return -ENOBUFS;
++
++	buf = &amp;pool-&gt;bufs[head % pool-&gt;nbufs];
++	pool-&gt;head++;
++
++	ent-&gt;payload_buf = *buf;
++
++	return 0;
++}
++
++static void fuse_uring_recycle_buffer(struct fuse_ring_ent *ent)
++{
++	struct fuse_bufpool_buf *ent_payload = &amp;ent-&gt;payload_buf;
++	struct fuse_ring_queue *queue = ent-&gt;queue;
++	struct fuse_bufpool_buf *buf;
++	struct fuse_bufpool *pool;
++
++	lockdep_assert_held(&amp;queue-&gt;lock);
++
++	if (!bufpool_enabled(queue) || !ent_payload-&gt;addr)
++		return;
++
++	pool = queue-&gt;bufpool;
++
++	/* pool should never be full */
++	WARN_ON_ONCE(pool-&gt;tail - pool-&gt;head &gt;= pool-&gt;nbufs);
++
++	buf = &amp;pool-&gt;bufs[(pool-&gt;tail) % pool-&gt;nbufs];
++	*buf = *ent_payload;
++
++	pool-&gt;tail++;
++
++	memset(ent_payload, 0, sizeof(*ent_payload));
++}
++
++static int fuse_uring_next_req_update_buffer(struct fuse_ring_ent *ent,
++					     struct fuse_req *req)
++{
++	bool buffer_selected;
++	bool has_payload;
++
++	if (!bufpool_enabled(ent-&gt;queue))
++		return 0;
++
++	buffer_selected = !!ent-&gt;payload_buf.addr;
++	has_payload = fuse_uring_req_has_payload(req);
++
++	if (has_payload &amp;&amp; !buffer_selected)
++		return fuse_uring_select_buffer(ent);
++
++	if (!has_payload &amp;&amp; buffer_selected)
++		fuse_uring_recycle_buffer(ent);
++
++	return 0;
++}
++
++static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
++				  struct fuse_req *req)
++{
++	if (!bufpool_enabled(ent-&gt;queue))
++		return 0;
++
++	/* no payload to copy, can skip selecting a buffer */
++	if (!fuse_uring_req_has_payload(req))
++		return 0;
++
++	return fuse_uring_select_buffer(ent);
++}
++
+ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+ 				   struct fuse_req *req)
+ {
+@@ -851,15 +1068,26 @@ static struct fuse_req *fuse_uring_ent_assign_req(struct fuse_ring_ent *ent)
+ 	struct fuse_req *req;
+ 	struct fuse_ring_queue *queue = ent-&gt;queue;
+ 	struct list_head *req_queue = &amp;queue-&gt;fuse_req_queue;
++	int err;
+ 
+ 	lockdep_assert_held(&amp;queue-&gt;lock);
+ 
+ 	/* get and assign the next entry while it is still holding the lock */
+ 	req = list_first_entry_or_null(req_queue, struct fuse_req, list);
+-	if (req)
+-		fuse_uring_add_req_to_ring_ent(ent, req);
++	if (req) {
++		/*
++		 * Buffer selection may fail if all the buffers are currently saturated.
++		 * The request will be serviced when a buffer is freed up.
++		 */
++		err = fuse_uring_next_req_update_buffer(ent, req);
++		if (!err) {
++			fuse_uring_add_req_to_ring_ent(ent, req);
++			return req;
++		}
++	}
+ 
+-	return req;
++	fuse_uring_recycle_buffer(ent);
++	return NULL;
+ }
+ 
+ /*
+@@ -1021,6 +1249,12 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	 * fuse requests would otherwise not get processed - committing
+ 	 * and fetching is done in one step vs legacy fuse, which has separated
+ 	 * read (fetch request) and write (commit result).
++	 *
++	 * If the server is using bufpools and has populated the pool with less
++	 * payload buffers than ents, it is possible that there may not be an
++	 * available buffer for the next request. If so, then the fetch is a
++	 * no-op and the next request will be serviced when a buffer becomes
++	 * available.
+ 	 */
+ 	if (fuse_uring_get_next_fuse_req(ent, queue))
+ 		fuse_uring_send(ent, cmd, 0, issue_flags);
+@@ -1094,32 +1328,6 @@ static int fuse_uring_do_register(struct fuse_ring_ent *ent,
+ 	return 0;
+ }
+ 
+-/*
+- * sqe-&gt;addr is a ptr to an iovec array, iov[FUSE_URING_IOV_HEADERS] has the
+- * headers, iov[FUSE_URING_IOV_PAYLOAD] the payload
+- */
+-static int fuse_uring_get_iovec_from_sqe(const struct io_uring_sqe *sqe,
+-					 struct iovec iov[FUSE_URING_IOV_SEGS])
+-{
+-	struct iovec __user *uiov = u64_to_user_ptr(READ_ONCE(sqe-&gt;addr));
+-	struct iov_iter iter;
+-	ssize_t ret;
+-
+-	if (sqe-&gt;len != FUSE_URING_IOV_SEGS)
+-		return -EINVAL;
+-
+-	/*
+-	 * Direction for buffer access will actually be READ and WRITE,
+-	 * using write for the import should include READ access as well.
+-	 */
+-	ret = import_iovec(WRITE, uiov, FUSE_URING_IOV_SEGS,
+-			   FUSE_URING_IOV_SEGS, &amp;iov, &amp;iter);
+-	if (ret &lt; 0)
+-		return ret;
+-
+-	return 0;
+-}
+-
+ static struct fuse_ring_ent *
+ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 			   struct fuse_ring_queue *queue)
+@@ -1144,13 +1352,6 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 		return ERR_PTR(err);
+ 	}
+ 
+-	payload = &amp;iov[FUSE_URING_IOV_PAYLOAD];
+-	if (payload-&gt;iov_len &lt; ring-&gt;max_payload_sz) {
+-		pr_info_ratelimited(&quot;Invalid req payload len %zu\n&quot;,
+-				    payload-&gt;iov_len);
+-		return ERR_PTR(err);
+-	}
+-
+ 	err = -ENOMEM;
+ 	ent = kzalloc_obj(*ent, GFP_KERNEL_ACCOUNT);
+ 	if (!ent)
+@@ -1160,12 +1361,30 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 
+ 	ent-&gt;queue = queue;
+ 	ent-&gt;headers = headers-&gt;iov_base;
+-	ent-&gt;payload = payload-&gt;iov_base;
++
++	err = -EINVAL;
++	if (!bufpool_enabled(queue)) {
++		payload = &amp;iov[FUSE_URING_IOV_PAYLOAD];
++		if (payload-&gt;iov_len &lt; ring-&gt;max_payload_sz) {
++			pr_info_ratelimited(&quot;Invalid req payload len %zu\n&quot;,
++					    payload-&gt;iov_len);
++			kfree(ent);
++			return ERR_PTR(err);
++		}
++		ent-&gt;payload = payload-&gt;iov_base;
++	}
+ 
+ 	atomic_inc(&amp;ring-&gt;queue_refs);
+ 	return ent;
+ }
+ 
++static bool init_flags_valid(u64 init_flags)
++{
++	u64 valid_flags = FUSE_URING_BUFPOOL;
++
++	return !(init_flags &amp; ~valid_flags);
++}
++
+ /*
+  * Register header and payload buffer with the kernel and puts the
+  * entry as &quot;ready to get fuse requests&quot; on the queue
+@@ -1175,6 +1394,7 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+ {
+ 	const struct fuse_uring_cmd_req *cmd_req = io_uring_sqe128_cmd(cmd-&gt;sqe,
+ 								       struct fuse_uring_cmd_req);
++	u64 init_flags = READ_ONCE(cmd_req-&gt;flags);
+ 	struct fuse_ring *ring = smp_load_acquire(&amp;fch-&gt;ring);
+ 	struct fuse_ring_queue *queue;
+ 	struct fuse_ring_ent *ent;
+@@ -1193,11 +1413,16 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
+ 		return -EINVAL;
+ 	}
+ 
++	if (!init_flags_valid(init_flags))
++		return -EINVAL;
++
+ 	queue = ring-&gt;queues[qid];
+ 	if (!queue) {
+-		queue = fuse_uring_create_queue(ring, qid);
+-		if (!queue)
+-			return err;
++		queue = fuse_uring_create_queue(cmd, ring, qid, init_flags);
++		if (IS_ERR(queue))
++			return PTR_ERR(queue);
++	} else if (!queue_init_flags_consistent(queue, init_flags)) {
++		return -EINVAL;
+ 	}
+ 
+ 	/*
+@@ -1370,14 +1595,18 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
+ 	req-&gt;ring_queue = queue;
+ 	ent = list_first_entry_or_null(&amp;queue-&gt;ent_avail_queue,
+ 				       struct fuse_ring_ent, list);
+-	if (ent)
+-		fuse_uring_add_req_to_ring_ent(ent, req);
+-	else
+-		list_add_tail(&amp;req-&gt;list, &amp;queue-&gt;fuse_req_queue);
+-	spin_unlock(&amp;queue-&gt;lock);
++	if (ent) {
++		err = fuse_uring_prep_buffer(ent, req);
++		if (!err) {
++			fuse_uring_add_req_to_ring_ent(ent, req);
++			spin_unlock(&amp;queue-&gt;lock);
++			fuse_uring_dispatch_ent(ent);
++			return;
++		}
++	}
+ 
+-	if (ent)
+-		fuse_uring_dispatch_ent(ent);
++	list_add_tail(&amp;req-&gt;list, &amp;queue-&gt;fuse_req_queue);
++	spin_unlock(&amp;queue-&gt;lock);
+ 
+ 	return;
+ 
+@@ -1395,6 +1624,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 	struct fuse_ring *ring = fch-&gt;ring;
+ 	struct fuse_ring_queue *queue;
+ 	struct fuse_ring_ent *ent = NULL;
++	int err;
+ 
+ 	queue = fuse_uring_task_to_queue(ring);
+ 	if (!queue)
+@@ -1427,14 +1657,16 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
+ 	req = list_first_entry_or_null(&amp;queue-&gt;fuse_req_queue, struct fuse_req,
+ 				       list);
+ 	if (ent &amp;&amp; req) {
+-		fuse_uring_add_req_to_ring_ent(ent, req);
+-		spin_unlock(&amp;queue-&gt;lock);
+-
+-		fuse_uring_dispatch_ent(ent);
+-	} else {
+-		spin_unlock(&amp;queue-&gt;lock);
++		err = fuse_uring_prep_buffer(ent, req);
++		if (!err) {
++			fuse_uring_add_req_to_ring_ent(ent, req);
++			spin_unlock(&amp;queue-&gt;lock);
++			fuse_uring_dispatch_ent(ent);
++			return true;
++		}
+ 	}
+ 
++	spin_unlock(&amp;queue-&gt;lock);
+ 	return true;
+ }
+ 
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index 55f8d04e4b0b..27a9d5742d8e 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -36,11 +36,32 @@ enum fuse_ring_req_state {
+ 	FRRS_RELEASED,
+ };
+ 
++struct fuse_bufpool_buf {
++	uintptr_t addr;
++	unsigned int len;
++	unsigned int id;
++};
++
++/* implemented as a buffer ring */
++struct fuse_bufpool {
++	/* metadata tracking state of the bufpool */
++	unsigned int nbufs;
++	unsigned int head;
++	unsigned int tail;
++
++	/* the buffers backing the pool */
++	__DECLARE_FLEX_ARRAY(struct fuse_bufpool_buf, bufs);
++};
++
+ /** A fuse ring entry, part of the ring queue */
+ struct fuse_ring_ent {
+-	/* userspace buffer */
+ 	struct fuse_uring_req_header __user *headers;
+-	void __user *payload;
++	union {
++		/* if bufpools are not used */
++		void __user *payload;
++		/* if bufpools are used */
++		struct fuse_bufpool_buf payload_buf;
++	};
+ 
+ 	/* the ring queue that owns the request */
+ 	struct fuse_ring_queue *queue;
+@@ -99,6 +120,12 @@ struct fuse_ring_queue {
+ 	unsigned int active_background;
+ 
+ 	bool stopped;
++
++	/*
++	 * only allocated if the server registers the ring with
++	 * FUSE_URING_BUFPOOL.
++	 */
++	struct fuse_bufpool *bufpool;
+ };
+ 
+ /*
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index d975073c6029..e942182dad37 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1462,7 +1462,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+ 		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
+ 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
+ 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
+-		FUSE_REQUEST_TIMEOUT;
++		FUSE_REQUEST_TIMEOUT | FUSE_HAS_IO_URING_BUFPOOL;
+ #ifdef CONFIG_FUSE_DAX
+ 	if (fm-&gt;fc-&gt;dax)
+ 		flags |= FUSE_MAP_ALIGNMENT;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index c13e1f9a2f12..5d377d8e8e27 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -240,6 +240,11 @@
+  *  - add FUSE_COPY_FILE_RANGE_64
+  *  - add struct fuse_copy_file_range_out
+  *  - add FUSE_NOTIFY_PRUNE
++ *
++ *  7.46
++ *  - add FUSE_HAS_IO_URING_BUFPOOL / FUSE_URING_BUFPOOL flags
++ *  - add fuse_uring_cmd_req init struct
++ *  - add buf_id field to fuse_uring_ent_in_out struct
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -275,7 +280,7 @@
+ #define FUSE_KERNEL_VERSION 7
+ 
+ /** Minor version number of this interface */
+-#define FUSE_KERNEL_MINOR_VERSION 45
++#define FUSE_KERNEL_MINOR_VERSION 46
+ 
+ /** The node ID of the root inode */
+ #define FUSE_ROOT_ID 1
+@@ -448,6 +453,7 @@ struct fuse_file_lock {
+  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
+  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+  *			 init_out.request_timeout contains the timeout (in secs)
++ * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools
+  */
+ #define FUSE_ASYNC_READ		(1 &lt;&lt; 0)
+ #define FUSE_POSIX_LOCKS	(1 &lt;&lt; 1)
+@@ -495,6 +501,7 @@ struct fuse_file_lock {
+ #define FUSE_ALLOW_IDMAP	(1ULL &lt;&lt; 40)
+ #define FUSE_OVER_IO_URING	(1ULL &lt;&lt; 41)
+ #define FUSE_REQUEST_TIMEOUT	(1ULL &lt;&lt; 42)
++#define FUSE_HAS_IO_URING_BUFPOOL (1ULL &lt;&lt; 43)
+ 
+ /**
+  * CUSE INIT request/reply flags
+@@ -1263,7 +1270,13 @@ struct fuse_uring_ent_in_out {
+ 
+ 	/* size of user payload buffer */
+ 	uint32_t payload_sz;
+-	uint32_t padding;
++
++	/*
++	 * if using bufpools, this is the id of the selected buffer.
++	 * the selected buffer holds the request payload
++	 */
++	uint16_t buf_id;
++	uint16_t padding;
+ 
+ 	uint64_t reserved;
+ };
+@@ -1294,6 +1307,9 @@ enum fuse_uring_cmd {
+ 	FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+ };
+ 
++/* fuse_uring_cmd_req flags */
++#define FUSE_URING_BUFPOOL		(1 &lt;&lt; 0)
++
+ /**
+  * In the 80B command area of the SQE.
+  */
+@@ -1306,6 +1322,13 @@ struct fuse_uring_cmd_req {
+ 	/* queue the command is for (queue index) */
+ 	uint16_t qid;
+ 	uint8_t padding[6];
++
++	union {
++		struct {
++			uint32_t buf_size;
++			uint16_t nr_bufs;
++		} init;
++	};
+ };
+ 
+ #endif /* _LINUX_FUSE_H */
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-8-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix, explained reasoning</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the handling of registered buffers in the buffer pool setup code, explaining that the pages backing the buffers are pinned upfront when registering buffers with io-uring, and that this eliminates the overhead of pinning/unpinning user pages. The author also clarified the requirements for using registered buffers, including setting the FUSE_URING_REGISTERED_BUFFERS init flag during registration and following standard protocol for using registered buffers.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Allow servers to use an io-uring registered buffer as the buffer pool.
+When the server registers buffers with io-uring, the pages backing the
+buffers are pinned upfront. This eliminates the overhead of
+pinning/unpinning user pages and translating virtual addresses per i/o
+request. This also allows servers to use the same registered buffers for
+subsequent backing store I/O (eg read_fixed/write_fixed), keeping data
+in the same pinned pages without additional pinning or mapping overhead
+required.
+
+Registered buffers require the buffer pool (FUSE_URING_BUFPOOL) to be
+enabled. To use registered buffers, the server needs to register the
+payload buffers through io-uring and during registration, set the
+FUSE_URING_REGISTERED_BUFFERS init flag (alongside the
+FUSE_URING_BUFPOOL flag) in the registration sqe. For all sqes the
+server passes in (including the registration ones), it needs to follow
+standard protocol for using registered buffers (eg set
+sqe-&gt;uring_cmd_flags to include IORING_URING_CMD_FIXED, and pass in the
+index where the registered buffers reside to sqe-&gt;buf_index). Kernel
+support for registered buffers is advertised to userspace via the
+FUSE_HAS_IO_URING_BUFPOOL init flag (a single umbrella flag).
+
+In benchmarks using passthrough_hp on a high-performance NVMe-backed
+system, using registered buffers showed around a 10% throughput
+improvement for direct randreads (~2150 MiB/s to ~2400 MiB/s), a 4%
+improvement for direct sequential reads (~2510 MiB/s to ~2620 MiB/s),
+a 8% improvement for buffered randreads (~2100 MiB/s to ~2280 MiB/s),
+and a 6% improvement for buffered sequential reads (~2500 MiB/s to
+~2670 MiB/s).
+
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev_uring.c       | 97 ++++++++++++++++++++++++++-------------
+ fs/fuse/dev_uring_i.h     |  2 +
+ include/uapi/linux/fuse.h |  5 +-
+ 3 files changed, 72 insertions(+), 32 deletions(-)
+
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 1c405ecb110a..9c79ec85e685 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -46,6 +46,11 @@ static inline bool bufpool_enabled(struct fuse_ring_queue *queue)
+ 	return queue-&gt;bufpool != NULL;
+ }
+ 
++static inline bool bufpool_registered_buffers(struct fuse_ring_queue *queue)
++{
++	return queue-&gt;bufpool &amp;&amp; queue-&gt;bufpool-&gt;registered_buffers;
++}
++
+ static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
+ 				   struct fuse_ring_ent *ring_ent)
+ {
+@@ -314,7 +319,8 @@ static int fuse_uring_get_iovec_from_sqe(const struct io_uring_sqe *sqe,
+ }
+ 
+ static int fuse_uring_bufpool_setup(struct io_uring_cmd *cmd,
+-				    struct fuse_ring_queue *queue)
++				    struct fuse_ring_queue *queue,
++				    u64 init_flags)
+ {
+ 	const struct fuse_uring_cmd_req *cmd_req =
+ 		io_uring_sqe128_cmd(cmd-&gt;sqe, struct fuse_uring_cmd_req);
+@@ -357,6 +363,7 @@ static int fuse_uring_bufpool_setup(struct io_uring_cmd *cmd,
+ 
+ 	pool-&gt;nbufs = nr_bufs;
+ 	pool-&gt;tail = nr_bufs;
++	pool-&gt;registered_buffers = init_flags &amp; FUSE_URING_REGISTERED_BUFFERS;
+ 
+ 	queue-&gt;bufpool = pool;
+ 
+@@ -373,8 +380,10 @@ static bool queue_init_flags_consistent(struct fuse_ring_queue *queue,
+ 					u64 init_flags)
+ {
+ 	bool bufpool = init_flags &amp; FUSE_URING_BUFPOOL;
++	bool registered_buffers = init_flags &amp; FUSE_URING_REGISTERED_BUFFERS;
+ 
+-	return bufpool_enabled(queue) == bufpool;
++	return bufpool_enabled(queue) == bufpool &amp;&amp;
++		bufpool_registered_buffers(queue) == registered_buffers;
+ }
+ 
+ static struct fuse_ring_queue *
+@@ -412,7 +421,7 @@ fuse_uring_create_queue(struct io_uring_cmd *cmd, struct fuse_ring *ring,
+ 	queue-&gt;fpq.processing = pq;
+ 
+ 	if (use_bufpool) {
+-		err = fuse_uring_bufpool_setup(cmd, queue);
++		err = fuse_uring_bufpool_setup(cmd, queue, init_flags);
+ 		if (err) {
+ 			kfree(pq);
+ 			kfree(queue);
+@@ -760,28 +769,41 @@ static int copy_header_from_ring(struct fuse_ring_ent *ent,
+ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+ 				 struct fuse_ring *ring, struct fuse_req *req,
+ 				 struct fuse_ring_ent *ent, int dir,
+-				 struct iov_iter *iter)
++				 struct iov_iter *iter,
++				 unsigned int issue_flags)
+ {
++	bool bufpool = bufpool_enabled(ent-&gt;queue);
++	bool registered_buffers = bufpool_registered_buffers(ent-&gt;queue);
+ 	void __user *payload;
+ 	size_t len;
+-	int err;
++	int err = 0;
+ 
+ 	memset(iter, 0, sizeof(*iter));
+ 
+-	if (bufpool_enabled(ent-&gt;queue)) {
+-		payload = (void __user *)ent-&gt;payload_buf.addr;
+-		len = ent-&gt;payload_buf.len;
++	if (registered_buffers) {
++		if (ent-&gt;payload_buf.addr)
++			err = io_uring_cmd_import_fixed(ent-&gt;payload_buf.addr,
++							ent-&gt;payload_buf.len,
++							dir, iter, ent-&gt;cmd,
++							issue_flags);
+ 	} else {
+-		payload = ent-&gt;payload;
+-		len = ring-&gt;max_payload_sz;
++		if (bufpool) {
++			payload = (void __user *)ent-&gt;payload_buf.addr;
++			len = ent-&gt;payload_buf.len;
++		} else {
++			payload = ent-&gt;payload;
++			len = ring-&gt;max_payload_sz;
++		}
++
++		if (payload)
++			err = import_ubuf(dir, payload, len, iter);
+ 	}
+ 
+-	if (payload) {
+-		err = import_ubuf(dir, payload, len, iter);
+-		if (err) {
+-			pr_info_ratelimited(&quot;fuse: Import of user buffer failed\n&quot;);
+-			return err;
+-		}
++	if (err) {
++		pr_info_ratelimited(&quot;fuse: Importing iter failed, bufpool=%d, &quot;
++				    &quot;registered_buffers=%d\n&quot;, bufpool,
++				    registered_buffers);
++		return err;
+ 	}
+ 
+ 	fuse_copy_init(cs, dir == ITER_DEST, iter);
+@@ -794,7 +816,8 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+ 
+ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 				     struct fuse_req *req,
+-				     struct fuse_ring_ent *ent)
++				     struct fuse_ring_ent *ent,
++				     unsigned int issue_flags)
+ {
+ 	struct fuse_copy_state cs;
+ 	struct fuse_args *args = req-&gt;args;
+@@ -807,7 +830,8 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	if (err)
+ 		return err;
+ 
+-	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_SOURCE, &amp;iter);
++	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_SOURCE, &amp;iter,
++				    issue_flags);
+ 	if (err)
+ 		return err;
+ 
+@@ -820,7 +844,8 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+  * Copy data from the req to the ring buffer
+  */
+ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+-				   struct fuse_ring_ent *ent)
++				   struct fuse_ring_ent *ent,
++				   unsigned int issue_flags)
+ {
+ 	struct fuse_copy_state cs;
+ 	struct fuse_args *args = req-&gt;args;
+@@ -836,7 +861,8 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 	if (bufpool_enabled(ent-&gt;queue))
+ 		ent_in_out.buf_id = ent-&gt;payload_buf.id;
+ 
+-	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_DEST, &amp;iter);
++	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_DEST, &amp;iter,
++				    issue_flags);
+ 	if (err)
+ 		return err;
+ 
+@@ -871,7 +897,8 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ }
+ 
+ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+-				   struct fuse_req *req)
++				   struct fuse_req *req,
++				   unsigned int issue_flags)
+ {
+ 	struct fuse_ring_queue *queue = ent-&gt;queue;
+ 	struct fuse_ring *ring = queue-&gt;ring;
+@@ -889,7 +916,7 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 		return err;
+ 
+ 	/* copy the request */
+-	err = fuse_uring_args_to_ring(ring, req, ent);
++	err = fuse_uring_args_to_ring(ring, req, ent, issue_flags);
+ 	if (unlikely(err)) {
+ 		pr_info_ratelimited(&quot;Copy to ring failed: %d\n&quot;, err);
+ 		return err;
+@@ -987,11 +1014,12 @@ static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
+ }
+ 
+ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+-				   struct fuse_req *req)
++				   struct fuse_req *req,
++				   unsigned int issue_flags)
+ {
+ 	int err;
+ 
+-	err = fuse_uring_copy_to_ring(ent, req);
++	err = fuse_uring_copy_to_ring(ent, req, issue_flags);
+ 	if (!err) {
+ 		set_bit(FR_SENT, &amp;req-&gt;flags);
+ 		trace_fuse_request_sent(req);
+@@ -1111,7 +1139,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 		goto out;
+ 	}
+ 
+-	err = fuse_uring_copy_from_ring(ring, req, ent);
++	err = fuse_uring_copy_from_ring(ring, req, ent, issue_flags);
+ out:
+ 	fuse_uring_req_end(ent, req, err);
+ }
+@@ -1123,7 +1151,8 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+  * Else, there is no next fuse request and this returns false.
+  */
+ static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
+-					 struct fuse_ring_queue *queue)
++					 struct fuse_ring_queue *queue,
++					 unsigned int issue_flags)
+ {
+ 	int err;
+ 	struct fuse_req *req;
+@@ -1135,7 +1164,7 @@ static bool fuse_uring_get_next_fuse_req(struct fuse_ring_ent *ent,
+ 	spin_unlock(&amp;queue-&gt;lock);
+ 
+ 	if (req) {
+-		err = fuse_uring_prepare_send(ent, req);
++		err = fuse_uring_prepare_send(ent, req, issue_flags);
+ 		if (err)
+ 			goto retry;
+ 	}
+@@ -1256,7 +1285,7 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
+ 	 * no-op and the next request will be serviced when a buffer becomes
+ 	 * available.
+ 	 */
+-	if (fuse_uring_get_next_fuse_req(ent, queue))
++	if (fuse_uring_get_next_fuse_req(ent, queue, issue_flags))
+ 		fuse_uring_send(ent, cmd, 0, issue_flags);
+ 	return 0;
+ }
+@@ -1380,7 +1409,12 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 
+ static bool init_flags_valid(u64 init_flags)
+ {
+-	u64 valid_flags = FUSE_URING_BUFPOOL;
++	u64 valid_flags = FUSE_URING_BUFPOOL | FUSE_URING_REGISTERED_BUFFERS;
++	bool bufpool = init_flags &amp; FUSE_URING_BUFPOOL;
++	bool registered_buffers = init_flags &amp; FUSE_URING_REGISTERED_BUFFERS;
++
++	if (registered_buffers &amp;&amp; !bufpool)
++		return false;
+ 
+ 	return !(init_flags &amp; ~valid_flags);
+ }
+@@ -1522,9 +1556,10 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 	int err;
+ 
+ 	if (!tw.cancel) {
+-		err = fuse_uring_prepare_send(ent, ent-&gt;fuse_req);
++		err = fuse_uring_prepare_send(ent, ent-&gt;fuse_req, issue_flags);
+ 		if (err) {
+-			if (!fuse_uring_get_next_fuse_req(ent, queue))
++			if (!fuse_uring_get_next_fuse_req(ent, queue,
++							  issue_flags))
+ 				return;
+ 			err = 0;
+ 		}
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index 27a9d5742d8e..f005dfa5f9df 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -44,6 +44,8 @@ struct fuse_bufpool_buf {
+ 
+ /* implemented as a buffer ring */
+ struct fuse_bufpool {
++	bool registered_buffers;
++
+ 	/* metadata tracking state of the bufpool */
+ 	unsigned int nbufs;
+ 	unsigned int head;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 5d377d8e8e27..e4740a64d4a1 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -245,6 +245,7 @@
+  *  - add FUSE_HAS_IO_URING_BUFPOOL / FUSE_URING_BUFPOOL flags
+  *  - add fuse_uring_cmd_req init struct
+  *  - add buf_id field to fuse_uring_ent_in_out struct
++ *  - add FUSE_URING_REGISTERED_BUFFERS flag
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -453,7 +454,8 @@ struct fuse_file_lock {
+  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
+  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+  *			 init_out.request_timeout contains the timeout (in secs)
+- * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools
++ * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools and
++ *			      registered buffers
+  */
+ #define FUSE_ASYNC_READ		(1 &lt;&lt; 0)
+ #define FUSE_POSIX_LOCKS	(1 &lt;&lt; 1)
+@@ -1309,6 +1311,7 @@ enum fuse_uring_cmd {
+ 
+ /* fuse_uring_cmd_req flags */
+ #define FUSE_URING_BUFPOOL		(1 &lt;&lt; 0)
++#define FUSE_URING_REGISTERED_BUFFERS	(1 &lt;&lt; 1)
+ 
+ /**
+  * In the 80B command area of the SQE.
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-9-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing a concern about the zero-copy implementation, specifically the need for CAP_SYS_ADMIN and FUSE_URING_REGISTERED_BUFFERS flags to enable zero-copy. The author explains that these flags are necessary because zero-copy allows the server direct access to the client&#x27;s underlying pages, rather than operating on an intermediary buffer. They also provide detailed information about the request flow for both the write and read paths, including how page-backed and non-page-backed args are handled.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Implement zero-copy for fuse io-uring, eliminating memory copies between
+userspace, the kernel, and the fuse server for read/write operations.
+The server can directly access client pages or page cache folios without
+copying data through an intermediary buffer. When a fuse request arrives,
+the kernel registers the relevant pages into a sparse slot in the
+server&#x27;s io_uring registered buffer table. The server can then operate
+on these pages directly using io-uring fixed buffer operations (eg
+read_fixed/write_fixed) and the kernel unregisters these pages when the
+request completes. Non-page-backed args (eg op out headers) will go
+through the payload buffer as normal.
+
+This requires CAP_SYS_ADMIN and FUSE_URING_REGISTERED_BUFFERS (which
+requires using bufpools). Gating on registered buffers keeps the
+configuration space small and avoids partially-optimized modes that are
+unlikely to be useful in practice. This is gated behind CAP_SYS_ADMIN
+because zero-copy allows the server direct access to the client&#x27;s
+underlying pages, rather than operating on an intermediary buffer that
+the contents of the client&#x27;s pages were copied into or on page cache
+folios. Kernel support for zero copy is advertised to userspace via the
+FUSE_HAS_IO_URING_BUFPOOL init flag (a single umbrella flag).
+
+The request flow for the zero-copy write path (client writes data,
+server reads it) is as follows:
+=======================================================================
+|  Kernel                                   |  FUSE server
+|                                           |
+|  &quot;write(fd, buf, 1MB)&quot;                    |
+|                                           |
+|  &gt;sys_write()                             |
+|    &gt;fuse_file_write_iter()                |
+|      &gt;fuse_send_one()                     |
+|        [req-&gt;args-&gt;in_pages = true]       |
+|        [folios hold client write data]    |
+|                                           |
+|  &gt;fuse_uring_copy_to_ring()               |
+|    &gt;copy_header_to_ring(IN_OUT)           |
+|      [memcpy fuse_in_header]              |
+|    &gt;copy_header_to_ring(OP)               |
+|      [memcpy write_in header]             |
+|                                           |
+|    &gt;fuse_uring_args_to_ring()             |
+|      &gt;setup_fuse_copy_state()             |
+|        [skip_folio_copy = true]           |
+|                                           |
+|      &gt;fuse_uring_set_up_zero_copy()       |
+|        [folio_get for each client folio]  |
+|        [build bio_vec array from folios]  |
+|        &gt;io_buffer_register_bvec()         |
+|          [register pages at
+                 ent-&gt;zero_copy_index]      |
+|        [ent-&gt;zero_copied = true]          |
+|                                           |
+|      &gt;fuse_copy_args()                    |
+|        [skip_folio_copy =&gt; return 0       |
+|         for page arg, skip data copy]     |
+|                                           |
+|    &gt;copy_header_to_ring(RING_ENT)         |
+|      [memcpy ent_in_out]                  |
+|    &gt;io_uring_cmd_done()                   |
+|                                           |
+|                                           | [CQE received]
+|                                           |
+|                                           | [issue io_uring READ at
+|                                           |  ent-&gt;zero_copy_index]
+|                                           | [reads directly from
+|                                           |client&#x27;s pages (ZERO_COPY)]
+|                                           |
+|                                           | [write data to backing
+|                                           | store]
+|                                           |  [submit COMMIT AND FETCH]
+|                                           |
+|  &gt;fuse_uring_commit_fetch()               |
+|    &gt;fuse_uring_commit()                   |
+|      &gt;fuse_uring_copy_from_ring()         |
+|    &gt;fuse_uring_req_end()                  |
+|      &gt;io_buffer_unregister(ent-&gt;zero_copy_index) |
+|        [unregister sparse buffer]         |
+|      &gt;fuse_zero_copy_release()            |
+|        [folio_put for each folio]         |
+|      [ent-&gt;zero_copied = false]           |
+|      &gt;fuse_request_end()                  |
+|        [wake up client]                   |
+
+The zero-copy read path is analogous.
+
+Some requests may have both page-backed args and non-page-backed args.
+For these requests, the page-backed args are zero-copied while the
+non-page-backed args are copied to the buffer selected from the buffer
+ring:
+    zero-copy: pages registered via io_buffer_register_bvec()
+    non-page-backed: copied to payload buffer via fuse_copy_args()
+
+For a request whose payload is zero-copied, the
+registration/unregistration path looks like:
+
+    register:  fuse_uring_set_up_zero_copy()
+                 folio_get() for each folio
+                 io_buffer_register_bvec(ent-&gt;zero_copy_index)
+
+    unregister: fuse_uring_req_end()
+                  io_buffer_unregister(ent-&gt;zero_copy_index)
+                  -&gt; fuse_zero_copy_release() callback
+                     folio_put() for each folio
+
+Please note that on abort for in-flight zero-copied requests that have
+been sent to userspace, the registered bvec slot remains occupied and
+its folios remain pinned until the io-uring ring is destroyed, at which
+point io-uring unregisters all buffers and the fuse_zero_copy_release()
+callback drops the folio references. Unregistering at teardown would
+require operating on the ring context directly, whose validity is hard
+to ascertain; this is deemed not worth the complexity for the abort
+race, since everything is freed when the ring is torn down.
+
+The throughput improvement from zero-copy depends on how much of the
+per-request latency is spent on data copying vs backing I/O. When
+backing I/O dominates, the saved memcpy is a negligible fraction of
+overall latency. Please also note that for the server to read/write
+into the zero-copied pages, the read/write must go through io-uring
+as an IORING_OP_READ_FIXED / IORING_OP_WRITE_FIXED operation. If the
+server&#x27;s backing I/O is instantaneous (eg served from cache), the
+overhead of the additional io_uring operation may negate the savings
+from eliminating the memcpy.
+
+In benchmarks using passthrough_hp on a high-performance NVMe-backed
+system, zero-copy showed around a 35% throughput improvement for direct
+randreads (~2150 MiB/s to ~2900 MiB/s), a 15% improvement for direct
+sequential reads (~2510 MiB/s to ~2900 MiB/s), a 15% improvement for
+buffered randreads (~2100 MiB/s to ~2470 MiB/s), and a 10% improvement
+for buffered sequential reads (~2500 MiB/s to ~2750 MiB/s).
+
+The benchmarks were run using:
+  fio --name=test_run --ioengine=sync --rw=rand{read,write} --bs=1M
+  --size=1G --numjobs=2 --ramp_time=30 --group_reporting=1
+
+Reviewed-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+Reviewed-by: Baokun Li &lt;libaokun@linux.alibaba.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev.c             |   7 +-
+ fs/fuse/dev_uring.c       | 150 +++++++++++++++++++++++++++++++++++---
+ fs/fuse/dev_uring_i.h     |   6 ++
+ fs/fuse/fuse_dev_i.h      |   1 +
+ include/uapi/linux/fuse.h |  14 +++-
+ 5 files changed, 162 insertions(+), 16 deletions(-)
+
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index 5763a7cd3b37..58e599c35291 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -1345,10 +1345,13 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
+ 
+ 	for (i = 0; !err &amp;&amp; i &lt; numargs; i++)  {
+ 		struct fuse_arg *arg = &amp;args[i];
+-		if (i == numargs - 1 &amp;&amp; argpages)
++		if (i == numargs - 1 &amp;&amp; argpages) {
++			if (cs-&gt;skip_folio_copy)
++				return 0;
+ 			err = fuse_copy_folios(cs, arg-&gt;size, zeroing);
+-		else
++		} else {
+ 			err = fuse_copy_one(cs, arg-&gt;value, arg-&gt;size);
++		}
+ 	}
+ 	return err;
+ }
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index 9c79ec85e685..3e5e551e4e4d 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -30,6 +30,11 @@ struct fuse_uring_pdu {
+ 	struct fuse_ring_ent *ent;
+ };
+ 
++struct fuse_zero_copy_bvs {
++	unsigned int nr_bvs;
++	struct bio_vec bvs[];
++};
++
+ static const struct fuse_iqueue_ops fuse_io_uring_ops;
+ 
+ enum fuse_uring_header_type {
+@@ -51,6 +56,11 @@ static inline bool bufpool_registered_buffers(struct fuse_ring_queue *queue)
+ 	return queue-&gt;bufpool &amp;&amp; queue-&gt;bufpool-&gt;registered_buffers;
+ }
+ 
++static inline bool bufpool_zero_copy(struct fuse_ring_queue *queue)
++{
++	return queue-&gt;bufpool &amp;&amp; queue-&gt;bufpool-&gt;use_zero_copy;
++}
++
+ static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
+ 				   struct fuse_ring_ent *ring_ent)
+ {
+@@ -96,8 +106,18 @@ static void fuse_uring_flush_bg(struct fuse_ring_queue *queue)
+ 	}
+ }
+ 
++static bool can_zero_copy_req(struct fuse_ring_ent *ent, struct fuse_req *req)
++{
++	struct fuse_args *args = req-&gt;args;
++
++	if (!bufpool_zero_copy(ent-&gt;queue))
++		return false;
++
++	return args-&gt;in_pages || args-&gt;out_pages;
++}
++
+ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+-			       int error)
++			       int error, unsigned int issue_flags)
+ {
+ 	struct fuse_ring_queue *queue = ent-&gt;queue;
+ 	struct fuse_ring *ring = queue-&gt;ring;
+@@ -117,6 +137,12 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 
+ 	spin_unlock(&amp;queue-&gt;lock);
+ 
++	if (ent-&gt;zero_copied) {
++		io_buffer_unregister(ent-&gt;cmd, ent-&gt;zero_copy_index,
++				     issue_flags);
++		ent-&gt;zero_copied = false;
++	}
++
+ 	if (error)
+ 		req-&gt;out.h.error = error;
+ 
+@@ -329,6 +355,7 @@ static int fuse_uring_bufpool_setup(struct io_uring_cmd *cmd,
+ 	struct iovec iov[FUSE_URING_IOV_SEGS];
+ 	uintptr_t payload_addr;
+ 	size_t payload_size, ring_size;
++	bool zero_copy = init_flags &amp; FUSE_URING_ZERO_COPY;
+ 	struct fuse_bufpool *pool;
+ 	unsigned int i;
+ 	int err;
+@@ -343,7 +370,7 @@ static int fuse_uring_bufpool_setup(struct io_uring_cmd *cmd,
+ 	payload_addr = (uintptr_t)iov[FUSE_URING_IOV_PAYLOAD].iov_base;
+ 	payload_size = iov[FUSE_URING_IOV_PAYLOAD].iov_len;
+ 
+-	if (payload_size &lt; (uint64_t)buf_size * nr_bufs)
++	if (!zero_copy &amp;&amp; (payload_size &lt; (uint64_t)buf_size * nr_bufs))
+ 		return -EINVAL;
+ 
+ 	/* create the pool, which is managed as a ring buffer */
+@@ -364,6 +391,7 @@ static int fuse_uring_bufpool_setup(struct io_uring_cmd *cmd,
+ 	pool-&gt;nbufs = nr_bufs;
+ 	pool-&gt;tail = nr_bufs;
+ 	pool-&gt;registered_buffers = init_flags &amp; FUSE_URING_REGISTERED_BUFFERS;
++	pool-&gt;use_zero_copy = zero_copy;
+ 
+ 	queue-&gt;bufpool = pool;
+ 
+@@ -381,9 +409,11 @@ static bool queue_init_flags_consistent(struct fuse_ring_queue *queue,
+ {
+ 	bool bufpool = init_flags &amp; FUSE_URING_BUFPOOL;
+ 	bool registered_buffers = init_flags &amp; FUSE_URING_REGISTERED_BUFFERS;
++	bool zero_copy = init_flags &amp; FUSE_URING_ZERO_COPY;
+ 
+ 	return bufpool_enabled(queue) == bufpool &amp;&amp;
+-		bufpool_registered_buffers(queue) == registered_buffers;
++		bufpool_registered_buffers(queue) == registered_buffers &amp;&amp;
++		bufpool_zero_copy(queue) == zero_copy;
+ }
+ 
+ static struct fuse_ring_queue *
+@@ -808,6 +838,9 @@ static int setup_fuse_copy_state(struct fuse_copy_state *cs,
+ 
+ 	fuse_copy_init(cs, dir == ITER_DEST, iter);
+ 
++	if (ent-&gt;zero_copied)
++		cs-&gt;skip_folio_copy = true;
++
+ 	cs-&gt;is_uring = true;
+ 	cs-&gt;req = req;
+ 
+@@ -840,6 +873,64 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+ 	return err;
+ }
+ 
++static void fuse_zero_copy_release(void *priv)
++{
++	struct fuse_zero_copy_bvs *zc_bvs = priv;
++	unsigned int i;
++
++	for (i = 0; i &lt; zc_bvs-&gt;nr_bvs; i++)
++		folio_put(page_folio(zc_bvs-&gt;bvs[i].bv_page));
++
++	kfree(zc_bvs);
++}
++
++static int fuse_uring_set_up_zero_copy(struct fuse_ring_ent *ent,
++				       struct fuse_req *req,
++				       unsigned int issue_flags)
++{
++	struct fuse_args_pages *ap;
++	int err, i, ddir = 0;
++	struct fuse_zero_copy_bvs *zc_bvs;
++	struct bio_vec *bvs;
++
++	/* out_pages indicates a read, in_pages indicates a write */
++	if (req-&gt;args-&gt;out_pages)
++		ddir |= IO_BUF_DEST;
++	if (req-&gt;args-&gt;in_pages)
++		ddir |= IO_BUF_SOURCE;
++
++	WARN_ON_ONCE(!ddir);
++
++	ap = container_of(req-&gt;args, typeof(*ap), args);
++
++	zc_bvs = kmalloc(struct_size(zc_bvs, bvs, ap-&gt;num_folios),
++			 GFP_KERNEL_ACCOUNT);
++	if (!zc_bvs)
++		return -ENOMEM;
++
++	zc_bvs-&gt;nr_bvs = ap-&gt;num_folios;
++	bvs = zc_bvs-&gt;bvs;
++	for (i = 0; i &lt; ap-&gt;num_folios; i++) {
++		bvs[i].bv_page = folio_page(ap-&gt;folios[i], 0);
++		bvs[i].bv_offset = ap-&gt;descs[i].offset;
++		bvs[i].bv_len = ap-&gt;descs[i].length;
++		folio_get(ap-&gt;folios[i]);
++	}
++
++	err = io_buffer_register_bvec(ent-&gt;cmd, bvs, ap-&gt;num_folios,
++				      fuse_zero_copy_release, zc_bvs,
++				      ddir, ent-&gt;zero_copy_index,
++				      issue_flags);
++	if (err) {
++		fuse_zero_copy_release(zc_bvs);
++		return err;
++	}
++
++	ent-&gt;zero_copied = true;
++
++	return 0;
++}
++
+ /*
+  * Copy data from the req to the ring buffer
+  */
+@@ -858,8 +949,15 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 		.commit_id = req-&gt;in.h.unique,
+ 	};
+ 
+-	if (bufpool_enabled(ent-&gt;queue))
++	if (bufpool_enabled(ent-&gt;queue)) {
+ 		ent_in_out.buf_id = ent-&gt;payload_buf.id;
++		if (can_zero_copy_req(ent, req)) {
++			ent_in_out.flags |= FUSE_URING_ENT_ZERO_COPY;
++			err = fuse_uring_set_up_zero_copy(ent, req, issue_flags);
++			if (err)
++				return err;
++		}
++	}
+ 
+ 	err = setup_fuse_copy_state(&amp;cs, ring, req, ent, ITER_DEST, &amp;iter,
+ 				    issue_flags);
+@@ -892,6 +990,10 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+ 	}
+ 
+ 	ent_in_out.payload_sz = cs.ring.copied_sz;
++	if (cs.skip_folio_copy &amp;&amp; args-&gt;in_pages)
++		ent_in_out.payload_sz +=
++			args-&gt;in_args[args-&gt;in_numargs - 1].size;
++
+ 	return copy_header_to_ring(ent, FUSE_URING_HEADER_RING_ENT,
+ 				   &amp;ent_in_out, sizeof(ent_in_out));
+ }
+@@ -927,11 +1029,25 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+ 				   sizeof(req-&gt;in.h));
+ }
+ 
+-static bool fuse_uring_req_has_payload(struct fuse_req *req)
++static bool fuse_uring_req_has_copyable_payload(struct fuse_ring_ent *ent,
++						struct fuse_req *req)
+ {
+ 	struct fuse_args *args = req-&gt;args;
+ 
+-	return args-&gt;in_numargs &gt; 1 || args-&gt;out_numargs;
++	if (!can_zero_copy_req(ent, req))
++		return args-&gt;in_numargs &gt; 1 || args-&gt;out_numargs;
++
++	/*
++	 * the asymmetry between in_numargs &gt; 2 and out_numargs &gt; 1 is because
++	 * the per-op header is extracted before fuse_copy_args() for inargs but
++	 * not for outargs
++	 */
++	if ((args-&gt;in_numargs &gt; 1) &amp;&amp; (!args-&gt;in_pages || args-&gt;in_numargs &gt; 2))
++		return true;
++	if (args-&gt;out_numargs &amp;&amp; (!args-&gt;out_pages || args-&gt;out_numargs &gt; 1))
++		return true;
++
++	return false;
+ }
+ 
+ static int fuse_uring_select_buffer(struct fuse_ring_ent *ent)
+@@ -989,7 +1105,7 @@ static int fuse_uring_next_req_update_buffer(struct fuse_ring_ent *ent,
+ 		return 0;
+ 
+ 	buffer_selected = !!ent-&gt;payload_buf.addr;
+-	has_payload = fuse_uring_req_has_payload(req);
++	has_payload = fuse_uring_req_has_copyable_payload(ent, req);
+ 
+ 	if (has_payload &amp;&amp; !buffer_selected)
+ 		return fuse_uring_select_buffer(ent);
+@@ -1007,7 +1123,7 @@ static int fuse_uring_prep_buffer(struct fuse_ring_ent *ent,
+ 		return 0;
+ 
+ 	/* no payload to copy, can skip selecting a buffer */
+-	if (!fuse_uring_req_has_payload(req))
++	if (!fuse_uring_req_has_copyable_payload(ent, req))
+ 		return 0;
+ 
+ 	return fuse_uring_select_buffer(ent);
+@@ -1033,7 +1149,7 @@ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+ 		ent-&gt;state = FRRS_INVALID;
+ 		spin_unlock(&amp;ent-&gt;queue-&gt;lock);
+ 
+-		fuse_uring_req_end(ent, req, err);
++		fuse_uring_req_end(ent, req, err, issue_flags);
+ 	}
+ 
+ 	return err;
+@@ -1141,7 +1257,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
+ 
+ 	err = fuse_uring_copy_from_ring(ring, req, ent, issue_flags);
+ out:
+-	fuse_uring_req_end(ent, req, err);
++	fuse_uring_req_end(ent, req, err, issue_flags);
+ }
+ 
+ /*
+@@ -1361,6 +1477,8 @@ static struct fuse_ring_ent *
+ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 			   struct fuse_ring_queue *queue)
+ {
++	const struct fuse_uring_cmd_req *cmd_req =
++		io_uring_sqe128_cmd(cmd-&gt;sqe, struct fuse_uring_cmd_req);
+ 	struct fuse_ring *ring = queue-&gt;ring;
+ 	struct fuse_ring_ent *ent;
+ 	struct iovec iov[FUSE_URING_IOV_SEGS];
+@@ -1403,19 +1521,27 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
+ 		ent-&gt;payload = payload-&gt;iov_base;
+ 	}
+ 
++	if (bufpool_zero_copy(queue))
++		ent-&gt;zero_copy_index = READ_ONCE(cmd_req-&gt;init.zero_copy_index);
++
+ 	atomic_inc(&amp;ring-&gt;queue_refs);
+ 	return ent;
+ }
+ 
+ static bool init_flags_valid(u64 init_flags)
+ {
+-	u64 valid_flags = FUSE_URING_BUFPOOL | FUSE_URING_REGISTERED_BUFFERS;
++	u64 valid_flags = FUSE_URING_BUFPOOL | FUSE_URING_REGISTERED_BUFFERS
++		| FUSE_URING_ZERO_COPY;
+ 	bool bufpool = init_flags &amp; FUSE_URING_BUFPOOL;
+ 	bool registered_buffers = init_flags &amp; FUSE_URING_REGISTERED_BUFFERS;
++	bool zero_copy = init_flags &amp; FUSE_URING_ZERO_COPY;
+ 
+ 	if (registered_buffers &amp;&amp; !bufpool)
+ 		return false;
+ 
++	if (zero_copy &amp;&amp; (!registered_buffers || !capable(CAP_SYS_ADMIN)))
++		return false;
++
+ 	return !(init_flags &amp; ~valid_flags);
+ }
+ 
+@@ -1573,7 +1699,7 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
+ 
+ 		io_uring_cmd_done(cmd, err, issue_flags);
+ 
+-		fuse_uring_req_end(ent, ent-&gt;fuse_req, err);
++		fuse_uring_req_end(ent, ent-&gt;fuse_req, err, issue_flags);
+ 		kfree(ent);
+ 		if (atomic_dec_and_test(&amp;queue-&gt;ring-&gt;queue_refs))
+ 			wake_up_all(&amp;queue-&gt;ring-&gt;stop_waitq);
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index f005dfa5f9df..81506ac4618e 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -45,6 +45,8 @@ struct fuse_bufpool_buf {
+ /* implemented as a buffer ring */
+ struct fuse_bufpool {
+ 	bool registered_buffers;
++	/* this is only allowed on privileged servers */
++	bool use_zero_copy;
+ 
+ 	/* metadata tracking state of the bufpool */
+ 	unsigned int nbufs;
+@@ -65,6 +67,10 @@ struct fuse_ring_ent {
+ 		struct fuse_bufpool_buf payload_buf;
+ 	};
+ 
++	/* true if the request&#x27;s pages are being zero-copied */
++	bool zero_copied;
++	unsigned int zero_copy_index;
++
+ 	/* the ring queue that owns the request */
+ 	struct fuse_ring_queue *queue;
+ 
+diff --git a/fs/fuse/fuse_dev_i.h b/fs/fuse/fuse_dev_i.h
+index 668c8391d61c..00722fee572e 100644
+--- a/fs/fuse/fuse_dev_i.h
++++ b/fs/fuse/fuse_dev_i.h
+@@ -325,6 +325,7 @@ struct fuse_copy_state {
+ 	bool write:1;
+ 	bool move_folios:1;
+ 	bool is_uring:1;
++	bool skip_folio_copy:1;
+ 	struct {
+ 		unsigned int copied_sz; /* copied size into the user buffer */
+ 	} ring;
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index e4740a64d4a1..5b7b7b7d050c 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -246,6 +246,7 @@
+  *  - add fuse_uring_cmd_req init struct
+  *  - add buf_id field to fuse_uring_ent_in_out struct
+  *  - add FUSE_URING_REGISTERED_BUFFERS flag
++ *  - add FUSE_URING_ZERO_COPY flag
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -454,8 +455,8 @@ struct fuse_file_lock {
+  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
+  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+  *			 init_out.request_timeout contains the timeout (in secs)
+- * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools and
+- *			      registered buffers
++ * FUSE_HAS_IO_URING_BUFPOOL: kernel supports io-uring buffer pools, registered
++ *			      buffers and zero-copy
+  */
+ #define FUSE_ASYNC_READ		(1 &lt;&lt; 0)
+ #define FUSE_POSIX_LOCKS	(1 &lt;&lt; 1)
+@@ -1260,6 +1261,13 @@ struct fuse_supp_groups {
+ #define FUSE_URING_IN_OUT_HEADER_SZ 128
+ #define FUSE_URING_OP_IN_OUT_SZ 128
+ 
++/**
++ * fuse_uring_ent_in_out flags
++ *
++ * FUSE_URING_ENT_ZERO_COPY: Set if the ent&#x27;s payload is zero-copied
++ */
++#define FUSE_URING_ENT_ZERO_COPY	(1 &lt;&lt; 0)
++
+ /* Used as part of the fuse_uring_req_header */
+ struct fuse_uring_ent_in_out {
+ 	uint64_t flags;
+@@ -1312,6 +1320,7 @@ enum fuse_uring_cmd {
+ /* fuse_uring_cmd_req flags */
+ #define FUSE_URING_BUFPOOL		(1 &lt;&lt; 0)
+ #define FUSE_URING_REGISTERED_BUFFERS	(1 &lt;&lt; 1)
++#define FUSE_URING_ZERO_COPY		(1 &lt;&lt; 2)
+ 
+ /**
+  * In the 80B command area of the SQE.
+@@ -1330,6 +1339,7 @@ struct fuse_uring_cmd_req {
+ 		struct {
+ 			uint32_t buf_size;
+ 			uint16_t nr_bufs;
++			uint16_t zero_copy_index;
+ 		} init;
+ 	};
+ };
+-- 
+2.52.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260612210513.1516038-10-joannelkoong@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-12">2026-06-12</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the zero-copy patch has a dependency on Jens&#x27;s io-uring tree patches, which may not be mergeable in time for 7.2. She asked Miklos to decide how to sync between the two trees and suggested co-shipping the bufpool and registered buffer patches with the zero-copy patch.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Miklos,
+
+The zero-copy patch has a dependency on the bvec patches in Jens&#x27;s
+io-uring tree. Since the merge window opens Monday, it&#x27;s probably too
+tight now to cross-coordinate this for 7.2. What do you prefer for
+syncing between the two trees? If Jens stages the patches in a stable
+branch, are you fine with pulling that in and then applying the fuse
+patches on top?
+
+Patches 7 and 8 (bufpools and registered buffers) don&#x27;t have this
+dependency, but to make the uapi cleaner under one single umbrella
+flag, it would be better to co-ship them with the zero-copy patch.
+
+Patches 1-6 are refactoring changes that have been out since October
+and have value on their own, independent of the bufpool and zero-copy
+work. Could you please pick these up for 7.2 so they don&#x27;t have to be
+carried and repeatedly rebased?
+
+Thanks,
+Joanne</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAJnrk1YtpVgELApN4ttFi32UcCcWW9dwv88aJpLwN8C9AmT5=w@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged dependency, asked for decision</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author confirmed that pinned pages are accounted and limited by the kernel&#x27;s io-uring infrastructure, addressing concerns about memory usage.
+
+The author addressed Miklos Szeredi&#x27;s concern that registered buffers and buffer pools are mutually exclusive, explaining that the buffer pool feature is simpler to implement and reduces testing surface area.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, pinned pages are accounted and limited by the kernel io-uring
+infrastructure (in io_account_mem() in io_uring/rsrc.c) when userspace
+registers the buffers in io-uring.
+
+---
+
+There&#x27;s no technical reason it can&#x27;t but it keeps things simpler (with
+the buffer pool, userspace can more optimally register the bufferpool
+into one fixed slot since the buffers are contiguous), reduces the
+surface area of configurations that need to be tested, and allows the
+feature to be advertised under the FUSE_URING_BUFPOOL capability flag
+during init instead of needing a separate flag. I think in practice,
+servers that would want the benefits from registered buffers would
+also want the benefits from buffer pools, so I don&#x27;t think we&#x27;re
+leaving out a wanted use case.
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Miklos Szeredi</div>
+<a href="https://lore.kernel.org/r/CAJnrk1YCKLPRVAhLSXou+FsicD7Zvu8QgEPYaOkNZivvp9dvLg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged, confirmed, acknowledged a concern</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-06-15">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch does not include a Reviewed-by tag, which is required for kernel patches.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Applied these.
+
+Thanks,
+Miklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpeguYHYgOE1dUt2p9Nr=o9uXp21F2O1RQwEDz=SXhUXYewA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: missing Reviewed-by tag</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-06-16">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-16">2026-06-16</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing a concern about queue setup in the io-uring buffer pool patch series, proposing to add a new command operation (FUSE_IO_URING_CMD_QUEUE_SETUP) to pass in queue-level settings, including flags and number of queues. This would create the queue upfront instead of lazily creating it when the first sqe gets registered, adding some friction on the userspace side but considered a reasonable tradeoff.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Looking at Bernd&#x27;s reduced queue series [1], I think we&#x27;d most likely
+want to also pass in the number of reduced queues separate from sqe
+registration. I think along the lines of the config sqe Bernd brought
+up, it seems cleanest to add a new cmd op
+(FUSE_IO_URING_CMD_QUEUE_SETUP) where queue-level settings (eg flags,
+number of queues, bufpool, etc) gets passed in. This would have the
+nice side effect of doing the queue creation in this op instead of
+right now creating the queue lazily when the first sqe gets
+registered. On the userspace side, this adds a bit more friction (eg a
+two-phase setup where userspace submits the queue setup cmd, reaps its
+completion, and reuses that sqe to register an entry), but that seems
+like a reasonable tradeoff.
+
+Does this sound ok to you and Bernd?
+
+Thanks,
+Joanne
+
+[1] https://lore.kernel.org/fuse-devel/20260529-reduced-nr-ring-queues_3-v5-0-1dc08c2fccf6@bsbernd.com/T/#u</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Miklos Szeredi</div>
+<a href="https://lore.kernel.org/r/CAJnrk1b1nVFZ8dQYA=iGn-p182HNhhRfZEVe-e_ks_daZAU3Rw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: considered a reasonable tradeoff</div>
+</div>
+</div>
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-16">2026-06-16</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about how the server would access buffers in the pool, explaining that it knows the starting address and size of each buffer, allowing it to compute the correct address from the buf_id.
+
+Author addressed Miklos Szeredi&#x27;s concern about the space efficiency of returning buf_id instead of buffer address in struct fuse_uring_ent_in_out, proposing a compromise to return a uint32_t offset that corresponds to the offset in the bufpool.
+
+Author agrees to add uAPI documentation for the new functionality, confirming the issue is resolved.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The server knows the starting address of the bufpool (since it
+allocated it) and it knows the size of each buffer in the pool. It can
+compute from the buf_id the address corresponding to the buffer.
+
+---
+
+This would have to be returned as part of the struct
+fuse_uring_ent_in_out. There&#x27;s currently 12 bytes that are free to
+use. Returning buf_id takes up 2 bytes and I think is better than
+using 8 bytes to provide the buffer address. However, returning the
+buf id makes adding incremental buffer consumption in the future a bit
+trickier (eg the server would need to keep track of the offset into
+the previously used buffer and do any alignment rounding up). Maybe a
+good compromise is returning a uint32_t offset that corresponds to the
+offset in the bufpool? The buf size is a uint32_t, so I think this
+would work just as well as providing the buffer address directly.
+
+---
+
+That sounds good. I&#x27;ll write some uAPI documentation for this and add
+it to that new directory.
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Miklos Szeredi</div>
+<a href="https://lore.kernel.org/r/CAJnrk1b=Mxy0N+QKjFZwb92arUVDRzz9PJVXvsZSmPq65bsbAQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged feedback, provided explanation, clarifying question</div>
+</div>
+</div>
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-16">2026-06-16</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the FIXED_READ call in io-uring, explaining that it takes a buf_index instead of an address and clarifying how userspace passes the ent-&gt;zero_copy_index to the kernel.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The userspace FIXED_READ call (eg set up usually through the liburing
+api io_uring_prep_read_fixed() [1]) takes a buf_index, not an address.
+Userspace would pass the ent-&gt;zero_copy_index as the buf index.
+ent-&gt;zero_copy_index corresponds to the fixed buffer where userspace
+told the kernel (at sqe registration time through the &quot;uint16_t
+zero_copy_index&quot; init param) to place the zero-copied pages for that
+sqe.
+
+Thanks,
+Joanne
+
+[1] https://man7.org/linux/man-pages/man3/io_uring_prep_read_fixed.3.html</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Miklos Szeredi</div>
+<a href="https://lore.kernel.org/r/CAJnrk1YiUn3JFZCEe5oADyK5+zx6Rh_6KTZbCzeHUjAebUVQBw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the interface is inconsistent because the decoupling of buffers from sequences also implies that buffer registration should be decoupled.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I find this interface inconsistent.   Decoupling the buffer(s) from
+the seq&#x27;s means that the registration should be decoupled as well, no?
+
+Thanks,
+Miklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpegsWpKE4kUUQo+NK_cu6oy6h6+A1M=xokvSQbFtZzu9UKQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: inconsistent interface, decoupling</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Miklos Szeredi expressed curiosity about the design choice behind a specific aspect of the patch, asking if there&#x27;s a particular reason for it without expressing any strong opinion or concern.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Is there any particular reason for this?  Not saying this is bad, just
+wondering...
+
+Thanks,
+Miklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpegsHxCbhZ8v1W7KA8A+9mUwR1iXEoxDDk4vhVaPCpw7Wfg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: curiosity, lack of criticism</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Miklos Szeredi questioned the mapping of buf_id to buffer address, suggesting it would be simpler to provide the buffer address directly.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">How does buf_id map to a buffer address?
+
+Wouldn&#x27;t it be simpler to provide the buffer address directly?
+
+We also need some uAPI documentation (generally not just for this
+patchset).  What about a new directory:
+Documentation/filesystems/fuse/uapi?
+
+Thanks,
+Milklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpegt8sfO681aoixfCc2XvUP-OH50GVHG-vmF8Q3oGqxF9MA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Miklos Szeredi questioned how FIXED_READ works at the userspace level, indicating a need for clarification on its interaction with the buffer pool and zero-copy features.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">FIXED_READ takes an address, right?  How does all this work at the
+userspace level?
+
+Thanks,
+Miklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpegs+EY+eCDOkBgVWhUyd8hBLE3bFY2oaum-k_tS=Cv2SVQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested clarification</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-06-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-15">2026-06-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the uAPI documentation is lacking and suggested removing internal implementation details from it, instead keeping them in commit messages.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Overall I think this series is good, the only part notably lacking is
+concise uAPI documentation.
+
+I&#x27;d even suggest dropping all internal implementation details from the
+documentation that was provided, since adding those details to the
+commit messages (which you did) should be sufficient.
+
+Thanks,
+Miklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpegtZDc6nt5vL+oKeJ9TEkYONxRKXYrSNYm0aE3yFFbpzaQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lacking, suggested</div>
 </div>
 </div>
 </div>
