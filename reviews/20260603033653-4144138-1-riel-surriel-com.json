@@ -189,6 +189,78 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series addresses performance issues in alloc_iova() caused by linear search, which can lead to soft lockups. It introduces a maple tree to index iova ranges, allowing alloc_iova() to have O(log n) complexity while maintaining similar memory usage. The patches also include self-tests for the iova code and were tested on various platforms."
+    },
+    "2026-06-17": {
+      "report_file": "2026-06-17_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Liam Howlett",
+          "summary": "Reviewer noted that callers should explicitly handle memory allocation errors by checking mas_is_err() and xa_err(mas) == -ENOMEM, suggesting a documentation update for the erase function\n\nReviewer Liam Howlett questioned the use of a timer-based retry for GFP_ATOMIC allocation and suggested that an external spinlock is being used unnecessarily, instead recommending the use of an internal lock.\n\nReviewer noted that using a maple tree for O(log n) allocation introduces complexity that may not be suitable for all contexts, specifically citing the inability to preallocate memory prior to entering the state where alloc_iova() is called.\n\nReviewer Liam Howlett questioned whether it's acceptable to drop the internal spinlock of the mt_mmap tree before calling try_to_unmap(), citing a potential retry in case of an erase operation.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "complexity",
+            "preallocation"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Callers can check mas_is_err() and check for xa_err(mas) == -ENOMEM.\nI'm going to add a note about it to the documentation of the erase\nfunction.\n\n---\n\nWhy is the retry GFP_ATOMIC on a timer of 10ms?\n\nAlso, why is this patch set using an external spinlock only created to\nmanage the tree?  Why isn't it using an internal lock?  Is it just to\navoid the possibility of the unlock?\n\n---\n\nI think this is even more complicated by the contexts it is called in -\nthat is, we cannot preallocate prior to going into this state either?\n\n---\n\nAre you sure that's not okay?  The mt_mmap tree is allocated with an\ninternal spinlock.  In this case, the lock will be dropped, the\nallocation will be satisfied and the erase operation will retry.\n\nThanks,\nLiam",
+          "reply_to": "Jason Gunthorpe",
+          "message_date": "2026-06-17",
+          "message_id": "vbtql77uf65vyxl4smefpol75x3opa7vnixdbzwg7ylxgre6j4@emvlfmdus4kj",
+          "email": "liam@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jason Gunthorpe",
+          "summary": "Reviewer noted that mas_erase() does not support GFP_ATOMIC, implying it's a separate issue from the current patch and suggesting it should be addressed independently.\n\nReviewer Jason Gunthorpe noted that under certain conditions, GFP_KERNEL allocations cannot fail, and questioned whether the external lock has any impact on mas_alloc_nodes failing or succeeding. He suggested documenting the implications of using sleeping locks with hard-wired GFP_KERNEL in mtree_erase/mas_erase.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "separate issue",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes, in this case at least the context is GFP_ATOMIC and there is no\nway to pre-allocate.. But that seems like another issue since the\nmas_erase does not support GFP_ATOMIC anyhow..\n\n---\n\nIs this what I was asking before? Under some conditions the allocation\ncan not fail because in the modern kernel we don't allow small\nGFP_KERNEL allocations to fail?\n\nOtherwise this:\n\n\tif (gfpflags_allow_blocking(gfp) && !mt_external_lock(mas->tree)) {\n\t\tmtree_unlock(mas->tree);\n\t\tmas_alloc_nodes(mas, gfp);\n\t\tmtree_lock(mas->tree);\n\t} else {\n\t\tmas_alloc_nodes(mas, gfp);\n\t}\n\nIs always called with GFP_KERNEL for erase. It doesn't seem like\nexternal lock has any impact if mas_alloc_nodes can fail or not?\n\nIt looks like if you have an external lock then the hard wired\nGFP_KERNEL in mtree_erase/mas_erase mean the lock has to be a sleeping\nkind to use those functions.\n\nIf that's the case it should be documented like this too :)\n\nJason",
+          "reply_to": "Liam Howlett",
+          "message_date": "2026-06-17",
+          "message_id": "20260617180419.GA231643@ziepe.ca",
+          "email": "jgg@ziepe.ca",
+          "is_maintainer": false
+        },
+        {
+          "author": "Liam Howlett",
+          "summary": "Reviewer Liam Howlett questioned the use of an external lock when a spinlock could suffice for protecting the tree\n\nReviewer Liam Howlett noted that the alloc_fail label in the error recovery path may overwrite the max32_alloc_size, which is intended to ensure 32bit safety, and suggested moving this check outside the spinlock.\n\nReviewer Liam Howlett questioned the possibility of a worst-case scenario in the maple tree implementation, suggesting that it's impossible for the offset off the end of an aligned range to be smaller than both the start and end of a gap.\n\nReviewer noted that the maple state keeps track of where things are in the tree, allowing for avoidance of rewalking the tree and reducing dereferences, but found this to be complicated.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested change",
+            "requested changes",
+            "questioning",
+            "complexity",
+            "performance"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "If the spinlock is only used to protect the tree, why are you using an\nexternal lock?\n\n---\n\nThis check seems to ensure the request is either both 32bit safe or it's\nfine to pass.  If a 64bit allocation uses a larger size and we fail\nlater, aren't we overwriting the 32bit size safety in your alloc_fail\nlabel?  It seems wrong to be changing the max32_alloc_size in the error\nrecovery.\n\nThis also could happen outside the spinlock?  I'm not sure why it was\ninside to begin with.\n\n---\n\nNeither of these can ever happen..?  You've searched for a gap that's\nthe worst case alignment and now you're ensuring the offset off the end\naligned isn't smaller than the start of the gap or the end of your\nsearch.  I'm no LLM, I don't think this is possible.\n\n---\n\nThe maple state keeps track of where things are, so if you have a maple\nstate pointing at the correct slot, then you can avoid rewalking the\ntree.  This is rather complicated, but it will save you a hand full of\ndereferences if you need them.",
+          "reply_to": "",
+          "message_date": "2026-06-17",
+          "message_id": "3bdrfc244zzmutjfpfyw4nivb4w4mckfs3b3mqbxr4ffr27mkv@x3i4v335ozww",
+          "email": "liam@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series addresses performance issues in alloc_iova() caused by linear search, which can lead to soft lockups. It introduces a maple tree to index iova ranges, allowing alloc_iova() to have O(log n) complexity while maintaining similar memory usage. The patches also include self-tests for the iova code and were tested on various platforms."
     }
   }
 }
