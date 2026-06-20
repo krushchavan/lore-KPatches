@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/1] sched/psi: skip irqtime accounting when no new irq time has elapsed</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260617175219.2494857-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-18</strong><div class="date-range-nav">Active on: <a href="#2026-06-18">2026-06-18</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch aims to optimize the irqtime accounting mechanism in the PSI (Pressure Stall Information) scheduler by skipping unnecessary updates when there is no new interrupt time elapsed. The current implementation treats a delta of zero as &#x27;do the work&#x27;, which leads to frequent and wasteful updates. The patch extends the early-return condition to also cover this case, reducing the number of unnecessary updates.</div></div>
+    <div class="date-range">Submitted: <strong>2026-06-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-19</strong><div class="date-range-nav">Active on: <a href="#2026-06-19">2026-06-19</a> &bull; <a href="#2026-06-18">2026-06-18</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to optimize the irqtime accounting mechanism in the PSI (Protection Keys for Userspace) system by skipping unnecessary updates when there is no new interrupt time elapsed. The current implementation reads irq_time_read() into a per-rq cumulative counter and only bails out when the delta vs. the previously accounted amount is negative. However, this results in frequent updates even when there is no actual work to be done, leading to performance overhead.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-06-18">
 <div class="review-comment">
@@ -251,7 +251,7 @@
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Acked the patch without raising any concerns or objections.</div>
+<div class="review-comment-text">Acked the patch with a Reviewed-by tag, indicating that it looks good to them and they&#x27;ve reviewed it thoroughly.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Wed, Jun 17, 2026 at 10:50:06AM -0700, Usama Arif wrote:
@@ -317,10 +317,67 @@ CCing Chengming as well, quote untrimmed.
 &gt; -- 
 &gt; 2.53.0-Meta
 &gt; 
+</pre>
+</details>
+<div class="review-comment-signals">Signals: ACK</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-06-19">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt</span>
+<a class="date-chip" href="../2026-06-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-19">2026-06-19</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Provided a Reviewed-by tag, indicating that they&#x27;ve reviewed the patch and it looks good to them.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Wed, Jun 17, 2026 at 10:50:06AM -0700, Usama Arif wrote:
+&gt; psi_account_irqtime() reads irq_time_read() into a per-rq cumulative
+&gt; counter and only bails out when the delta vs. the previously accounted
+&gt; amount is negative.  A delta of exactly zero is treated as &quot;do the
+&gt; work&quot;: psi_write_begin() is taken, cpu_clock(cpu) is read (which on
+&gt; x86 ends up in native_sched_clock() / rdtsc) and the cgroup ancestor
+&gt; chain is walked to add zero to every group&#x27;s PSI_IRQ_FULL bucket.
+&gt; 
+&gt; The zero-delta case is common in practice -- it fires every time a
+&gt; context switch crosses a PSI group boundary on a CPU that hasn&#x27;t
+&gt; serviced an interrupt between the two switches.
+&gt; 
+&gt; Measured on a 176-thread AMD EPYC 9D64 server running a compute
+&gt; intensive production workload, instrumented with bpftrace over a 30s
+&gt; window (irq_time_read() read directly from the per-CPU cpu_irqtime so
+&gt; that delta == 0 and delta &lt; 0 could be separated):
+&gt; 
+&gt;   @total              17,229,311    (100.0%)
+&gt;   @ret_curr_swapper    7,864,195    ( 45.6%)  curr-&gt;pid == 0
+&gt;   @ret_samegrp           323,299    (  1.9%)  same cgroup as prev
+&gt;   @reached_delta       9,041,817    ( 52.5%)
+&gt;     @delta_positive    6,358,192    ( 36.9%)  real work
+&gt;     @delta_zero        2,683,625    ( 15.6%)  work wasted (this patch)
+&gt;     @delta_negative          (0)    (  0.0%)  monotonic clock
+&gt; 
+&gt; So 15.6 % of all psi_account_irqtime() calls - and 29.7 % of the
+&gt; calls that get past the early returns - hit the delta == 0 case;
+&gt; delta &lt; 0 did not occur once in the 30 s window.  Under the current
+&gt; code each of those ~89 k calls per second performs the full seqcount
+&gt; write + cpu_clock() read + cgroup-chain walk just to add 0 to every
+&gt; group&#x27;s PSI_IRQ_FULL counter.
+&gt; 
+&gt; Extend the early-return to also cover delta == 0.  rq-&gt;psi_irq_time
+&gt; does not need updating in that case (it would store the same value
+&gt; back) and no PSI bucket would change.  The existing behaviour for
+&gt; delta &gt; 0 is untouched.
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+
+Reviewed-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
 
 </pre>
 </details>
-<div class="review-comment-signals">Signals: ACKED</div>
+<div class="review-comment-signals">Signals: REVIEWED</div>
 </div>
 </div>
 </div>

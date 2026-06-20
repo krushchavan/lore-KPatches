@@ -238,9 +238,145 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 2/3] mm/pagewalk: let folio_walk_start() run under the per-VMA lock</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260616190300.1509639-3-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-16</strong><div class="date-range-nav">Active on: <a href="#2026-06-16">2026-06-16</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch allows the folio_walk_start() function to run under the per-VMA lock instead of the mmap lock, reducing contention and improving performance for callers that only need to read a single page. The per-VMA lock is used when the FW_VMA_LOCKED flag is passed, which requires RCU-freed page tables and excludes hugetlb VMAs. This change does not affect existing callers, as none currently pass the FW_VMA_LOCKED flag. The patch also adds documentation to explain the new flag and its requirements.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-06-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-19</strong><div class="date-range-nav">Active on: <a href="#2026-06-19">2026-06-19</a> &bull; <a href="#2026-06-16">2026-06-16</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new flag FW_VMA_LOCKED for the folio_walk_start() function, allowing it to run under the per-VMA lock instead of the mmap lock. This is done to reduce contention and improve performance for callers that only need to read a single page. The patch also adds documentation explaining the behavior and requirements of this new flag.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-06-19">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lorenzo Stoakes</span>
+<a class="date-chip" href="../2026-06-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-19">2026-06-19</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Raised concerns about the patch, including unclear explanations of why RCU-freed page tables are required and how higher-level page tables would be freed. Also questioned the need for CONFIG_MMU_GATHER_RCU_TABLE_FREE.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Jun 16, 2026 at 03:02:59PM -0400, Rik van Riel wrote:
+&gt; folio_walk_start() asserts that the mmap lock is held.  For callers that
+&gt; only need to read a single, already-present page, the mmap lock is a
+&gt; heavy and often badly contended hammer: the VMA can instead be
+&gt; stabilized with the per-VMA lock, and the page table pages that are
+&gt; walked are kept alive by RCU page-table freeing
+&gt; (CONFIG_MMU_GATHER_RCU_TABLE_FREE).
+
+See below, I don&#x27;t think this is correct?
+
+&gt;
+&gt; Add an FW_VMA_LOCKED flag.  When passed, folio_walk_start() asserts the
+&gt; per-VMA lock instead of the mmap lock, requires RCU-freed page tables,
+&gt; and refuses hugetlb VMAs (PMD sharing cannot be walked safely this way).
+
+This is mostly superfluous. You can just say you added the flag to use a VMA
+flag. You put in parens the key thing about hugetlb, I think you should break
+that out.
+
+&gt; Everything else folio_walk_start() relies on -- the page table locks,
+&gt; pmdp_get_lockless() and pte_offset_map_lock() -- is already safe without
+
+is -&gt; are.
+
+&gt; the mmap lock, mirroring the per-VMA lock page fault path.
+
+I&#x27;m not sure I understand why you have to have RCU freed page tables but then
+say that you didn&#x27;t need it here? Strange to reference arbitrary functions from
+folio_walk_start() too.
+
+&gt;
+&gt; No existing caller passes FW_VMA_LOCKED, so behaviour is unchanged.
+&gt;
+&gt; Assisted-by: Claude:claude-opus-4-8
+&gt; Signed-off-by: Rik van Riel &lt;riel@surriel.com&gt;
+&gt; ---
+&gt;  include/linux/pagewalk.h |  5 +++++
+&gt;  mm/pagewalk.c            | 18 ++++++++++++++++--
+&gt;  2 files changed, 21 insertions(+), 2 deletions(-)
+&gt;
+&gt; diff --git a/include/linux/pagewalk.h b/include/linux/pagewalk.h
+&gt; index b41d7265c01b..84dd0d68f747 100644
+&gt; --- a/include/linux/pagewalk.h
+&gt; +++ b/include/linux/pagewalk.h
+&gt; @@ -150,6 +150,11 @@ typedef int __bitwise folio_walk_flags_t;
+&gt;
+&gt;  /* Walk shared zeropages (small + huge) as well. */
+&gt;  #define FW_ZEROPAGE			((__force folio_walk_flags_t)BIT(0))
+&gt; +/*
+&gt; + * The caller holds the per-VMA lock instead of the mmap lock. Only valid with
+&gt; + * RCU-freed page tables (CONFIG_MMU_GATHER_RCU_TABLE_FREE) and not for hugetlb.
+&gt; + */
+
+Hang on how could we be freeing higher level page tables of a VMA that&#x27;s still
+locked?
+
+A VMA lock stabilises page tables for traversal, so why do you require
+CONFIG_MMU_GATHER_RCU_TABLE_FREE here?
+
+What will free the higher-level page tables?
+
+Ref: https://origin.kernel.org/doc/html/latest/mm/process_addrs.html#page-table
+
+
+&gt; +#define FW_VMA_LOCKED			((__force folio_walk_flags_t)BIT(1))
+&gt;
+&gt;  enum folio_walk_level {
+&gt;  	FW_LEVEL_PTE,
+&gt; diff --git a/mm/pagewalk.c b/mm/pagewalk.c
+&gt; index 3ae2586ff45b..c85364b73e12 100644
+&gt; --- a/mm/pagewalk.c
+&gt; +++ b/mm/pagewalk.c
+&gt; @@ -890,7 +890,9 @@ int walk_page_mapping(struct address_space *mapping, pgoff_t first_index,
+&gt;   * huge_ptep_set_*, ...). Note that the page table entry stored in @fw might
+&gt;   * not correspond to the first physical entry of a logical hugetlb entry.
+&gt;   *
+&gt; - * The mmap lock must be held in read mode.
+&gt; + * The mmap lock must be held in read mode. Alternatively, if @FW_VMA_LOCKED is
+&gt; + * passed, the VMA&#x27;s per-VMA lock must be held (only supported with RCU-freed
+&gt; + * page tables, i.e. CONFIG_MMU_GATHER_RCU_TABLE_FREE, and not for hugetlb).
+&gt;   *
+&gt;   * Return: folio pointer on success, otherwise NULL.
+&gt;   */
+&gt; @@ -908,7 +910,19 @@ struct folio *folio_walk_start(struct folio_walk *fw,
+&gt;  	pgd_t *pgdp;
+&gt;  	p4d_t *p4dp;
+&gt;
+&gt; -	mmap_assert_locked(vma-&gt;vm_mm);
+&gt; +	if (flags &amp; FW_VMA_LOCKED) {
+&gt; +		/*
+&gt; +		 * Lockless walk: the per-VMA lock keeps the VMA stable, and
+&gt; +		 * RCU-freed page tables keep the walked page table pages alive
+&gt; +		 * across the lockless upper-level walk and pte_offset_map_lock().
+
+Err, but we take locks as normal on the walk?
+
+&gt; +		 * Hugetlb (PMD sharing) is not supported on this path.
+
+I don&#x27;t get the explanation above and then you just write a line that says what
+your assert is doing with zero explanation here.
+
+You should explain why hugetlb isn&#x27;t supported.
+
+&gt; +		 */
+&gt; +		VM_WARN_ON_ONCE(!IS_ENABLED(CONFIG_MMU_GATHER_RCU_TABLE_FREE));
+&gt; +		VM_WARN_ON_ONCE(is_vm_hugetlb_page(vma));
+&gt; +		vma_assert_locked(vma);
+&gt; +	} else {
+&gt; +		mmap_assert_locked(vma-&gt;vm_mm);
+&gt; +	}
+&gt;  	vma_pgtable_walk_begin(vma);
+&gt;
+&gt;  	if (WARN_ON_ONCE(addr &lt; vma-&gt;vm_start || addr &gt;= vma-&gt;vm_end))
+&gt; --
+&gt; 2.53.0-Meta
+&gt;
+
+Thanks, Lorenzo
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik van Riel</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

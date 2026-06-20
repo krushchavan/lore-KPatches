@@ -1,0 +1,59 @@
+{
+  "thread_id": "20260619-exportd-netlink-v6-0-ddef3499793c@kernel.org",
+  "subject": "[PATCH v6 0/6] nfsd/sunrpc: convert nfsstat server-side interfaces to use netlink",
+  "url": "https://lore.kernel.org/all/20260619-exportd-netlink-v6-0-ddef3499793c@kernel.org/",
+  "dates": {
+    "2026-06-19": {
+      "report_file": "2026-06-19_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Chuck Lever",
+          "summary": "Reviewer Chuck Lever noted that the netlink handler in nfsd_netlink.c does not properly handle errors when sending a server-stats object, and requested that error handling be added to ensure that an error is returned when nla_put_*() calls fail.\n\nReviewer Chuck Lever noted that the netlink handler does not stream across subsequent messages, instead emitting all server-stats objects in a single message on the first invocation, which contradicts the commit message's description of streaming design.\n\nThe reviewer, Chuck Lever, pointed out that the server-stats object assembly in one message could lead to a buffer overflow issue when the assembled message exceeds the dump buffer size of NLMSG_GOODSIZE (approximately 3.7k on a 4k-page host). He noted that with LAST_NFS4_OP at 75, the proc4ops-ops loop alone emits around 2.1k bytes, and adding more NFSv4 operations would further increase the total size, potentially exceeding the buffer limit.\n\nThe reviewer pointed out that the patch duplicates code from nfsd_nl_fill_proc_ops() and suggested generalizing a helper function to take the per-op counter source, reducing code duplication. Additionally, they noted that the loop emits entries for zero-count ops, which may not be intentional, and requested consideration of including the wdeleg_getattr counter in the netlink dump.\n\nReviewer noted that when an nla_put fails, genlmsg_cancel() trims the partial message and skb->len becomes 0, causing -EMSGSIZE to be delivered as a terminal error instead of indicating a buffer full condition. He suggested building the dump in the same streaming pattern used by nfsd_nl_rpc_status_get_dumpit(), where one entry is emitted per message with the cursor saved in cb->args.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "error handling",
+            "contradiction between code and commit message",
+            "buffer overflow",
+            "potential issue",
+            "code duplication"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "A couple of questions on the dump design and one on the commit message,\nthen some smaller items.\n\nThe commit message says:\n\n---\n\nThe code does not stream across subsequent messages.  The proc4ops-ops\nnests are emitted in the first message, inside the same \"if (start == 0)\"\nblock as the scalars, and cb->args[0] only ever holds 0 or -1, never an\noperation index.  The function's own kerneldoc agrees: \"The entire\nserver-stats object is emitted in a single netlink message on the first\ninvocation.\"\n\nShould the commit message be reworded to match the code, or should the code\nmove to the streaming design the message describes?  That second option ties\ninto the next question.\n\n---\n\nThis handler assembles the entire server-stats object -- all scalars, the\nproc2/3/4-ops nests, and one proc4ops-ops nest per NFSv4 operation -- in one\nmessage under \"if (start == 0)\", then sets cb->args[0] = -1 so the next call\nends the dump.\n\nDoes that hold up once the assembled message no longer fits the dump buffer?\nA dump skb is allocated at max(cb->min_dump_alloc, NLMSG_GOODSIZE), and this\nhandler sets neither cb->min_dump_alloc nor a .start callback, so the floor\nis NLMSG_GOODSIZE, which is SKB_WITH_OVERHEAD(PAGE_SIZE), roughly 3.7k on a\n4k-page host.  A larger skb is allocated only when userspace has previously\ngrown its receive buffer.\n\nWith LAST_NFS4_OP at 75, the proc4ops-ops loop alone emits 76 nests of about\n28 bytes each (~2.1k); the proc2 and proc3 nests plus the scalar block bring\nthe total to roughly 3.5k -- already within a few hundred bytes of the floor,\nand growing by one nest for every NFSv4 operation added later.\n\n[ ... scalar puts for reply cache, fh, io, net, rpc snipped ... ]\n\n---\n\nThis loop open-codes the same nest that nfsd_nl_fill_proc_ops() builds just\nabove -- nla_nest_start(), nla_put_u32(PROC_ENTRY_OP),\nnla_put_u64_64bit(PROC_ENTRY_COUNT), nla_nest_end() -- into the same\nNFSD_A_SERVER_STATS_PROC4OPS_OPS attribute.  Could the helper be generalized\nto take the per-op counter source so this is not a second copy of the same\ncode?\n\nThe per-version block above skips empty versions:\n\n\tif (!prog->pg_vers[i] || !statp->vs_count[i])\n\t\tcontinue;\n\nbut this loop emits an entry for every op 0..LAST_NFS4_OP, zero-count ops\nincluded.  Is that difference intentional?  Skipping zero counts here would\nalso trim the worst-case message size above.\n\nThere is also a counter that this dump does not emit.  /proc/net/rpc/nfsd\nprints a wdeleg_getattr line after proc4ops:\n\n\tseq_printf(seq, \"\\nwdeleg_getattr %lld\",\n\t\tpercpu_counter_sum_positive(&nn->counter[NFSD_STATS_WDELEG_GETATTR]));\n\nincremented by nfsd_stats_wdeleg_getattr_inc().  Since the goal is to expose\nthe statistics currently available via /proc/net/rpc/nfsd, should\nwdeleg_getattr get an attribute here too, so nfsstat over netlink does not\ndrop it relative to the procfs path?\n\n---\n\nBack to the buffer question: when an nla_put eventually fails, control\nreaches err_cancel, and genlmsg_cancel() trims the partial message back out,\nso skb->len is 0 on return.  In netlink_dump():\n\n\tif (nlk->dump_done_errno == -EMSGSIZE && skb->len)\n\t\tnlk->dump_done_errno = skb->len;\n\nthe skb->len test fails, so -EMSGSIZE is delivered to userspace as a\nterminal error rather than being taken as \"buffer full, call again\".  With\neverything emitted under \"if (start == 0)\" and no per-attribute cursor in\ncb->args, a retry rebuilds the same oversized message, so the dump cannot\never complete.\n\nnfsd_nl_rpc_status_get_dumpit() already follows the streaming pattern the\ncommit message describes: one entry per message, saving the cursor in\ncb->args and returning skb->len on EMSGSIZE.  Would building this dump the\nsame way be more robust than the single-message form?\n\n-- \nChuck Lever",
+          "reply_to": "",
+          "message_date": "2026-06-19",
+          "message_id": "8173debc-96fb-4354-ba11-dff99b772523@app.fastmail.com",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Chuck Lever",
+          "summary": "The reviewer noted that the code captures the cb_ops pointer and reads ops->opcode after nfsd4_queue_cb() returns, which is safe because every cb_ops points at a file-scope static const nfsd4_callback_ops structure that outlives cb. The reviewer suggested that the comment would read more accurately as snapshotting the cb_ops pointer rather than the opcode.\n\nReviewer Chuck Lever noted that the increment of OP_CB_SEQUENCE count is triggered by minorversion > 0, including cases where no CB_SEQUENCE is sent on the wire, such as callback-channel probes and client teardown. He suggested moving the increment inside the if (ops) block to avoid this issue.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "clarification_request",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The comment says the opcode is snapshotted before queuing, but the code\ncaptures the cb_ops pointer and reads ops->opcode after nfsd4_queue_cb()\nreturns:\n\n\tif (ops)\n\t\tnfsd_stats_cb_op_inc(nn, ops->opcode);\n\nThat read is safe because every cb_ops points at a file-scope\nstatic const nfsd4_callback_ops (nfsd4_cb_recall_ops,\nnfsd4_cb_getattr_ops, and so on), which outlives cb, unlike cb and clp\nthemselves.  Would the comment read more accurately as snapshotting the\ncb_ops pointer rather than the opcode, perhaps noting that ops stays\nvalid afterward because it points at static data?\n\n---\n\nCan this inflate the OP_CB_SEQUENCE count for callbacks that never send\na CB_SEQUENCE?  The increment fires whenever minorversion > 0, including\nthe ops == NULL case.  The only callback with cb_ops == NULL is the\nnull probe:\n\n  nfsd4_init_cb(&clp->cl_cb_null, clp, NULL, NFSPROC4_CLNT_CB_NULL);\n\nwhich nfsd4_probe_callback() and nfsd4_shutdown_callback() queue via\nnfsd4_run_cb(&clp->cl_cb_null).  For a 4.1+ client, nfsd4_run_cb_work()\ndrops that work item without sending any RPC:\n\n\t/*\n\t * Don't send probe messages for 4.1 or later.\n\t */\n\tif (!cb->cb_ops && clp->cl_minorversion) {\n\t\tnfsd4_mark_cb_state(clp, NFSD4_CB_UP);\n\t\tnfsd41_destroy_cb(cb);\n\t\treturn;\n\t}\n\nSo callback-channel probes, backchannel changes, and client teardown\neach bump OP_CB_SEQUENCE for a minorversion > 0 client even though no\nCB_SEQUENCE (and no callback at all) goes on the wire.\n\nWould moving the CB_SEQUENCE increment inside the if (ops) block avoid\nthis?  A real callback on a 4.1+ client always prepends CB_SEQUENCE, and\nthe null probe carries cb_ops == NULL, so:\n\n\tif (queued) {\n\t\tif (ops) {\n\t\t\tnfsd_stats_cb_op_inc(nn, ops->opcode);\n\t\t\tif (minorversion > 0)\n\t\t\t\tnfsd_stats_cb_op_inc(nn, OP_CB_SEQUENCE);\n\t\t}\n\t} else {\n\t\tnfsd41_cb_inflight_end(clp);\n\t}",
+          "reply_to": "",
+          "message_date": "2026-06-19",
+          "message_id": "a13eff8e-7444-4ba2-bcfa-a981b25af393@app.fastmail.com",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series converts the nfsstat server-side interfaces to use netlink instead of /proc/net/rpc/nfsd, which has several limitations. The new implementation adds per-network-namespace procedure call counts and exposes them through a new netlink handler in the nfsd generic netlink family. It also tracks callback operation counts and provides a procfs fallback for older kernels. The patch series includes six patches that make changes to various files in the kernel, including sunrpc, nfsd, and lockd."
+    }
+  }
+}
