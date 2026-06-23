@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH v2 0/4] memcg: shrink obj_stock_pcp and cache multiple objcgs</title>
+    <title>Review Comments: [v2 15/16] mm: install PMD swap entries on swap-out</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,30 +236,84 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH v2 0/4] memcg: shrink obj_stock_pcp and cache multiple objcgs</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260522011908.1669332-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-25</strong><div class="date-range-nav">Active on: <a href="#2026-05-25">2026-05-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a performance regression caused by the introduction of per-node obj_cgroup in commit 01b9da291c49. The regression occurs when threads of the same memcg run on different NUMA nodes, causing the per-CPU obj_stock_pcp to thrash. To fix this, the patches shrink the existing single-slot obj_stock_pcp fields and convert cached_objcg and nr_bytes into slot arrays using a multi-slot pattern already used by memcg_stock_pcp. This approach allows multiple objcgs per CPU to coexist in the stock without forcing a drain, making it more efficient than the temporary fix introduced earlier.</div></div>
+    <h1>[v2 15/16] mm: install PMD swap entries on swap-out</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/6a5d0a20-6830-4f34-b11e-e711e27edcc3@ghiti.fr/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-06-22</strong><div class="date-range-nav">Active on: <a href="#2026-06-22">2026-06-22</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a problem in the zswap code where PMD swap entries are created before zswap is enabled, leading to errors when trying to read from disk. The fix involves checking if a large folio&#x27;s range is entirely absent from zswap and returning an error if any slot is still present. This ensures that partially-initialised data is not returned in case of an unexpected failure.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-05-25">
+<div class="thread-node depth-0" id="2026-06-22">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Shakeel Butt (author)</span>
-<a class="date-chip" href="../2026-05-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-25">2026-05-25</a>
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-06-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-22">2026-06-22</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Author acknowledged a specific concern about archs with 256KiB base page sizes and promised to fix it in v3.</div>
+<div class="review-comment-text">Reviewer Usama Arif noted that the current strategy for handling PMD swap entries on zswap enablement can lead to a SIGBUS error, and suggested modifying the code in mm/zswap.c to scan the covered slots before attempting to read from disk. He also mentioned that his local patch is similar to Lance&#x27;s suggestion in an earlier email.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Yes, I saw that comment. It is kind of very specific to archs with 256KiB base
-page sizes. Anyways, I have a simple fix for that and there were minor
-suggestions from others for simple changes, I will send v3 with the requested
-changes.</pre>
+<pre class="raw-body-text">Thanks Alexandre! 
+
+I think its similar to what Lance raised in https://lore.kernel.org/all/20260612142124.73367-1-lance.yang@linux.dev/.
+
+What I have locally is at the end, but I need to test it and spend more time into it.
+I will look at your change as well before sending the next revision (looks better at a first glance)!
+The current strategy for this series is in: https://lore.kernel.org/all/c5ae6e6f-9b48-4ec2-a1c1-33ec3b1d3143@linux.dev/
+
+
+diff --git a/mm/zswap.c b/mm/zswap.c
+index 761cd699e0a3..f94133d876a1 100644
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@ -1592,17 +1592,40 @@ int zswap_load(struct folio *folio)
+        if (zswap_never_enabled())
+                return -ENOENT;
+ 
++       entry = xa_load(tree, offset);
++
+        /*
+         * Large folios should not be swapped in while zswap is being used, as
+         * they are not properly handled. Zswap does not properly load large
+         * folios, and a large folio may only be partially in zswap.
++        *
++        * If no zswap entry exists for the folio, however, the caller can read
++        * it from the backing swap device. Scan the covered slots so a PMD
++        * swapin racing with zswap enable does not SIGBUS solely because zswap
++        * became available after the PMD swap entry was installed.
+         */
+-       if (WARN_ON_ONCE(folio_test_large(folio))) {
++       if (folio_test_large(folio)) {
++               unsigned int type = swp_type(swp);
++               bool found = !!entry;
++               long index;
++
++               if (!found) {
++                       for (index = 1; index &lt; folio_nr_pages(folio); index++) {
++                               swp_entry_t cur = swp_entry(type, offset + index);
++
++                               if (xa_load(swap_zswap_tree(cur), offset + index)) {
++                                       found = true;
++                                       break;
++                               }
++                       }
++               }
++               if (!found)
++                       return -ENOENT;
++
++               WARN_ON_ONCE(1);
+                folio_unlock(folio);
+                return -EINVAL;
+        }
+-
+-       entry = xa_load(tree, offset);
+        if (!entry)
+                return -ENOENT;</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Andrew Morton</div>
-<a href="https://lore.kernel.org/r/ahSaKlJ04BYsayQZ@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged a specific concern, promised to fix</div>
+<div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
+<a href="https://lore.kernel.org/r/fce94294-3659-45a7-8391-3ccd3f35d4a6@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>
