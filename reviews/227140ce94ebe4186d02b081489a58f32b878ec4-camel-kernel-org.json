@@ -1,0 +1,149 @@
+{
+  "thread_id": "227140ce94ebe4186d02b081489a58f32b878ec4.camel@kernel.org",
+  "subject": "NFS delegations behavior analysis",
+  "url": "https://lore.kernel.org/all/227140ce94ebe4186d02b081489a58f32b878ec4.camel@kernel.org/",
+  "dates": {
+    "2026-06-23": {
+      "report_file": "2026-06-23_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Benjamin Coddington",
+          "summary": "Reviewer noted that optimizing readdir performance for NFS delegations is challenging due to varying syscall patterns in user-space utilities, and suggested re-hydrating the dentry cache from directory page mappings if the delegation is still valid.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "challenging problem",
+            "additional improvements needed"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I haven't (shame) thought about READDIR in the context of directory\ndelegations.\n\nBut during my time at Red Hat we worked hard to optimize some readdir\nproblems and I learned that almost any change we made ended up making\nsomeone's workload regress.  We also found that our performance benchmarks\nrarely matched the most common real-world workloads.  We made the mistake of\ntrying to improve the benchmark which resulted in performance regressions\nfor real-world users.\n\nJeff, you've already touched on the core issue regarding fixing this with\nbulk GETATTR calls - the kernel doesn't know what syscall pattern the\nuserspace process is going to use next.  The `ls -l` command and `find` and\nfriends have complex history and branching logic, they do different lookup\nand getattr patterns based on their own goals, and NFS cannot optimize for\nany one case.\n\nI think the last time we discussed additional improvements there were some\nideas about teaching the readdir code to respond to fadvise flags, but then\nyou'd also need to teach the utilities how to use them as well, and those\nutilities try to be filesystem-agnostic.\n\nIts a tough problem, and sometimes the simplest thing might be to just use\nmore directories on NFS.\n\n**coffee!**\n\n.... er - so with directory delegations, can we simply re-hydrate the dentry\ncache from the directory page mappings if the delegation is still valid?\nDoes the directory delegation pin the mapping?  Clearly I need to look at\nthe code..\n\nBen",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-06-23",
+          "message_id": "4323491E-64A0-4883-8343-5EB569A0D81A@hammerspace.com",
+          "email": "ben.coddington@hammerspace.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Daire Byrne",
+          "summary": "Reviewer Daire Byrne noted that the heuristics for tuning NFS delegations behavior are unclear and requested specific thoughts on how to improve them, also inquiring about potential workloads that might be regressed.\n\nReviewer suggested using directory delegations to cache or speed up negative lookups, specifically for cases where a client has the complete cache of directory contents and can serve negative lookups until the server tells it that something has changed.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 23 Jun 2026 at 14:12, Benjamin Coddington\n<ben.coddington@hammerspace.com> wrote:\n\n---\n\nI have also long hoped for a way to cache or speed up \"negative\"\nlookups using something akin to directory delegations.\n\nSo if you have your software (e.g. PYTHONPATH) on an NFS share, then\nnegative lookups are a huge scalability problem. It would be nice if a\nclient that got the directory contents could also serve negative\nlookups until the server told it that something had changed.\n\nBut as has been explained to me multiple times before, there is no\nmechanism to say that a client \"has the complete cache of directory\ncontents\". But I will forever live in hope!\n\nThis kind of path search walking is also something that is unlikely to\never trigger readdirplus as it does a file and then tries the same\nfile in another directory etc etc.\n\nDaire",
+          "reply_to": "Benjamin Coddington",
+          "message_date": "2026-06-23",
+          "message_id": "CAPt2mGPFoW5h7J2V8sCGnU7cQ9Xjx4ddc_sq8pPi4rPZy+J6bQ@mail.gmail.com",
+          "email": "daire@brahma.io",
+          "is_maintainer": false
+        },
+        {
+          "author": "Benjamin Coddington",
+          "summary": "reviewer noted that the current implementation does not keep file attributes in the mappings and that directory delegation does not protect those file attributes, requiring the implementation of NOTIFY4_CHANGE_CHILD_ATTRIBUTES",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": ".. right - we don't keep the file attributes in the mappings today.  And,\nmore to the point - the directory delegation doesn't protect those file\nattributes either.  We'd need NOTIFY4_CHANGE_CHILD_ATTRIBUTES implemented.\n\nBen",
+          "reply_to": "",
+          "message_date": "2026-06-23",
+          "message_id": "E86DDFB0-6E5E-40CC-8DFA-7233793D25E1@hammerspace.com",
+          "email": "ben.coddington@hammerspace.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author identified the root cause of performance issues as inode attributes and attrcache timeouts, explaining that the first pass uses a full-attrs READDIR but subsequent passes rely on delegation and attrcache, leading to GETATTR calls for statx() operations.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "explained technical issue",
+            "acknowledged complexity"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I think the main problem is not the dcache, but the attributes on the\ninodes. The first pass uses a full-attrs READDIR (aka readdirplus) and\neverything goes reasonably quick.\n\nThen, on the second pass, the client skips checking directory\nattributes before trusting the dcache because of the delegation (which\nis good), but the inodes those dentries point to have an attrcache\ntimeout, and we end up doing a GETATTR for each statx() call when a\nreaddirplus would have been cheaper.\n\nI guess after you see a few statx() calls from the same pid on the same\ndirectory in a short timeframe you could switch to doing READDIR, but\nthat sounds horrid to get right and keep working.\n\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "Benjamin Coddington",
+          "message_date": "2026-06-23",
+          "message_id": "6076ff478091a512354443e7764ca1b737a386aa.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author acknowledged that using fsnotify to watch for child attribute changes is a possible solution, but noted it could be chatty and require nfsd to send callbacks in larger chunks.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged a potential solution",
+            "raised concerns about performance"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Which I think could be done, at least on the Linux server. fsnotify\ndoes support watching for child attribute changes (FS_EVENT_ON_CHILD |\nFS_ATTRIB).\n\nThat could be very chatty though. We would need to do the work to make\nnfsd send callbacks >1 page in order to keep up, I imagine.\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "Benjamin Coddington",
+          "message_date": "2026-06-23",
+          "message_id": "509e5aecbccb57cd7cd033d45a0c28db8ba8b52c.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Benjamin Coddington",
+          "summary": "reviewer expressed concern that proposed heuristics to optimize NFS performance could have unintended consequence of increasing operation counts for unused data, and requested consideration of specific workloads",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "potential optimization issue"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I agree - it could easily end up having the opposite effect of optimizing\nperformance by amplifying op counts for information the client might not\nactually use.\n\nBen",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-06-23",
+          "message_id": "C21821AB-720B-444C-852F-CA492DFA8914@hammerspace.com",
+          "email": "ben.coddington@hammerspace.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Trond Myklebust",
+          "summary": "Reviewer Trond Myklebust expressed skepticism about the use of NOTIFY4_CHANGE_CHILD_ATTRS in informing clients whether to use READDIR or READDIRPLUS, noting that receiving a notification does not guarantee safety from attribute changes and suggesting an alternative approach.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "skeptical",
+            "requested alternative"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Unlike delegations, notifications are asynchronous by design. Upon\nreception of a notification, you may deduce that you should revalidate\nthe attributes on a file. However the absence of that notification is\ninsufficient to deduce that it is safe not to revalidate those\nattributes.\n\nSo when it comes to informing the client whether to use READDIR or\nREADDIRPLUS, I'm sceptical concerning the value of throwing\nNOTIFY4_CHANGE_CHILD_ATTRS at the problem.\n\n-- \nTrond Myklebust\nLinux NFS client maintainer, Hammerspace\ntrondmy@kernel.org, trond.myklebust@hammerspace.com",
+          "reply_to": "Benjamin Coddington",
+          "message_date": "2026-06-23",
+          "message_id": "3aab8cd1b42edbd1cbfc3981fd3624ab8e988993.camel@kernel.org",
+          "email": "trondmy@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch is related to NFS delegations behavior analysis and appears to be a discussion about tuning heuristics for improving performance, specifically regarding ls-ish workloads that may regress."
+    }
+  }
+}

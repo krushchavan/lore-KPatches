@@ -123,6 +123,93 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series introduces Virtual Swap Space (Swap Table Edition), which aims to address the limitations of current swap design by decoupling swap entries from physical backing slots. This allows for more efficient use of disk space, especially in scenarios where zswap is used. The changes include rebasing to a newer mm-unstable tip, fixing assorted issues, and simplifying code. Additionally, the patch series introduces new features such as deferring memcg_table allocation on physical clusters until the first vswap-backing slot installs and widening swap_info_struct->max and ->pages to support up to 8 PB of swap space."
+    },
+    "2026-06-23": {
+      "report_file": "2026-06-23_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer Yosry Ahmed noted that a comment intended for an earlier patch was mistakenly included in this one, and that another comment's changes were being undone.\n\nReviewer Yosry Ahmed noted that the code should only execute in the !ret case, but this is not immediately clear from the current implementation. They suggested moving the check to if (!ret) and also proposed alternative reordering of the code to avoid indentation issues.\n\nReviewer Yosry Ahmed suggested avoiding THP swapin for vswap initially, noting that it's not specific to vswap and could be allowed even without vswap if an entire folio is on-disk.\n\nReviewer Yosry Ahmed questioned whether calling folio_release_vswap_backing() is necessary, suggesting that __vswap_release_backing() directly calls zswap_entry_free() and no vswap-specific state is cleaned up.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "comment placement error",
+            "undoing previous changes",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Seems like this comment belongs in the previous patch, and the other\ncomment movement is undoing what last patch did.\n\n---\n\nHmm the above should also only happen in the !ret case, but that's not\nobvious from the code here. I think all of this should go under if\n(!ret), but maybe reverse the polarity to avoid the indentation?\n\n\tif (ret)\n\t\treturn ret;\n\n\tif (is_vswap_entry(swp)) {\n\t\tif (partial_store)\n\t\t\tfolio_release_vswap_backing(folio);\n\t\treturn ret;\n\t}\n\n\t...\n\nAlternatively you can move the check_old code for xarray into a helper\nand do:\n\n\tif (!ret) {\n\t\tif (is_vswap_entry(swp)) {\n\t\t\tif (partial_store)\n\t\t\t\tfolio_release_vswap_backing(folio);\n\t\t} else {\n\t\t\tzswap_free_old_xa_entries(swp, nr_pages)\n\t\t}\n\t}\n\nAlso, I think you can probably drop partial_store and check the index\ndirectly here.\n\n---\n\nHmm should we start simple and avoid THP swapin for vswap initially?\n\nIIUC, it isn't really vswap specific. Even without vswap, it's possible\nthat an entire folio is on-disk, not in zswap, in which case THP swap\nshould be allowed.\n\nI assume it's not common for zswap to be enabled and an entire THP worth\nof pages are not in zswap, so maybe we can add this later?\n\n---\n\nIs there any advantage to calling folio_release_vswap_backing() over\nzswap_entry_free()? Seems like __vswap_release_backing() ends up just\ncalling zswap_entry_free() -- and I don't see any vswap-specific state\nbeing cleaned up.\n\nI wonder if the zswap code should call zswap_entry_free() directly? Same\ngoes for the call in zswap_store() above.",
+          "reply_to": "",
+          "message_date": "2026-06-23",
+          "message_id": "ajnNWRO7apBq2-kQ@google.com",
+          "email": "yosry@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer Yosry Ahmed questioned whether calling `folio_realloc_swap()` without first loading the swap entry is a valid use case and suggested modifying the API to take the swap entry directly, allowing for the load to be done within.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I didn't look through the rest of the series, but are there use cases\nfor calling folio_realloc_swap() without calling vswap_zswap_load()\nfirst? I wonder if the realloc_swap API should take the swpentry\ndirectly and do the load within? Something like\nvswap_alloc_phys(swpentry, folio)?",
+          "reply_to": "",
+          "message_date": "2026-06-23",
+          "message_id": "ajnRulrxAKnZavOl@google.com",
+          "email": "yosry@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Nhat Pham (author)",
+          "summary": "Author acknowledged that the swapout fallback path also uses phys swap space allocation and agreed to avoid calling zswap_load() in this case.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a potential issue",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "It's also use on the swapout fallback path! If zswap rejects the page\nor is disabled, and memory.zswap.writeback=1, then we allocate phys\nswap space. We probably don't wanna do zswap_load() there again :)",
+          "reply_to": "Yosry Ahmed",
+          "message_date": "2026-06-23",
+          "message_id": "CAKEwX=PsyKgD5UufUsX138wFnmz9hKfi8zvrbs6gsh4Kj+F+yw@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer Yosry Ahmed suggested abstracting xarray operations and vswap operations into separate helpers, such as zswap_tree_store() and zswap_tree_load(), to reduce code divergence and improve maintainability.\n\nReviewer Yosry Ahmed suggested abstracting away the xarray vs. vswap distinction in the code by introducing a helper function that can remove zswap entries from vswap, and also proposed creating additional helpers to simplify the code.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "code divergence",
+            "suggested abstraction",
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "There's a lot of divergence in the code (in this patch and previous\nones). Seems like a lot of it is to do xarray operations vs vswap\noperations. I wonder if we can abstract these into helpers, e.g.\nzswap_tree_store(), zswap_tree_load(), etc. Maybe the name is not the\nbest, but you get the point :)\n\nHere we can then do zswap_tree_load() for both code paths and only the\nfolio_realloc_swap() needs to be different for vswap. We can do\nsimilar cleanups for the load/store paths as well.\n\n---\n\nMaybe this can also be abstracted into a helper, but I wonder what the\ncorresponding vswap operation would be. I think folio_realloc_swap()\nwill have already \"erased\" the zswap entry from vswap. Maybe have a\nvswap helper that will only remove it if it's a zswap entry? We can\nprobably do a lockless check first to make it cheap?\n\nIt's probably silly to do this, and maybe there's a better way.\nGenerally, I think the code would be easier to follow if we abstract\naway the xarray vs. vswap stuff into helpers (where it's reasonable).",
+          "reply_to": "",
+          "message_date": "2026-06-23",
+          "message_id": "CAO9r8zPXk2eRbVcEMQDTCH1j-w241h189=p04FenAfKAjkkQtA@mail.gmail.com",
+          "email": "yosry@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series introduces Virtual Swap Space (Swap Table Edition), which aims to address the limitations of current swap design by decoupling swap entries from physical backing slots. This allows for more efficient use of disk space, especially in scenarios where zswap is used. The changes include rebasing to a newer mm-unstable tip, fixing assorted issues, and simplifying code. Additionally, the patch series introduces new features such as deferring memcg_table allocation on physical clusters until the first vswap-backing slot installs and widening swap_info_struct->max and ->pages to support up to 8 PB of swap space."
     }
   }
 }
