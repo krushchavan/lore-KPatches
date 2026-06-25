@@ -1,0 +1,50 @@
+{
+  "thread_id": "120367a5-0a3c-40ba-a821-f46f8494ef85@linux.dev",
+  "subject": "[PATCH v4 4/5] mm/memcontrol: convert memcg to use page_counter_stock",
+  "url": "https://lore.kernel.org/all/120367a5-0a3c-40ba-a821-f46f8494ef85@linux.dev/",
+  "dates": {
+    "2026-06-24": {
+      "report_file": "2026-06-24_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif",
+          "summary": "Raised concerns about undercounting and charge leakage when using page_counter_stock in memcg. Provided a detailed explanation of the stock-hit case and its implications.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "undercounting",
+            "charge leakage"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joshua Hahn",
+          "summary": "Clarified the stock-hit case and its relationship to actual charging. Asked for further explanation of 'consumed credit' and questioned the subtraction from counter->usage.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, 24 Jun 2026 17:43:56 +0100 Usama Arif <usama.arif@linux.dev> wrote:\n\n> \n> \n> On 24/06/2026 16:23, Joshua Hahn wrote:\n> > On Wed, 24 Jun 2026 07:43:47 -0700 Usama Arif <usama.arif@linux.dev> wrote:\n> > \n> >> On Tue, 23 Jun 2026 11:01:22 -0700 Joshua Hahn <joshua.hahnjy@gmail.com> wrote:\n> > \n> > Hello Usama!!\n> > \n> > Thank you for reviewing the patch : -)\n> > \n> > [...snip...]\n> > \n> >>> @@ -2595,7 +2596,6 @@ void __mem_cgroup_handle_over_high(gfp_t gfp_mask)\n> >>>  static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n> >>>  \t\t\t    unsigned int nr_pages)\n> >>>  {\n> >>> -\tunsigned int batch = max(MEMCG_CHARGE_BATCH, nr_pages);\n> >>>  \tint nr_retries = MAX_RECLAIM_RETRIES;\n> >>>  \tstruct mem_cgroup *mem_over_limit;\n> >>>  \tstruct page_counter *counter;\n> >>> @@ -2606,36 +2606,30 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n> >>>  \tbool raised_max_event = false;\n> >>>  \tunsigned long pflags;\n> >>>  \tbool allow_spinning = gfpflags_allow_spinning(gfp_mask);\n> >>> +\tunsigned long nr_charged = 0;\n> >>>  \n> >>>  retry:\n> >>> -\tif (consume_stock(memcg, nr_pages))\n> >>> -\t\treturn 0;\n> >>> -\n> >>> -\tif (!allow_spinning)\n> >>> -\t\t/* Avoid the refill and flush of the older stock */\n> >>> -\t\tbatch = nr_pages;\n> >>> -\n> >>>  \treclaim_options = MEMCG_RECLAIM_MAY_SWAP;\n> >>>  \tif (do_memsw_account() &&\n> >>> -\t    !page_counter_try_charge(&memcg->memsw, batch, &counter)) {\n> >>> +\t    !page_counter_try_charge_stock(&memcg->memsw, nr_pages,\n> >>> +\t\t\t\t\t   &counter, NULL)) {\n> >>>  \t\tmem_over_limit = mem_cgroup_from_counter(counter, memsw);\n> >>>  \t\treclaim_options &= ~MEMCG_RECLAIM_MAY_SWAP;\n> >>>  \t\tgoto reclaim;\n> >>>  \t}\n> >>>  \n> >>> -\tif (page_counter_try_charge(&memcg->memory, batch, &counter))\n> >>> -\t\tgoto done_restock;\n> >>> +\tif (page_counter_try_charge_stock(&memcg->memory, nr_pages,\n> >>> +\t\t\t\t\t  &counter, &nr_charged)) {\n> >>> +\t\tif (!nr_charged)\n> >>> +\t\t\treturn 0;\n> >>> +\t\tgoto handle_high;\n> >>> +\t}\n> >>>  \n> >>>  \tif (do_memsw_account())\n> >>> -\t\tpage_counter_uncharge(&memcg->memsw, batch);\n> >>> +\t\tpage_counter_uncharge(&memcg->memsw, nr_pages);\n> >>\n> >> This needs a transactional rollback. page_counter_try_charge_stock() can\n> >> succeed by consuming memsw stock and charging 0 new pages, but the\n> >> memory-failure path unconditionally uncharges nr_pages from memsw.\n> >> That turns a failed allocation into a real memsw usage decrement.\n> > \n> > Hmmmmmmmmmm....... I'm not sure.\n> > \n> > At this point in the code, we are either (1) using cgroup v1 with memsw\n> > and charged successfully, or (2) not using cgroup v1 with memsw. So I'm\n> > not sure if this really is unconditional, we're just distinguishing\n> > between cases (1) and (2) by checking if we're using cgroupv1.\n> > \n> > Or is your concern with taking a charge via stock, but uncharging with\n> > a hierarchical page_counter walk?\n> \n> This was my concern. But I re-read the page_counter stock invariant,\n> and the stock-hit case is not an undercount? Consuming stock transfers\n> already-charged credit to the pending allocation; if the later memory charge\n> fails, page_counter_uncharge() discards that consumed credit from the\n> hierarchy. That should keeps usage equal to real charges plus remaining stock?\n\nYes, stock-hit case just does some math without doing any actual\ncharging. It's stuff that was pre-charged before, so we're not doing\nany undercounting or leaking any charges.\n\nWhat do you mean by \"consumed credit\"? From what I can see\npage_counter_uncharge --> page_counter_cancel subtracts from\ncounter->usage, which should be the real charge + hierarchy walk.\n\nAm I missing something :p please feel free to let me know!\nJoshua\n\n",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-06-24",
+          "message_id": "",
+          "email": "joshua.hahnjy@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Conversion of memcg to use page_counter_stock, addressing concerns about undercounting and charge leakage."
+    }
+  }
+}

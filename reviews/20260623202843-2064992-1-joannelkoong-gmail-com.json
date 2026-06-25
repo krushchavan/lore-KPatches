@@ -4,30 +4,59 @@
   "url": "https://lore.kernel.org/all/20260623202843.2064992-1-joannelkoong@gmail.com/",
   "dates": {
     "2026-06-24": {
-      "report_file": "2026-06-23_ollama_llama3.1-8b.html",
+      "report_file": "2026-06-24_ollama_llama3.1-8b.html",
       "developer": "Joanne Koong",
       "reviews": [
         {
           "author": "Matthew Wilcox",
-          "summary": "Identified a double-put bug and expressed concerns that clearing the uptodate flag can lead to MM sanity checks bringing down the machine. Suggested removing calls to clear uptodate in all filesystems.",
+          "summary": "Identified a fundamental problem with the folio uptodate flag belonging to the filesystem, which can lead to security issues. Suggested removing calls to clear uptodate in all filesystems.",
           "sentiment": "needs_work",
           "sentiment_signals": [
-            "bug",
-            "concerns about MM sanity checks"
+            "CONTENTIOUS"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Tue, Jun 23, 2026 at 01:28:42PM -0700, Joanne Koong wrote:\n> +++ b/fs/fuse/file.c\n> @@ -1250,13 +1250,13 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,\n>  \t\tstruct folio *folio = ap->folios[i];\n>  \n>  \t\tif (err) {\n> -\t\t\tfolio_clear_uptodate(folio);\n> +\t\t\tiomap_folio_clear_uptodate(folio);\n>  \t\t} else {\n>  \t\t\tif (count >= folio_size(folio) - offset)\n>  \t\t\t\tcount -= folio_size(folio) - offset;\n>  \t\t\telse {\n>  \t\t\t\tif (short_write)\n> -\t\t\t\t\tfolio_clear_uptodate(folio);\n> +\t\t\t\t\tiomap_folio_clear_uptodate(folio);\n>  \t\t\t\tcount = 0;\n\nI believe this to be a bug.  I talked about this a bit as LSFMM, but the\nfundamental problem is that the folio uptodate flag DOES NOT BELONG TO THE\nFILESYSTEM (unlike the buffer_head uptodate flag, which definitely does).\n\nThe MM has a number of sanity checks that make sure we haven't\ndone something awful like mapping a !uptodate folio into userspace.\nThat would potentially leak confidential information to userspace.\nSo when a filesystem clears the uptodate flag, the MM can come along\nand bring down the whole machine because the mapped folio is now !uptodate.\n\nI know we have a terrible writeback error handling story.  But I think\nthe right thing to do is just take out the calls to clear uptodate.\nIn all filesystems.  Darrick took it out of iomap in e9c3a8e820ed but\nit's time to purge it everywhere.\n\n",
+          "raw_body": "On Tue, Jun 23, 2026 at 01:28:42PM -0700, Joanne Koong wrote:\n> +++ b/fs/fuse/file.c\n> @@ -1250,13 +1250,13 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,\n>  \t\tstruct folio *folio = ap->folios[i];\n>  \n>  \t\tif (err) {\n> -\t\t\tfolio_clear_uptodate(folio);\n> +\t\t\tiomap_folio_clear_uptodate(folio);\n>  \t\t} else {\n>  \t\t\tif (count >= folio_size(folio) - offset)\n>  \t\t\t\tcount -= folio_size(folio) - offset;\n>  \t\t\telse {\n>  \t\t\t\tif (short_write)\n> -\t\t\t\t\tfolio_clear_uptodate(folio);\n> +\t\t\t\t\tiomap_folio_clear_uptodate(folio);\n>  \t\t\t\tcount = 0;\n\nI believe this to be a bug.  I talked about this a bit as LSFMM, but the\nfundamental problem is that the folio uptodate flag DOES NOT BELONG TO THE\nFILESYSTEM (unlike the buffer_head uptodate flag, which definitely does).\n\nThe MM has a number of sanity checks that make sure we haven't\ndone something awful like mapping a !uptodate folio into userspace.\nThat would potentially leak confidential information to userspace.\nSo when a filesystem clears the uptodate flag, the MM can come along\nand bring down the whole machine because the mapped folio is now !uptodate.\n\nI know we have a terrible writeback error handling story.  But I think\nthe right thing to do is just take out the calls to clear uptodate.\nIn all filesystems.  Darrick took it out of iomap in e9c3a8e820ed but\nit's time to purge it everywhere.\n",
           "reply_to": "Joanne Koong",
           "message_date": "2026-06-24",
           "message_id": "",
           "email": "willy@infradead.org",
           "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Agreed with Matthew's assessment and suggested a gradual approach to removing the clearing of uptodate bits.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, Jun 24, 2026 at 04:29:54AM +0100, Matthew Wilcox wrote:\n> I believe this to be a bug.  I talked about this a bit as LSFMM, but the\n> fundamental problem is that the folio uptodate flag DOES NOT BELONG TO THE\n> FILESYSTEM (unlike the buffer_head uptodate flag, which definitely does).\n> \n> The MM has a number of sanity checks that make sure we haven't\n> done something awful like mapping a !uptodate folio into userspace.\n> That would potentially leak confidential information to userspace.\n> So when a filesystem clears the uptodate flag, the MM can come along\n> and bring down the whole machine because the mapped folio is now !uptodate.\n> \n> I know we have a terrible writeback error handling story.  But I think\n> the right thing to do is just take out the calls to clear uptodate.\n> In all filesystems.  Darrick took it out of iomap in e9c3a8e820ed but\n> it's time to purge it everywhere.\n\nYeah.  We're not going to fix everything at once, but we should\nslowly move to stop clearing the folio uptodate bit.  And I suspect\nthe same is trye for the sub-folio uptodate bits.\n",
+          "reply_to": "Matthew Wilcox",
+          "message_date": "2026-06-24",
+          "message_id": "",
+          "email": "hch@lst.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joanne Koong",
+          "summary": "Acknowledged the concerns and agreed to send a patch to remove the clearing of uptodate bits in fuse.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Wed, Jun 24, 2026 at 12:36 AM Christoph Hellwig <hch@lst.de> wrote:\n>\n> On Wed, Jun 24, 2026 at 04:29:54AM +0100, Matthew Wilcox wrote:\n> > I believe this to be a bug.  I talked about this a bit as LSFMM, but the\n> > fundamental problem is that the folio uptodate flag DOES NOT BELONG TO THE\n> > FILESYSTEM (unlike the buffer_head uptodate flag, which definitely does).\n> >\n> > The MM has a number of sanity checks that make sure we haven't\n> > done something awful like mapping a !uptodate folio into userspace.\n> > That would potentially leak confidential information to userspace.\n> > So when a filesystem clears the uptodate flag, the MM can come along\n> > and bring down the whole machine because the mapped folio is now !uptodate.\n> >\n> > I know we have a terrible writeback error handling story.  But I think\n> > the right thing to do is just take out the calls to clear uptodate.\n> > In all filesystems.  Darrick took it out of iomap in e9c3a8e820ed but\n> > it's time to purge it everywhere.\n\nSounds good, thanks for looking at this. I'll send a patch to remove\nthis in fuse.\n\nThanks,\nJoanne\n\n",
+          "reply_to": "",
+          "message_date": "2026-06-24",
+          "message_id": "",
+          "email": "joannelkoong@gmail.com",
+          "is_maintainer": false
         }
       ],
       "analysis_source": "llm",
-      "patch_summary": "This patch series adds two helpers to iomap to update the uptodate bitmap in sync, addressing a double-put bug and ensuring that external callers can update the uptodate folio state from non-iomap paths."
+      "patch_summary": "This patch series adds two helpers to iomap to update the uptodate bitmap whenever a folio's uptodate status needs to be set or cleared, allowing external callers to keep the bitmap in sync. The second patch introduces the fuse caller side of this functionality."
     },
     "2026-06-23": {
       "report_file": "2026-06-23_ollama_llama3.1-8b.html",
