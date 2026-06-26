@@ -1,0 +1,66 @@
+{
+  "thread_id": "aj0u12N_GzGtQT6K@cmpxchg.org",
+  "subject": "[RFC PATCH] mm: Avoiding split large folios if swap has no space",
+  "url": "https://lore.kernel.org/all/aj0u12N_GzGtQT6K@cmpxchg.org/",
+  "dates": {
+    "2026-06-25": {
+      "report_file": "2026-06-25_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer questioned the necessity of avoiding split large folios if swap has no space, citing that the remaining headroom is less than a large folio and suggesting a fuzz factor around the limit is acceptable\n\nReviewer questioned whether implementing a more complex solution is worth it, given the remaining headroom is less than a large folio and temporary overcharging in other places is acceptable.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "questioning necessity",
+            "suggested alternative approach",
+            "questioning complexity",
+            "acceptance of temporary overcharging"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I was asking myself the same, but when we think in terms of THPs on arm64 64k\nwe're in the range of double-digit MiBs.\n\n---\n\nThanks! @Barry, up to you if we want to implement that right away or if we're\nsimply going to assume that if charging fails, not worth splitting (changing the\nexisting handling IIUC).\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-06-25",
+          "message_id": "3af41c23-2365-4ac1-b1b9-076b6ef7ae9e@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the Linux kernel's memory cgroup charging mechanism to avoid splitting large folios when there is no available swap space. The current implementation tries to charge against the first ancestor that fails, but this can lead to unnecessary splits. Instead, the patch proposes calculating the actual headroom by walking up the hierarchy and taking the minimum of all ancestors' available swap space. This approach aims to relax the strict limit enforcement in favor of a more flexible margin-based calculation."
+    },
+    "2026-06-26": {
+      "report_file": "2026-06-25_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Barry Song",
+          "summary": "Reviewer questioned the necessity of the patch, suggesting that a fuzz factor around the limit is acceptable and noting that the remaining headroom is less than a large folio.\n\nReviewer Barry Song noted that the current implementation may incur significant latency for I/O or compression, and suggested splitting huge folios into 2MB folios instead of base pages when swapping out to allow architectures with large folios to use THP_SWAP.\n\nReviewer pointed out that the patch's approach is similar to what mem_cgroup_get_nr_swap_pages() already does, suggesting that the effort may not be worth it given the limited headroom.\n\nReviewer Barry Song suggested modifying the __mem_cgroup_try_charge_swap() function to return an additional argument for the remaining swap space, which would be used in conjunction with mem_cgroup_margin() math to determine headroom. He proposed adding a fuzz factor around the limit and provided a code concept that includes this modification.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "questioning necessity",
+            "suggesting alternative approach",
+            "requested changes",
+            "suggested alternative approach",
+            "questioning the value of the patch"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Thu, Jun 25, 2026 at 9:46 PM David Hildenbrand (Arm)\n<david@kernel.org> wrote:\n\n---\n\nYep. But we haven't enabled thp_swp for 64KB base pages yet; there\nis an ongoing attempt[1].\n\nThe current concern is that such large folios may incur significant\nlatency for I/O or compression, and reclaim could end up waiting\nfor a long time.\nFor huge folios, maybe we should split them into 2MB folios\ninstead of splitting all the way down to base pages when swapping\nout.\nThat way, we could allow architectures with \"huge\" large folios to swap\nout using THP_SWAP?\n\nBTW, PowerPC is enabling THP_SWPOUT for up to 16MB THP[2].\n\n[1] https://lore.kernel.org/linux-mm/20251226063759.4020782-2-tongweilin@linux.alibaba.com/\n[2] https://lore.kernel.org/linux-mm/cover.1781843449.git.ritesh.list@gmail.com/\n\n---\n\nIt seems it is exactly what mem_cgroup_get_nr_swap_pages() is doing:\n\nlong mem_cgroup_get_nr_swap_pages(struct mem_cgroup *memcg)\n{\n        long nr_swap_pages = get_nr_swap_pages();\n\n        if (mem_cgroup_disabled() || do_memsw_account())\n                return nr_swap_pages;\n        for (; !mem_cgroup_is_root(memcg); memcg = parent_mem_cgroup(memcg))\n                nr_swap_pages = min_t(long, nr_swap_pages,\n                                      READ_ONCE(memcg->swap.max) -\n                                      page_counter_read(&memcg->swap));\n        return nr_swap_pages;\n}\n\n---\n\nThanks very much to Johannes and David for the help.\n\nHi Johannes, I wonder if you're comfortable with something like\nthe code below (just as a concept):\n\ndiff --git a/include/linux/swap.h b/include/linux/swap.h\nindex 8f0f68e245ba..be4f86271c0d 100644\n--- a/include/linux/swap.h\n+++ b/include/linux/swap.h\n@@ -573,12 +573,12 @@ static inline void\nfolio_throttle_swaprate(struct folio *folio, gfp_t gfp)\n #endif\n\n #if defined(CONFIG_MEMCG) && defined(CONFIG_SWAP)\n-int __mem_cgroup_try_charge_swap(struct folio *folio);\n-static inline int mem_cgroup_try_charge_swap(struct folio *folio)\n+int __mem_cgroup_try_charge_swap(struct folio *folio, long *left_space);\n+static inline int mem_cgroup_try_charge_swap(struct folio *folio,\nlong *left_space)\n {\n        if (mem_cgroup_disabled())\n                return 0;\n-       return __mem_cgroup_try_charge_swap(folio);\n+       return __mem_cgroup_try_charge_swap(folio, left_space);\n }\n\n extern void __mem_cgroup_uncharge_swap(unsigned short id, unsigned\nint nr_pages);\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 56cd4af08232..c8c9a10befad 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -5578,7 +5578,7 @@ int __init mem_cgroup_init(void)\n  *\n  * Returns 0 on success, -ENOMEM on failure.\n  */\n-int __mem_cgroup_try_charge_swap(struct folio *folio)\n+int __mem_cgroup_try_charge_swap(struct folio *folio, long *left_space)\n {\n        unsigned int nr_pages = folio_nr_pages(folio);\n        struct swap_cluster_info *ci;\n@@ -5611,6 +5611,10 @@ int __mem_cgroup_try_charge_swap(struct folio *folio)\n                memcg_memory_event(memcg, MEMCG_SWAP_MAX);\n                memcg_memory_event(memcg, MEMCG_SWAP_FAIL);\n                mem_cgroup_private_id_put(memcg, nr_pages);\n+               if (folio_test_large(folio))\n+                       *left_space = mem_cgroup_get_nr_swap_pages(memcg);\n+               else\n+                       *left_space = 0;\n                return -ENOMEM;\n        }\n        mod_memcg_state(memcg, MEMCG_SWAP, nr_pages);\n\nThanks\nBarry",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-06-26",
+          "message_id": "CAGsJ_4wXTpTS4RF=qPs0wvF3UosrOQ7s9-zdXpx4OKGEysf=VA@mail.gmail.com",
+          "email": "baohua@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the Linux kernel's memory cgroup charging mechanism to avoid splitting large folios when there is no available swap space. The current implementation tries to charge against the first ancestor that fails, but this can lead to unnecessary splits. Instead, the patch proposes calculating the actual headroom by walking up the hierarchy and taking the minimum of all ancestors' available swap space. This approach aims to relax the strict limit enforcement in favor of a more flexible margin-based calculation."
+    }
+  }
+}

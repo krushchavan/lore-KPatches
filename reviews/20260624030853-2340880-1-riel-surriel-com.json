@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260624030853.2340880-1-riel@surriel.com",
+  "subject": "[PATCH 0/3] convert iova to maple tree",
+  "url": "https://lore.kernel.org/all/20260624030853.2340880-1-riel@surriel.com/",
+  "dates": {
+    "2026-06-25": {
+      "report_file": "2026-06-25_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Ashok Raj",
+          "summary": "Raised a concern about the in-place marker store failing and causing a struct iova leak. Suggested using BUG_ON to express the invariant that this cannot happen.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Jun 23, 2026 at 11:07:36PM -0400, Rik van Riel wrote:\n\nHi Rik,\n\n  Thanks for the v4 redesign \\u2014 the in-place marker approach is much cleaner than\n  the delayed_work/llist scheme from v3, and it directly addresses the\n  retry-forever concern I raised earlier.\n\n[snip]\n\n> +/*\n> + * Remove an IOVA entry from the maple tree and free it.\n> + *\n> + * This runs in atomic context (DMA map/unmap can be called from hardirq,\n> + * softirq, or with spinlocks held) and must not fail. Erasing an entry can\n> + * require a maple tree node for rebalancing, and mas_store_gfp(NULL,\n> + * GFP_ATOMIC) can fail under memory pressure. When it does, overwrite the slot\n> + * in place with IOVA_DEFERRED -- an in-place store needs no node allocation and\n> + * so cannot fail -- which keeps the address range reserved (the allocator's gap\n> + * search treats the non-NULL slot as occupied) and lets the struct iova be\n> + * freed now. The marker is erased later by iova_drain_deferred().\n> + */\n>  static void remove_iova(struct iova_domain *iovad, struct iova *iova)\n>  {\n> -\tMA_STATE(mas, &iovad->mtree, iova->pfn_lo, iova->pfn_hi);\n> +\tunsigned long pfn_lo = iova->pfn_lo, pfn_hi = iova->pfn_hi;\n> +\n> +\tMA_STATE(mas, &iovad->mtree, pfn_lo, pfn_hi);\n>  \n>  \tassert_spin_locked(&iovad->iova_lock);\n>  \n> -\tif (iova->pfn_lo < iovad->dma_32bit_pfn)\n> +\tif (pfn_lo < iovad->dma_32bit_pfn)\n>  \t\tiovad->max32_alloc_size = iovad->dma_32bit_pfn;\n>  \n> -\tmas_store_gfp(&mas, NULL, GFP_ATOMIC);\n> +\tif (iova_kunit_defer_erase || mas_store_gfp(&mas, NULL, GFP_ATOMIC)) {\n> +\t\t/* Erase failed: mark the slot in place and defer removal. */\n> +\t\tmas_set_range(&mas, pfn_lo, pfn_hi);\n> +\t\tif (WARN_ON_ONCE(mas_store_gfp(&mas, IOVA_DEFERRED, GFP_ATOMIC)))\n> +\t\t\treturn;\t/* in-place store cannot fail; entry stays put */\n\t\t/* \n\t\t * <-- deferred_lo/hi not updated and range stays\n\t\t * occupied for ever?\n\t\t */\n> +\t\tif (pfn_lo < iovad->deferred_lo)\n> +\t\t\tiovad->deferred_lo = pfn_lo;\n> +\t\tif (pfn_hi > iovad->deferred_hi)\n> +\t\t\tiovad->deferred_hi = pfn_hi;\n> +\t\tfree_iova_mem(iova);  \n\t\t\t<--- only reached if second store succeeds?\n> +\t\treturn;\n> +\t}\n> +\n> +\tfree_iova_mem(iova);\n> +\n> +\t/* A successful erase means memory is available; clear any backlog. */\n> +\tif (unlikely(iova_has_deferred(iovad)))\n> +\t\tiova_drain_deferred(iovad);\n>  }\n>  \n\n  If the in-place marker store fails and WARN_ON_ONCE fires:\n\n  - free_iova_mem(iova) is never reached \\u2014 the struct iova leaks.\n  - deferred_lo/hi is not updated \\u2014 the address range stays permanently\n  occupied with no way to reclaim it.\n  - After the first occurrence, WARN_ON_ONCE suppresses the warning on all\n  subsequent hits, so further failures on this path are completely silent.\n\n  I understand the comment says this cannot happen, and if that guarantee holds\n  then it's fine. But if it can, a BUG_ON might be a cleaner way to express\n  that invariant \\u2014 it makes the intent unambiguous rather than leaving the\n  impression the failure is being gracefully handled when it isn't.\n\n  Happy to be wrong if I'm missing something about the maple tree's in-place store\n  guarantees.\n\n  Cheers,\n  Ashok\n",
+          "reply_to": "",
+          "message_date": "2026-06-25",
+          "message_id": "",
+          "email": "ashok.raj@oss.qualcomm.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Ashok Raj",
+          "summary": "Corrected the subject line to include 'v4' and pointed out that the in-place marker approach is cleaner than the delayed_work/llist scheme from v3.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "POSITIVE"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Jun 23, 2026 at 11:07:33PM -0400, Rik van Riel wrote:\n> Based on 5d6919055dec Linux 7.1-rc3\n> \n> v4:\n>  - reduce the size of struct iova to 16 bytes\n>  - simplify the (hopefully rare) remove_iova GFP_ATOMIC failure path\n>  - test case for the deferred free code\n\nSomehow the v4 in the subject got dropped out. \n\n> v3:\n>  - switch to maple tree (suggested by Robin Murphy)\n> v2:\n>  - clean up selftests (thanks Jason Gunthorpe)\n>  - address Sashiko concerns\n>  - drop the search-with-alignment, since most iova requests\n>    should be of similar sizes, so the worst case behavior\n>    is unlikely to hit once ranges are excluded by the augmented\n>    rbtree\n> \n> \n\n-- \n/ashok.raj\nashok.raj@oss.qualcomm.com\nQualcomm Inc\n\n",
+          "reply_to": "Rik van Riel",
+          "message_date": "2026-06-25",
+          "message_id": "",
+          "email": "ashok.raj@oss.qualcomm.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series converts the iova (I/O virtual address) allocation to use a maple tree data structure, improving the complexity of alloc_iova() from O(n) to O(log n) while keeping memory usage similar. The patches also add self-tests for the iova code and make various cleanups and optimizations."
+    }
+  }
+}
