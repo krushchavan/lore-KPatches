@@ -136,76 +136,194 @@
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
-          "author": "Doug Anderson",
-          "summary": "Expressed support for landing Kiryl's patches as a stop-gap solution until true NMI is available, citing their relatively low complexity and the need to address the functional gap in the field.",
-          "sentiment": "positive",
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author is addressing concerns about the performance cost of pseudo-NMI on arm64 systems. They acknowledge that previous numbers were unreliable and provide fresh measurements from NVIDIA Grace (Neoverse V2) showing a measurable cost, but claim it's a constant per-syscall tax rather than a contention effect.\n\nAuthor acknowledges that FEAT_NMI is the long-term solution, but expresses concern about a decade-long gap where existing silicon will not have either FEAT_NMI or pseudo-NMI, and argues that their SDEI-based patch is a minimal use of a deprecated interface to cover this gap. Author asks for an alternative solution if the current approach is unacceptable.",
+          "sentiment": "neutral",
           "sentiment_signals": [
-            "supportive of patch series"
+            "acknowledged concerns",
+            "provided additional data"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "Hi,\n\nOn Mon, Jun 22, 2026 at 6:56 AM Kiryl Shutsemau <kirill@shutemov.name> wrote:\n>\n> The ratio is flat across the whole 1-to-72 sweep, so -- relevant to the\n> scalability question -- it's a constant per-syscall tax, not a contention\n> effect. The impact tracks syscall/exception density: page_fault1, a more\n> realistic workload, stays within ~5%.\n\nFWIW, I'm not sure 5% is truly a \"realistic\" measure of the overhead\nhere. While it cannot be denied that pseudo-NMI has some overhead,\nevery time I've seen someone study it in \"real world\" scenarios it\nends up being fairly negligible. Not zero, mind you. ...but some\namount below 1%.  ...and by this, I mean put real-world workloads on a\nsystem with pseudo NMI enabled and pick your favorite metric. Perhaps\nmeasure the amount of work completed in a given time. I dunno if this\nis possible for you to do in this case.\n\n\n> > The direction of travel is to deprecate SDEI. I wouldn't add more stuff\n> > on top of this interface.\n>\n> I understand FEAT_NMI is the long-term answer, and I'm not arguing against\n> deprecating SDEI. My concern is the gap in between. By our estimate it's\n> 10+ years before the last non-FEAT_NMI machine retires from the fleet --\n> for scale, we're still running Skylake today. So there's roughly a\n> decade where a large installed base has neither FEAT_NMI nor affordable\n> pseudo-NMI, and no way to reach a DAIF-masked CPU for an all-CPU\n> backtrace or to capture a wedged CPU in a crash dump. That's the\n> functional gap this series tries to cover.\n>\n> Given the deprecation direction, I deliberately kept the SDEI footprint as\n> small as I could. The series adds no new firmware interface and no vendor\n> SMC -- it uses only the standard software-signalled event (event 0) via\n> SDEI_EVENT_SIGNAL, which is already present on these systems for\n> firmware-first RAS (APEI/GHES). And SDEI is only ever invoked in a \"bad\n> state\": to deliver a backtrace signal to a CPU that a normal IPI can't\n> reach, or to stop a CPU that ignored the stop IPIs. Nothing on any hot or\n> steady-state path touches it.\n>\n> If even that minimal use is unacceptable on a deprecated interface, I'd\n> rather know now and redirect the effort -- but I'd appreciate a pointer to\n> what should cover this gap for existing silicon in the meantime.\n\nFWIW, despite the fact that pseudo-NMI (in my experience) ends up\nbeing mostly negligible, personally I'd be in favor of landing Kiryl's\npatches. I dunno how many times I've had the discussion of pseudo-NMI\noverhead over the years and it's certainly very easy to show that\nthere is _some_ overhead and that in pathological cases there is a lot\nof overhead. As Kiryl says, the patches don't add a ton of extra\ncomplexity and they even combine some of the stop/crash-stop code,\nwhich is nice. Having them as a stop-gap until true NMI is available\nseems nice to me. ...of course, I'm not an ARM maintainer, so it's\nobviously not up to me. :-)\n\n-Doug\n\n",
-          "reply_to": "",
+          "raw_body": "Full disclosure: the ~66% figures come from internal testing about a year ago.\nI no longer have the details of the machine it ran on and can't confirm whether\nICC_CTLR_EL1.PMHE was set there -- it may well have been. I shouldn't have\ncarried those numbers forward without being able to stand behind them, so\nplease disregard them.\n\nHere are fresh numbers from NVIDIA Grace (Neoverse V2). Importantly, this\nbox reports:\n\n  GICv3: Pseudo-NMIs enabled using relaxed ICC_PMR_EL1 synchronisation\n\ni.e. PMHE == 0, so the synchronising DSB on the unmask path is already\npatched to a NOP (ARM64_HAS_GIC_PRIO_RELAXED_SYNC). What's left is the\nfloor cost of PMR-based masking itself plus the PMR save/restore on\nexception entry/exit -- not the DSB. So this is the case Catalin asked\nabout (DSB omitted), and there is still a measurable cost.\n\nA trivial single-threaded gettid() loop (1e6 calls, median of 5,\nperformance governor, ASLR off):\n\n  pseudo_nmi=0 (DAIF):       178.4 ns/call\n  pseudo_nmi=1 (PMR):        252.5 ns/call\n  delta:                     +74.1 ns/call  (~230-250 cycles)\n                             +41.5% wall time / 0.706 throughput\n\n  --- u-bench.c ---\n  #include <unistd.h>\n  #include <sys/syscall.h>\n  #include <time.h>\n  #include <stdio.h>\n  int main(void) {\n          struct timespec a, b;\n          clock_gettime(CLOCK_MONOTONIC, &a);\n          for (long i = 0; i < 1000000; i++)\n                  syscall(SYS_gettid);\n          clock_gettime(CLOCK_MONOTONIC, &b);\n          printf(\"%f ns\\n\", (b.tv_sec-a.tv_sec)*1e9 + (b.tv_nsec-a.tv_nsec));\n          return 0;\n  }\n\nwill-it-scale agrees independently. sched_yield (ops/s, median of 5):\n\n                      1 task       72 tasks\n  pseudo_nmi=0      3,195,656    230,824,534\n  pseudo_nmi=1      2,253,753    163,914,837\n  ratio                0.705          0.710\n\nThe ratio is flat across the whole 1-to-72 sweep, so -- relevant to the\nscalability question -- it's a constant per-syscall tax, not a contention\neffect. The impact tracks syscall/exception density: page_fault1, a more\nrealistic workload, stays within ~5%.\n\n---\n\nI understand FEAT_NMI is the long-term answer, and I'm not arguing against\ndeprecating SDEI. My concern is the gap in between. By our estimate it's\n10+ years before the last non-FEAT_NMI machine retires from the fleet --\nfor scale, we're still running Skylake today. So there's roughly a\ndecade where a large installed base has neither FEAT_NMI nor affordable\npseudo-NMI, and no way to reach a DAIF-masked CPU for an all-CPU\nbacktrace or to capture a wedged CPU in a crash dump. That's the\nfunctional gap this series tries to cover.\n\nGiven the deprecation direction, I deliberately kept the SDEI footprint as\nsmall as I could. The series adds no new firmware interface and no vendor\nSMC -- it uses only the standard software-signalled event (event 0) via\nSDEI_EVENT_SIGNAL, which is already present on these systems for\nfirmware-first RAS (APEI/GHES). And SDEI is only ever invoked in a \"bad\nstate\": to deliver a backtrace signal to a CPU that a normal IPI can't\nreach, or to stop a CPU that ignored the stop IPIs. Nothing on any hot or\nsteady-state path touches it.\n\nIf even that minimal use is unacceptable on a deprecated interface, I'd\nrather know now and redirect the effort -- but I'd appreciate a pointer to\nwhat should cover this gap for existing silicon in the meantime.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Marc Zyngier",
           "message_date": "2026-06-22",
-          "message_id": "",
+          "message_id": "ajk-Vge2qhaY-TwJ@thinkstation",
+          "email": "kirill@shutemov.name",
+          "is_maintainer": false
+        },
+        {
+          "author": "Doug Anderson",
+          "summary": "Reviewer Doug Anderson noted that the SDEI event signal handler does not properly handle the case where the target CPU is already in a low-power state, and requested additional checks to ensure the CPU is powered up before attempting to deliver the NMI.\n\nReviewer questioned the accuracy of the original patch's claim that pseudo-NMI has a 5% overhead, suggesting that real-world measurements show it to be negligible, below 1%, and requested further investigation into this metric.\n\nReviewer Doug Anderson expressed support for the patches despite concerns about pseudo-NMI overhead, noting that the patches don't add significant complexity and combine some stop/crash-stop code.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "questioning accuracy",
+            "request for further investigation",
+            "NEEDS_WORK",
+            "POSITIVE"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi,\n\nOn Mon, Jun 22, 2026 at 6:56 AM Kiryl Shutsemau <kirill@shutemov.name> wrote:\n\n---\n\nFWIW, I'm not sure 5% is truly a \"realistic\" measure of the overhead\nhere. While it cannot be denied that pseudo-NMI has some overhead,\nevery time I've seen someone study it in \"real world\" scenarios it\nends up being fairly negligible. Not zero, mind you. ...but some\namount below 1%.  ...and by this, I mean put real-world workloads on a\nsystem with pseudo NMI enabled and pick your favorite metric. Perhaps\nmeasure the amount of work completed in a given time. I dunno if this\nis possible for you to do in this case.\n\n---\n\nFWIW, despite the fact that pseudo-NMI (in my experience) ends up\nbeing mostly negligible, personally I'd be in favor of landing Kiryl's\npatches. I dunno how many times I've had the discussion of pseudo-NMI\noverhead over the years and it's certainly very easy to show that\nthere is _some_ overhead and that in pathological cases there is a lot\nof overhead. As Kiryl says, the patches don't add a ton of extra\ncomplexity and they even combine some of the stop/crash-stop code,\nwhich is nice. Having them as a stop-gap until true NMI is available\nseems nice to me. ...of course, I'm not an ARM maintainer, so it's\nobviously not up to me. :-)\n\n-Doug",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-06-22",
+          "message_id": "CAD=FV=UTcL1NVkvR8Fw_BXvHHk-vBtLSGoJrU-RFSt0yvGUjxA@mail.gmail.com",
           "email": "dianders@chromium.org",
-          "is_maintainer": false
-        },
-        {
-          "author": "Kiryl Shutsemau",
-          "summary": "Provided fresh numbers from NVIDIA Grace, highlighting the measurable cost of pseudo-NMI and arguing for its inclusion as a temporary solution until FEAT_NMI becomes widely available.",
-          "sentiment": "neutral",
-          "sentiment_signals": [
-            "presenting data to support patch series"
-          ],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
-          "is_maintainer": false
-        },
-        {
-          "author": "Kiryl Shutsemau",
-          "summary": "Acknowledged Doug's concerns about pseudo-NMI overhead and emphasized the need for a temporary solution to address the functional gap in the field.",
-          "sentiment": "neutral",
-          "sentiment_signals": [
-            "addressing reviewer concerns"
-          ],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "Doug Anderson",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
-          "is_maintainer": false
-        },
-        {
-          "author": "Kiryl Shutsemau",
-          "summary": "Disclosed that the ~66% figures were based on outdated internal testing and provided fresh numbers from NVIDIA Grace, highlighting the measurable cost of pseudo-NMI.",
-          "sentiment": "neutral",
-          "sentiment_signals": [
-            "clarifying data and providing new information"
-          ],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "The patch series aims to provide a cross-CPU NMI solution via SDEI, addressing the gap between FEAT_NMI and pseudo-NMI availability in the field."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series adds a new mechanism to deliver NMI (Non-Maskable Interrupt) across CPUs on arm64 architecture using SDEI (System Description Event Infrastructure). This is necessary for certain debug and observability features, such as capturing CPU backtraces and crash dumps, which require interrupting a CPU that has its interrupts locally masked. The existing pseudo-NMI mechanism is too expensive in terms of performance overhead, so this new approach uses SDEI to deliver the NMI at a lower cost. This allows for more accurate debugging and observability features without introducing significant performance regressions."
+    },
+    "2026-06-26": {
+      "report_file": "2026-06-26_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "YinFengwei",
+          "summary": "Reviewer YinFengwei noted that the patch does not handle the case where SDEI is disabled in firmware, which would prevent the cross-CPU NMI mechanism from working.\n\nReviewer YinFengwei tested the patch on a Neoverse N2 based arm64 server and found that enabling pseudo-NMI (PMR) resulted in a significant increase in latency compared to disabling it, with an average delta of +73.5 ns/call.\n\nReviewer YinFengwei expressed strong agreement and support for the patchset, stating that it is necessary for existing systems and should be merged.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "missing edge case",
+            "firmware dependency",
+            "performance issue",
+            "requested changes",
+            "agreement",
+            "support"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Kirill\nOn Mon, Jun 22, 2026 at 02:56:16PM +0100, Kiryl Shutsemau wrote:\n\n---\n\nI tested the u-bench.c on a Neoverse N2 based arm64 server. The result\nis as following:\n   pseudo_nmi=0 (DAIF):       96.3  ns/call\n   pseudo_nmi=1 (PMR):        169.8 ns/call\n   delta:                     +73.5 ns/call\n\n---\n\nI couldn't agree more: We need a solution for existing system. And\nlike to see this patchset merged. Thanks.\n\nRegards\nYin, Fengwei",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-06-26",
+          "message_id": "aj43dFtbcZHvWBv5@U-V2QX163P-2032.local",
+          "email": "fengwei_yin@linux.alibaba.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Breno Leitao",
+          "summary": "Reviewer Breno Leitao agrees with the patch and suggests maintaining it downstream if it doesn't get upstreamed, citing the trade-offs of pseudo-NMI performance overhead, losing debuggability by disabling NMI entirely, or carrying downstream patches as the least disruptive option for their business needs.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "agreement",
+            "consideration_of_tradeoffs"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I completely agree. Should these patches unfortunately not make it upstream,\nmy plan is to maintain them downstream at Meta kernels until the Meta fleet\nno longer contains any non-FEAT_NMI hosts.\n\nThe trade-offs under consideration are:\n\n\t1) Accept the performance overhead from pseudo-NMI\n\t2) Lose debuggability by disabling NMI entirely\n\t3) Maintain downstream patches\n\nOf these three options, carrying downstream patches appears to be the least\ndisruptive path for our business needs.",
+          "reply_to": "Doug Anderson",
+          "message_date": "2026-06-26",
+          "message_id": "aj46xP6jgZ6fmsPb@gmail.com",
+          "email": "leitao@debian.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Catalin Marinas",
+          "summary": "Reviewer Catalin Marinas questioned whether firmware can handle a PSCI CPU_OFF call from the SDEI handler, which is one of the required calls for this mechanism to work.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested clarification on firmware requirements"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Just to understand, your firmware cannot cope with a PSCI CPU_OFF from\nthe SDEI handler? This is one of the required calls to be supported.\n\n-- \nCatalin",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-06-26",
+          "message_id": "aj6xvvY4AA-fQG2X@arm.com",
+          "email": "catalin.marinas@arm.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Catalin Marinas",
+          "summary": "The reviewer noted that a dsb(ishst) instruction should be used instead of smp_wmb() to ensure proper ordering, citing the GIC IPI code as an example and expressing uncertainty about whether this is mandated by the SDEI spec.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested change",
+            "uncertainty about spec"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "The smp_wmb() is not sufficient here. In the GIC IPI code we use a\ndsb(ishst). It should be similar here. I think TF-A does this already\nbut it's unclear from the SDEI spec that it is mandated.\n\n-- \nCatalin",
+          "reply_to": "",
+          "message_date": "2026-06-26",
+          "message_id": "aj6yGbnPDjUpboFZ@arm.com",
+          "email": "catalin.marinas@arm.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Catalin Marinas",
+          "summary": "The reviewer, Catalin Marinas, questioned whether a barrier is needed in the patch, citing that backtrace_mask won't be visible without it, and referenced a similar concern raised in patch 4.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "concern about potential issue",
+            "request for clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Does this need a barrier as in patch 4? Sashiko spotted that\nbacktrace_mask won't be visible without a dsb(ishst). Again, as per my\ncomment in patch 4, we get away with this because of the TF-A\nimplementation but that's not guaranteed (we could ask for the SDEI spec\nto be updated assuming all firmware implementations do this).\n\n-- \nCatalin",
+          "reply_to": "",
+          "message_date": "2026-06-26",
+          "message_id": "aj6ywfhRtYn4kaWc@arm.com",
+          "email": "catalin.marinas@arm.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author investigated a hang issue on Grace that occurred when calling PSCI CPU_OFF after completing an SDEI event, and found that it persisted even with DAIF masked and the GIC PMR reset first. They acknowledged this as a separate issue from the main patch series and stated that it's only necessary for crash kernel reclamation, not required for the series.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged a separate issue",
+            "considered it a side quest"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I did chase it a fair bit. Bisecting on Grace: completing the event and\nparking (no CPU_OFF) works, and so does the stack-switch + C-call setup\non its own. The hang only appears once I call PSCI CPU_OFF after the\nevent -- and it persists even with DAIF masked and the GIC PMR reset\nfirst, so it isn't leftover interrupt/priority state from the dispatch.\nIt's a silent wedge: no TF-A exception report, nothing after the\nlast console line.\n\nBut I have not tried calling CPU_OFF directly, without completing the\nevent. I assumed it is required. Will give it a try when I have time.\n\nEither way this is a side quest: it only lets a crash kernel reclaim the\nstopped CPU. The dump itself is complete, so it's nice-to-have, not\nrequired for the series.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Catalin Marinas",
+          "message_date": "2026-06-26",
+          "message_id": "aj7Pm5H0MN5WwhDK@thinkstation",
+          "email": "kirill@shutemov.name",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledged a technical issue in patch 3/4, agreeing to add a barrier (dsb(ishst)) to the backtrace path to ensure correct ordering of operations.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "You're right, I'll switch it to dsb(ishst) to match gic_ipi_send_mask().\n\nAnd as you pointed, the xame fix is needed in 3/4: the backtrace path\npublishes backtrace_mask before signalling and currently has no barrier\nat all (as the bot spotted), so it needs the dsb(ishst) there too.\n\nI'll also drop the now-incorrect \"cumulative wmb\" comment.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Catalin Marinas",
+          "message_date": "2026-06-26",
+          "message_id": "aj7WqoMneJjzbo9B@thinkstation",
+          "email": "kirill@shutemov.name",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series adds a new mechanism to deliver NMI (Non-Maskable Interrupt) across CPUs on arm64 architecture using SDEI (System Description Event Infrastructure). This is necessary for certain debug and observability features, such as capturing CPU backtraces and crash dumps, which require interrupting a CPU that has its interrupts locally masked. The existing pseudo-NMI mechanism is too expensive in terms of performance overhead, so this new approach uses SDEI to deliver the NMI at a lower cost. This allows for more accurate debugging and observability features without introducing significant performance regressions."
     }
   }
 }

@@ -238,18 +238,24 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/3] convert iova to maple tree</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260624030853.2340880-1-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-25</strong><div class="date-range-nav">Active on: <a href="#2026-06-25">2026-06-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series converts the iova (I/O virtual address) allocation to use a maple tree data structure, improving the complexity of alloc_iova() from O(n) to O(log n) while keeping memory usage similar. The patches also add self-tests for the iova code and make various cleanups and optimizations.</div></div>
+    <div class="date-range">Submitted: <strong>2026-06-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-26</strong><div class="date-range-nav">Active on: <a href="#2026-06-26">2026-06-26</a> &bull; <a href="#2026-06-25">2026-06-25</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series converts the iova (I/O virtual address) allocation code to use a maple tree data structure, which improves the complexity of the alloc_iova function from O(n) to O(log n). This change is motivated by issues in production workloads where linear searches caused soft lockups. The patches also include self-tests for the iova code and were tested on various systems.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-06-25">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Ashok Raj</span>
 <a class="date-chip" href="../2026-06-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-25">2026-06-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Raised a concern about the in-place marker store failing and causing a struct iova leak. Suggested using BUG_ON to express the invariant that this cannot happen.</div>
+<div class="review-comment-text">reviewer noted that the in-place marker approach directly addresses the retry-forever concern he previously raised, and is a cleaner solution than the delayed_work/llist scheme from v3
+
+Reviewer Ashok Raj noted that the deferred_lo/hi values are not being updated, causing a memory leak where the iova range remains occupied indefinitely.
+
+Reviewer noted that if the in-place marker store fails, a struct iova can leak and an address range stays permanently occupied without being reclaimable, suggesting a BUG_ON to make the intent unambiguous.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Tue, Jun 23, 2026 at 11:07:36PM -0400, Rik van Riel wrote:
@@ -262,59 +268,16 @@ Hi Rik,
 
 [snip]
 
-&gt; +/*
-&gt; + * Remove an IOVA entry from the maple tree and free it.
-&gt; + *
-&gt; + * This runs in atomic context (DMA map/unmap can be called from hardirq,
-&gt; + * softirq, or with spinlocks held) and must not fail. Erasing an entry can
-&gt; + * require a maple tree node for rebalancing, and mas_store_gfp(NULL,
-&gt; + * GFP_ATOMIC) can fail under memory pressure. When it does, overwrite the slot
-&gt; + * in place with IOVA_DEFERRED -- an in-place store needs no node allocation and
-&gt; + * so cannot fail -- which keeps the address range reserved (the allocator&#x27;s gap
-&gt; + * search treats the non-NULL slot as occupied) and lets the struct iova be
-&gt; + * freed now. The marker is erased later by iova_drain_deferred().
-&gt; + */
-&gt;  static void remove_iova(struct iova_domain *iovad, struct iova *iova)
-&gt;  {
-&gt; -	MA_STATE(mas, &amp;iovad-&gt;mtree, iova-&gt;pfn_lo, iova-&gt;pfn_hi);
-&gt; +	unsigned long pfn_lo = iova-&gt;pfn_lo, pfn_hi = iova-&gt;pfn_hi;
-&gt; +
-&gt; +	MA_STATE(mas, &amp;iovad-&gt;mtree, pfn_lo, pfn_hi);
-&gt;  
-&gt;  	assert_spin_locked(&amp;iovad-&gt;iova_lock);
-&gt;  
-&gt; -	if (iova-&gt;pfn_lo &lt; iovad-&gt;dma_32bit_pfn)
-&gt; +	if (pfn_lo &lt; iovad-&gt;dma_32bit_pfn)
-&gt;  		iovad-&gt;max32_alloc_size = iovad-&gt;dma_32bit_pfn;
-&gt;  
-&gt; -	mas_store_gfp(&amp;mas, NULL, GFP_ATOMIC);
-&gt; +	if (iova_kunit_defer_erase || mas_store_gfp(&amp;mas, NULL, GFP_ATOMIC)) {
-&gt; +		/* Erase failed: mark the slot in place and defer removal. */
-&gt; +		mas_set_range(&amp;mas, pfn_lo, pfn_hi);
-&gt; +		if (WARN_ON_ONCE(mas_store_gfp(&amp;mas, IOVA_DEFERRED, GFP_ATOMIC)))
-&gt; +			return;	/* in-place store cannot fail; entry stays put */
-		/* 
+---
+
+/* 
 		 * &lt;-- deferred_lo/hi not updated and range stays
 		 * occupied for ever?
 		 */
-&gt; +		if (pfn_lo &lt; iovad-&gt;deferred_lo)
-&gt; +			iovad-&gt;deferred_lo = pfn_lo;
-&gt; +		if (pfn_hi &gt; iovad-&gt;deferred_hi)
-&gt; +			iovad-&gt;deferred_hi = pfn_hi;
-&gt; +		free_iova_mem(iova);  
-			&lt;--- only reached if second store succeeds?
-&gt; +		return;
-&gt; +	}
-&gt; +
-&gt; +	free_iova_mem(iova);
-&gt; +
-&gt; +	/* A successful erase means memory is available; clear any backlog. */
-&gt; +	if (unlikely(iova_has_deferred(iovad)))
-&gt; +		iova_drain_deferred(iovad);
-&gt;  }
-&gt;  
 
-  If the in-place marker store fails and WARN_ON_ONCE fires:
+---
+
+If the in-place marker store fails and WARN_ON_ONCE fires:
 
   - free_iova_mem(iova) is never reached \u2014 the struct iova leaks.
   - deferred_lo/hi is not updated \u2014 the address range stays permanently
@@ -331,54 +294,44 @@ Hi Rik,
   guarantees.
 
   Cheers,
-  Ashok
-</pre>
+  Ashok</pre>
 </details>
-<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+<a href="https://lore.kernel.org/r/aj1OlqBtTOUSFm-h@hu-ashoraj-lv.qualcomm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledgment of previous issue, appreciation for design change, memory leak</div>
 </div>
-</div>
-<div class="thread-node depth-0">
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-06-26">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Ashok Raj</span>
-<a class="date-chip" href="../2026-06-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-25">2026-06-25</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-06-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-26">2026-06-26</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Corrected the subject line to include &#x27;v4&#x27; and pointed out that the in-place marker approach is cleaner than the delayed_work/llist scheme from v3.</div>
+<div class="review-comment-text">Author acknowledged that the in-place store failure case needs special handling, suggesting two possible solutions: returning early and warning or panicking.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Tue, Jun 23, 2026 at 11:07:33PM -0400, Rik van Riel wrote:
-&gt; Based on 5d6919055dec Linux 7.1-rc3
-&gt; 
-&gt; v4:
-&gt;  - reduce the size of struct iova to 16 bytes
-&gt;  - simplify the (hopefully rare) remove_iova GFP_ATOMIC failure path
-&gt;  - test case for the deferred free code
+<pre class="raw-body-text">If the in-place store fails, then updating
+deferred_lo / hi won&#x27;t help, since the
+sweep later on will be unable to identify
+this area.
 
-Somehow the v4 in the subject got dropped out. 
+Freeing the iova at that point would leave
+the maple tree with a pointer into memory
+that could be re-used for something else.
 
-&gt; v3:
-&gt;  - switch to maple tree (suggested by Robin Murphy)
-&gt; v2:
-&gt;  - clean up selftests (thanks Jason Gunthorpe)
-&gt;  - address Sashiko concerns
-&gt;  - drop the search-with-alignment, since most iova requests
-&gt;    should be of similar sizes, so the worst case behavior
-&gt;    is unlikely to hit once ranges are excluded by the augmented
-&gt;    rbtree
-&gt; 
-&gt; 
+We need to either return early and warn,
+or panic.
 
--- 
-/ashok.raj
-ashok.raj@oss.qualcomm.com
-Qualcomm Inc
+I&#x27;m fine with either.
 
-</pre>
+Robin, do you have a preference here?</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Rik van Riel</div>
-<div class="review-comment-signals">Signals: POSITIVE</div>
+<div class="reply-to-label">&#8627; replying to Ashok Raj</div>
+<a href="https://lore.kernel.org/r/ab7b21eba098ec85e8977b03208639873f43e071.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a problem, no clear resolution</div>
+</div>
+</div>
 </div>
 </div>
 </div>

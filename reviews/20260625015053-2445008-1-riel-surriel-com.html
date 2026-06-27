@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 0/3] mm: __access_remote_vm with per-VMA lock</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260625015053.2445008-1-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-25</strong><div class="date-range-nav">Active on: <a href="#2026-06-25">2026-06-25</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-06-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-26</strong><div class="date-range-nav">Active on: <a href="#2026-06-26">2026-06-26</a> &bull; <a href="#2026-06-25">2026-06-25</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces a fast path for __access_remote_vm that uses per-VMA locks instead of the process-wide mmap_lock, improving system monitoring reliability and speeding up the function under contention. The fast path is only enabled when it&#x27;s safe to do so, requiring a kernel with per-VMA locks, RCU page table freeing, and specific VMA types excluded. This change aims to address issues where processes get stuck holding the mmap_lock for extended periods, hindering system monitoring tools&#x27; ability to assess and log situations.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0">
@@ -451,6 +451,172 @@ All Rights Reversed.</pre>
 <div class="reply-to-label">&#8627; replying to David (Arm)</div>
 <a href="https://lore.kernel.org/r/5a4ff628c1b947f9cd4da53e1e64b3934a1f2d9a.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: acknowledged a concern, wants clarification</div>
+</div>
+</div>
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-06-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-26">2026-06-26</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author identified __access_remote_vm as a suitable starting point for implementing per-VMA locks, citing its pain points and high caller count.
+
+Author addressed David&#x27;s concern that normal pages could be accessed using only per-VMA locks, proposing to implement a locking function for __access_remote_vm() that takes the appropriate lock and handles expand_stack() calls. The author suggests taking the slow path for accesses spanning multiple VMAs and adjusting locking assertions in related functions.
+
+Author is addressing David&#x27;s (Arm) feedback on whether __access_remote_vm can use gup-fast for accesses entirely within a single VMA, and considering switching to gup-fast as an alternative to eliding the first VMA lookup in get_user_pages. Author acknowledges that this makes things clearer but asks if there are any major issues overlooked.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">__access_remote_vm seems like a decent place to start,
+since that is a pain point for several people, and also
+the path into remote get_user_pages with the most callers.
+
+After that there are a few more callers in performance
+sensitive paths:
+- execve / argv setup -&gt; new mm, no lock contention?
+- KVM async pagefault path -&gt; most/all of these to the same VMA?
+- make_device_exclusive -&gt; ???
+- pin_user_pages_remote -&gt; probably a good target?
+
+---
+
+It looks like for normal pages, any access that
+does not require expanding the stack could be
+done using just the per-VMA locks.
+
+That might allow us to implement a locking
+function for __access_remote_vm() that
+takes the appropriate lock for the situation,
+and also takes care of the expand_stack() 
+calls, if needed.
+
+We could also take the slow path for an
+access that spans multiple VMAs.
+
+Then we could have an inner loop that does
+only the page accessing and copying, with
+no calls to expand_stack() in the while (len)
+loop.
+
+At the end of __access_remote_vm() we can
+then unlock according to the way we locked.
+
+Adjusting the locking assertions in __get_user_pages_locked
+and untagged_addr_remote to allow the per-VMA lock seem
+fairly straightforward.
+
+Passing the starting vma all the way into __get_user_pages
+would also allow us to skip looking up the VMA a second
+time after the first lookup in __access_remote_vm().
+
+---
+
+If an access is entirely inside a single VMA,
+it looks like using gup-fast could be possible?
+
+The whole &quot;look up VMA permissions&quot; thing inside
+get_user_pages() should not be necessary for callers
+like __access_remote_vm() that have already done
+that.
+
+That could be a nice speedup for thing like
+ptrace, BPF copy_from_user_task, etc
+
+Another question is whether switching right
+to gup-fast would be cleaner than trying to
+elide the first VMA lookup from __get_user_pages,
+but answering that may require looking at some
+prototype code and figuring out more of the
+details.
+
+Thank you for asking the questions above.
+Looking into those made things a little
+clearer.
+
+This looks a whole lot more manageable now.
+
+Are there any major things I overlooked?
+
+Are there any pending patches in -mm or
+elsewhere that I should pull into my tree
+before starting?
+
+-- 
+All Rights Reversed.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to David (Arm)</div>
+<a href="https://lore.kernel.org/r/ec196457675cf2feb65cc729090f958080cca052.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: no clear resolution signal, focusing on one path at a time, acknowledges need for fix</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-06-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-06-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-26">2026-06-26</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David (Arm) expressed concerns about the patch&#x27;s potential to introduce unnecessary complexity, specifically in GUP users, and requested that alternatives be explored before proceeding.
+
+Reviewer David (Arm) expressed confusion and skepticism about the patch&#x27;s intention to add a fast path for __access_remote_vm under mmap_lock contention, questioning how the current implementation aligns with the stated goal of not doing something &#x27;unless inevitable&#x27;.
+
+Reviewer David expressed frustration and disappointment with the patch&#x27;s reimplementation of a GUP-like interface, suggesting that it is not necessary and may be overly complex. He requests someone with GUP experience to properly rethink the lookup+fault path instead of adding workarounds.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Well, I know what we do not want to reimplement GUP in some GUP users unless
+really unavoidable. And I want that explored first before moving further into
+this growing complexity in a GUP users.
+
+---
+
+I really don&#x27;t know how you concluded that.
+
+I mean, I know, my English is bad, but it&#x27;s hard for me to get how
+
+	&quot;Yeah, we&#x27;re not doing that unless inevitable.&quot;
+
+is a wish list.
+
+Yeah, well, ok, my kids treat also a &quot;no&quot; as a wish list ;)
+
+---
+
+Did you actually read at least some of the stuff I wrote in my mails? You know,
+the ones where you didn&#x27;t reply to? :)
+
+Seeing a v2 with some weird gup-fast-like looking reimplementatiom (eww) is not
+something I enjoyed at this point. We don&#x27;t need another set of special page
+table walkers.
+
+We really need someone to look into this with some GUP experience or the
+willingness to properly think the GUP lookup+fault path through, instead of
+adding some creative workarounds to selective GUP user.
+
+I will try to find some time to think it through, but my time would be better
+spent guiding someone (and definitely not someones LLM) to understand
+
+(1) which interface we could start with (as I said, a GUP interface where we
+pass a VMA-lcoked / mm-read-lcoked VMA instead of the MM)
+
+(2) which faults we could automatically resolve under VMA lock (I mentioned
+userfaultfd is tricky but the existing GUP call already doesn&#x27;t trigger uffd)
+
+(3) whether gup-fast could be reused to some degree, or what it would take in
+order to do that.
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/05538f68-c3ec-422d-babb-7427068f79f4@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: complexity, alternatives, confusion</div>
+</div>
+</div>
 </div>
 </div>
 </div>

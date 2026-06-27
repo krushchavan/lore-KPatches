@@ -134,6 +134,60 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series introduces a fast path for __access_remote_vm that uses per-VMA locks instead of the process-wide mmap_lock, improving system monitoring reliability and speeding up the function under contention. The fast path is only enabled when it's safe to do so, requiring a kernel with per-VMA locks, RCU page table freeing, and specific VMA types excluded. This change aims to address issues where processes get stuck holding the mmap_lock for extended periods, hindering system monitoring tools' ability to assess and log situations."
+    },
+    "2026-06-26": {
+      "report_file": "2026-06-26_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) expressed concerns about the patch's potential to introduce unnecessary complexity, specifically in GUP users, and requested that alternatives be explored before proceeding.\n\nReviewer David (Arm) expressed confusion and skepticism about the patch's intention to add a fast path for __access_remote_vm under mmap_lock contention, questioning how the current implementation aligns with the stated goal of not doing something 'unless inevitable'.\n\nReviewer David expressed frustration and disappointment with the patch's reimplementation of a GUP-like interface, suggesting that it is not necessary and may be overly complex. He requests someone with GUP experience to properly rethink the lookup+fault path instead of adding workarounds.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "complexity",
+            "alternatives",
+            "confusion",
+            "skepticism",
+            "frustration",
+            "disappointment"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Well, I know what we do not want to reimplement GUP in some GUP users unless\nreally unavoidable. And I want that explored first before moving further into\nthis growing complexity in a GUP users.\n\n---\n\nI really don't know how you concluded that.\n\nI mean, I know, my English is bad, but it's hard for me to get how\n\n\t\"Yeah, we're not doing that unless inevitable.\"\n\nis a wish list.\n\nYeah, well, ok, my kids treat also a \"no\" as a wish list ;)\n\n---\n\nDid you actually read at least some of the stuff I wrote in my mails? You know,\nthe ones where you didn't reply to? :)\n\nSeeing a v2 with some weird gup-fast-like looking reimplementatiom (eww) is not\nsomething I enjoyed at this point. We don't need another set of special page\ntable walkers.\n\nWe really need someone to look into this with some GUP experience or the\nwillingness to properly think the GUP lookup+fault path through, instead of\nadding some creative workarounds to selective GUP user.\n\nI will try to find some time to think it through, but my time would be better\nspent guiding someone (and definitely not someones LLM) to understand\n\n(1) which interface we could start with (as I said, a GUP interface where we\npass a VMA-lcoked / mm-read-lcoked VMA instead of the MM)\n\n(2) which faults we could automatically resolve under VMA lock (I mentioned\nuserfaultfd is tricky but the existing GUP call already doesn't trigger uffd)\n\n(3) whether gup-fast could be reused to some degree, or what it would take in\norder to do that.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-06-26",
+          "message_id": "05538f68-c3ec-422d-babb-7427068f79f4@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author identified __access_remote_vm as a suitable starting point for implementing per-VMA locks, citing its pain points and high caller count.\n\nAuthor addressed David's concern that normal pages could be accessed using only per-VMA locks, proposing to implement a locking function for __access_remote_vm() that takes the appropriate lock and handles expand_stack() calls. The author suggests taking the slow path for accesses spanning multiple VMAs and adjusting locking assertions in related functions.\n\nAuthor is addressing David's (Arm) feedback on whether __access_remote_vm can use gup-fast for accesses entirely within a single VMA, and considering switching to gup-fast as an alternative to eliding the first VMA lookup in get_user_pages. Author acknowledges that this makes things clearer but asks if there are any major issues overlooked.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "no clear resolution signal",
+            "focusing on one path at a time",
+            "acknowledges need for fix",
+            "proposes restructuring",
+            "clarification",
+            "considering alternatives"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "__access_remote_vm seems like a decent place to start,\nsince that is a pain point for several people, and also\nthe path into remote get_user_pages with the most callers.\n\nAfter that there are a few more callers in performance\nsensitive paths:\n- execve / argv setup -> new mm, no lock contention?\n- KVM async pagefault path -> most/all of these to the same VMA?\n- make_device_exclusive -> ???\n- pin_user_pages_remote -> probably a good target?\n\n---\n\nIt looks like for normal pages, any access that\ndoes not require expanding the stack could be\ndone using just the per-VMA locks.\n\nThat might allow us to implement a locking\nfunction for __access_remote_vm() that\ntakes the appropriate lock for the situation,\nand also takes care of the expand_stack() \ncalls, if needed.\n\nWe could also take the slow path for an\naccess that spans multiple VMAs.\n\nThen we could have an inner loop that does\nonly the page accessing and copying, with\nno calls to expand_stack() in the while (len)\nloop.\n\nAt the end of __access_remote_vm() we can\nthen unlock according to the way we locked.\n\nAdjusting the locking assertions in __get_user_pages_locked\nand untagged_addr_remote to allow the per-VMA lock seem\nfairly straightforward.\n\nPassing the starting vma all the way into __get_user_pages\nwould also allow us to skip looking up the VMA a second\ntime after the first lookup in __access_remote_vm().\n\n---\n\nIf an access is entirely inside a single VMA,\nit looks like using gup-fast could be possible?\n\nThe whole \"look up VMA permissions\" thing inside\nget_user_pages() should not be necessary for callers\nlike __access_remote_vm() that have already done\nthat.\n\nThat could be a nice speedup for thing like\nptrace, BPF copy_from_user_task, etc\n\nAnother question is whether switching right\nto gup-fast would be cleaner than trying to\nelide the first VMA lookup from __get_user_pages,\nbut answering that may require looking at some\nprototype code and figuring out more of the\ndetails.\n\nThank you for asking the questions above.\nLooking into those made things a little\nclearer.\n\nThis looks a whole lot more manageable now.\n\nAre there any major things I overlooked?\n\nAre there any pending patches in -mm or\nelsewhere that I should pull into my tree\nbefore starting?\n\n-- \nAll Rights Reversed.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-06-26",
+          "message_id": "ec196457675cf2feb65cc729090f958080cca052.camel@surriel.com",
+          "email": "riel@surriel.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series introduces a fast path for __access_remote_vm that uses per-VMA locks instead of the process-wide mmap_lock, improving system monitoring reliability and speeding up the function under contention. The fast path is only enabled when it's safe to do so, requiring a kernel with per-VMA locks, RCU page table freeing, and specific VMA types excluded. This change aims to address issues where processes get stuck holding the mmap_lock for extended periods, hindering system monitoring tools' ability to assess and log situations."
     }
   }
 }
