@@ -1,0 +1,49 @@
+{
+  "thread_id": "aj83c5ix_YCFMU-M@linux.dev",
+  "subject": "[PATCH v2 1/4] mm: avoid unnecessary lru drain for wp_can_reuse_anon_folio()",
+  "url": "https://lore.kernel.org/all/aj83c5ix_YCFMU-M@linux.dev/",
+  "dates": {
+    "2026-06-27": {
+      "report_file": "2026-06-27_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Shakeel Butt",
+          "summary": "Raised concerns about premature LRU drain potentially making lru lock contention worse for workloads that churn a lot of LRU pages through allocation, free, and/or reclaim.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "CONTROVERSIAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Barry Song",
+          "summary": "Expressed uncertainty about the patch's necessity and potential impact, suggesting a conservative approach to avoid introducing dramatic changes.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Sat, Jun 27, 2026 at 10:44 AM Shakeel Butt <shakeel.butt@linux.dev> wrote:\n>\n> On Fri, Jun 26, 2026 at 06:25:48PM +0200, David Hildenbrand (Arm) wrote:\n> > On 6/24/26 23:04, Barry Song wrote:\n> > > On Wed, Jun 24, 2026 at 11:02 PM David Hildenbrand (Arm)\n> > > <david@kernel.org> wrote:\n> > >>\n> > >> On 6/24/26 01:16, Barry Song (Xiaomi) wrote:\n> > >>> We always unconditionally drain the LRU before retrying anon folio\n> > >>> reuse in wp_can_reuse_anon_folio(). Instead, assume !LRU anon folios\n> > >>> are in lru_cache, and use the refcount to avoid many unnecessary LRU\n> > >>> drains.\n> > >>>\n> > >>> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > >>> Reviewed-by: Baoquan He <baoquan.he@linux.dev>\n> > >>> Signed-off-by: Barry Song (Xiaomi) <baohua@kernel.org>\n> > >>> ---\n> > >>>  mm/memory.c | 8 +++++++-\n> > >>>  1 file changed, 7 insertions(+), 1 deletion(-)\n> > >>>\n> > >>> diff --git a/mm/memory.c b/mm/memory.c\n> > >>> index ff338c2abe92..f6848f4234a6 100644\n> > >>> --- a/mm/memory.c\n> > >>> +++ b/mm/memory.c\n> > >>> @@ -4193,12 +4193,18 @@ static bool wp_can_reuse_anon_folio(struct folio *folio,\n> > >>>        */\n> > >>>       if (folio_test_ksm(folio) || folio_ref_count(folio) > 3)\n> > >>>               return false;\n> > >>> -     if (!folio_test_lru(folio))\n> > >>> +     if (!folio_test_lru(folio)) {\n> > >>> +             /*\n> > >>> +              * Assume folio is on lru_cache and holds a cache reference.\n> > >>> +              */\n> > >>> +             if (folio_ref_count(folio) > 2 + folio_test_swapcache(folio))\n> > >>> +                     return false;\n> > >>\n> > >> I'm not keen on making this function even uglier, so no, not like that.\n> > >>\n> > >> We have the earlier \"folio_ref_count(folio) > 3\" check.\n> > >>\n> > >> In which scenarios can you trigger this such that we would care?\n> > >>\n> > >> If the answer is \"I don't know\" there is no reason for a change.\n> > >\n> > > As I replied to Shakeel in the v1 discussion [1], this can avoid a\n> > > large number of drains, both during Ubuntu boot and under normal\n> > > workloads:\n> > >\n> > > \"I booted the system into Ubuntu, and after\n> >\n> > is this with this patch only?\n\nRight. wp_reuse_skipped_drain accounts for the behavior\nintroduced by this patch, while do_swap_skipped_drain comes\nfrom patch 3/3.\n\n> >\n> > >\n> > > boot completed I observed:\n> > >\n> > > wp_reuse_skipped_drain: 5542\n> > > do_swap_skipped_drain: 0\n> > >\n> > > Then I built the kernel in a 1GB memcg using zRAM swap, and observed:\n> > >\n> > > wp_reuse_skipped_drain: 25017\n> > > do_swap_skipped_drain: 43595\n> >\n> > This is all data that belongs into this patch description, not hidden\n> > somewhere on the internet :)\n\nAgreed. Sorry, I was being a bit lazy.\n\n>\n> I asked the same i.e. to include this information in the commit message [1].\n>\n> [1] https://lore.kernel.org/linux-mm/ajK4N2zK3sPZFQuf@linux.dev/\n\nSorry, I missed this one. I'll add it in v3.\n\n>\n> >\n> >\n> > And why do we care about local draining? This is not a drain-all.\n>\n> Let me take a stab at it. Local draining can potentially make the lru cache's\n> batching ineffective. The whole reason for lru caches is to batch the lru\n> operations to keep the lru lock contention low but if we keep draining\n> prematurely we will continue to make lru lock contention worse. This is\n> particularly bad for workloads which chrun a lot of LRU pages through\n> allocation, free and/or reclaim.\n\nI actually asked the same question myself in the RFC here[1]:\n\n\"On the other hand, the folio may be sitting in the lru_cache of\nanother CPU, which the current drain cannot flush. As things stand\ntoday, the drain only succeeds if the folio happens to be queued on\nthe current CPU's lru_cache, giving it roughly a 1/nr_cpus chance of\nworking. drain_all would clearly be too expensive to avoid.\nSo another possibility is to drop this drain as well. The folio can\nbe released later, at the cost of missing some opportunities for\nreuse.\"\n\nAfter thinking about it for a couple of days, my gut feeling is\nthat keeping it might increase the chances of reuse in at least\ntwo cases:\n1. It could be a newly allocated folio in do_swap_page(), and\ndo_swap_page() may subsequently call do_wp_page(). In\nthat case, task migration is less likely to have occurred.\n2. On systems with fewer CPUs (and typically less memory), the\nchance of having the folio in the same CPU's lru_cache,\nwhich is roughly 1 / nr_cpus, may still be reasonably high.\n\nI'm not entirely sure about this, so I chose a relatively\nconservative approach: making an obviously correct improvement\nwithout introducing dramatic changes. Another reason is that it's\nalso hard to evaluate the impact of removing the local drain\nacross all systems and workloads.\n\nShakeel, David, what are your thoughts on this? Should we go\nwith a code refinement in v3 as David suggested, or completely\nremove this drain?\n\n[1] https://lore.kernel.org/linux-mm/CAGsJ_4yFgcvpTAZ_YV73+U=BEnOiSxaFtGNFpbf0DWBkVcOQ3Q@mail.gmail.com/\n\nBest Regards\nBarry\n\n",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-06-27",
+          "message_id": "",
+          "email": "baohua@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Patch aims to avoid unnecessary LRU drain for wp_can_reuse_anon_folio(), but discussion centers around whether this is necessary and its potential impact on lru cache effectiveness."
+    }
+  }
+}

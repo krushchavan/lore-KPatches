@@ -1,0 +1,47 @@
+{
+  "thread_id": "20260627202243.758289-1-gourry@gourry.net",
+  "subject": "[PATCH v2] mm/vmstat: fold stranded per-cpu node stats when a node comes online",
+  "url": "https://lore.kernel.org/all/20260627202243.758289-1-gourry@gourry.net/",
+  "dates": {
+    "2026-06-27": {
+      "report_file": "2026-06-27_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Andrew Morton",
+          "summary": "Raised concerns about the safety of folding stranded per-cpu node statistics during offlining, suggesting that it could lead to deadlocks or other issues. Also questioned the need for visiting every possible CPU.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Sat, 27 Jun 2026 16:22:43 -0400 Gregory Price <gourry@gourry.net> wrote:\n\n> A per-node vmstat counter is pgdat->vm_stat[] plus per-cpu deltas.\n> A balanced counter can sit split as global=+N / per-cpu=-N.\n> \n> The folds reconciling the split only walk online nodes, so when\n> try_offline_node() marks a node offline the per-cpu deltas are stranded.\n> \n> A subsequent online resets the per-cpu area but not pgdat->vm_stat[],\n> orphaning the +N permanently.  All NR_VM_NODE_STAT_ITEMS are affected.\n\nGeeze, simple mistake, been there ten years...\n\n> The existing code zeroes the per-cpu counters and causes a permanent\n> skew. Fold the stranded deltas instead, before the node rejoins the\n> online set. The node is not online yet and the hotplug lock is held,\n> so the remote access to per-cpu values is safe.\n\nOh.  Shouldn't we be doing this during offlining?\n\n> Discovered when node compaction hung for a nearly empty node, as the\n> math to determine throttling broke.  Reproduced by repeated memory\n> hotplug/unplug cycles on a node under pressure: NR_ISOLATED_ANON\n> ratchets up and never returns to zero.\n> \n> ...\n>\n> --- a/mm/mm_init.c\n> +++ b/mm/mm_init.c\n> @@ -1536,7 +1536,7 @@ void __ref free_area_init_core_hotplug(struct pglist_data *pgdat)\n>  {\n>  \tint nid = pgdat->node_id;\n>  \tenum zone_type z;\n> -\tint cpu;\n> +\tint cpu, i;\n>  \n>  \tpgdat_init_internals(pgdat);\n>  \n> @@ -1554,10 +1554,17 @@ void __ref free_area_init_core_hotplug(struct pglist_data *pgdat)\n>  \tpgdat->node_start_pfn = 0;\n>  \tpgdat->node_present_pages = 0;\n>  \n> -\tfor_each_online_cpu(cpu) {\n> -\t\tstruct per_cpu_nodestat *p;\n> +\t/*\n> +\t * Hot-unplug can leave per-cpu vmstat deltas unfolded (folders skip\n> +\t * offline nodes) - reconcile this at online. Foreign access to counters\n> +\t * is safe: the node is not online yet and we hold the hotplug lock.\n> +\t */\n> +\tfor_each_possible_cpu(cpu) {\n\nThat's a lot of CPUs\n\n> +\t\tstruct per_cpu_nodestat *p = per_cpu_ptr(pgdat->per_cpu_nodestats, cpu);\n>  \n> -\t\tp = per_cpu_ptr(pgdat->per_cpu_nodestats, cpu);\n> +\t\tfor (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)\n\nand that's a lot of items.\n\nI guess the overall loop count won't be large enough to cause issues,\nbut it's large!\n\nPerhaps there's some simple test we can do on the per_cpu_nodestat to\navoid the inner loop?  Perhaps might need to add a field for this?\n\nbtw, \"for(int i...\" is allowed nowadays.  It'll make this code nicer, IMO.\n\nAnd... Sashiko seems to have found a pre-existing issue:\n\thttps://sashiko.dev/#/patchset/20260627202243.758289-1-gourry@gourry.net\n\n> +\t\t\tif (p->vm_node_stat_diff[i])\n> +\t\t\t\tnode_page_state_add(p->vm_node_stat_diff[i], pgdat, i);\n>  \t\tmemset(p, 0, sizeof(*p));\n>  \t}\n\n",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-06-27",
+          "message_id": "",
+          "email": "akpm@linux-foundation.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price",
+          "summary": "Responded to Andrew Morton's concerns, explaining the difficulties of safely folding stranded per-cpu node statistics during offlining and the potential risks of visiting every possible CPU.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Sat, Jun 27, 2026 at 04:10:07PM -0700, Andrew Morton wrote:\n> \n> > The existing code zeroes the per-cpu counters and causes a permanent\n> > skew. Fold the stranded deltas instead, before the node rejoins the\n> > online set. The node is not online yet and the hotplug lock is held,\n> > so the remote access to per-cpu values is safe.\n> \n> Oh.  Shouldn't we be doing this during offlining?\n>\n\nI tried this first.  I was unable to convince myself there was a \nsafe way to accomplish this.\n\n1) sashiko pointed out we can't schedule_on_each_cpu while holding\n   the hotplug lock because we'll re-take cpus_read_lock and cause\n   a deadlock condition with cpu-hotplug.\n\n2) I'm not sure we can do it after the hotplug lock as been dropped,\n   at least not safely.  At the very least another hot-plug re-adding\n   the node could start.  That just seemed like a bad path.\n\n3) foreign cpu access to the per-cpu values are not atomic with\n   respect to in-flight folds on the target cpu.  this_cpu_xchg\n   and this_cpu_add are (i believe) only atomic wrt the cpu itself\n   (can't be interrupted mid-exchange).\n\ndoing it before node_offline() has problems (in-flight folds),\ndoing it after node_offline() still *technically* carries the same\nin-flight fold risk - just narrower (fold has to have started already).\n\nI couldn't convince myself there wasn't still a race, so here we are.\n\n> > +\tfor_each_possible_cpu(cpu) {\n> \n> That's a lot of CPUs\n> \n\nUnfortunately - cpus may have gone offline while the node was offline,\nso we legitimately have to visit every *possible* cpu :[\n\n> > +\t\tstruct per_cpu_nodestat *p = per_cpu_ptr(pgdat->per_cpu_nodestats, cpu);\n> >  \n> > -\t\tp = per_cpu_ptr(pgdat->per_cpu_nodestats, cpu);\n> > +\t\tfor (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)\n> \n> and that's a lot of items.\n\nI am aware :[.  I suppose we could vectorize the collection here on some\narchs, but I try to avoid being clever where I can.\n\n> \n> I guess the overall loop count won't be large enough to cause issues,\n> but it's large!\n> \n> Perhaps there's some simple test we can do on the per_cpu_nodestat to\n> avoid the inner loop?  Perhaps might need to add a field for this?\n\nHadn't considered this, but maybe.  Will take a look.\n\n> \n> btw, \"for(int i...\" is allowed nowadays.  It'll make this code nicer, IMO.\n> \n\naye aye o7\n\n> And... Sashiko seems to have found a pre-existing issue:\n> \thttps://sashiko.dev/#/patchset/20260627202243.758289-1-gourry@gourry.net\n> \n\nWill take a look, thanks!\n\n~Gregory\n\n",
+          "reply_to": "",
+          "message_date": "2026-06-27",
+          "message_id": "",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch addresses a long-standing issue where per-cpu node statistics are not properly folded when a node comes online, leading to permanent skew in the vmstat counters. The existing code zeroes out the per-cpu counters, causing a permanent loss of data. This patch folds the stranded deltas before the node rejoins the online set, ensuring accurate and consistent statistics."
+    }
+  }
+}
