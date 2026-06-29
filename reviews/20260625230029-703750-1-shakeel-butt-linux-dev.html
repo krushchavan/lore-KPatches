@@ -238,54 +238,10 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] mm/slub: serve slabobj_ext array from a strictly larger kmalloc cache</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260625230029.703750-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-27</strong><div class="date-range-nav">Active on: <a href="#2026-06-27">2026-06-27</a> &bull; <a href="#2026-06-26">2026-06-26</a> &bull; <a href="#2026-06-25">2026-06-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a kernel stack overflow issue caused by a recursive cycle between kmalloc-512 and kmalloc-1k slabs when freeing resources. The problem occurs because the obj_exts array, used for allocation profiling and memcg accounting, is allocated from the same cache as the slab it describes. To fix this, the patch changes the allocation to use a strictly larger cache than the one described by the slab, breaking the cycle and preventing the stack overflow.</div></div>
+    <div class="date-range">Submitted: <strong>2026-06-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-29</strong><div class="date-range-nav">Active on: <a href="#2026-06-29">2026-06-29</a> &bull; <a href="#2026-06-28">2026-06-28</a> &bull; <a href="#2026-06-27">2026-06-27</a> &bull; <a href="#2026-06-26">2026-06-26</a> &bull; <a href="#2026-06-25">2026-06-25</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the way SLUB allocates memory for slab object extensions, ensuring that it uses a larger kmalloc cache when necessary to improve performance and reduce fragmentation.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Shakeel Butt (author)</span>
-<a class="date-chip" href="../2026-06-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-26">2026-06-26</a>
-<span class="badge" style="color:#721c24;background:#f8d7da">Contentious</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author acknowledges that the patch is intended to address a specific issue related to slabobj_ext array allocation and confirms that the fix will be implemented in a future version (v2) by restructuring the code.
-
-Author acknowledges reviewer&#x27;s concern about adding kmem caches for users not using memory profiling, but pushes back on the idea of it being a separate discussion.
-
-The author acknowledges that the patch needs to address the issue of slabobj_ext array being served from a cache smaller than the one it describes, and agrees to restructure in v2.
-
-Author acknowledged a minor issue with a comment and promised to remove it in the next version, indicating no further revision is needed.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Yes, we have enabled memory allocation profiling fleet wide.
-
-[...]
-
----
-
-Yes but I assume that would add kmem caches even for users not using memory
-profiling. Anyways, I think that is a separate discussion. Am I understanding
-correctly that you don&#x27;t have any concerns with this approach?
-
----
-
-Ack.
-
-[...]
-
----
-
-I will remove the comment in next version.
-
-Thanks for the review.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Harry Yoo</div>
-<a href="https://lore.kernel.org/r/aj6re83IC84lkFL0@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledges, will implement, pushes back</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-06-26">
+<div class="thread-node depth-0" id="2026-06-26">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Harry Yoo</span>
@@ -294,25 +250,75 @@ Thanks for the review.</pre>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Harry Yoo noted that the patch description does not clearly explain why the current solution in commit 280ea9c3154b is insufficient to prevent the stack overflow, and requested a more detailed explanation of the fix.
-
-The reviewer noted that the patch&#x27;s assumption about KMALLOC_NORMAL caches not needing obj_exts arrays may be incorrect and suggested considering a scenario where memory allocation profiling is enabled.
-
-Reviewer Harry Yoo noted that the proposed fix will waste memory due to a larger obj_exts array size, and suggested creating a new kmalloc type to avoid cycles instead.
-
-Reviewer Harry Yoo pointed out that the patch&#x27;s logic is no longer relevant due to a change in how object sizes are compared, and suggested that the comparison should be done based on cache pointers instead of object size.</div>
+<div class="review-comment-text">Reviewer Harry Yoo noted that the proposed fix will waste memory as it requires smaller obj_exts arrays for larger sizes, and suggested creating a new kmalloc type to avoid cycles instead of relocating the array.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Hi Shakeel,
 
 On 6/26/26 8:00 AM, Shakeel Butt wrote:
+&gt; A production host in the Meta fleet (6.16 kernel, memory allocation
+&gt; profiling enabled) panicked with a kernel stack overflow while a kernel
+&gt; driver was freeing a resource:
+&gt; 
+&gt;   BUG: TASK stack guard page was hit
+&gt;   Oops: stack guard page
+&gt;   RIP: 0010:kfree+0x8/0x5d0
+&gt;   Call Trace:
+&gt;    __free_slab+0x66/0xc0
+&gt;    kfree+0x3f0/0x5d0
+&gt;    ... ( ~125x __free_slab &lt;-&gt; kfree ) ...
+&gt;    &lt;kernel driver freeing a resource&gt;
+&gt;    do_syscall_64
+&gt; 
+&gt; The crash dump shows a 125-deep __free_slab&lt;-&gt;kfree recursion that
+&gt; overflowed the 16 KiB kernel stack.
 
----
+Ouch!
+
+&gt; What happened: a KMALLOC_NORMAL slab&#x27;s obj_exts array (used by allocation
+&gt; profiling / memcg accounting) is itself kmalloc()&#x27;d from a KMALLOC_NORMAL
+&gt; cache,
 
 Usually KMALLOC_NORMAL caches don&#x27;t need obj_exts array, but yes,
 this could happen if memory allocation profiling is enabled.
 
----
+&gt; so the &quot;slab holds another slab&#x27;s obj_exts array&quot; relation can form
+&gt; cycles.  With sizeof(struct slabobj_ext) == 16 and the host&#x27;s geometry:
+&gt;
+&gt;   - kmalloc-512 has 64 objects/slab -&gt; array is 64*16 == 1024 bytes,
+&gt;     served from kmalloc-1k;
+&gt;   - kmalloc-1k  has 32 objects/slab -&gt; array is 32*16 ==  512 bytes,
+&gt;     served from kmalloc-512.
+
+Right.
+
+&gt; A kmalloc-512 slab and a kmalloc-1k slab therefore hold each other&#x27;s
+&gt; obj_exts array.  Discarding one frees the other&#x27;s array, which empties and
+&gt; discards that slab, which frees the first&#x27;s array, and so on:
+&gt; __free_slab() -&gt; free_slab_obj_exts() -&gt; kfree() -&gt; discard_slab() -&gt;
+&gt; __free_slab() recurses along the cycle until the stack is exhausted.
+
+Right.
+
+&gt; The
+&gt; dump confirms it: the recursion&#x27;s slabs strictly alternate kmalloc-512
+&gt; (obj_exts in kmalloc-1k) and kmalloc-1k (obj_exts in kmalloc-512), and
+&gt; mem_alloc_profiling_key was enabled.
+&gt; 
+&gt; Commit 280ea9c3154b (&quot;mm/slab: avoid allocating slabobj_ext array from
+&gt; its own slab&quot;) is not sufficient: it bumps the allocation size only when
+&gt; the array would come from the *same* cache (object_size ==).  At the
+&gt; geometry above neither cache is self-referential (512 != 1024 and
+&gt; 1024 != 512), so the bump never triggers and the kmalloc-512 &lt;-&gt; kmalloc-1k
+&gt; cross cycle remains.
+
+Right.
+
+&gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt; from a cache strictly larger than the one it describes whenever it would
+&gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
 
 This will fix the problem.
 
@@ -324,31 +330,678 @@ We should probably create a new kmalloc type to avoid cycles instead?
 
 That would also prevent recursion even further.
 
----
+&gt; No slab can be self- or cross-pinned, the tear-down recursion is bounded
+&gt; by the number of kmalloc size classes (it terminates at the large-kmalloc
+&gt; path, which carries no obj_exts), and profiling/accounting coverage is
+&gt; unchanged - the array is still allocated, only relocated.
+&gt; 
+&gt; Reproduced on next-20260623 at the same geometry: churning
+&gt; kmalloc-512/kmalloc-1k under vm.mem_profiling and then shrinking leaves
+&gt; kmalloc-512 with thousands of unreclaimable objects without this patch
+&gt; (8056) and at baseline with it (847).
+&gt; 
+&gt; Fixes: 4b8736964640 (&quot;mm/slab: add allocation accounting into slab allocation and free paths&quot;)
+
+Perhaps Cc: stable? v6.12 and v6.18 are affected.
+
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; Reported-by: Danielle Costantino &lt;dcostantino@meta.com&gt;
+&gt; ---
+&gt;  mm/slub.c | 26 ++++++++++----------------
+&gt;  1 file changed, 10 insertions(+), 16 deletions(-)
+&gt; 
+&gt; diff --git a/mm/slub.c b/mm/slub.c
+&gt; index 9ec774dc7009..48e54d340865 100644
+&gt; --- a/mm/slub.c
+&gt; +++ b/mm/slub.c
+&gt; @@ -2124,15 +2124,14 @@ static inline void init_slab_obj_exts(struct slab *slab)
+&gt;  }
+&gt;  
+&gt;  /*
+&gt; - * Calculate the allocation size for slabobj_ext array.
+&gt; + * Size of the slabobj_ext array for @slab.
+&gt;   *
+&gt; - * When memory allocation profiling is enabled, the obj_exts array
+&gt; - * could be allocated from the same slab cache it&#x27;s being allocated for.
+&gt; - * This would prevent the slab from ever being freed because it would
+&gt; - * always contain at least one allocated object (its own obj_exts array).
+&gt; - *
+&gt; - * To avoid this, increase the allocation size when we detect the array
+&gt; - * may come from the same cache, forcing it to use a different cache.
+&gt; + * The array is itself kmalloc()&#x27;d. If it came from the same or a smaller
+&gt; + * kmalloc cache than @s, the &quot;slab holds another slab&#x27;s array&quot; relation could
+&gt; + * form a cycle (self, or e.g. kmalloc-512 &lt;-&gt; kmalloc-1k) that pins the slabs
+&gt; + * forever and recurses via free_slab_obj_exts() -&gt; kfree() -&gt; discard_slab()
+&gt; + * at teardown. Force it into a strictly larger cache to keep that relation a
+&gt; + * DAG (acyclic).
+&gt;   */
+&gt;  static inline size_t obj_exts_alloc_size(struct kmem_cache *s,
+&gt;  					 struct slab *slab, gfp_t gfp)
+&gt; @@ -2147,14 +2146,9 @@ static inline size_t obj_exts_alloc_size(struct kmem_cache *s,
+&gt;  		return sz;
+&gt;  
+&gt;  	obj_exts_cache = kmalloc_slab(sz, NULL, gfp, __kmalloc_token(0));
+&gt; -	/*
+&gt; -	 * We can&#x27;t simply compare s with obj_exts_cache, because partitioned kmalloc
+&gt; -	 * caches have multiple caches per size, selected by caller address or type.
+&gt; -	 * Since caller address or type may differ between kmalloc_slab() and actual
+&gt; -	 * allocation, bump size when sizes are equal.
+&gt; -	 */
+&gt; -	if (s-&gt;object_size == obj_exts_cache-&gt;object_size)
+&gt; -		return obj_exts_cache-&gt;object_size + 1;
+&gt; +	/* compare object_size, not the cache pointer (partitioned kmalloc caches) */
 
 This comment is no longer relevant, by the way.
 
 &quot;compare object_size instead of cache pointers because there can be
- multiple caches of the same size&quot; doesn&#x27;t apply anymore.</pre>
+ multiple caches of the same size&quot; doesn&#x27;t apply anymore.
+
+&gt; +	if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+&gt; +		return s-&gt;object_size + 1;
+&gt;  
+&gt;  	return sz;
+&gt;  }
+
+-- 
+Cheers,
+Harry / Hyeonggon
+
+---
+
+On 6/27/26 2:11 AM, Vlastimil Babka (SUSE) wrote:
+&gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt; with &quot;never&quot;.
+&gt;
+&gt; We probably should have done that already in 280ea9c3154b2.
+
+I think we did already.
+
+obj_exts allocation triggered by memcg has __GFP_ACCOUNT, kmalloc type
+is KMALLOC_CGROUP, and so is_kmalloc_normal() should return false?
+
+Perhaps a comment above !is_kmalloc_normal() check would be nice.
+
+&gt; Because AFAIU
+&gt; memcg-only obj_exts array don&#x27;t have this issue
+&gt; (or maybe they do have the &gt; [1] issue? Harry?).
+
+memcg-only obj_exts array doesn&#x27;t have this issue and [1].
+
+Because obj_exts are not accounted and so we can&#x27;t allocate obj_exts
+from KMALLOC_CGROUP.
+
+-- 
+Cheers,
+Harry / Hyeonggon
+
+---
+
+On 6/28/26 5:10 PM, Harry Yoo wrote:
+&gt; 
+&gt; 
+&gt; On 6/27/26 2:11 AM, Vlastimil Babka (SUSE) wrote:
+&gt;&gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt;&gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt;&gt; with &quot;never&quot;.
+&gt;&gt;
+&gt;&gt; We probably should have done that already in 280ea9c3154b2.
+&gt; 
+&gt; I think we did already.
+&gt; 
+&gt; obj_exts allocation triggered by memcg has __GFP_ACCOUNT, kmalloc type
+&gt; is KMALLOC_CGROUP, and so is_kmalloc_normal() should return false?
+&gt; 
+&gt; Perhaps a comment above !is_kmalloc_normal() check would be nice.
+&gt; 
+&gt;&gt; Because AFAIU
+&gt;&gt; memcg-only obj_exts array don&#x27;t have this issue
+&gt;&gt; (or maybe they do have the &gt; [1] issue? Harry?).
+&gt; 
+&gt; memcg-only obj_exts array doesn&#x27;t have this issue and [1].
+&gt;&gt; Because obj_exts are not accounted and so we can&#x27;t allocate obj_exts
+&gt; from KMALLOC_CGROUP.
+
+Oh god, I am confused again! Commit 8dafa9f5900c says it might have this
+issue. However is_kmalloc_normal(s) == true detects that it might have
+the problem when either 1) memory allocation profiling is enabled, or 2)
+SLUB_TINY w/ __GFP_RECLAIMABLE|__GFP_ACCOUNT allocates accounted slab
+objects from KMALLOC_NORMAL.
+
+-- 
+Cheers,
+Harry / Hyeonggon
+
+---
+
+On 6/28/26 4:47 PM, Vlastimil Babka (SUSE) wrote:
+&gt; On 6/28/26 5:23 AM, Shakeel Butt wrote:
+&gt;&gt; On Sat, Jun 27, 2026 at 07:58:12PM -0700, Shakeel Butt wrote:
+&gt;&gt;&gt; On Fri, Jun 26, 2026 at 07:11:33PM +0200, Vlastimil Babka (SUSE) wrote:
+&gt;&gt;&gt; [...]
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; from a cache strictly larger than the one it describes whenever it would
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; This will fix the problem.
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; But this will waste memory as we need smaller obj_exts array
+&gt;&gt;&gt;&gt;&gt;&gt; as the size gets larger.
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt;&gt;&gt;&gt;&gt;&gt; (needed only when memory profiling is enabled, though)
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; That would also prevent recursion even further.
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; Yes but I assume that would add kmem caches even for users not using memory
+&gt;&gt;&gt;&gt;&gt; profiling. Anyways, I think that is a separate discussion. Am I understanding
+&gt;&gt;&gt;&gt;&gt; correctly that you don&#x27;t have any concerns with this approach?
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; Umm, the memory waste is a concern?
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt;&gt;&gt;&gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt;&gt;&gt;&gt; with &quot;never&quot;.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; We probably should have done that already in 280ea9c3154b2. Because AFAIU
+&gt;&gt;&gt;&gt; memcg-only obj_exts array don&#x27;t have this issue (or maybe they do have the
+&gt;&gt;&gt;&gt; [1] issue? Harry?). But if memcg-only should keep avoiding the same size
+&gt;&gt;&gt;&gt; bucket, it can keep what it was doing and only memalloc profiling would do
+&gt;&gt;&gt;&gt; the strictly larger thing.
+&gt;&gt;&gt;
+&gt;&gt;&gt; memcg should not have this issue as normal kmalloc caches do not serve memcg
+&gt;&gt;&gt; charged objects. 
+&gt;&gt;
+&gt;&gt; I am wrong here as I went back and see d8df600b67d7.
+
+I was confused too :)
+
+&gt; (8dafa9f5900c upstream)
+&gt; 
+&gt;&gt;&gt;
+&gt;&gt;&gt; So here we can do dedicated caches as Harry suggested or make this size bumping
+&gt;&gt;&gt; very specialized as Vlastimil suggested. What do we want long term? Orthogonally
+&gt; 
+&gt; Maybe long term we make kmem_buckets unconditional and use that.
+&gt; 
+&gt;&gt;&gt; we do want this fix to be backported easily to older stable kernels. I will see
+&gt;&gt;&gt; how does this narrowed down size bumping looks like.
+&gt;&gt;&gt;
+&gt;&gt;
+&gt;&gt; BTW I think we need something like the following, right?
+&gt;&gt;
+&gt;&gt; 	if (mem_alloc_profiling_enabled()) {
+&gt;&gt; 		if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+&gt;&gt; 			return s-&gt;object_size + 1;
+&gt;&gt; 	} else {
+&gt;&gt; 		if (obj_exts_cache-&gt;object_size == s-&gt;object_size)
+&gt;&gt; 			return s-&gt;object_size + 1;
+&gt;&gt; 	}
+
+We should not add mem_alloc_profiling_enabled() check because,
+then we&#x27;re not fixing this issue on SLUB_TINY, when the caller specifies
+__GFP_RECLAIMABLE|__GFP_ACCOUNT without memory allocation profiling.
+
+`if (!is_kmalloc_normal(s))` check already bails out when it doesn&#x27;t
+need to bump the size.
+
+So Shakeel&#x27;s original code will work fine.
+
+We&#x27;re only pessimizing memory allocation profiling and
+SLUB_TINY &amp;&amp; MEMCG users, but (as Vlastimil suggests off-list)
+it wouldn&#x27;t make much sense to enable MEMCG on memory restricted systems
+anyway. (IIRC even raspberry pis don&#x27;t enable the memory controller by
+default...)
+
+I think it&#x27;s okay to fix the bug first, but we need to address
+the memory wastage issue sooner or later if companies (Meta and
+Google I guess?) are deploying kernels with memory allocation profiling
+on in production systems.
+
+Perhaps it&#x27;s worth adding a comment like this, though:
+
+/*
+ * Only bump the size when the object (not the obj_exts array) is
+ * allocated from KMALLOC_NORMAL, either by memory allocation profiling
+ * or memcg on SLUB_TINY with __GFP_RECLAIMABLE|__GFP_ACCOUNT.
+ * Otherwise, obj_exts allocations cannot form a cycle between
+ * kmalloc caches.
+ */
+if (!is_kmalloc_normal(s))
+        return sz;
+
+Thanks!
+
+-- 
+Cheers,
+Harry / Hyeonggon
+
+---
+
+[ Adding Kees Cook for SLAB_BUCKETS conversation ]
+
+The thread:
+https://lore.kernel.org/linux-mm/20260625230029.703750-1-shakeel.butt@linux.dev/
+
+On 6/29/26 8:37 AM, Suren Baghdasaryan wrote:
+&gt; On Sun, Jun 28, 2026 at 2:22\u202fAM Harry Yoo &lt;harry@kernel.org&gt; wrote:
+&gt;&gt; On 6/28/26 4:47 PM, Vlastimil Babka (SUSE) wrote:
+&gt;&gt;&gt; On 6/28/26 5:23 AM, Shakeel Butt wrote:
+&gt;&gt;&gt;&gt; On Sat, Jun 27, 2026 at 07:58:12PM -0700, Shakeel Butt wrote:
+&gt;&gt;&gt;&gt;&gt; On Fri, Jun 26, 2026 at 07:11:33PM +0200, Vlastimil Babka (SUSE) wrote:
+&gt;&gt;&gt;&gt;&gt; [...]
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; from a cache strictly larger than the one it describes whenever it would
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; This will fix the problem.
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; But this will waste memory as we need smaller obj_exts array
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; as the size gets larger.
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; (needed only when memory profiling is enabled, though)
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt; That would also prevent recursion even further.
+&gt;&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; Yes but I assume that would add kmem caches even for users not using memory
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; profiling. Anyways, I think that is a separate discussion. Am I understanding
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; correctly that you don&#x27;t have any concerns with this approach?
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; Umm, the memory waste is a concern?
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt;&gt;&gt;&gt;&gt;&gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt;&gt;&gt;&gt;&gt;&gt; with &quot;never&quot;.
+&gt;&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;&gt; We probably should have done that already in 280ea9c3154b2. Because AFAIU
+&gt;&gt;&gt;&gt;&gt;&gt; memcg-only obj_exts array don&#x27;t have this issue (or maybe they do have the
+&gt;&gt;&gt;&gt;&gt;&gt; [1] issue? Harry?). But if memcg-only should keep avoiding the same size
+&gt;&gt;&gt;&gt;&gt;&gt; bucket, it can keep what it was doing and only memalloc profiling would do
+&gt;&gt;&gt;&gt;&gt;&gt; the strictly larger thing.
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; memcg should not have this issue as normal kmalloc caches do not serve memcg
+&gt;&gt;&gt;&gt;&gt; charged objects.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; I am wrong here as I went back and see d8df600b67d7.
+&gt;&gt;
+&gt;&gt; I was confused too :)
+&gt;&gt;
+&gt;&gt;&gt; (8dafa9f5900c upstream)
+&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; So here we can do dedicated caches as Harry suggested or make this size bumping
+&gt;&gt;&gt;&gt;&gt; very specialized as Vlastimil suggested. What do we want long term? Orthogonally
+&gt;&gt;&gt;
+&gt;&gt;&gt; Maybe long term we make kmem_buckets unconditional and use that.
+&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; we do want this fix to be backported easily to older stable kernels. I will see
+&gt;&gt;&gt;&gt;&gt; how does this narrowed down size bumping looks like.
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; BTW I think we need something like the following, right?
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;      if (mem_alloc_profiling_enabled()) {
+&gt;&gt;&gt;&gt;              if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+&gt;&gt;&gt;&gt;                      return s-&gt;object_size + 1;
+&gt;&gt;&gt;&gt;      } else {
+&gt;&gt;&gt;&gt;              if (obj_exts_cache-&gt;object_size == s-&gt;object_size)
+&gt;&gt;&gt;&gt;                      return s-&gt;object_size + 1;
+&gt;&gt;&gt;&gt;      }
+&gt;&gt;
+&gt;&gt; We should not add mem_alloc_profiling_enabled() check because,
+&gt;&gt; then we&#x27;re not fixing this issue on SLUB_TINY, when the caller specifies
+&gt;&gt; __GFP_RECLAIMABLE|__GFP_ACCOUNT without memory allocation profiling.
+&gt;&gt;
+&gt;&gt; `if (!is_kmalloc_normal(s))` check already bails out when it doesn&#x27;t
+&gt;&gt; need to bump the size.
+&gt;&gt;
+&gt;&gt; So Shakeel&#x27;s original code will work fine.
+&gt;&gt;
+&gt;&gt; We&#x27;re only pessimizing memory allocation profiling and
+&gt;&gt; SLUB_TINY &amp;&amp; MEMCG users, but (as Vlastimil suggests off-list)
+&gt;&gt; it wouldn&#x27;t make much sense to enable MEMCG on memory restricted systems
+&gt;&gt; anyway. (IIRC even raspberry pis don&#x27;t enable the memory controller by
+&gt;&gt; default...)
+&gt;&gt;
+&gt;&gt; I think it&#x27;s okay to fix the bug first, but we need to address
+&gt;&gt; the memory wastage issue sooner or later if companies (Meta and
+&gt;&gt; Google I guess?) are deploying kernels with memory allocation profiling
+&gt;&gt; on in production systems.
+&gt; 
+&gt; Sorry for the delay folks. I just got a chance to read through this thread.
+
+Hi Suren, no worries!
+
+&gt; I think adding a new KMALLOC_TYPE would be the cleanest way to fix
+&gt; this recursion problem once and for all. This size bumping and the
+&gt; special case of SLUB_TINY are quite confusing.
+
+As mentioned by Vlsatimil, in the long term, using SLAB_BUCKETS
+infrastructure would be more straightforward than new KMALLOC_TYPE
+because (I think) the kmalloc type is decided purely based on GFP
+flags and we need to somehow work around that. SLAB_BUCKETS provides
+a nice abstraction to do this.
+
+Luckily, SLAB_BUCKETS is introduced in v6.11.
+Unfortunately, SLAB_BUCKETS is optional.
+
+&gt; We could define that&gt; new KMALLOC_TYPE only if memory allocation profiling or SLUB_TINY are
+&gt; enabled to avoid new caches when not needed. Does not seem too complex
+&gt; but maybe I&#x27;m missing something? WDYT?
+
+I think we need some enhancements to achieve that with SLAB_BUCKETS
+
+1. Rename SLAB_BUCKETS to SLAB_BUCKETS_HARDENING
+   (w/ SLAB_BUCKETS being a transitional config for _HARDENING)
+
+2. Make the SLAB_BUCKETS infrastructure unconditional,
+   but the decision is made at runtime:
+
+   1) actually creating a kmem_buckets vs.
+   2) falling back to kmalloc.
+
+3. kmem_buckets_create() creates kmem_buckets only when
+   SLAB_BUCKETS_HARDENING is enabled.
+
+4. SLUB decides (not) to create kmem_buckets for internal use
+   during the boot process. Use the kmem_buckets for obj_exts
+   array allocation.
+
+Side note: this would unconditionally add the kmem_buckets parameter to
+the kmalloc slowpath. Probably it&#x27;d be worth introducing a dedicated
+entrypoint for kmem_buckets instead.
+
+&gt; If it is more complex than I imaging then I&#x27;m fine with Shakeel&#x27;s
+&gt; approach as a temporary fix.
+
+Since above requires quite some changes, I&#x27;d say let&#x27;s proeed with
+the fix (since it&#x27;s one line of code change that fixes a bug),
+and then see how we can make SLAB_BUCKETS changes as minimal
+as possible for backporting?
+
+-- 
+Cheers,
+Harry / Hyeonggon</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
 <a href="https://lore.kernel.org/r/62453403-954c-4cf1-8924-6d38184b0810@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: lacking clarity, request for additional information, requested consideration of alternative scenario</div>
+<div class="review-comment-signals">Signals: requested changes, alternative solution</div>
 </div>
 </div>
-<div class="thread-node depth-1">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt (author)</span>
+<a class="date-chip" href="../2026-06-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-26">2026-06-26</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing concerns about memory waste and the approach to fix cycles in slabobj_ext array allocation. The author agrees that the current solution will waste memory as the size gets larger, but thinks it&#x27;s a separate discussion. Vlastimil Babka points out that the memory waste is a concern and suggests only doing the size bumping when allocation profiling is enabled. The author acknowledges this concern and proposes to either create dedicated caches or make the size bumping very specialized.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri, Jun 26, 2026 at 01:22:09PM +0900, Harry Yoo wrote:
+&gt; 
+&gt; Hi Shakeel,
+&gt; 
+
+[...]
+
+&gt; &gt; What happened: a KMALLOC_NORMAL slab&#x27;s obj_exts array (used by allocation
+&gt; &gt; profiling / memcg accounting) is itself kmalloc()&#x27;d from a KMALLOC_NORMAL
+&gt; &gt; cache,
+&gt; 
+&gt; Usually KMALLOC_NORMAL caches don&#x27;t need obj_exts array, but yes,
+&gt; this could happen if memory allocation profiling is enabled.
+
+Yes, we have enabled memory allocation profiling fleet wide.
+
+[...]
+
+&gt; 
+&gt; &gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt; &gt; from a cache strictly larger than the one it describes whenever it would
+&gt; &gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt; &gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt; &gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt; 
+&gt; This will fix the problem.
+&gt; 
+&gt; But this will waste memory as we need smaller obj_exts array
+&gt; as the size gets larger.
+&gt; 
+&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt; (needed only when memory profiling is enabled, though)
+&gt; 
+&gt; That would also prevent recursion even further.
+
+Yes but I assume that would add kmem caches even for users not using memory
+profiling. Anyways, I think that is a separate discussion. Am I understanding
+correctly that you don&#x27;t have any concerns with this approach?
+
+&gt; 
+&gt; &gt; No slab can be self- or cross-pinned, the tear-down recursion is bounded
+&gt; &gt; by the number of kmalloc size classes (it terminates at the large-kmalloc
+&gt; &gt; path, which carries no obj_exts), and profiling/accounting coverage is
+&gt; &gt; unchanged - the array is still allocated, only relocated.
+&gt; &gt; 
+&gt; &gt; Reproduced on next-20260623 at the same geometry: churning
+&gt; &gt; kmalloc-512/kmalloc-1k under vm.mem_profiling and then shrinking leaves
+&gt; &gt; kmalloc-512 with thousands of unreclaimable objects without this patch
+&gt; &gt; (8056) and at baseline with it (847).
+&gt; &gt; 
+&gt; &gt; Fixes: 4b8736964640 (&quot;mm/slab: add allocation accounting into slab allocation and free paths&quot;)
+&gt; 
+&gt; Perhaps Cc: stable? v6.12 and v6.18 are affected.
+
+Ack.
+
+[...]
+
+&gt; &gt; -	if (s-&gt;object_size == obj_exts_cache-&gt;object_size)
+&gt; &gt; -		return obj_exts_cache-&gt;object_size + 1;
+&gt; &gt; +	/* compare object_size, not the cache pointer (partitioned kmalloc caches) */
+&gt; 
+&gt; This comment is no longer relevant, by the way.
+&gt; 
+&gt; &quot;compare object_size instead of cache pointers because there can be
+&gt;  multiple caches of the same size&quot; doesn&#x27;t apply anymore.
+&gt; 
+
+I will remove the comment in next version.
+
+Thanks for the review.
+
+&gt; &gt; +	if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+&gt; &gt; +		return s-&gt;object_size + 1;
+&gt; &gt;  
+&gt; &gt;  	return sz;
+&gt; &gt;  }
+&gt; 
+&gt; -- 
+&gt; Cheers,
+&gt; Harry / Hyeonggon
+
+---
+
+On Fri, Jun 26, 2026 at 07:11:33PM +0200, Vlastimil Babka (SUSE) wrote:
+[...]
+&gt; &gt;&gt; &gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt; &gt;&gt; &gt; from a cache strictly larger than the one it describes whenever it would
+&gt; &gt;&gt; &gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt; &gt;&gt; &gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt; &gt;&gt; &gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt; &gt;&gt; 
+&gt; &gt;&gt; This will fix the problem.
+&gt; &gt;&gt; 
+&gt; &gt;&gt; But this will waste memory as we need smaller obj_exts array
+&gt; &gt;&gt; as the size gets larger.
+&gt; &gt;&gt; 
+&gt; &gt;&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt; &gt;&gt; (needed only when memory profiling is enabled, though)
+&gt; &gt;&gt; 
+&gt; &gt;&gt; That would also prevent recursion even further.
+&gt; &gt; 
+&gt; &gt; Yes but I assume that would add kmem caches even for users not using memory
+&gt; &gt; profiling. Anyways, I think that is a separate discussion. Am I understanding
+&gt; &gt; correctly that you don&#x27;t have any concerns with this approach?
+&gt; 
+&gt; Umm, the memory waste is a concern?
+&gt; 
+&gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt; with &quot;never&quot;.
+&gt; 
+&gt; We probably should have done that already in 280ea9c3154b2. Because AFAIU
+&gt; memcg-only obj_exts array don&#x27;t have this issue (or maybe they do have the
+&gt; [1] issue? Harry?). But if memcg-only should keep avoiding the same size
+&gt; bucket, it can keep what it was doing and only memalloc profiling would do
+&gt; the strictly larger thing.
+
+memcg should not have this issue as normal kmalloc caches do not serve memcg
+charged objects. 
+
+So here we can do dedicated caches as Harry suggested or make this size bumping
+very specialized as Vlastimil suggested. What do we want long term? Orthogonally
+we do want this fix to be backported easily to older stable kernels. I will see
+how does this narrowed down size bumping looks like.
+
+&gt; 
+&gt; Suren&#x27;s input would be also nice to have.
+&gt; 
+&gt; Thanks!
+&gt; 
+&gt; [1] https://lore.kernel.org/oe-lkp/202601231457.f7b31e09-lkp@intel.com
+&gt;
+
+---
+
+On Sat, Jun 27, 2026 at 07:58:12PM -0700, Shakeel Butt wrote:
+&gt; On Fri, Jun 26, 2026 at 07:11:33PM +0200, Vlastimil Babka (SUSE) wrote:
+&gt; [...]
+&gt; &gt; &gt;&gt; &gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt; &gt; &gt;&gt; &gt; from a cache strictly larger than the one it describes whenever it would
+&gt; &gt; &gt;&gt; &gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt; &gt; &gt;&gt; &gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt; &gt; &gt;&gt; &gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt; &gt; &gt;&gt; 
+&gt; &gt; &gt;&gt; This will fix the problem.
+&gt; &gt; &gt;&gt; 
+&gt; &gt; &gt;&gt; But this will waste memory as we need smaller obj_exts array
+&gt; &gt; &gt;&gt; as the size gets larger.
+&gt; &gt; &gt;&gt; 
+&gt; &gt; &gt;&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt; &gt; &gt;&gt; (needed only when memory profiling is enabled, though)
+&gt; &gt; &gt;&gt; 
+&gt; &gt; &gt;&gt; That would also prevent recursion even further.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Yes but I assume that would add kmem caches even for users not using memory
+&gt; &gt; &gt; profiling. Anyways, I think that is a separate discussion. Am I understanding
+&gt; &gt; &gt; correctly that you don&#x27;t have any concerns with this approach?
+&gt; &gt; 
+&gt; &gt; Umm, the memory waste is a concern?
+&gt; &gt; 
+&gt; &gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt; &gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt; &gt; with &quot;never&quot;.
+&gt; &gt; 
+&gt; &gt; We probably should have done that already in 280ea9c3154b2. Because AFAIU
+&gt; &gt; memcg-only obj_exts array don&#x27;t have this issue (or maybe they do have the
+&gt; &gt; [1] issue? Harry?). But if memcg-only should keep avoiding the same size
+&gt; &gt; bucket, it can keep what it was doing and only memalloc profiling would do
+&gt; &gt; the strictly larger thing.
+&gt; 
+&gt; memcg should not have this issue as normal kmalloc caches do not serve memcg
+&gt; charged objects. 
+
+I am wrong here as I went back and see d8df600b67d7.
+
+&gt; 
+&gt; So here we can do dedicated caches as Harry suggested or make this size bumping
+&gt; very specialized as Vlastimil suggested. What do we want long term? Orthogonally
+&gt; we do want this fix to be backported easily to older stable kernels. I will see
+&gt; how does this narrowed down size bumping looks like.
+&gt; 
+
+BTW I think we need something like the following, right?
+
+	if (mem_alloc_profiling_enabled()) {
+		if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+			return s-&gt;object_size + 1;
+	} else {
+		if (obj_exts_cache-&gt;object_size == s-&gt;object_size)
+			return s-&gt;object_size + 1;
+	}
+
+&gt; &gt; 
+&gt; &gt; Suren&#x27;s input would be also nice to have.
+&gt; &gt; 
+&gt; &gt; Thanks!
+&gt; &gt; 
+&gt; &gt; [1] https://lore.kernel.org/oe-lkp/202601231457.f7b31e09-lkp@intel.com
+&gt; &gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/aj6re83IC84lkFL0@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges_concern, proposes_alternatives</div>
+</div>
+</div>
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Vlastimil (SUSE)</span>
 <a class="date-chip" href="../2026-06-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-26">2026-06-26</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Vlastimil (SUSE) expressed concern about the memory waste caused by the patch, suggesting that the size bumping should only occur when allocation profiling is enabled and not booted with &#x27;never&#x27;. They also questioned whether memcg-only obj_exts arrays have this issue and suggested seeking input from Suren.</div>
+<div class="review-comment-text">Reviewer Vlastimil (SUSE) expressed concern about the memory waste caused by serving slabobj_ext arrays from a strictly larger kmalloc cache, suggesting that creating a new kmalloc type to avoid cycles would be more efficient and requested that size bumping only occur when allocation profiling is enabled.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Umm, the memory waste is a concern?
+<pre class="raw-body-text">On 6/26/26 18:49, Shakeel Butt wrote:
+&gt; On Fri, Jun 26, 2026 at 01:22:09PM +0900, Harry Yoo wrote:
+&gt;&gt; 
+&gt;&gt; Hi Shakeel,
+&gt;&gt; 
+&gt; 
+&gt; [...]
+&gt; 
+&gt;&gt; &gt; What happened: a KMALLOC_NORMAL slab&#x27;s obj_exts array (used by allocation
+&gt;&gt; &gt; profiling / memcg accounting) is itself kmalloc()&#x27;d from a KMALLOC_NORMAL
+&gt;&gt; &gt; cache,
+&gt;&gt; 
+&gt;&gt; Usually KMALLOC_NORMAL caches don&#x27;t need obj_exts array, but yes,
+&gt;&gt; this could happen if memory allocation profiling is enabled.
+&gt; 
+&gt; Yes, we have enabled memory allocation profiling fleet wide.
+&gt; 
+&gt; [...]
+&gt; 
+&gt;&gt; 
+&gt;&gt; &gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt;&gt; &gt; from a cache strictly larger than the one it describes whenever it would
+&gt;&gt; &gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt;&gt; &gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt;&gt; &gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt;&gt; 
+&gt;&gt; This will fix the problem.
+&gt;&gt; 
+&gt;&gt; But this will waste memory as we need smaller obj_exts array
+&gt;&gt; as the size gets larger.
+&gt;&gt; 
+&gt;&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt;&gt; (needed only when memory profiling is enabled, though)
+&gt;&gt; 
+&gt;&gt; That would also prevent recursion even further.
+&gt; 
+&gt; Yes but I assume that would add kmem caches even for users not using memory
+&gt; profiling. Anyways, I think that is a separate discussion. Am I understanding
+&gt; correctly that you don&#x27;t have any concerns with this approach?
+
+Umm, the memory waste is a concern?
 
 Minimally I&#x27;d now want to only do that size bumping when allocation
 profiling is enabled. Ideally that means both configured in and not booted
@@ -364,49 +1017,336 @@ Suren&#x27;s input would be also nice to have.
 
 Thanks!
 
-[1] https://lore.kernel.org/oe-lkp/202601231457.f7b31e09-lkp@intel.com</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
-<a href="https://lore.kernel.org/r/09267187-6c85-438f-8791-4cce8d07892a@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: memory waste concern, requested changes</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2" id="2026-06-27">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Shakeel Butt (author)</span>
-<a class="date-chip" href="../2026-06-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-27">2026-06-27</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author addressed a concern about the patch&#x27;s impact on slabobj_ext array allocation, explaining that the relocation of the array to a larger kmalloc cache will not increase memory usage and will prevent cycles in the slab object graph.
+[1] https://lore.kernel.org/oe-lkp/202601231457.f7b31e09-lkp@intel.com
 
-Author acknowledged that the issue is specific to slab allocation and not memcg, and plans to explore either dedicated caches or a specialized size bumping approach, prioritizing easy backportability.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On Fri, Jun 26, 2026 at 07:11:33PM +0200, Vlastimil Babka (SUSE) wrote:
-[...]
+&gt;&gt; 
+&gt;&gt; &gt; No slab can be self- or cross-pinned, the tear-down recursion is bounded
+&gt;&gt; &gt; by the number of kmalloc size classes (it terminates at the large-kmalloc
+&gt;&gt; &gt; path, which carries no obj_exts), and profiling/accounting coverage is
+&gt;&gt; &gt; unchanged - the array is still allocated, only relocated.
+&gt;&gt; &gt; 
+&gt;&gt; &gt; Reproduced on next-20260623 at the same geometry: churning
+&gt;&gt; &gt; kmalloc-512/kmalloc-1k under vm.mem_profiling and then shrinking leaves
+&gt;&gt; &gt; kmalloc-512 with thousands of unreclaimable objects without this patch
+&gt;&gt; &gt; (8056) and at baseline with it (847).
+&gt;&gt; &gt; 
+&gt;&gt; &gt; Fixes: 4b8736964640 (&quot;mm/slab: add allocation accounting into slab allocation and free paths&quot;)
+&gt;&gt; 
+&gt;&gt; Perhaps Cc: stable? v6.12 and v6.18 are affected.
+&gt; 
+&gt; Ack.
+&gt; 
+&gt; [...]
+&gt; 
+&gt;&gt; &gt; -	if (s-&gt;object_size == obj_exts_cache-&gt;object_size)
+&gt;&gt; &gt; -		return obj_exts_cache-&gt;object_size + 1;
+&gt;&gt; &gt; +	/* compare object_size, not the cache pointer (partitioned kmalloc caches) */
+&gt;&gt; 
+&gt;&gt; This comment is no longer relevant, by the way.
+&gt;&gt; 
+&gt;&gt; &quot;compare object_size instead of cache pointers because there can be
+&gt;&gt;  multiple caches of the same size&quot; doesn&#x27;t apply anymore.
+&gt;&gt; 
+&gt; 
+&gt; I will remove the comment in next version.
+&gt; 
+&gt; Thanks for the review.
+&gt; 
+&gt;&gt; &gt; +	if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+&gt;&gt; &gt; +		return s-&gt;object_size + 1;
+&gt;&gt; &gt;  
+&gt;&gt; &gt;  	return sz;
+&gt;&gt; &gt;  }
+&gt;&gt; 
+&gt;&gt; -- 
+&gt;&gt; Cheers,
+&gt;&gt; Harry / Hyeonggon
+&gt; 
+&gt; 
+&gt;
 
 ---
 
-memcg should not have this issue as normal kmalloc caches do not serve memcg
-charged objects. 
+On 6/28/26 5:23 AM, Shakeel Butt wrote:
+&gt; On Sat, Jun 27, 2026 at 07:58:12PM -0700, Shakeel Butt wrote:
+&gt;&gt; On Fri, Jun 26, 2026 at 07:11:33PM +0200, Vlastimil Babka (SUSE) wrote:
+&gt;&gt; [...]
+&gt;&gt;&gt;&gt;&gt;&gt; Fix it structurally by removing cycles of every shape: serve the array
+&gt;&gt;&gt;&gt;&gt;&gt; from a cache strictly larger than the one it describes whenever it would
+&gt;&gt;&gt;&gt;&gt;&gt; otherwise come from the same or a smaller cache.  Every reference edge
+&gt;&gt;&gt;&gt;&gt;&gt; then points from a smaller to a larger cache (here kmalloc-1k&#x27;s array
+&gt;&gt;&gt;&gt;&gt;&gt; moves to kmalloc-2k), so the relation is a DAG and cannot contain a cycle.
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; This will fix the problem.
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; But this will waste memory as we need smaller obj_exts array
+&gt;&gt;&gt;&gt;&gt; as the size gets larger.
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; We should probably create a new kmalloc type to avoid cycles instead?
+&gt;&gt;&gt;&gt;&gt; (needed only when memory profiling is enabled, though)
+&gt;&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;&gt; That would also prevent recursion even further.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; Yes but I assume that would add kmem caches even for users not using memory
+&gt;&gt;&gt;&gt; profiling. Anyways, I think that is a separate discussion. Am I understanding
+&gt;&gt;&gt;&gt; correctly that you don&#x27;t have any concerns with this approach?
+&gt;&gt;&gt;
+&gt;&gt;&gt; Umm, the memory waste is a concern?
+&gt;&gt;&gt;
+&gt;&gt;&gt; Minimally I&#x27;d now want to only do that size bumping when allocation
+&gt;&gt;&gt; profiling is enabled. Ideally that means both configured in and not booted
+&gt;&gt;&gt; with &quot;never&quot;.
+&gt;&gt;&gt;
+&gt;&gt;&gt; We probably should have done that already in 280ea9c3154b2. Because AFAIU
+&gt;&gt;&gt; memcg-only obj_exts array don&#x27;t have this issue (or maybe they do have the
+&gt;&gt;&gt; [1] issue? Harry?). But if memcg-only should keep avoiding the same size
+&gt;&gt;&gt; bucket, it can keep what it was doing and only memalloc profiling would do
+&gt;&gt;&gt; the strictly larger thing.
+&gt;&gt;
+&gt;&gt; memcg should not have this issue as normal kmalloc caches do not serve memcg
+&gt;&gt; charged objects. 
+&gt; 
+&gt; I am wrong here as I went back and see d8df600b67d7.
 
-So here we can do dedicated caches as Harry suggested or make this size bumping
-very specialized as Vlastimil suggested. What do we want long term? Orthogonally
-we do want this fix to be backported easily to older stable kernels. I will see
-how does this narrowed down size bumping looks like.</pre>
+(8dafa9f5900c upstream)
+
+&gt;&gt;
+&gt;&gt; So here we can do dedicated caches as Harry suggested or make this size bumping
+&gt;&gt; very specialized as Vlastimil suggested. What do we want long term? Orthogonally
+
+Maybe long term we make kmem_buckets unconditional and use that.
+
+&gt;&gt; we do want this fix to be backported easily to older stable kernels. I will see
+&gt;&gt; how does this narrowed down size bumping looks like.
+&gt;&gt;
+&gt; 
+&gt; BTW I think we need something like the following, right?
+&gt; 
+&gt; 	if (mem_alloc_profiling_enabled()) {
+&gt; 		if (obj_exts_cache-&gt;object_size &lt;= s-&gt;object_size)
+&gt; 			return s-&gt;object_size + 1;
+&gt; 	} else {
+&gt; 		if (obj_exts_cache-&gt;object_size == s-&gt;object_size)
+&gt; 			return s-&gt;object_size + 1;
+&gt; 	}
+
+Yeah.
+
+&gt;&gt;&gt;
+&gt;&gt;&gt; Suren&#x27;s input would be also nice to have.
+&gt;&gt;&gt;
+&gt;&gt;&gt; Thanks!
+&gt;&gt;&gt;
+&gt;&gt;&gt; [1] https://lore.kernel.org/oe-lkp/202601231457.f7b31e09-lkp@intel.com
+&gt;&gt;&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/09267187-6c85-438f-8791-4cce8d07892a@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: memory waste concern, requested change</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-06-28">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Harry Yoo</span>
+<a class="date-chip" href="../2026-06-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-28">2026-06-28</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Harry Yoo noted that the patch&#x27;s mem_alloc_profiling_enabled() check is unnecessary because it doesn&#x27;t address the issue on SLUB_TINY, and suggested removing it to avoid pessimizing memory allocation profiling and SLUB_TINY &amp;&amp; MEMCG users. He also proposed adding a comment to explain why obj_exts allocations cannot form a cycle between kmalloc caches when allocated from non-KMALLOC_NORMAL caches.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">We should not add mem_alloc_profiling_enabled() check because,
+then we&#x27;re not fixing this issue on SLUB_TINY, when the caller specifies
+__GFP_RECLAIMABLE|__GFP_ACCOUNT without memory allocation profiling.
+
+`if (!is_kmalloc_normal(s))` check already bails out when it doesn&#x27;t
+need to bump the size.
+
+So Shakeel&#x27;s original code will work fine.
+
+We&#x27;re only pessimizing memory allocation profiling and
+SLUB_TINY &amp;&amp; MEMCG users, but (as Vlastimil suggests off-list)
+it wouldn&#x27;t make much sense to enable MEMCG on memory restricted systems
+anyway. (IIRC even raspberry pis don&#x27;t enable the memory controller by
+default...)
+
+I think it&#x27;s okay to fix the bug first, but we need to address
+the memory wastage issue sooner or later if companies (Meta and
+Google I guess?) are deploying kernels with memory allocation profiling
+on in production systems.
+
+Perhaps it&#x27;s worth adding a comment like this, though:
+
+/*
+ * Only bump the size when the object (not the obj_exts array) is
+ * allocated from KMALLOC_NORMAL, either by memory allocation profiling
+ * or memcg on SLUB_TINY with __GFP_RECLAIMABLE|__GFP_ACCOUNT.
+ * Otherwise, obj_exts allocations cannot form a cycle between
+ * kmalloc caches.
+ */
+if (!is_kmalloc_normal(s))
+        return sz;
+
+Thanks!
+
+-- 
+Cheers,
+Harry / Hyeonggon</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Vlastimil (SUSE)</div>
-<a href="https://lore.kernel.org/r/akCJRTnmA2um3CIy@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: clarification, explanation, acknowledged</div>
+<a href="https://lore.kernel.org/r/68122038-e8e0-47ed-82f8-cb6a23e4658e@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Suren Baghdasaryan</span>
+<a class="date-chip" href="../2026-06-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-28">2026-06-28</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer suggested adding a new KMALLOC_TYPE to resolve the recursion problem, proposing that it be defined only when memory allocation profiling or SLUB_TINY are enabled, and expressed willingness to accept Shakeel&#x27;s approach as a temporary fix if their suggestion is too complex</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Sorry for the delay folks. I just got a chance to read through this thread.
+
+I think adding a new KMALLOC_TYPE would be the cleanest way to fix
+this recursion problem once and for all. This size bumping and the
+special case of SLUB_TINY are quite confusing. We could define that
+new KMALLOC_TYPE only if memory allocation profiling or SLUB_TINY are
+enabled to avoid new caches when not needed. Does not seem too complex
+but maybe I&#x27;m missing something? WDYT?
+
+If it is more complex than I imaging then I&#x27;m fine with Shakeel&#x27;s
+approach as a temporary fix.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Harry Yoo</div>
+<a href="https://lore.kernel.org/r/CAJuCfpFanDcpqq5B7eNZbw2HnWOXD-xzcnrdbz-e2gnSM2EYHA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NEEDS_WORK, POSITIVE</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3" id="2026-06-29">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Harry Yoo</span>
+<a class="date-chip" href="../2026-06-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-29">2026-06-29</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Harry Yoo noted that the patch&#x27;s logic for returning a larger kmalloc cache size is incorrect and suggested an alternative condition to check for mem_alloc_profiling_enabled()
+
+Reviewer Harry Yoo noted that the patch&#x27;s use of a new KMALLOC_TYPE may not be ideal in the long term, as it is based on GFP flags and does not provide a clear abstraction for slab object size, whereas SLAB_BUCKETS infrastructure introduced in v6.11 provides a more straightforward solution.
+
+Reviewer Harry Yoo requested enhancements to achieve the desired behavior with SLAB_BUCKETS, including renaming it to SLAB_BUCKETS_HARDENING and making its infrastructure unconditional but runtime-decided, creating kmem_buckets only when enabled, and using them for obj_exts array allocation during boot process.
+
+Reviewer Harry Yoo suggested a two-step approach to address the patch: first, apply the one-line fix that resolves the bug, and then minimize changes for backporting SLAB_BUCKETS</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">[ Adding Kees Cook for SLAB_BUCKETS conversation ]
+
+The thread:
+https://lore.kernel.org/linux-mm/20260625230029.703750-1-shakeel.butt@linux.dev/
+
+On 6/29/26 8:37 AM, Suren Baghdasaryan wrote:
+
+---
+
+As mentioned by Vlsatimil, in the long term, using SLAB_BUCKETS
+infrastructure would be more straightforward than new KMALLOC_TYPE
+because (I think) the kmalloc type is decided purely based on GFP
+flags and we need to somehow work around that. SLAB_BUCKETS provides
+a nice abstraction to do this.
+
+Luckily, SLAB_BUCKETS is introduced in v6.11.
+Unfortunately, SLAB_BUCKETS is optional.
+
+---
+
+I think we need some enhancements to achieve that with SLAB_BUCKETS
+
+1. Rename SLAB_BUCKETS to SLAB_BUCKETS_HARDENING
+   (w/ SLAB_BUCKETS being a transitional config for _HARDENING)
+
+2. Make the SLAB_BUCKETS infrastructure unconditional,
+   but the decision is made at runtime:
+
+   1) actually creating a kmem_buckets vs.
+   2) falling back to kmalloc.
+
+3. kmem_buckets_create() creates kmem_buckets only when
+   SLAB_BUCKETS_HARDENING is enabled.
+
+4. SLUB decides (not) to create kmem_buckets for internal use
+   during the boot process. Use the kmem_buckets for obj_exts
+   array allocation.
+
+Side note: this would unconditionally add the kmem_buckets parameter to
+the kmalloc slowpath. Probably it&#x27;d be worth introducing a dedicated
+entrypoint for kmem_buckets instead.
+
+---
+
+Since above requires quite some changes, I&#x27;d say let&#x27;s proeed with
+the fix (since it&#x27;s one line of code change that fixes a bug),
+and then see how we can make SLAB_BUCKETS changes as minimal
+as possible for backporting?
+
+-- 
+Cheers,
+Harry / Hyeonggon</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Suren Baghdasaryan</div>
+<a href="https://lore.kernel.org/r/eac2ed38-432a-4d95-8968-2663540d73d7@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, requested enhancements, additional work needed</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Suren Baghdasaryan</span>
+<a class="date-chip" href="../2026-06-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-28">2026-06-28</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Suren Baghdasaryan suggested using the new kmalloc_flags() function introduced by Vlastimil to simplify slab allocation, but noted that it is not backportable due to its recent introduction.
+
+Reviewer Suren Baghdasaryan suggested Shakeel&#x27;s approach for backports and kmalloc_flags()+KMALLOC_TYPE as an alternative to SLAB_BUCKETS, but noted that they haven&#x27;t looked closely into it yet</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yeah, this sounds quite complex. Maybe we could use the new
+kmalloc_flags() introduced by Vlastimil in [1] to avoid using GFP
+flags to indicate that we want to use this new KMALLOC_TYPE? That
+seems simpler, though it&#x27;s not backportable because kmalloc_flags() is
+brand new.
+
+[1] https://lore.kernel.org/all/20260615-slab_alloc_flags-v3-0-ce1146d140fb@kernel.org/
+
+---
+
+I was thinking Shakeel&#x27;s approach for backports and
+kmalloc_flags()+KMALLOC_TYPE going forward. Just throwing this as an
+option. I haven&#x27;t looked closely into SLAB_BUCKETS yet, so that might
+be indeed a better direction.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Harry Yoo</div>
+<a href="https://lore.kernel.org/r/CAJuCfpF78_5CjLsbJLte+B4MzfaSiAmyeH57VLhgLtj8AXD2NA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, NEUTRAL</div>
 </div>
 </div>
 </div>
 </div>
 </div>
 </div>
-<div class="thread-node depth-0">
+<div class="thread-node depth-0" id="2026-06-27">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Shakeel Butt (author)</span>
@@ -414,7 +1354,7 @@ how does this narrowed down size bumping looks like.</pre>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author is addressing a concern about the patch&#x27;s logic for handling slabobj_ext array allocation when memcg accounting is enabled or disabled, proposing an additional check to ensure that the obj_exts cache object size is strictly larger than the current slab&#x27;s object size.</div>
+<div class="review-comment-text">Author responded to concerns about the patch&#x27;s approach to size bumping, proposing a conditional check for mem_alloc_profiling_enabled() and explaining that it would allow for easier backporting to older stable kernels.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">BTW I think we need something like the following, right?
@@ -428,7 +1368,7 @@ how does this narrowed down size bumping looks like.</pre>
 	}</pre>
 </details>
 <a href="https://lore.kernel.org/r/akCSftF6mrsKsz1V@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: clarification, proposed modification</div>
+<div class="review-comment-signals">Signals: clarifying explanation, no clear resolution signal</div>
 </div>
 </div>
 </div>

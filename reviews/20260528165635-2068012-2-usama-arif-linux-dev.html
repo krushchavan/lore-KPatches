@@ -238,105 +238,10 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 1/2] mm: bypass mmap_miss heuristic for VM_EXEC readahead</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260528165635.2068012-2-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-05-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-05-29</strong><div class="date-range-nav">Active on: <a href="#2026-05-29">2026-05-29</a> &bull; <a href="#2026-05-28">2026-05-28</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-05-29</strong><div class="date-range-nav">Active on: <a href="#2026-05-29">2026-05-29</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the Linux kernel&#x27;s memory management to bypass the mmap_miss heuristic for VM_EXEC readahead mappings. The mmap_miss heuristic is intended to prevent speculative mmap readahead when a file appears to be randomly accessed, but this does not fit well with the VM_EXEC path. The patch changes the behavior of do_async_mmap_readahead and filemap_map_pages to skip both increments and decrements of the mmap_miss counter for VM_EXEC mappings, matching the existing treatment for VM_SEQ_READ mappings. This ensures that the counter remains symmetric and accurate for executable mappings.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-05-28">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Usama Arif (author)</span>
-<a class="date-chip" href="../2026-05-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-05-28">2026-05-28</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is reiterating the original patch description and reasoning, emphasizing that VM_EXEC readahead is already constrained differently from ordinary mmap read-around, and that skipping both increments and decrements for VM_EXEC mappings keeps the counter accounting symmetric.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">The mmap_miss heuristic is intended to stop speculative mmap readahead
-when a file looks like a random-access workload. That does not fit the
-VM_EXEC path very well.
-
-VM_EXEC readahead is already constrained differently from ordinary mmap
-read-around: it is bounded by the VMA, uses exec_folio_order() to choose
-an order useful for executable mappings, and sets async_size to 0 so it
-does not create follow-on readahead. When VM_HUGEPAGE is also present,
-the larger readahead is an explicit userspace opt-in.
-
-The mmap_miss counter is decremented from cache-hit paths in
-do_async_mmap_readahead() and filemap_map_pages(). Those paths are not
-always enough to balance the synchronous miss increments for executable
-mappings. In particular, when fault-around is effectively disabled, such
-as configurations where fault_around_pages is 1, filemap_map_pages() is
-not reached from the fault path. The counter can then become a stale
-throttle for VM_EXEC mappings and suppress the readahead behavior that
-the executable-specific path is trying to provide.
-
-Skip both mmap_miss increments and decrements for VM_EXEC mappings,
-matching the existing VM_SEQ_READ treatment and keeping the counter
-accounting symmetric.
-
-Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
-Reviewed-by: Jan Kara &lt;jack@suse.cz&gt;
-Reviewed-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
----
- mm/filemap.c | 14 +++++++-------
- 1 file changed, 7 insertions(+), 7 deletions(-)
-
-diff --git a/mm/filemap.c b/mm/filemap.c
-index cca20e350c95..a16b33e0fc71 100644
---- a/mm/filemap.c
-+++ b/mm/filemap.c
-@@ -3339,7 +3339,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
- 		}
- 	}
- 
--	if (!(vm_flags &amp; VM_SEQ_READ)) {
-+	if (!(vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
- 		/* Avoid banging the cache line if not needed */
- 		mmap_miss = READ_ONCE(ra-&gt;mmap_miss);
- 		if (mmap_miss &lt; MMAP_LOTSAMISS * 10)
-@@ -3434,12 +3434,12 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
- 	 * times for a single folio and break the balance with mmap_miss
- 	 * increase in do_sync_mmap_readahead().
- 	 *
--	 * VM_SEQ_READ mappings skip the mmap_miss increment in
-+	 * VM_SEQ_READ and VM_EXEC mappings skip the mmap_miss increment in
- 	 * do_sync_mmap_readahead(), so skip the decrement here as well to
- 	 * keep the counter symmetric.
- 	 */
- 	if (likely(!folio_test_locked(folio)) &amp;&amp;
--	    !(vmf-&gt;vma-&gt;vm_flags &amp; VM_SEQ_READ)) {
-+	    !(vmf-&gt;vma-&gt;vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
- 		mmap_miss = READ_ONCE(ra-&gt;mmap_miss);
- 		if (mmap_miss)
- 			WRITE_ONCE(ra-&gt;mmap_miss, --mmap_miss);
-@@ -3941,14 +3941,14 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
- 		 * Don&#x27;t decrease mmap_miss in this scenario to make sure
- 		 * we can stop read-ahead.
- 		 *
--		 * VM_SEQ_READ mappings skip the mmap_miss increment in
--		 * do_sync_mmap_readahead(), so skip the decrement here as
--		 * well to keep the counter symmetric.
-+		 * VM_SEQ_READ and VM_EXEC mappings skip the mmap_miss
-+		 * increment in do_sync_mmap_readahead(), so skip the
-+		 * decrement here as well to keep the counter symmetric.
- 		 */
- 		if ((map_ret &amp; VM_FAULT_NOPAGE) &amp;&amp;
- 		    !(vmf-&gt;flags &amp; FAULT_FLAG_TRIED) &amp;&amp;
- 		    !folio_test_workingset(folio) &amp;&amp;
--		    !(vma-&gt;vm_flags &amp; VM_SEQ_READ)) {
-+		    !(vma-&gt;vm_flags &amp; (VM_SEQ_READ | VM_EXEC))) {
- 			unsigned short mmap_miss;
- 
- 			mmap_miss = READ_ONCE(file-&gt;f_ra.mmap_miss);
--- 
-2.52.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260528165635.2068012-2-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: no clear resolution signal, author reiterating original patch description</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-05-29">
+<div class="thread-node depth-0" id="2026-05-29">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Pedro Falcato</span>
@@ -348,8 +253,6 @@ index cca20e350c95..a16b33e0fc71 100644
 <div class="review-comment-text">Gave Reviewed-by</div>
 <div class="reply-to-label">&#8627; replying to Usama Arif</div>
 <a href="https://lore.kernel.org/r/ahlgda3xJ587eSCg@pedro-suse.lan" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-</div>
-</div>
 </div>
 </div>
 </div>
