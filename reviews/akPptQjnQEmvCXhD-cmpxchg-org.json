@@ -1,0 +1,51 @@
+{
+  "thread_id": "akPptQjnQEmvCXhD@cmpxchg.org",
+  "subject": "[PATCH v3 1/2] mm/vmpressure: skip tree=true accounting on cgroup v2",
+  "url": "https://lore.kernel.org/all/akPptQjnQEmvCXhD@cmpxchg.org/",
+  "dates": {
+    "2026-06-30": {
+      "report_file": "2026-06-30_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Johannes Weiner",
+          "summary": "Acknowledged the patch and suggested a simplification to the guard condition, but expressed no strong feelings about it.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEUTRAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Posted an updated patch with a fixlet to simplify the guard, and asked for Andrew's opinion on applying it.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEUTRAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "\n\nOn 30/06/2026 17:07, Johannes Weiner wrote:\n> On Tue, Jun 30, 2026 at 04:23:32AM -0700, Usama Arif wrote:\n>> vmpressure() has two outputs gated by the @tree argument:\n>>\n>>   @tree=false drives in-kernel socket pressure (mem_cgroup_set_\n>>               socket_pressure), consumed by TCP/SCTP. This only\n>>               applies on cgroup v2; on v1 socket memory is charged\n>>               separately via tcpmem and the consumer reads\n>>               memcg->tcpmem_pressure instead.\n>>\n>>   @tree=true  drives userspace eventfd notifications via the v1\n>>               memory.pressure_level / cgroup.event_control interface.\n>>               v2 has no equivalent: userspace gets reclaim signals\n>>               through memory.pressure (PSI), which does not touch\n>>               vmpressure.\n>>\n>> The existing early return covered v1 + @tree=false. The symmetric\n>> v2 + @tree=true case was falling through and doing the full lock /\n>> accumulate / schedule_work / parent-walk dance for an events list\n>> that can never be populated. bpftrace on a 176-core production host\n>> (cgroup v2, CONFIG_MEMCG_V1=n, 285 memcgs, sustained reclaim) showed\n>> ~16,200 @tree=true vmpressure() calls per minute. Add an early return\n>> that skips cgroup v2 + tree = true which avoids us doing all this work.\n>> On a v2-only host this also eliminates a lock contention path that can\n>> serialise reclaimers on a single global sr_lock.\n>>\n>> Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n>> Signed-off-by: Usama Arif <usama.arif@linux.dev>\n>> ---\n>>  mm/vmpressure.c | 10 ++++++----\n>>  1 file changed, 6 insertions(+), 4 deletions(-)\n>>\n>> diff --git a/mm/vmpressure.c b/mm/vmpressure.c\n>> index f053554e5826..c82cee1ab43b 100644\n>> --- a/mm/vmpressure.c\n>> +++ b/mm/vmpressure.c\n>> @@ -246,11 +246,13 @@ void vmpressure(gfp_t gfp, int order, struct mem_cgroup *memcg, bool tree,\n>>  \t\treturn;\n>>  \n>>  \t/*\n>> -\t * The in-kernel users only care about the reclaim efficiency\n>> -\t * for this @memcg rather than the whole subtree, and there\n>> -\t * isn't and won't be any in-kernel user in a legacy cgroup.\n>> +\t * Only two combinations have a consumer:\n>> +\t *   cgroup v2 + tree=false -> in-kernel socket pressure\n>> +\t *   cgroup v1 + tree=true  -> userspace eventfds (memory.pressure_level)\n>> +\t * Skip the other two: nothing consumes the result.\n>>  \t */\n>> -\tif (!cgroup_subsys_on_dfl(memory_cgrp_subsys) && !tree)\n>> +\tif ((!cgroup_subsys_on_dfl(memory_cgrp_subsys) && !tree) ||\n>> +\t    (cgroup_subsys_on_dfl(memory_cgrp_subsys) && tree))\n>>  \t\treturn;\n> \n> I had already acked this one, with a half serious suggestion to make\n> this\n> \n> \tif (cgroup_subsys_on_dfl(memory_cgrp_subsys) == tree)\n> \t\treturn;\n> \n> Anyway, no strong feelings. If nobody agrees,\n> \n> Acked-by: Johannes Weiner <hannes@cmpxchg.org>\n\nYeah sorry about this! I just amended my last patch to move code\nfrom vmpressure-v1.c to memcontrol-v1.c and just sent it, without\nother changes. Forgot Shakeels ack on v2 as well :(\n\nAndrew would you mind applying the below fixlet? I can also respin\nif its easier. Thanks!!\n\n>From 969c19da782bbcd77ae4b9e94d3a9e1d78c198d7 Mon Sep 17 00:00:00 2001\nFrom: Usama Arif <usama.arif@linux.dev>\nDate: Tue, 30 Jun 2026 09:25:05 -0700\nSubject: [fixlet] mm/vmpressure: skip tree=true accounting on cgroup v2\n\nSimplify the guard. Both cgroup_subsys_on_dfl() and tree are bool, so\nthe two combinations that have no consumer (v1 + tree=false, v2 +\ntree=true) are exactly the cases where dfl == tree.\n\nSuggested-by: Johannes Weiner <hannes@cmpxchg.org>\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n mm/vmpressure.c | 3 +--\n 1 file changed, 1 insertion(+), 2 deletions(-)\n\ndiff --git a/mm/vmpressure.c b/mm/vmpressure.c\nindex 14470141bbe6..9629240d77ad 100644\n--- a/mm/vmpressure.c\n+++ b/mm/vmpressure.c\n@@ -120,8 +120,7 @@ void vmpressure(gfp_t gfp, int order, struct mem_cgroup *memcg, bool tree,\n \t *   cgroup v1 + tree=true  -> userspace eventfds (memory.pressure_level)\n \t * Skip the other two: nothing consumes the result.\n \t */\n-\tif ((!cgroup_subsys_on_dfl(memory_cgrp_subsys) && !tree) ||\n-\t    (cgroup_subsys_on_dfl(memory_cgrp_subsys) && tree))\n+\tif (cgroup_subsys_on_dfl(memory_cgrp_subsys) == tree)\n \t\treturn;\n \n \tvmpr = memcg_to_vmpressure(memcg);\n-- \n2.53.0-Meta\n\n\n\n\n\n\n",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-06-30",
+          "message_id": "",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Patch v3 of mm/vmpressure: skip tree=true accounting on cgroup v2, with a suggested fixlet to simplify the guard."
+    }
+  }
+}

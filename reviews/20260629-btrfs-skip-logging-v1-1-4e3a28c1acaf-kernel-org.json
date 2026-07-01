@@ -9,6 +9,44 @@
       "reviews": [
         {
           "author": "Filipe Manana",
+          "summary": "Reviewer Filipe Manana questioned the patch's logic, pointing out that fsync takes the inode's i_mmap_lock in write/exclusive mode and btrfs_scan_inode also takes this lock in shared/read mode, making it unlikely for the shrinker to race with fsync. He also corrected a minor syntax error.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "corrected syntax"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I don't see how that can happen, because fsync always takes the\ninode's i_mmap_lock (in write/exclusive mode), and btrfs_scan_inode()\ntakes the same lock too (in shared/read mode).\nEXTENT_FLAG_LOGGING is only set and cleared during fsync, so how can\nthe shrinker race with fsync?\n\nAlso, there should be no () after modified_extents (it's not a function name).\n\nThanks.",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-06-29",
+          "message_id": "CAL3q7H5o6vKOcQ0G4shQw6q7vCpfZYo8KO6Rg6VdChDoMB+C=g@mail.gmail.com",
+          "email": "fdmanana@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author acknowledged that the i_mmap_lock interlock is incomplete and can't guarantee that LOGGING won't be set on extent maps after taking the lock, which contradicts the original invariant. The author provided analysis showing that tree-log.c never takes i_mmap_lock, but btrfs_sync_file does only for the inode being fsync'd, leaving other inodes vulnerable to having their ems' LOGGING flag set while the shrinker is running.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "incomplete interlock",
+            "LOGGING can still be set"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "...and yet, the vmcore shows that the shrinker hit an extent_map that\nhad LOGGING set while holding the i_mmap_lock.\n\nI had hoped to add an assertion here that LOGGING couldn't be set on\nthe em's after taking the i_mmap_lock, but that's not viable:\n\nThe problem is that the i_mmap_lock coverage isn't complete. I had\nClaude assist me with some analysis so take it with a hefty grain of\nsalt but the problem is that the em tree can contain em's from other\ninodes where the i_mmap_lock is not held:\n\n-----------------------8<---------------------\n\n...that inode is in progress, therefore no em in its tree should have LOGGING set. Your invariant is the right one.\n\n But it's violated, because the i_mmap_lock interlock is incomplete. Two facts:                                                                                                                                         \n                                                                                                                                                                                                                         \n  1. tree-log.c never takes i_mmap_lock — grep returns 0 occurrences. Only btrfs_sync_file takes it (file.c:1608/1610), and only                                                                                         \n  on the one inode being fsync'd.                                                                                                                                                                                        \n  2. A single fsync logs many other inodes, and each can set LOGGING on its own ems via btrfs_log_changed_extents().                                                                                                     \n  btrfs_log_inode() is called recursively on conflicting inodes, parent directories, and referenced inodes:                                                                                                              \n  tree-log.c:5982  btrfs_log_inode(di_inode, log_mode)        # dir dentries                                                                                                                                             \n  tree-log.c:6339  btrfs_log_inode(inode, LOG_INODE_ALL)      # conflicting inodes                                                                                                                                       \n  tree-log.c:6900  btrfs_log_inode(di_inode, log_mode)        # new dir dentries                                                                                                                                         \n  tree-log.c:7389  btrfs_log_inode(dir_inode, LOG_INODE_ALL)  # log_all_parents                                                                                                                                          \n  tree-log.c:7488  btrfs_log_inode(inode, ...)                # referenced inodes                                                                                                                                        \n\n  2. For all of these, btrfs_sync_file holds i_mmap_lock on the original fsync'd inode — not on these side inodes. So a side                                                                                             \n  inode X gets LOGGING set on its ems while X's own i_mmap_lock is free.                                                                                                                                                 \n                                                                                                                                                                                                                         \n  So the shrinker can down_read_trylock(X->i_mmap_lock) successfully (nobody holds it) and walk X's tree while X's ems are                                                                                               \n  LOGGING-flagged → it removes+frees one → corruption. The interlock only protects the directly-fsync'd inode, not the inodes                                                                                            \n  logged as its dependencies.",
+          "reply_to": "Filipe Manana",
+          "message_date": "2026-06-29",
+          "message_id": "5084d9c6b6a7025be156354194cf7d3fffebb0e2.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Filipe Manana",
           "summary": "Reviewer noted that the em tree should only contain extent maps for its owning inode, and suggested investigating why the buggy behavior occurs elsewhere in the code",
           "sentiment": "needs_work",
           "sentiment_signals": [
@@ -47,6 +85,32 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch fixes a bug in the Btrfs extent map shrinker that can cause corruption and RCU stalls by freeing an extent map that is still being logged. The fix involves adding a check to skip extent maps that are being logged, similar to how pinned maps are skipped. This prevents a use-after-free situation where a later fsync operation tries to access the freed extent map. The patch addresses a problem that has been observed in production environments on both ARM64 and x86_64 architectures."
+    },
+    "2026-06-30": {
+      "report_file": "2026-06-30_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Filipe Manana",
+          "summary": "Reviewer noted that if the shrinker gets an extent map with the LOGGING flag, it could be due to a bug where one inode's fsync is logging extent maps of another inode, causing corruption and data loss because two locks are not held. Alternatively, it could indicate corrupted extent maps.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "bug",
+            "corruption"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "To make it as simple as possible:\n\nAn fsync can only log extent maps for the inode being fsynced; other\ninodes can be logged, but not their extent maps.\nIn order to log extent maps, we need to have the i_mmap_lock (in\nwrite/exclusive mode) and the vfs lock on the inode too.\n\nSymlinks have an inline extent but no extent map.\nDirectories never have extents.\n\nSo if the shrinker gets an extent map with the LOGGING flag, one of\ntwo things is happening:\n\n1) An fsync of one inode is logging extent maps of another. This bug\ncan cause corruption and data loss, because we must hold those two\nlocks to prevent races with writes (buffered, direct IO, mmap) and\nother operations (truncate, hole punching, etc.), as previously\nstated.\n\n2) Something is corrupting an extent map, either inside or outside\n(most likely) the fsync code.\n\nThanks.",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-06-30",
+          "message_id": "CAL3q7H5Gdz2jE1_=JhaU1wXR8izbHb_3a76zuYdBKEWDXVjN0w@mail.gmail.com",
+          "email": "fdmanana@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch prevents the btrfs shrinker from modifying extent maps that are currently being logged, which can cause data corruption and other issues."
     }
   }
 }

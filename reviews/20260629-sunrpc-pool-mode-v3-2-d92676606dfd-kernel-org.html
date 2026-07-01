@@ -238,9 +238,115 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 2/4] sunrpc: hardcode pool_mode to pernode, remove other modes</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260629-sunrpc-pool-mode-v3-2-d92676606dfd@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-29</strong><div class="date-range-nav">Active on: <a href="#2026-06-29">2026-06-29</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch hardcodes the pool mode to pernode, removing other modes such as SVC_POOL_AUTO/GLOBAL/PERCPU. The default behavior on multi-NUMA hosts is changed to create one pool per NUMA node by default. This change simplifies the code and improves performance by providing proper thread affinity and NUMA-local memory allocation. The module parameter and netlink interfaces are preserved for backward compatibility, but writing any value other than &#x27;pernode&#x27; will emit a deprecation notice.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-06-29</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-30</strong><div class="date-range-nav">Active on: <a href="#2026-06-30">2026-06-30</a> &bull; <a href="#2026-06-29">2026-06-29</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch hardcodes the pool mode to pernode, which is considered the right choice everywhere. It removes other modes such as SVC_POOL_AUTO/GLOBAL/PERCPU/PERNODE and simplifies pool map functions. The default behavior on multi-NUMA hosts changes to one pool per NUMA node by default. The module parameter and netlink interfaces are preserved for backward compatibility, but writing any previously-accepted value succeeds silently and reading always returns &quot;pernode&quot;. The patch also updates the documentation to mark the pool_mode parameter deprecated and describe the new behavior.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-06-30">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-06-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-30">2026-06-30</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the removal of prefix matching in __param_set_pool_mode() causes previously accepted values like &#x27;globalx&#x27; to be rejected with -EINVAL, and requested a fix to ensure backwards compatibility
+
+Reviewer Chuck Lever noted that the kdoc modification in Documentation/admin-guide/kernel-parameters.txt is inconsistent, as it still refers to &#x27;cpus to pools&#x27; despite percpu mode being removed and the patch correcting struct field comments to reflect a node-to-pool mapping.
+
+Reviewer Chuck Lever noted that an unpooled svc_new_thread() running concurrently with an nfsd start or stop may observe m-&gt;count != 0 while pool_to is still NULL or already freed, and dereference it in svc_pool_map_put(), requesting the lock be dropped before calling try_to_unmap().
+
+The reviewer noted that the patch introduces a potential dereference of pool_to[] when m-&gt;count is non-zero, and svc_new_thread() calls svc_pool_map_get_node(pool-&gt;sp_id) without holding any necessary locks or references.
+
+Reviewer noted that pool_to[pidx] is dereferenced before the m-&gt;count == 0 check, making the WARN/return in svc_pool_map_get() dead code due to the sv_nrpools &gt; 1 gate at the call site.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">sysfs_match_string() compares the whole string, whereas the old
+__param_set_pool_mode() matched prefixes (strncmp(val, &quot;global&quot;, 6)
+and friends). An input like &quot;globalx&quot; that the old code accepted is
+now rejected with -EINVAL.
+
+The commit message says:
+
+  Writing any previously-accepted value succeeds silently
+
+The four documented names still succeed, including with a trailing
+newline since sysfs_streq() tolerates one, so only prefix-extended
+strings change.
+
+---
+
+Regarding the kdoc modification above: with percpu removed the
+map is node-to-pool; &quot;cpus to pools&quot; now contradicts the struct
+field comments this same patch corrected (&quot;maps pool id to
+node&quot; / &quot;maps node to pool id&quot;).
+
+---
+
+svc_pool_map_put() frees pool_to[] and sets it back to NULL when the
+last pooled reference drops.
+
+Can an unpooled svc_new_thread() running concurrently with an nfsd
+start or stop observe m-&gt;count != 0 while pool_to is still NULL (the
+first get) or already freed (the last put), and dereference it here?
+The reads of m-&gt;count and m-&gt;pool_to are not under the mutex.
+
+The old default global mode returned numa_mem_id() in this case and
+never touched pool_to[]; with pernode as the default this path runs
+for every server. Would it help to consult pool_to[] only when the
+service holds a reference, the way svc_pool_map_set_cpumask() is
+already gated in svc_new_thread()?
+
+        if (serv-&gt;sv_nrpools &gt; 1)
+                svc_pool_map_set_cpumask(task, pool-&gt;sp_id);
+
+An unpooled service (sv_nrpools == 1) could then take numa_mem_id()
+without reading the shared map.
+
+---
+
+This path now dereferences pool_to[] whenever m-&gt;count is non-zero.
+
+svc_new_thread() calls it for every service, pooled or not, holding
+neither svc_pool_map_mutex nor a map reference:
+
+        node = svc_pool_map_get_node(pool-&gt;sp_id);
+
+Unpooled services reach this too: lockd and the NFS callback are both
+created with svc_create(), which passes npools = 1 and never calls
+svc_pool_map_get(), so their m-&gt;count is whatever a pooled nfsd has
+left set.
+
+svc_pool_map_get() bumps the count before pool_to[] is allocated, and
+the whole sequence is serialized only against other map writers:
+
+        mutex_lock(&amp;svc_pool_map_mutex);
+        if (m-&gt;count++) {
+                ...
+        }
+        npools = svc_pool_map_init_pernode(m);   /* allocates pool_to */
+
+---
+
+pool_to[pidx] is dereferenced before the m-&gt;count == 0 check, so if
+count were ever 0 the NULL deref has already happened and the
+WARN/return can never fire. The sv_nrpools &gt; 1 gate at the call site
+keeps this safe, so the guard is now dead code.
+
+For the series as a whole, let&#x27;s consider moving 5/4 to the front.
+It looks like a fix that might want to be backported.
+
+
+-- 
+Chuck Lever</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/3f46fdf3-553f-489f-9259-e98e3e1fb9e5@app.fastmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: backward compatibility issue, potential regression, inconsistency in documentation</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
