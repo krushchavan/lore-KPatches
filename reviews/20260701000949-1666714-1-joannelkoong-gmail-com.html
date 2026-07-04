@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 00/18] iomap: convert to in-iter iomap_next() model</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260701000949.1666714-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-30</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-02</strong><div class="date-range-nav">Active on: <a href="#2026-07-02">2026-07-02</a> &bull; <a href="#2026-07-01">2026-07-01</a> &bull; <a href="#2026-06-30">2026-06-30</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-06-30</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-03</strong><div class="date-range-nav">Active on: <a href="#2026-07-03">2026-07-03</a> &bull; <a href="#2026-07-02">2026-07-02</a> &bull; <a href="#2026-07-01">2026-07-01</a> &bull; <a href="#2026-06-30">2026-06-30</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series converts the iomap code to use an iterator model, replacing the legacy -&gt;iomap_begin() and -&gt;iomap_end() interface. The conversion is mechanical, with no functional changes intended. The new -&gt;iomap_next() interface allows filesystems to provide direct begin/end helper functions, which are then used by the iomap_process() inline helper. The patches also update the documentation to reflect the new iterator model.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-06-30">
@@ -11715,6 +11715,221 @@ https://lists.sourceforge.net/lists/listinfo/linux-f2fs-devel</pre>
 </details>
 <a href="https://lore.kernel.org/r/20260703014255.GR9392@frogsfrogsfrogs" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: agreed, suggested</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-07-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Darrick Wong</span>
+<a class="date-chip" href="../2026-07-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-03">2026-07-03</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Darrick Wong noted that iomap::private and iomap_iter::private serve different purposes, with the former being used for per-mapping data and the latter for per-operation context, and suggested moving private from struct iomap to struct iomap_iter to address constness issues. He also pointed out that low-level begin/end ops should be updated to pass the iter instead of using container_of.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri, Jul 03, 2026 at 02:43:31PM +0200, Christoph Hellwig wrote:
+&gt; On Thu, Jul 02, 2026 at 07:00:20PM -0700, Darrick J. Wong wrote:
+&gt; &gt; The -&gt;begin method can still set iomap::private and the -&gt;end method can
+&gt; &gt; dispose of it, right?  Oh, wait, no, that doesn&#x27;t work because you&#x27;re
+&gt; &gt; talking about -&gt;begin/-&gt;end passing something to the next -&gt;begin.
+&gt; 
+&gt; Should we move -&gt;private from struct iomap to struct iomap_iter?
+&gt; That&#x27;ll deal with the constness and the fact that private data
+&gt; really is a per-operation thing.
+
+I dunno -- towards the end of the fuse-iomap development work I actually
+had started using iomap.private to store per-mapping private data.  But
+that work is dead now, so that&#x27;s not a strong argument.
+
+&gt; That also reminds me that now that we actually still keep the low-level
+&gt; begin/end ops we need to switch them to a calling convention that
+&gt; passes the iter instead of the ugly container_of.  This is something
+&gt; I wanted deferred until we get the iter conversion, but it turns out
+&gt; that now leaves them untouched..
+
+Oh, you mean changing the signature to:
+
+typedef int (iomap_begin_fn)(struct iomap_iter *iter...);
+
+instead of passing parts of the iter as separate arguments?
+Yeah, that would be nice.
+
+&gt; &gt; Hm.  I was thinking that the signature for iomap_process could be
+&gt; &gt; cleaner if you didn&#x27;t have to pass iomap/srcmap explicitly.
+&gt; &gt; iomap_process could do the (dangerous) casting from the (const struct
+&gt; &gt; iomap_iter *) to the (struct iomap *) pointers before calling -&gt;begin
+&gt; &gt; and -&gt;end.
+&gt; 
+&gt; I don&#x27;t quite understand those part.
+
+Let me try again.  Instead of passing three arguments:
+
+int fubar_iomap_next(const struct iomap_iter *iter,
+	struct iomap *i, struct iomap *s)
+{
+	...
+}
+
+pass one instead:
+
+int fubar_iomap_next(const struct iomap_iter *iter)
+{
+	struct iomap *i = (struct iomap *)&amp;iter-&gt;iomap;
+	struct iomap *s = (struct iomap *)&amp;iter-&gt;srcmap;
+	...
+}
+
+to simplify the call sites.  The gross part of this is (1) having a
+const iomap_iter pointer to prevent filesystems from screwing around
+with the iter, and therefore (2) the need for explicit casting to remove
+the constness from the two iomappings.
+
+--D
+
+---
+
+On Fri, Jul 03, 2026 at 05:34:59PM -0700, Joanne Koong wrote:
+&gt; On Fri, Jul 3, 2026 at 9:11\u202fAM Darrick J. Wong &lt;djwong@kernel.org&gt; wrote:
+&gt; &gt;
+&gt; &gt; On Fri, Jul 03, 2026 at 02:43:31PM +0200, Christoph Hellwig wrote:
+&gt; &gt; &gt; On Thu, Jul 02, 2026 at 07:00:20PM -0700, Darrick J. Wong wrote:
+&gt; &gt; &gt; &gt; The -&gt;begin method can still set iomap::private and the -&gt;end method can
+&gt; &gt; &gt; &gt; dispose of it, right?  Oh, wait, no, that doesn&#x27;t work because you&#x27;re
+&gt; &gt; &gt; &gt; talking about -&gt;begin/-&gt;end passing something to the next -&gt;begin.
+&gt; &gt; &gt;
+&gt; &gt; &gt; Should we move -&gt;private from struct iomap to struct iomap_iter?
+&gt; &gt; &gt; That&#x27;ll deal with the constness and the fact that private data
+&gt; &gt; &gt; really is a per-operation thing.
+&gt; 
+&gt; I&#x27;m not sure I understand. Doesn&#x27;t struct iomap_iter already have a
+&gt; private field that holds caller-supplied per-operation context?
+&gt; afaics, the users of iomap-&gt;private (gfs2, ntfs3, fuse-dax) do use it
+&gt; for per-mapping data and release it in the same iteration.
+
+Oh right, iomap_iter::private is a private pointer that the filesystem
+can sometimes set to pass per-file-operation data to -&gt;iomap_{begin,end}
+... that is tortuously extracted from the iomap_iter via the iomap
+pointer.
+
+iomap::private is a private pointer that the filesystem can set to pass
+per-mapping data from -&gt;iomap_begin to -&gt;iomap_end.
+
+IOWS, never mind, I&#x27;m babbling nonsense.
+
+--D
+
+&gt; &gt; I dunno -- towards the end of the fuse-iomap development work I actually
+&gt; &gt; had started using iomap.private to store per-mapping private data.  But
+&gt; &gt; that work is dead now, so that&#x27;s not a strong argument.
+&gt; &gt;
+&gt; &gt; &gt; That also reminds me that now that we actually still keep the low-level
+&gt; &gt; &gt; begin/end ops we need to switch them to a calling convention that
+&gt; &gt; &gt; passes the iter instead of the ugly container_of.  This is something
+&gt; &gt; &gt; I wanted deferred until we get the iter conversion, but it turns out
+&gt; &gt; &gt; that now leaves them untouched..
+&gt; 
+&gt; That&#x27;s a good point. Do you think it&#x27;d be better to include those
+&gt; changes as part of this series or do that as a separate follow-up
+&gt; series that targets the same merge window timeline as this one?
+&gt; 
+&gt; &gt;
+&gt; &gt; Oh, you mean changing the signature to:
+&gt; &gt;
+&gt; &gt; typedef int (iomap_begin_fn)(struct iomap_iter *iter...);
+&gt; &gt;
+&gt; &gt; instead of passing parts of the iter as separate arguments?
+&gt; &gt; Yeah, that would be nice.
+&gt; 
+&gt; Agreed.
+&gt; 
+&gt; Thanks,
+&gt; Joanne</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260703161147.GB9407@frogsfrogsfrogs" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NEEDS_WORK, POSITIVE</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Christian Brauner</span>
+<a class="date-chip" href="../2026-07-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-03">2026-07-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Christian Brauner noted that Christoph Hellwig suggested delaying the patch series until the next merge window to minimize cross-subsystem merge pain, and Joanne Koong agreed to submit everything but this patch and the last one before the merge window closes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 2026-07-02 18:47 -0700, Joanne Koong wrote:
+&gt; On Thu, Jul 2, 2026 at 9:51\u202fAM Darrick J. Wong &lt;djwong@kernel.org&gt; wrote:
+&gt; &gt;
+&gt; &gt; On Thu, Jul 02, 2026 at 04:07:05PM +0200, Christoph Hellwig wrote:
+&gt; &gt; &gt; Looks good:
+&gt; &gt; &gt;
+&gt; &gt; &gt; Reviewed-by: Christoph Hellwig &lt;hch@lst.de&gt;
+&gt; &gt; &gt;
+&gt; &gt; &gt; In terms of merge logistics, I wonder if we should delay this and
+&gt; &gt; &gt; the previous patch to the next merge window so that we can minimize the
+&gt; &gt; &gt; cross-subsystem merge pain with more file system iomap conversion.
+&gt; &gt; &gt; If none of them actually happen until rc6 or so, orif  the merges aren&#x27;t
+&gt; &gt; &gt; painful we could still pick them up late in the merge window.
+&gt; &gt;
+&gt; &gt; I&#x27;d say everything but this patch should go in during the merge window
+&gt; &gt; for 7.3, along with clear instructions to brauner/torvalds to expect
+&gt; &gt; this patch to appear right before 7.3-rc1 gets tagged, to clean up all
+&gt; &gt; the other changes that come in.
+&gt; 
+&gt; Just to clarify, did you mean this patch and the previous one? If i&#x27;m
+&gt; interpreting Christoph&#x27;s concern correctly, I think he&#x27;s worried about
+&gt; other filesystems converting to iomap using the -&gt;iomap_begin() /
+&gt; -&gt;iomap_end() functions still? That sounds like a good plan to me, for
+&gt; v3 I&#x27;ll submit everything but this patch and the last one and then
+
+Ok, so we&#x27;ll do the prep for vfs-7.3.iomap (aka to be merged in the
+v7.3-rc1 cycle)...
+
+&gt; submit these patches (and any cleanup ones that become necessary) to
+&gt; Christian right before 7.3-rc1 gets tagged (which as I understand it,
+&gt; is when the merge window is about to close).
+
+and merge these _after_ v7.3-rc1 has been tagged...</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260703-nachrangig-gegeben-befestigen-8219a53648c7@brauner" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: delay, merge</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Andreas Gruenbacher</span>
+<a class="date-chip" href="../2026-07-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-03">2026-07-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Andreas Gruenbacher questioned the base commit of the patch series, citing that it does not match the expected repository and branch (vfs.iomap) in the Linux kernel&#x27;s git tree, and requested a proper merge point.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Joanne,
+
+you say in the cover letter that
+
+&gt;This series is submitted against Christian&#x27;s vfs iomap tree, and is based
+&gt; on top of the current head of his tree (commit f2727952b21d1).
+
+which repository and branch is that? It&#x27;s not vfs.iomap in
+git://git.kernel.org/pub/scm/linux/kernel/git/vfs/vfs.git; I don&#x27;t
+have a proper merge point.
+
+Thanks,
+Andreas</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAHc6FU76J-YYRd2B=ZPN2DMabQjkzgG9qSzbP_S1s9AsSJNh=w@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested clarification on base commit, requested proper merge point</div>
 </div>
 </div>
 </div>

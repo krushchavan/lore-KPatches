@@ -1,0 +1,85 @@
+{
+  "thread_id": "20260703173903.3789516-1-usama.arif@linux.dev",
+  "subject": "[PATCH v3 00/11] mm: PMD-level swap entries for anonymous THPs",
+  "url": "https://lore.kernel.org/all/20260703173903.3789516-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-07-03": {
+      "report_file": "2026-07-03_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "David Hildenbrand",
+          "summary": "Identified a potential issue with PMD swap entries being split into PTE-level swap entries when the cache has per-slot state, leading to incorrect rmap metadata updates. Suggested adding additional checks and handling for this scenario.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Zi Yan",
+          "summary": "Expressed interest in the patch series and asked for more information on how PMD swap entries are handled during swap-in.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "neutral"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Responded to David's concerns by explaining the current handling of PMD swap entries and proposing additional checks to address the issue.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "neutral"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Currently when a PMD-mapped THP is swapped out, the PMD is always split into 512 PTE-level swap entries.  To preserve huge page information across swap cycles, later patches will install a single PMD-level swap entry instead.  This patch adds the infrastructure to detect those entries.\n\nTeach the softleaf layer to recognise PMD swap entries: pmd_is_swap_entry() detects them and softleaf_is_valid_pmd_entry() accepts them as a valid non-present type.  Clear the exclusive overlay bit in softleaf_from_pmd() before decoding, matching how soft_dirty and uffd_wp bits are already stripped.\n\nAdd pmd_swp_mkexclusive(), pmd_swp_exclusive(), and pmd_swp_clear_exclusive() helpers to each architecture that supports PMD softleaf entries (x86, arm64, s390, riscv, loongarch, powerpc), mirroring the existing PTE swap exclusive helpers in each arch's pgtable.h.  Provide generic no-op PMD swap exclusive fallbacks for architectures without PMD softleaf support, matching the generic PMD swap soft-dirty fallbacks.\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n arch/arm64/include/asm/pgtable.h             |  4 ++++\n arch/loongarch/include/asm/pgtable.h         | 17 ++++++++++++++\n arch/powerpc/include/asm/book3s/64/pgtable.h | 15 ++++++++++++\n arch/riscv/include/asm/pgtable.h             | 15 ++++++++++++\n arch/s390/include/asm/pgtable.h              | 15 ++++++++++++\n arch/x86/include/asm/pgtable.h               | 15 ++++++++++++\n include/linux/leafops.h                      | 24 ++++++++++++++++----\n include/linux/pgtable.h                      | 17 ++++++++++++++\n 8 files changed, 117 insertions(+), 5 deletions(-)\n\ndiff --git a/arch/arm64/include/asm/pgtable.h b/arch/arm64/include/asm/pgtable.h\nindex 984badfa9a74..0de4a2917fe2 100644\n--- a/arch/arm64/include/asm/pgtable.h\n+++ b/arch/arm64/include/asm/pgtable.h\n@@ -601,6 +601,10 @@ static inline int pmd_protnone(pmd_t pmd)\n #define pmd_swp_clear_uffd_wp(pmd) \\\n \t\t\t\tpte_pmd(pte_swp_clear_uffd_wp(pmd_pte(pmd)))\n #endif /* CONFIG_HAVE_ARCH_USERFAULTFD_WP */\n+#define pmd_swp_exclusive(pmd)\tpte_swp_exclusive(pmd_pte(pmd))\n+#define pmd_swp_mkexclusive(pmd)\tpte_pmd(pte_swp_mkexclusive(pmd_pte(pmd)))\n+#define pmd_swp_clear_exclusive(pmd) \\\n+\t\t\t\tpte_pmd(pte_swp_clear_exclusive(pmd_pte(pmd)))\n \n #define pmd_write(pmd)\t\tpte_write(pmd_pte(pmd))\n \ndiff --git a/arch/loongarch/include/asm/pgtable.h b/arch/loongarch/include/asm/pgtable.h\nindex 223528c04d73..a63567eb4e3b 100644\n--- a/arch/loongarch/include/asm/pgtable.h\n+++ b/arch/loongarch/include/asm/pgtable.h\n@@ -357,6 +357,23 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)\n \treturn pte;\n }\n \n+static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n+{\n+\tpmd_val(pmd) |= _PAGE_SWP_EXCLUSIVE;\n+\treturn pmd;\n+}\n+\n+static inline bool pmd_swp_exclusive(pmd_t pmd)\n+{\n+\treturn pmd_val(pmd) & _PAGE_SWP_EXCLUSIVE;\n+}\n+\n+static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n+{\n+\tpmd_val(pmd) &= ~_PAGE_SWP_EXCLUSIVE;\n+\treturn pmd;\n+}\n+\n #define pte_none(pte)\t\t(!(pte_val(pte) & ~_PAGE_GLOBAL))\n #define pte_present(pte)\t(pte_val(pte) & (_PAGE_PRESENT | _PAGE_PROTNONE))\n #define pte_no_exec(pte)\t(pte_val(pte) & _PAGE_NO_EXEC)\ndiff --git a/arch/powerpc/include/asm/book3s/64/pgtable.h b/arch/powerpc/include/asm/book3s/64/pgtable.h\nindex 6f30aa8a6490..e8467ea4f4de 100644\n--- a/arch/powerpc/include/asm/book3s/64/pgtable.h\n+++ b/arch/powerpc/include/asm/book3s/64/pgtable.h\n@@ -699,6 +699,21 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)\n \treturn __pte_raw(pte_raw(pte) & cpu_to_be64(~_PAGE_SWP_EXCLUSIVE));\n }\n \n+static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n+{\n+\treturn __pmd_raw(pmd_raw(pmd) | cpu_to_be64(_PAGE_SWP_EXCLUSIVE));\n+}\n+\n+static inline bool pmd_swp_exclusive(pmd_t pmd)\n+{\n+\treturn !!(pmd_raw(pmd) & cpu_to_be64(_PAGE_SWP_EXCLUSIVE));\n+}\n+\n+static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n+{\n+\treturn __pmd_raw(pmd_raw(pmd) & cpu_to_be64(~_PAGE_SWP_EXCLUSIVE));\n+}\n+\n static inline bool check_pte_access(unsigned long access, unsigned long ptev)\n {\n \t/*\ndiff --git a/arch/riscv/include/asm/pgtable.h b/arch/riscv/include/asm/pgtable.h\nindex 2aa529e882d3..9918b3f51efd 100644\n--- a/arch/riscv/include/asm/pgtable.h\n+++ b/arch/riscv/include/asm/pgtable.h\n@@ -930,6 +930,21 @@ static inline pmd_t pmd_swp_clear_uffd_wp(pmd_t pmd)\n }\n #endif /* CONFIG_HAVE_ARCH_USERFAULTFD_WP */\n \n+static inline bool pmd_swp_exclusive(pmd_t pmd)\n+{\n+\treturn pte_swp_exclusive(pmd_pte(pmd));\n+}\n+\n+static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n+{\n+\treturn pte_pmd(pte_swp_mkexclusive(pmd_pte(pmd)));\n+}\n+\n+static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n+{\n+\treturn pte_pmd(pte_swp_clear_exclusive(pmd_pte(pmd)));\n+}\n+\n #ifdef CONFIG_HAVE_ARCH_SOFT_DIRTY\n static inline bool pmd_soft_dirty(pmd_t pmd)\n {\ndiff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h\nindex 6faccfa63b09..e9d29439d817 100644\n--- a/arch/s390/include/asm/pgtable.h\n+++ b/arch/s390/include/asm/pgtable.h\n@@ -870,6 +870,21 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)\n \treturn clear_pte_bit(pte, __pgprot(_PAGE_SWP_EXCLUSIVE));\n }\n \n+static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n+{\n+\treturn set_pmd_bit(pmd, __pgprot(_PAGE_SWP_EXCLUSIVE));\n+}\n+\n+static inline bool pmd_swp_exclusive(pmd_t pmd)\n+{\n+\treturn pmd_val(pmd) & _PAGE_SWP_EXCLUSIVE;\n+}\n+\n+static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n+{\n+\treturn clear_pmd_bit(pmd, __pgprot(_PAGE_SWP_EXCLUSIVE));\n+}\n+\n static inline int pte_soft_dirty(pte_t pte)\n {\n \treturn pte_val(pte) & _PAGE_SOFT_DIRTY;\ndiff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h\nindex e0fd318d4004..2dd7a5c590a9 100644\n--- a/arch/x86/include/asm/pgtable.h\n+++ b/arch/x86/include/asm/pgtable.h\n@@ -1529,6 +1529,21 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)\n \treturn pte_clear_flags(pte, _PAGE_SWP_EXCLUSIVE);\n }\n \n+static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n+{\n+\treturn pmd_set_flags(pmd, _PAGE_SWP_EXCLUSIVE);\n+}\n+\n+static inline int pmd_swp_exclusive(pmd_t pmd)\n+{\n+\treturn pmd_flags(pmd) & _PAGE_SWP_EXCLUSIVE;\n+}\n+\n+static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n+{\n+\treturn pmd_clear_flags(pmd, _PAGE_SWP_EXCLUSIVE);\n+}\n+\n #ifdef CONFIG_HAVE_ARCH_SOFT_DIRTY\n static inline pte_t pte_swp_mksoft_dirty(pte_t pte)\n {\ndiff --git a/include/linux/leafops.h b/include/linux/leafops.h\nindex 88888daeb018..988e59c6fa8a 100644\n--- a/include/linux/leafops.h\n+++ b/include/linux/leafops.h\n@@ -102,6 +102,8 @@ static inline softleaf_t softleaf_from_pmd(pmd_t pmd)\n \t\tpmd = pmd_swp_clear_soft_dirty(pmd);\n \tif (pmd_swp_uffd_wp(pmd))\n \t\tpmd = pmd_swp_clear_uffd_wp(pmd);\n+\tif (pmd_swp_exclusive(pmd))\n+\t\tpmd = pmd_swp_clear_exclusive(pmd);\n \tarch_entry = __pmd_to_swp_entry(pmd);\n \n \t/* Temporary until swp_entry_t eliminated. */\n@@ -634,18 +636,30 @@ static inline bool pmd_is_migration_entry(pmd_t pmd)\n  */\n static inline bool softleaf_is_valid_pmd_entry(softleaf_t entry)\n {\n-\t/* Only device private, migration entries valid for PMD. */\n+\t/* Device private, migration, and swap entries valid for PMD. */\n \treturn softleaf_is_device_private(entry) ||\n-\t\tsoftleaf_is_migration(entry);\n+\t\tsoftleaf_is_migration(entry) ||\n+\t\tsoftleaf_is_swap(entry);\n+}\n+\n+/**\n+ * pmd_is_swap_entry() - Does this PMD entry encode an actual swap entry?\n+ * @pmd: PMD entry.\n+ *\n+ * Returns: true if the PMD encodes a swap entry, otherwise false.\n+ */\n+static inline bool pmd_is_swap_entry(pmd_t pmd)\n+{\n+\treturn softleaf_is_swap(softleaf_from_pmd(pmd));\n }\n \n /**\n  * pmd_is_valid_softleaf() - Is this PMD entry a valid softleaf entry?\n  * @pmd: PMD entry.\n  *\n- * PMD leaf entries are valid only if they are device private or migration\n- * entries. This function asserts that a PMD leaf entry is valid in this\n- * respect.\n+ * PMD leaf entries are valid only if they are device private, migration,\n+ * or swap entries. This function asserts that a PMD leaf entry is valid\n+ * in this respect.\n  *\n  * Returns: true if the PMD entry is a valid leaf entry, otherwise false.\n  */\ndiff --git a/include/linux/pgtable.h b/include/linux/pgtable.h\nindex e38f069c1c91..0b985ce6673e 100644\n--- a/include/linux/pgtable.h\n+++ b/include/linux/pgtable.h\n@@ -1917,6 +1917,23 @@ static inline pmd_t pmd_swp_clear_soft_dirty(pmd_t pmd)\n }\n #endif\n \n+#ifndef CONFIG_ARCH_SUPPORTS_PMD_SOFTLEAF\n+static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n+{\n+\treturn pmd;\n+}\n+\n+static inline bool pmd_swp_exclusive(pmd_t pmd)\n+{\n+\treturn false;\n+}\n+\n+static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n+{\n+\treturn pmd;\n+}\n+#endif\n+\n #ifndef __HAVE_PFNMAP_TRACKING\n /*\n  * Interfaces that can be used by architecture code to keep track of\n-- \n2.53.0-Meta\n\n",
+          "reply_to": "",
+          "message_date": "2026-07-03",
+          "message_id": "",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Addressed David's concerns by adding additional checks and handling for the scenario where PMD swap entries are split into PTE-level swap entries.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "addressed reviewer's concerns"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Add a swap branch in __split_huge_pmd_locked() that splits a PMD swap\nentry into 512 PTE swap entries.  Unlike migration splits, no folio\nreference is needed because swap entries point to swap slots, not\npages.  Each PTE inherits the correct sub-slot offset and preserves\nsoft_dirty, uffd_wp, and exclusive flags.\n\nThis branch is reached from the explicit __split_huge_pmd() callers\nthat hit a non-present PMD: partial-range mprotect / munmap, the\nwp_huge_pmd() PMD-COW fallback, and the swap-in / swapoff fallbacks\nadded in later patches when the cached folio is no longer PMD-sized.\npage_vma_mapped_walk() does not iterate PMD swap entries, so\ntry_to_unmap_one() and try_to_migrate_one() do not reach this branch\nand freeze=true cannot occur in this branch today.  page and folio\nare therefore left uninitialized in the swap branch; a\nVM_WARN_ON_ONCE(freeze) catches any future caller that breaks this\ninvariant before the freeze path dereferences page_to_pfn(page + i)\nor put_page(page).\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n mm/huge_memory.c | 27 ++++++++++++++++++++++++++-\n 1 file changed, 26 insertions(+), 1 deletion(-)\n\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex bdd8635922f9..201193ce0373 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -3143,6 +3143,12 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,\n \t\t\tfolio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,\n \t\t\t\t\t\t vma, haddr, rmap_flags);\n \t\t}\n+\t} else if (pmd_is_swap_entry(*pmd)) {\n+\t\tVM_WARN_ON_ONCE(freeze);\n+\t\told_pmd = *pmd;\n+\t\tsoft_dirty = pmd_swp_soft_dirty(old_pmd);\n+\t\tuffd_wp = pmd_swp_uffd_wp(old_pmd);\n+\t\tanon_exclusive = pmd_swp_exclusive(old_pmd);\n \t} else {\n \t\t/*\n \t\t * Up to this point the pmd is present and huge and userland has\n@@ -3279,6 +3285,25 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,\n \t\t\tVM_WARN_ON(!pte_none(ptep_get(pte + i)));\n \t\t\tset_pte_at(mm, addr, pte + i, entry);\n \t\t}\n+\t} else if (pmd_is_swap_entry(old_pmd)) {\n+\t\tsoftleaf_t sl_entry = softleaf_from_pmd(old_pmd);\n+\t\tpte_t swp_pte;\n+\t\tswp_entry_t sub_entry;\n+\n+\t\tfor (i = 0, addr = haddr; i < HPAGE_PMD_NR;\n+\t\t     i++, addr += PAGE_SIZE) {\n+\t\t\tsub_entry = swp_entry(swp_type(sl_entry),\n+\t\t\t\t\t      swp_offset(sl_entry) + i);\n+\t\t\tswp_pte = swp_entry_to_pte(sub_entry);\n+\t\t\tif (soft_dirty)\n+\t\t\t\tswp_pte = pte_swp_mksoft_dirty(swp_pte);\n+\t\t\tif (uffd_wp)\n+\t\t\t\tswp_pte = pte_swp_mkuffd_wp(swp_pte);\n+\t\t\tif (anon_exclusive)\n+\t\t\t\tswp_pte = pte_swp_mkexclusive(swp_pte);\n+\t\t\tVM_WARN_ON(!pte_none(ptep_get(pte + i)));\n+\t\t\tset_pte_at(mm, addr, pte + i, swp_pte);\n+\t\t}\n \t} else {\n \t\tpte_t entry;\n \n@@ -3302,7 +3327,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,\n \t}\n \tpte_unmap(pte);\n \n-\tif (!pmd_is_migration_entry(*pmd))\n+\tif (!pmd_is_migration_entry(*pmd) && !pmd_is_swap_entry(*pmd))\n \t\tfolio_remove_rmap_pmd(folio, page, vma);\n \tif (freeze)\n \t\tput_page(page);\n-- \n2.53.0-Meta\n\n",
+          "reply_to": "David Hildenbrand",
+          "message_date": "2026-07-03",
+          "message_id": "",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series introduces PMD-level swap entries for anonymous THPs, allowing them to survive the swap round-trip and be restored directly on swap-in without waiting for khugepaged to collapse the range later."
+    }
+  }
+}
