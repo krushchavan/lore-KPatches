@@ -9,6 +9,65 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch adds a new handler for PMD swap entry faults on swap-in, allowing the kernel to handle large page mappings in one shot. It introduces a new function do_huge_pmd_swap_page() that resolves the entire 2 MB mapping by looking up the folio in the swap cache, allocating a PMD-order folio if necessary, and restoring soft_dirty and uffd_wp from the swap PMD. The handler also updates vmf->orig_pmd and calls wp_huge_pmd() to COW immediately when the resulting PMD is read-only but the fault was a write. If PMD-order resources are unavailable, it splits the PMD swap entry into 512 PTE swap entries via __split_huge_pmd()."
+    },
+    "2026-07-07": {
+      "report_file": "2026-07-06_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Kairui Song",
+          "summary": "Reviewer Kairui Song noted that the patch does not handle the case where a PMD swap entry is split into PTEs, and requested that the handling of this case be added.\n\nReviewer Kairui Song noted that the patch does a synchronous swap-in without readahead, which makes sense due to the PMD size, but suggested mentioning this in the commit message for clarity and proposed using the return value of swapin_sync directly instead of handling its possible values separately.\n\nReviewer Kairui Song noted that repeated faults may occur when trying to lock a PMD-sized folio on a slower device, potentially leading to performance issues, and asked if this problem will worsen for PMDs.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "split_pmd_swap_entry",
+            "requested changes",
+            "suggested improvement",
+            "performance issue",
+            "potential worsening"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hello Usama\n\nAmazing work.\n\n---\n\nHmm, so here we always do a sync swapin which means there is no\nreadahead, kind of make sense since PMD is huge, readahead might be\nnot helpful and a order 0 readahead breaks following PMD. But maybe\nworth mention it in the commit message at least so it's easiler to\nfollow. (partly because the name swapin_sync is a bit confusing at the\nmoment, we could change that name as we improve swap readahead later).\n\nAnd just an idea that will it be suffient if we just use the return\nvalue of swapin_sync directly? If a smaller folio covers the PMD start\nentry, the smaller folio is returned and you catched that just fine.\nIf a smaller folio covers a follow-up sub-entry or a sub-entry is\nfreed, -EBUSY is returned here and you just do the split. And it\ndoesn't do the allocation for the first lookup check, so there should\nbe no thrashing issue.\n\n---\n\nWith PMD sized folio on a slower device, this try lock could fail much\nmore frequently, leading to repeated faults. That's not a new issue\nand I remember Barry talked about it at the LSFMM this year, just I'm\nnot sure if that will get much worse for PMD?",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-07-07",
+          "message_id": "CAMgjq7CQ+1gsptFYH+Y0GEqyYj+5QpAKjtZLekRS4h+k4f8QvQ@mail.gmail.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds a new handler for PMD swap entry faults during the swap-in process. The handler, do_huge_pmd_swap_page(), resolves the entire 2 MB mapping in one shot by looking up the folio in the swap cache and allocating a PMD-order folio if necessary. It then re-validates the folio and restores soft_dirty and uffd_wp from the swap PMD. If the resulting PMD is read-only but the fault was a write, it updates vmf->orig_pmd and calls wp_huge_pmd() to COW immediately. The patch also handles cases where PMD-order resources are unavailable by splitting the PMD swap entry into 512 PTE swap entries via __split_huge_pmd()."
+    },
+    "2026-07-06": {
+      "report_file": "2026-07-06_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2\n\nAuthor acknowledged a concern about readahead not being useful for PMDs and agreed to add it to the commit message.\n\nThe author addressed a concern about zswap handling in PMD swap entry faults, explaining that zswap stores ranges as order-0 objects which can lead to non-updated large folios in the cache and subsequent SIGBUS errors.\n\nThe author acknowledged a potential issue with PMD-sized IO keeping the folio locked longer on slow swap devices, but agreed that the current behavior matches do_swap_page() and is not a tight retry loop. They suggested any improvement belongs to broader swap readahead/async swapin work.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure",
+            "acknowledged",
+            "agreed",
+            "clarification",
+            "explanation",
+            "acknowledged potential issue",
+            "agreed with current behavior"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Hi Kairui,\n\nThanks! and Thanks for the review comments!\n\n---\n\nYes, I\\u2019ll add this to the commit message. Thanks!\n\nYes readahead won't be useful for PMD as you said.\n\n---\n\nThe main issue over here is zswap.\nzswap still stores the range as order-0 objects. If we call PMD-order\nswapin_sync() when the cache is empty but any slot is in zswap, zswap_load()\nfails the large-folio load and leaves a non-uptodate PMD-sized folio in\nswapcache. Splitting the PMD after that is not enough unless we also delete that\nfailed large folio, because the subsequent PTE fault can find the non-uptodate\nlarge folio and SIGBUS instead of loading the individual zswap entries.\n\n---\n\nAgreed that PMD-sized IO can keep the folio locked longer, especially on\nslow swap devices. (Which hopefully are dying away :))\nThe current behavior matches do_swap_page(): on the normal retryable fault\npath it drops the fault lock and waits for the folio unlock before returning\nVM_FAULT_RETRY, so it should not be a tight retry loop.\nThe wait can be longer for 2MB IO, but the retry usually comes back to\neither an uptodate folio or a PMD that another fault already  installed.\nI think this is the right baseline behavior, and any improvement here\nbelongs with the broader swap readahead / async swapin work.",
+          "reply_to": "Kairui Song",
+          "message_date": "2026-07-06",
+          "message_id": "d0d47811-44b2-490f-ad57-f9b57aa70a0a@linux.dev",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds a new handler for PMD swap entry faults during the swap-in process. The handler, do_huge_pmd_swap_page(), resolves the entire 2 MB mapping in one shot by looking up the folio in the swap cache and allocating a PMD-order folio if necessary. It then re-validates the folio and restores soft_dirty and uffd_wp from the swap PMD. If the resulting PMD is read-only but the fault was a write, it updates vmf->orig_pmd and calls wp_huge_pmd() to COW immediately. The patch also handles cases where PMD-order resources are unavailable by splitting the PMD swap entry into 512 PTE swap entries via __split_huge_pmd()."
     }
   }
 }
