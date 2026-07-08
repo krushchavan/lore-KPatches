@@ -1,0 +1,96 @@
+{
+  "thread_id": "akxW5dzvR9e2CfGq@linux.dev",
+  "subject": "[PATCH 0/3] selftests/bpf: compare BPF and memory.stat memcg stat readers",
+  "url": "https://lore.kernel.org/all/akxW5dzvR9e2CfGq@linux.dev/",
+  "dates": {
+    "2026-07-07": {
+      "report_file": "2026-07-07_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Eduard Zingerman",
+          "summary": "reviewer noted that the selftests/bpf benchmarking code is not suitable for CI execution and suggested moving it to tools folder or archiving on lkml",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "alternative placement suggestions"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Shakeel,\n\nWe do have bpf benchmarks in the kernel tree, the entry point is\ntools/testing/selftests/bpf/bench.c. These are supposed to be\nperformance measurements and are executed manually from time to time\n(quite rarely, as far as I understand), not by CI.\nHowever, if I understand Ziyang's assessment correctly, this code is\nnot really a performance test, but kind of a load test.\n\nThanks,\nEduard",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-07-07",
+          "message_id": "eccfd9a8dd1af1668e142b9b866194333647b0d5.camel@gmail.com",
+          "email": "eddyz87@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Ziyang Men",
+          "summary": "Reviewer Ziyang Men noted that the existing test in cgroup_iter_memcg.c only checks if stats are non-zero, but not their actual correctness, and suggested adding a comparison of BPF-based cgroup stats collection against memory.stat values. He also pointed out that the existing test does not verify the flush operation by comparing numbers after activity stops.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvements"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Eduard,\n\nThanks a lot for the review. Yes, as Shakeel mentioned, the performance\ncomparison for BPF-based cgroup stats collection was the original motivation.\nBut the patch also carries functional value: alongside that comparison, it\nchecks the correctness of the stats the kfuncs return.\n\nLet me first answer the main question -- what these tests add over what we\nalready have -- and then lay out a plan.\n\nFirst, the static test (memcg_stat_reader) vs the existing cgroup_iter_memcg.\n\nThe existing test calls the kfuncs, but for each value it only checks whether it\nis greater than zero. For example, in prog_tests/cgroup_iter_memcg.c:\n\n     memset(map, 1, len);                    /* dirty some anon */\n     if (!ASSERT_OK(read_stats(link), \"read stats\"))\n             goto cleanup;\n     ASSERT_GT(memcg_query->nr_anon_mapped, 0, \"final anon mapped val\");\n\nIt never checks the value is actually correct -- i.e. compares it against the\nvalue in cgroupfs -- only that it is non-zero.\n\nBesides, it also walks a single cgroup:\n\n     .cgroup.order = BPF_CGROUP_ITER_SELF_ONLY,\n\nand reads only five fields.\n\nThe memcg_stat_reader in this patch adds three things:\n\n   1. It compares the numbers. It reads the stats through the kfuncs and checks\n      they match the values in memory.stat, instead of only checking they are\n      non-zero (memcg_stat_reader.c, check_correctness()):\n\n         /*\n          * anon (NR_ANON_MAPPED) is rstat-flushed and, with the charger\n          * stopped, deterministic: BPF and memory.stat must agree.\n          */\n         if ((b.anon > f.anon ? b.anon - f.anon\n                              : f.anon - b.anon) > anon_tol)\n                 anon_mism++;\n         ...\n         ASSERT_EQ(anon_mism, 0, \"bpf vs file anon (rstat-flushed)\");\n\n      This is the main gap: b.anon comes from the kfunc, f.anon from parsing\n      memory.stat, and the test requires them to agree.\n\n   2. It covers a whole subtree, not a single cgroup:\n\n         linfo.cgroup.order = BPF_CGROUP_ITER_DESCENDANTS_PRE;\n\n   3. It reads a much broader field set (~40 fields, collect_full_stats()).\n      Minor.\n\nSecond, the churn test adds something the static test cannot.\n\nThese counters are kept separately on each CPU for speed, and are only added\ntogether when the code \"flushes\" them. The existing test does call the flush,\nright before reading (progs/cgroup_iter_memcg.c):\n\n     bpf_mem_cgroup_flush_stats(memcg);\n     memcg_query.nr_anon_mapped = bpf_mem_cgroup_page_state(\n             memcg, bpf_core_enum_value(enum node_stat_item, NR_ANON_MAPPED));\n\nBut if the cgroup is idle there is nothing to add up, so the flush does no real\nwork -- and since the result is only checked for non-zero, nothing verifies the\nflush gathered anything. If bpf_mem_cgroup_flush_stats() were replaced by an\nempty stub, this test would very likely still pass (the kernel also flushes on\nits own, periodically and on thresholds).\n\nWith activity going on, especially spread across several CPUs, we can make the\nflush do real work and then check it by comparing the numbers after the activity\nstops. That flush check is missing from all of the current tests, and this is\nwhere memcg_stat_churn / churn_percpu come in.\n\nFinally, my plan:\n\n   1. Keep the static (value-correctness) test, or fold it into cgroup_iter_memcg\n      if that works better. I also noticed that several kfuncs are not called by\n       any test today (no callers anywhere under tools/testing/selftests/bpf/,\n       only __ksym declarations in vmlinux.h): bpf_get_root_mem_cgroup,\n       bpf_mem_cgroup_usage, and bpf_mem_cgroup_memory_events. The static test\n       would be a good place to cover them too.\n\n   2. Keep only one of the two churn tests -- most likely the per-CPU one, since\n      it is the stronger of the two -- and change its correctness check to\n      actually verify the flush by comparing the numbers. The current check is\n      weak; it only checks non-zero values and that every cgroup was visited:\n\n         ASSERT_EQ(missing, 0, \"all cgroups present in map\");\n         ASSERT_GT(total_anon, 0, \"tree carries anon under churn\");\n\n   3. Move the code these tests share into a common header, to remove the\n      duplication you pointed out. Or we can combine these two tests into a\n      single one if works better.\n\n   4. Keep the focus on functional testing in the selftests. The file-vs-BPF\n      timing could stay as an extra bonus -- printed only as informational\n      output in verbose mode, never as pass/fail -- but I'm happy to move that\n      comparison to the bench framework if you think it fits better there.\n\nPlease let me know if you have any concerns with this plan. I am happy to take\nany suggestions on how to improve the tests, or to change the focus of the\nselftests\n\nThanks again,\nZiyang",
+          "reply_to": "Eduard Zingerman",
+          "message_date": "2026-07-07",
+          "message_id": "ak2LXDWoPFSJL2Q9@devvm16600.scu0.facebook.com",
+          "email": "ziyang.meme@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Eduard Zingerman",
+          "summary": "Reviewer noted that the selftest is actually a performance benchmark, not a functional test, and suggested moving it to the tools folder or archiving it on lkml for easier searching.\n\nReviewer suggested extending cgroup_iter_memcg.c tests to allocate memory and check stats, but argued BPF selftests should not be used for stress-testing MM functionality\n\nReviewer noted that BPF selftests should not be responsible for checking all these fields, implying that the code is overstepping its functional testing scope and potentially polluting the test suite.\n\nreviewer suggested simplifying the code by reusing existing selftest functionality, specifically creating a hierarchy of cgroups and walking them, instead of implementing a generic tree construction",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested alternative approach",
+            "expressed disagreement with original idea",
+            "scope",
+            "pollution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "You said yourself that the test is comparing an in-kernel walk to\nparsing strings and opening files.\n\n---\n\nArguably one of the the cgroup_iter_memcg.c tests can be extended to\nallocate some mem and check if the value is reflected in the stats.\nBut there is a line between MM tests and BPF tests.\nAll BPF kfuncs except iterator logic itself are thin wrappers on\ntop of the existing MM functionality. Hence, I don't think that\nBPF selftests are a place to stress-test these things.\n\n---\n\nI don't think that it's responsibility of BPF selftests to check all\nthese fields.\n\n---\n\nThere is no need for a generic tree construction.\nCreating a hierarchy of several cgroups, allocating memory within\nthese cgroups and walking them would work perfectly fine.\nExisting selftests already do that. Aside from querying actual memory\namount what else do you want to cover?",
+          "reply_to": "Ziyang Men",
+          "message_date": "2026-07-07",
+          "message_id": "bc47c75a00acab57e7fea72612e0f6f089ddecc9.camel@gmail.com",
+          "email": "eddyz87@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author acknowledged a concern about the placement of performance benchmarking code and discussed possible locations within the kernel tree, but did not commit to moving it.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged a concern",
+            "did not commit to a fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "That is actually a good discussion point. Where does such kind of tests (i.e.\ntesting that bpf based memcg stats read functionality is equivalent to\ntraditional memcg stats reading). As more subsystems are exposed to bpf, similar\nquestions would arise more often.\n\nIn this particular case, IIUC you want only tests for bpf related code (wrappers\n& iterator) to be present in bpf selftests, right?\n\nPersonally I don't have strong opinion where this test should live.\nFunctionality wise as it is testing rstat infra, I think cgroup selftests might\nbe better home for this.",
+          "reply_to": "Eduard Zingerman",
+          "message_date": "2026-07-07",
+          "message_id": "ak2Wpk6OnhTyon65@linux.dev",
+          "email": "shakeel.butt@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series is a performance benchmarking code that compares BPF (Berkeley Packet Filter) and memory.stat memcg stat readers. The original intention was to include it in the selftests/bpf directory, but due to its focus on performance testing rather than functional verification, it may be more suitable for placement under the tools folder. The patch aims to provide a reference implementation and comparison of BPF-based cgroup/memcg stats collection, which can be useful for developers and testers."
+    }
+  }
+}

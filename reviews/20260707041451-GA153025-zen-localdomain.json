@@ -1,0 +1,183 @@
+{
+  "thread_id": "20260707041451.GA153025@zen.localdomain",
+  "subject": "[PATCH] btrfs: fix a regression where PAGECACHE_TAG_DIRTY is never cleared",
+  "url": "https://lore.kernel.org/all/20260707041451.GA153025@zen.localdomain/",
+  "dates": {
+    "2026-07-06": {
+      "report_file": "2026-07-07_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author confirmed that the patch causes a deadlock on specific test cases (btrfs/062 and btrfs/070) and acknowledged that the issue needs to be addressed, but did not commit to fixing it in this patch",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a problem",
+            "did not promise a fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I re-tested by applying your patch to my for-next and I do believe b/062\nhangs indefinitely, while it passes in ~45s for me normally.",
+          "reply_to": "",
+          "message_date": "2026-07-06",
+          "message_id": "20260707045151.GA247134@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a regression in Btrfs where PAGECACHE_TAG_DIRTY is never cleared, leading to potential issues such as csum corruption when mmap writes are allowed on folios under writeback. The problem arises from the removal of folio_clear_dirty_for_io() and folio_mkclean(), which previously ensured that folios were write-protected during writeback. To fix this, the patch likely takes a lock in writeback to prevent races between truncate and writeback operations, ensuring that csums are correctly computed."
+    },
+    "2026-07-07": {
+      "report_file": "2026-07-07_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer Qu Wenruo pointed out that the patch's approach to clearing PAGECACHE_TAG_DIRTY is flawed, as it creates a timing issue between folio dirty and writeback flags changes. Specifically, if the folio dirty flag is cleared early, it can lead to losing the TOWRITE tag for the last block; if it's not cleared until the last dirty block clearing, folio_start_writeback() may have already been called, preventing the TOWRITE tag from being cleared.\n\nReviewer Qu Wenruo questioned the necessity of calling btrfs_mark_ordered_io_finished(), pointing out that the folio is already locked and the timing difference should not cause issues related to this function.\n\nReviewer Qu Wenruo noted that the patch introduces a deadlock caused by clearing dirty pages without calling btrfs_mark_ordered_io_finished(), which leads to leaked unfinished ordered extents and potential hangs on test cases btrfs/062 and btrfs/070. He suggested using folio_mkclean() instead of folio_clear_dirty_for_io() as a possible solution.\n\nReviewer Qu Wenruo identified two serious bugs in the original patch: a bug that causes clearing TOWRITE on non-sync writebacks and losing it for other pages in the folio, and a deadlock caused by truncating pages past the new file size without calling btrfs_mark_ordered_io_finished(). He suggested de-coupling PAGECACHE_TAG_DIRTY/TOWRITE from folio_*_writeback() calls to fix these issues.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "requested clarification",
+            "disagreement with patch",
+            "deadlock",
+            "potential hangs",
+            "suggested alternative solution"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "You're right on this changed btrfs_subpage_start_writeback() change.\n\nBut there is a deeper problem, the timing of folio dirty and writeback \nflags change is not synced anyway.\n\nIf we do not clear the folio dirty early, then the timing of folio dirty \nclearing is always on the last dirty block clearing.\nBut at that time, we may have already called folio_start_writeback(), \nthus for the last block we do not clear the TOWRITE tag.\n\nIf we do clear the folio dirty early, then it's exactly the problem \nyou're describing.\n\nSo I believe we should not rely on btrfs_start/end_writeback() to handle \nthe pagecache tags at all.\n\n---\n\nMind to explain exactly where the missing \nbtrfs_mark_ordered_io_finished() is?\n\nThe point here is, we always have the folio locked already, the \ndifference is just in the timing where the folio dirty flag is cleared.\n\nI didn't see a problem that the changed timing can cause problem related \nto btrfs_mark_ordered_io_finished().\n\n---\n\nI have not yet experienced btrfs/062 nor btrfs/070 hang.\n\n[...]\n\n---\n\nI believe the root cause is that we can not rely on folio_*_writeback() \ncalls to do the sub-folio level handling correctly.\n\nI think the long term solution would be the iomap solution by tracking \nhow many write bytes are still pending, and only call \nfolio_end_writeback() once.\n\nBut for now, I think a quicker fix is, to de-couple the \nPAGECACHE_TAG_DIRTY/TOWRITE from folio_*_writeback().\n\nThe idea is, we clear PAGECACHE_TAG_DIRTY when the last subblock dirty \nflag is cleared.\n\nThen do the same for PAGECACHE_TAG_TOWRITE, this time do not rely on \n__folio_end_writeback(), but manually do it inside \nbtrfs_subpage_set_writeback().\n\n\nI think this would be much smaller, and completely free us from the \nspecial handling of folio_*_writeback().\n\nThanks,\nQu",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-07-07",
+          "message_id": "e5a0dbb8-27f5-4b7d-8923-54373622729d@gmx.com",
+          "email": "quwenruo.btrfs@gmx.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author Boris Burkov addressed Qu Wenruo's feedback about a deadlock caused by clearing dirty flags too early, explaining that the issue arises from a race condition between truncate and writeback operations. He provided detailed explanations of the problem, including a sequence of events leading to the deadlock, and acknowledged that his previous fix was insufficient. However, he did not commit to revising the patch or providing a new solution.\n\nThe author acknowledges the reviewer's report of deadlocks in btrfs/062 and btrfs/070, but suggests that the issue may be due to a race condition rather than a bug in their patch. They confirm reproducing the issue on two systems and are still investigating the cause.\n\nAuthor is addressing Qu Wenruo's concern about the patch causing a deadlock due to clearing DIRTY at an incorrect point in btrfs_subpage_set_writeback(). The author has been testing a hacky solution that clears both DIRTY and TOWRITE marks, but is still unsure if it's correct. A fix is planned.\n\nAuthor clarifies that under his proposed solution, folio_clear_dirty_for_io() would still be called, and asks for confirmation on the importance of using folio_mkclean() to write protect the folio.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a technical issue",
+            "did not promise a fix",
+            "acknowledges reviewer's report",
+            "suggests alternative explanation",
+            "acknowledges a problem",
+            "planning to revise",
+            "clarifying question",
+            "no clear resolution signal"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Sorry, my explanation last night was rushed and clumsy, let me try to be\nmuch more clear and specific!\n\nThe key change is your recent one, that went together with the removal\nof folio_clear_dirty_for_io():\n\n334509ce9d07 (\"btrfs: use dirty flag to check if an ordered extent needs to be truncated\")\n\nand specifically the lines:\n\n  /*\n  * If the range is not dirty, the range has been submitted and\n  * since we have waited for the writeback, endio has been\n  * executed, thus we must skip the range to avoid double\n  * accounting for the ordered extent.\n  */\n  if (!btrfs_folio_test_dirty(fs_info, folio, cur, range_len))\n    goto next;\n\n\nand quoting from the changelog:\n\n  If the OE range is dirty, it means we have allocated an ordered extent but\n  have not yet submitted the range. And that's exactly the case where we need\n  to truncate the ordered extent.\n\nBut with this new fix, which returns folio_clear_dirty_for_io before\nsubmission, the comment, skip, and changelog argument are no longer\ntrue.\n\nSuppose we dirty folios [F,F+K] at the end of a file and start writeback\non them, creating a single OE for [F, F+K]. extent_writepage will keep\nlooping through the folios submitting them.\n\nNow suppose a truncate races in and shrinks i_size (taking i_rwsem but\nno folio locks or blocking on OEs) via:\nbtrfs_setsize\n  truncate_setsize\n    i_size_write // shrinks i_size to M <= F\n      truncate_pagecache\n        folio_wait_writeback (not yet marked writeback)\n        folio_invalidate\n          btrfs_invalidate_folio (folio clean, skipped, this is the bug)\n\nextent_writepage hits the code\n\n  if (folio->index > end_index ||\n    (folio->index == end_index && !pg_offset)) {\n      folio_invalidate(folio, 0, folio_size(folio));\n      folio_unlock(folio);\n      return 0;\n  }\n\nwhich calls btrfs_folio_invalidate() which needs to mark the OE past\nisize finished but skips it because the folio is clean (same issue as in\ntruncate above)\n\nNow a bunch of processes, including a later call in the truncate itself,\nwill hang waiting on the OE which never finishes because these latter\nfolios never get submitted, nor does an invalidate truncate and finish\nthe lost OE.\n\nHere are some trace printks showing the buggy sequence:\n# btrfs_alloc_ordered_extent\n91.901347  OE-CREATE      ino=306 oe_off=3637248 num_bytes=73728 isize=4587672\n# btrfs_setsize the file, changing memory isize to newsize < oe_off\n91.901392  TRUNCATE       ino=306 oldsize=4587672 newsize=2573711\n# extent_writepage calls folio_invalidate for being past i_size (905 * 4096 = 3706880 > 2473711)\n91.901528  WB-INVALIDATE  ino=306 folio_idx=905 isize=2573711 dirty=0 writeback=0\n# btrfs_invalidate_folio does goto next and skips calling btrfs_mark_ordered_extent_truncated()\n91.901531  SKIP-OE-FINISH ino=306 oe_off=3637248 bytes_left=73728 isize=2573711 writeback=0\n\nI hope this is enough to figure out which one of us is missing\nsomething! Sorry again for being so unclear earlier.\n\n---\n\nI have reproduced it on two systems with your patch (x86 4k pages for both)\nand also while working on my own version which was basically your patch with\na hack to clean up the TOWRITE bit only in btrfs_subpage_set_writeback().\n\nWhile working on the details of my explanation for this email, I was\nadding lots of printks and it did go away in one build, so I guess the\nrace between truncate and writeback is finicky enough that you are\ngetting unlucky? I played with some delays but haven't yet found a\nperfect place to make it 100% reliable.\n\n---\n\nI have been testing something hacky like this in\nbtrfs_subpage_set_writeback(), and I believe it is correct for TOWRITE\nbut still convincing myself about DIRTY. Just putting code out to be\nmore concrete. I think it's clearly hacky, but it's something we have\nthrown around before so it was easy to start with:\n\n \tkeep_write = folio_test_dirty(folio);\n \tif (!folio_test_writeback(folio))\n \t\t__folio_start_writeback(folio, keep_write);\n+\tif (!keep_write) {\n+\t\tstruct address_space *mapping = folio_mapping(folio);\n+\t\tunsigned long xas_flags;\n+\t\tXA_STATE(xas, &mapping->i_pages, folio->index);\n+\n+\t\txas_lock_irqsave(&xas, xas_flags);\n+\t\txas_load(&xas);\n+\t\txas_clear_mark(&xas, PAGECACHE_TAG_DIRTY);\n+\t\txas_clear_mark(&xas, PAGECACHE_TAG_TOWRITE);\n+\t\txas_unlock_irqrestore(&xas, xas_flags);\n+\t}\n \tspin_unlock_irqrestore(&bfs->lock, flags);\n\n---\n\nUnder your proposal would we still be calling folio_clear_dirty_for_io()\nas in this current incomplete fix? You haven't commented yet either way\non your view of the importance of getting to a folio_mkclean() *somehow*\nto write protect the folio, so I just wanted to make sure we were synced\non that, as that is what got me debugging this in the first place, not\nthe messed up PAGECACHE_TAG_DIRTY, which we obviously need to fix as\nwell!\n\nThanks,\nBoris",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-07",
+          "message_id": "20260707191208.GA516053@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author acknowledged that their previous explanation was rushed and agreed that the issue arises after i_size_write(), indicating they understand the problem but may need to revisit their patch\n\nAuthor acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2\n\nAuthor expressed concern about potential truncate vs writeback races, suggesting that taking a lock in writeback may be necessary to prevent such issues.\n\nAuthor addressed Qu Wenruo's concern about a regression where PAGECACHE_TAG_DIRTY is never cleared, explaining that the issue is actually csum corruption caused by mmap being allowed to write to folios under writeback, and plans to send a holistic fix proposal",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a mistake in their previous explanation",
+            "acknowledged a specific technical issue",
+            "concern about potential issue",
+            "acknowledgment of need for fix",
+            "acknowledges a fix is needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Good point, but I think the issue is as soon as you do i_size_write(),\nso the rest is just my explanation being a little misleading, I think.\n\n---\n\nyes, I think this path to the hang definitely requires the fact that\nwriteback does not hold i_rwsem while reading i_size.\n\n---\n\nDon't we risk weird truncate vs writeback races where they undo each\nother, then? I assume taking the lock in writeback will be \"correct\" but\nit might be slow or introduce some other locking order problem...\n\n---\n\nNo it's a csum corruption with mmap being allowed to write to folios\nthat are under writeback (and thus computing csums)\n\nSince we got rid of folio_clear_dirty_for_io() (and thus\nfolio_mkclean()), then if we mmap a large folio, then start writeback on\nit, we never write protect the folios while they are under writeback so\nthe mmap user can trigger write faults and mess up the csums. We have\nobserved this in practice in our early testing of btrfs large folios in\nproduction and we also have a racy reproducer that enables large folios,\nmmaps a file and has a bunch of threads racing between touching each\nsector with some new random data and fsyncing the file. We do that a bunch\nof times, then drop caches and read everything. Do that whole thing in a\nloop a few times and eventually you hit it. I can share the exact LLM\nreproducer slop code if you would like, but that is the rough shape, to\nexplain the point.\n\nI can send my holistic fix proposal with your v2 included in a series?",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-07",
+          "message_id": "20260707231632.GA690447@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2, and plans to send a separate patch to fix csum corruption.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I gave your v2 my r-b, and will send the patch to fix the corruption\nnext, separately. It shouldn't affect your patch, as it only conflicted\nif we went back to folio_clear_dirty_for_io().",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-07",
+          "message_id": "20260707234846.GB83688@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a regression in Btrfs where PAGECACHE_TAG_DIRTY is never cleared, leading to potential issues such as csum corruption when mmap writes are allowed on folios under writeback. The problem arises from the removal of folio_clear_dirty_for_io() and folio_mkclean(), which previously ensured that folios were write-protected during writeback. To fix this, the patch likely takes a lock in writeback to prevent races between truncate and writeback operations, ensuring that csums are correctly computed."
+    },
+    "2026-07-08": {
+      "report_file": "2026-07-07_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer noted that the problem lies in the interaction between truncate_pagecache and extent_writepage, where the former grabs the folio lock while the latter is holding it for writeback, causing a deadlock.\n\nReviewer Qu Wenruo questioned whether an inode lock is necessary to prevent stale results from i_size_read() during writeback operations, suggesting that if not locked, the writeback should proceed regardless of isize.\n\nReviewer Qu Wenruo expressed concerns about the patch's complexity and potential impact on beyond-isize handling, specifically mentioning the need to remove async-submission from compression.\n\nThe reviewer noted that the patch's fix for a regression where PAGECACHE_TAG_DIRTY is never cleared has an issue: when a truncate operation races with writeback, it can lead to a hang due to the folio being marked as clean and skipped by btrfs_folio_invalidate(), causing the ordered extent to never finish.\n\nReviewer Qu Wenruo asked for clarification on why folio_mkclean() is necessary, specifically inquiring if it's to prevent another instance of OE hang",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "lock ordering violation",
+            "questioning the necessity of an inode lock",
+            "suggesting a change in behavior",
+            "complexity",
+            "potential impact",
+            "requested changes",
+            "inquiry",
+            "request for explanation"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Just a small nitpick, the problem is not from the truncate_setsize() \ncall site, as truncate_pagecache() is grabbing the folio with FGP_LOCK, \nso it can not grab the folio locked by writeback.\n\n---\n\nThanks a lot! Now I understand how things are going wrong now.\n\nBut I still have a question, I thought we should have some kind of inode \nlock or something else to prevent i_size_read() from getting stale results.\n\nAnd digging deeper, for the btrfs_setsize(), the inode is already \nlocked. E.g. inside notify_change() there is a WARN_ON_ONCE() if the \ninode is not locked.\n\nWould the root cause of the problem is that we did not lock the inode \nfor writeback?\n\nAnd if we do not have proper inode lock for writeback, then I think \nwrite back should never bother the isize check, and always do the \nwriteback no matter isize.\n\n---\n\nThat has a lot of extra requirements, and may have also change the \ntiming of a lot of beyond-isize handling.\n\nAnd the biggest requirement is to get rid of the cursed async-submission \nfrom compression.\n\nSo we're still quite away from that.\n\n---\n\nNo, no folio_clear_dirty_for_io() call anymore, all changes are inside \nsubpage.c now, just the extra PAGECACHE_TAG_* clearing during \nbtrfs_subpage_set_writeback().\n\n---\n\nMind to explain why folio_mkclean() is required? Is it for the same OE \nhang or something else?\n\nThanks,\nQu",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-07-08",
+          "message_id": "58a76be5-12b2-469e-a9a0-146bfeb55773@gmx.com",
+          "email": "quwenruo.btrfs@gmx.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer Qu Wenruo noted that truncation should wait for writeback to complete before invalidating a folio, and suggested exploring this idea without breaking existing functionality.\n\nReviewer Qu Wenruo expressed concern that the patch may introduce additional overhead and break cachestat(), requesting the v2 fix to be used as a hotfix first.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "exploring alternative solution",
+            "additional overhead"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Writeback still has the folio locked, so truncation should wait for the \nwriteback first then invalidate it.\n\nThe other direction would also be true, if the invalidation invalidated \nthe page first, then writeback should not got a dirty folio anymore.\n\nBut I can be totally wrong considering how complex things are.\n\nI can explore if this idea won't break the existing runs first.\n\n---\n\nSounds great. Feel free to include the v2 fix:\nhttps://lore.kernel.org/linux-btrfs/d47af8cae38e32462d61cb62139c2732e4e8fdbe.1783407237.git.wqu@suse.com/T/\n\nAlthough considering this is already breaking cachestat() and will cause \nextra overhead for writeback, I'd prefer the v2 as a hot fix first.\n\nThanks,\nQu",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-07-08",
+          "message_id": "9a5f8318-fb44-4f0c-b8b0-5f8af1fbbfa3@suse.com",
+          "email": "wqu@suse.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a regression in Btrfs where PAGECACHE_TAG_DIRTY is never cleared, leading to potential issues such as csum corruption when mmap writes are allowed on folios under writeback. The problem arises from the removal of folio_clear_dirty_for_io() and folio_mkclean(), which previously ensured that folios were write-protected during writeback. To fix this, the patch likely takes a lock in writeback to prevent races between truncate and writeback operations, ensuring that csums are correctly computed."
+    }
+  }
+}

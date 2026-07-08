@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 0/3] mm: __access_remote_vm with per-VMA lock</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260625015053.2445008-1-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-27</strong><div class="date-range-nav">Active on: <a href="#2026-06-27">2026-06-27</a> &bull; <a href="#2026-06-26">2026-06-26</a> &bull; <a href="#2026-06-25">2026-06-25</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-06-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-07</strong><div class="date-range-nav">Active on: <a href="#2026-07-07">2026-07-07</a> &bull; <a href="#2026-06-27">2026-06-27</a> &bull; <a href="#2026-06-26">2026-06-26</a> &bull; <a href="#2026-06-25">2026-06-25</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces a fast path for __access_remote_vm that uses per-VMA locks instead of the process-wide mmap_lock, improving system monitoring reliability and speeding up the function under contention. The fast path is only enabled when it&#x27;s safe to do so, requiring a kernel with per-VMA locks, RCU page table freeing, and specific VMA types excluded. This change aims to address issues where processes get stuck holding the mmap_lock for extended periods, hindering system monitoring tools&#x27; ability to assess and log situations.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0">
@@ -651,6 +651,136 @@ Thanks, Lorenzo</pre>
 <div class="reply-to-label">&#8627; replying to David (Arm)</div>
 <a href="https://lore.kernel.org/r/aj92U3McDAoKNeMB@lucifer" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: reviewer emphasized the importance of engagement, reviewer highlighted potential consequences of not addressing comments</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-07-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-07">2026-07-07</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that a key issue was overlooked and thanked Lorenzo for pointing it out, indicating that the patch will be revised to address this new information.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Ahhh! That&#x27;s the part I was missing. Thank you.
+
+That simplifies things nicely.
+
+-- 
+All Rights Reversed.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Lorenzo Stoakes</div>
+<a href="https://lore.kernel.org/r/5c06c0ad2f2a7a039181a1775623ec06ca063dff.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a missing piece, will revise</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-07-07">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lorenzo Stoakes</span>
+<a class="date-chip" href="../2026-07-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-07">2026-07-07</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer questioned whether the patch effectively addresses all necessary locking scenarios, suggesting that explicit mention of per-thread locks (PTLs) might be needed
+
+reviewer questioned the relevance of Khugepaged to the patch and asked for clarification on whether pmdp_get_lockless_sync() calls tlb_remove_table_sync_one() in the context of GUP fast paths
+
+Reviewer noted that vswap_free() acquires the per-vswap spinlock while holding the folio lock, creating a potential deadlock with reclaim paths, and suggested dropping the lock before calling try_to_unmap().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Actually not so sure I do now :) I mean maybe I need to be explicit about
+the need for PTL&#x27;s too. I guess &#x27;other than the PTLs your page table walker
+will take&#x27; is kinda implicit there.
+
+---
+
+This is confusing too. Khugepaged _could_ fix this one of two ways, right now it
+_does_ the first?
+
+You mean pmdp_get_lockless_sync() calls tlb_remove_table_sync_one()?
+
+But that&#x27;s for GUP fast right, not folio_walk_start/end()?
+
+---
+
+I think so! Otherwise we&#x27;d already have very broken page table walkers
+right?
+
+So:
+
+pte_t *pte_offset_map_lock(struct mm_struct *mm, pmd_t *pmd,
+			   unsigned long addr, spinlock_t **ptlp)
+{
+	spinlock_t *ptl;
+	pmd_t pmdval;
+	pte_t *pte;
+again:
+	pte = __pte_offset_map(pmd, addr, &amp;pmdval);
+	if (unlikely(!pte))
+		return pte;
+	ptl = pte_lockptr(mm, &amp;pmdval);
+	spin_lock(ptl);
+	if (likely(pmd_same(pmdval, pmdp_get_lockless(pmd)))) {
+		*ptlp = ptl;
+		return pte;
+	}
+	pte_unmap_unlock(pte, ptl);
+	goto again;
+}
+
+__pte_offset_map() takes the RCU lock, then locklessly retrieves a pointer
+to the PTE page table.
+
+As mentioned above, khugepaged retraction causing PTE page table freeing is
+also under RCU, so this is safe:
+
+	retract_page_tables() -&gt; pte_free_defer() -&gt; RCU
+	try_collapse_pte_mapped_thp() -&gt; pte_free_defer() -&gt; RCU
+
+And on page table retraction, importantly, the PMD entry is cleared _with
+the PTE PTL held_, e.g. in retract_page_tables():
+
+		ptl = pte_lockptr(mm, pmd);
+		if (ptl != pml)
+			spin_lock_nested(ptl, SINGLE_DEPTH_NESTING);
+		...
+		if (likely(file_backed_vma_is_retractable(vma))) {
+			pgt_pmd = pmdp_collapse_flush(vma, addr, pmd);
+			...
+		}
+
+		if (ptl != pml)
+			spin_unlock(ptl);
+
+For anon, we take the mmap write lock/VMA write lock anyway.
+
+And going back to pte_offset_map_lock() - we _recheck the PMD under the
+PTL_.
+
+So if the PMD was since cleared, we don&#x27;t get anything stale. If it wasn&#x27;t,
+then we hold the PTE PTL and exclude khugepaged from changing things under
+us.
+
+Thus folio_walk_start(), which holds the PTE PTL, is perfectly fine, and
+folio_walk_end() marks the point at which things are no longer safe (but
+then we&#x27;re done with the folio).
+
+So again I don&#x27;t think there&#x27;s any problem here, actually.
+
+Thanks, Lorenzo</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/akzv9FWH1peGukyp@lucifer" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested clarification on PTLs, questioning, clarification requested</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>

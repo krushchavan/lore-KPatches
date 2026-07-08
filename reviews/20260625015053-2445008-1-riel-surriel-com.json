@@ -236,6 +236,55 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series introduces a fast path for __access_remote_vm that uses per-VMA locks instead of the process-wide mmap_lock, improving system monitoring reliability and speeding up the function under contention. The fast path is only enabled when it's safe to do so, requiring a kernel with per-VMA locks, RCU page table freeing, and specific VMA types excluded. This change aims to address issues where processes get stuck holding the mmap_lock for extended periods, hindering system monitoring tools' ability to assess and log situations."
+    },
+    "2026-07-07": {
+      "report_file": "2026-07-07_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Lorenzo Stoakes",
+          "summary": "reviewer questioned whether the patch effectively addresses all necessary locking scenarios, suggesting that explicit mention of per-thread locks (PTLs) might be needed\n\nreviewer questioned the relevance of Khugepaged to the patch and asked for clarification on whether pmdp_get_lockless_sync() calls tlb_remove_table_sync_one() in the context of GUP fast paths\n\nReviewer noted that vswap_free() acquires the per-vswap spinlock while holding the folio lock, creating a potential deadlock with reclaim paths, and suggested dropping the lock before calling try_to_unmap().",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested clarification on PTLs",
+            "questioning",
+            "clarification requested",
+            "potential deadlock",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Actually not so sure I do now :) I mean maybe I need to be explicit about\nthe need for PTL's too. I guess 'other than the PTLs your page table walker\nwill take' is kinda implicit there.\n\n---\n\nThis is confusing too. Khugepaged _could_ fix this one of two ways, right now it\n_does_ the first?\n\nYou mean pmdp_get_lockless_sync() calls tlb_remove_table_sync_one()?\n\nBut that's for GUP fast right, not folio_walk_start/end()?\n\n---\n\nI think so! Otherwise we'd already have very broken page table walkers\nright?\n\nSo:\n\npte_t *pte_offset_map_lock(struct mm_struct *mm, pmd_t *pmd,\n\t\t\t   unsigned long addr, spinlock_t **ptlp)\n{\n\tspinlock_t *ptl;\n\tpmd_t pmdval;\n\tpte_t *pte;\nagain:\n\tpte = __pte_offset_map(pmd, addr, &pmdval);\n\tif (unlikely(!pte))\n\t\treturn pte;\n\tptl = pte_lockptr(mm, &pmdval);\n\tspin_lock(ptl);\n\tif (likely(pmd_same(pmdval, pmdp_get_lockless(pmd)))) {\n\t\t*ptlp = ptl;\n\t\treturn pte;\n\t}\n\tpte_unmap_unlock(pte, ptl);\n\tgoto again;\n}\n\n__pte_offset_map() takes the RCU lock, then locklessly retrieves a pointer\nto the PTE page table.\n\nAs mentioned above, khugepaged retraction causing PTE page table freeing is\nalso under RCU, so this is safe:\n\n\tretract_page_tables() -> pte_free_defer() -> RCU\n\ttry_collapse_pte_mapped_thp() -> pte_free_defer() -> RCU\n\nAnd on page table retraction, importantly, the PMD entry is cleared _with\nthe PTE PTL held_, e.g. in retract_page_tables():\n\n\t\tptl = pte_lockptr(mm, pmd);\n\t\tif (ptl != pml)\n\t\t\tspin_lock_nested(ptl, SINGLE_DEPTH_NESTING);\n\t\t...\n\t\tif (likely(file_backed_vma_is_retractable(vma))) {\n\t\t\tpgt_pmd = pmdp_collapse_flush(vma, addr, pmd);\n\t\t\t...\n\t\t}\n\n\t\tif (ptl != pml)\n\t\t\tspin_unlock(ptl);\n\nFor anon, we take the mmap write lock/VMA write lock anyway.\n\nAnd going back to pte_offset_map_lock() - we _recheck the PMD under the\nPTL_.\n\nSo if the PMD was since cleared, we don't get anything stale. If it wasn't,\nthen we hold the PTE PTL and exclude khugepaged from changing things under\nus.\n\nThus folio_walk_start(), which holds the PTE PTL, is perfectly fine, and\nfolio_walk_end() marks the point at which things are no longer safe (but\nthen we're done with the folio).\n\nSo again I don't think there's any problem here, actually.\n\nThanks, Lorenzo",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-07-07",
+          "message_id": "akzv9FWH1peGukyp@lucifer",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author acknowledged that a key issue was overlooked and thanked Lorenzo for pointing it out, indicating that the patch will be revised to address this new information.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a missing piece",
+            "will revise"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ahhh! That's the part I was missing. Thank you.\n\nThat simplifies things nicely.\n\n-- \nAll Rights Reversed.",
+          "reply_to": "Lorenzo Stoakes",
+          "message_date": "2026-07-07",
+          "message_id": "5c06c0ad2f2a7a039181a1775623ec06ca063dff.camel@surriel.com",
+          "email": "riel@surriel.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series introduces a fast path for __access_remote_vm that uses per-VMA locks instead of the process-wide mmap_lock, improving system monitoring reliability and speeding up the function under contention. The fast path is only enabled when it's safe to do so, requiring a kernel with per-VMA locks, RCU page table freeing, and specific VMA types excluded. This change aims to address issues where processes get stuck holding the mmap_lock for extended periods, hindering system monitoring tools' ability to assess and log situations."
     }
   }
 }
