@@ -1,0 +1,30 @@
+{
+  "thread_id": "20260709-nfsd-testing-v2-3-0a1ba233bf87@kernel.org",
+  "subject": "[PATCH v2 03/10] nfsd: fix stale s2s_cp_stateids IDR entry for async COPY",
+  "url": "https://lore.kernel.org/all/20260709-nfsd-testing-v2-3-0a1ba233bf87@kernel.org/",
+  "dates": {
+    "2026-07-09": {
+      "report_file": "2026-07-09_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Chuck Lever",
+          "summary": "Identified two critical issues: stale IDR entry due to missing nfs4_free_copy_state() call and uninitialized stateid caused by reordering dup_copy_fields() and nfs4_init_copy_state().",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "WAITING_FOR_REVIEW"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "\n\nOn Thu, Jul 9, 2026, at 2:47 PM, Jeff Layton wrote:\n> For an async COPY, nfsd4_copy() called nfs4_init_copy_state() before\n> dup_copy_fields(), so the s2s_cp_stateids IDR was pointed at\n> &u->copy->cp_stateid -- memory in the per-rqstp COMPOUND buffer that is\n> reused by the next request. dup_copy_fields() copies only the value into\n> async_copy, so the IDR slot dangled at the transient buffer for the whole\n> background copy. Any IDR walker then dereferences reused request memory:\n> the laundromat reads cs_type from it and, if the bytes look like an\n> expired NFS4_COPYNOTIFY_STID, follows into\n> refcount_dec()/idr_remove()/kfree() on garbage; manage_cpntf_state() has\n> the same exposure via idr_find().\n>\n> Duplicate the fields first, then register the stateid on the stable\n> async_copy. result->cb_stateid is unchanged.\n>\n> Fixes: e0639dc5805a (\"NFSD introduce async copy feature\")\n> Assisted-by: Claude:claude-opus-4-8\n> Signed-off-by: Jeff Layton <jlayton@kernel.org>\n> ---\n>  fs/nfsd/nfs4proc.c | 16 +++++++++++++---\n>  1 file changed, 13 insertions(+), 3 deletions(-)\n>\n> diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c\n> index fad01d67bf3f..1c674479d4ca 100644\n> --- a/fs/nfsd/nfs4proc.c\n> +++ b/fs/nfsd/nfs4proc.c\n> @@ -2272,11 +2272,21 @@ nfsd4_copy(struct svc_rqst *rqstp, struct \n> nfsd4_compound_state *cstate,\n>  \t\tasync_copy->cp_src = kmalloc_obj(*async_copy->cp_src);\n>  \t\tif (!async_copy->cp_src)\n>  \t\t\tgoto out_dec_async_copy_err;\n> -\t\tif (!nfs4_init_copy_state(nn, copy))\n> +\t\tdup_copy_fields(copy, async_copy);\n> +\t\t/*\n> +\t\t * Register the copy stateid on the long-lived async_copy\n> +\t\t * rather than on the transient COMPOUND argument buffer\n> +\t\t * (&u->copy). nfs4_init_copy_state() installs a pointer to\n> +\t\t * the copy_stateid_t in nn->s2s_cp_stateids, and that pointer\n> +\t\t * outlives this call (it is removed only when the background\n> +\t\t * copy finishes). Pointing it at &u->copy would leave a stale\n> +\t\t * pointer into reused request memory that the laundromat and\n> +\t\t * OFFLOAD_CANCEL later dereference.\n> +\t\t */\n> +\t\tif (!nfs4_init_copy_state(nn, async_copy))\n>  \t\t\tgoto out_dec_async_copy_err;\n> -\t\tmemcpy(&result->cb_stateid, &copy->cp_stateid.cs_stid,\n> +\t\tmemcpy(&result->cb_stateid, &async_copy->cp_stateid.cs_stid,\n>  \t\t\tsizeof(result->cb_stateid));\n> -\t\tdup_copy_fields(copy, async_copy);\n>  \t\tif ((READ_ONCE(copy->nf_dst->nf_file->f_mode) &\n>  \t\t\t       FMODE_NOCMTIME) != 0)\n>  \t\t\tasync_copy->attr_update = true;\n>\n> -- \n> 2.55.0\n\nSashiko spotted some severe issues:\n\n- [Critical] Async copy cancellation paths remove the copy from `clp->async_copies` and free the `async_copy` object, but fail to call `nfs4_free_copy_state()`. This leaks the IDR entry in `nn->s2s_cp_stateids` and leaves it pointing to freed memory, causing a remote Use-After-Free (UAF) DoS.\n- [High] Reordering `dup_copy_fields()` before `nfs4_init_copy_state()` leaves `async_copy->cp_res.cb_stateid` uninitialized, causing the server to send an invalid (all-zero) stateid in the `CB_OFFLOAD` callback.\n\nThe second one was also spotted by gpt-5.6-sol.\n\nThe new code comment here is a design breadcrumb. Probably not useful\nto carry it as part of the code, but YMMV.\n\n\n-- \nChuck Lever\n\n",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-07-09",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch addresses a stale IDR entry issue in the NFS server for async COPY operations. The problem arises when the s2s_cp_stateids IDR is pointed at reused request memory, leading to potential Use-After-Free (UAF) DoS attacks. To fix this, the patch duplicates fields first and then registers the stateid on the stable async_copy object."
+    }
+  }
+}

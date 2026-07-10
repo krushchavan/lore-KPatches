@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/4] mm: fix reclaim storms in defrag_mode</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260626182215.1107966-1-hannes@cmpxchg.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-26</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-02</strong><div class="date-range-nav">Active on: <a href="#2026-07-02">2026-07-02</a> &bull; <a href="#2026-07-01">2026-07-01</a> &bull; <a href="#2026-06-26">2026-06-26</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-06-26</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-09</strong><div class="date-range-nav">Active on: <a href="#2026-07-09">2026-07-09</a> &bull; <a href="#2026-07-02">2026-07-02</a> &bull; <a href="#2026-07-01">2026-07-01</a> &bull; <a href="#2026-06-26">2026-06-26</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a performance issue in the Linux kernel&#x27;s memory management system, specifically when vm.defrag_mode is enabled. The problem arises from non-movable requests spinning and reclaiming unproductively due to kswapd/kcompactd being overwhelmed. To fix this, the patches modify the allocator slowpath to allow non-movable requests to participate in pageblock production, which has been successfully tested on an affected workload for two weeks.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-06-26">
@@ -2084,6 +2084,291 @@ index cb422505c6ef..f7f5245e7ca1 100644
 </details>
 <a href="https://lore.kernel.org/r/61bc1ad0-f9e3-405a-ae32-b89bcdd2e1d1@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: asymmetry, questioned</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-07-09">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner (author)</span>
+<a class="date-chip" href="../2026-07-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-09">2026-07-09</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about the definition of &#x27;small&#x27; in the code, acknowledged that it&#x27;s already clear from the order &lt; pageblock_order condition, and agreed to explicitly spell it out by changing the text to &#x27;&lt;pageblock_order&#x27;.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, Jul 02, 2026 at 11:28:47AM +0200, Vlastimil Babka (SUSE) wrote:
+&gt; On 7/1/26 23:11, Johannes Weiner wrote:
+&gt; &gt; On Wed, Jul 01, 2026 at 08:14:05PM +0200, Vlastimil Babka (SUSE) wrote:
+&gt; &gt;&gt; 
+&gt; &gt;&gt; &gt; This made the migratetype filtering about preventing block
+&gt; &gt;&gt; &gt; pollution. The patch quotes reduced extfrag numbers.
+&gt; &gt;&gt; &gt; 
+&gt; &gt;&gt; &gt; So now we have a block pollution guard that we apply only if... the
+&gt; &gt;&gt; &gt; scanner is latency sensitive? :) Is this actually desired behavior?
+&gt; &gt;&gt; 
+&gt; &gt;&gt; Yeah indeed I was wondering in this direction.
+&gt; &gt;&gt; 
+&gt; &gt;&gt; &gt; Another way of looking at it would be this:
+&gt; &gt;&gt; &gt; 
+&gt; &gt;&gt; &gt; 	/*
+&gt; &gt;&gt; &gt; 	 * Allocation fallbacks can spread migratable pages
+&gt; &gt;&gt; &gt; 	 * into non-movable blocks.
+&gt; &gt;&gt; 
+&gt; &gt;&gt; But also vice versa, non-movable pages into movable blocks? (without
+&gt; &gt;&gt; defrag_mode?).
+&gt; &gt; 
+&gt; &gt; Uhm but those aren&#x27;t compactable anymore then, right?
+&gt; 
+&gt; Yeah.
+&gt; 
+&gt; &gt; There is a flipside, but it isn&#x27;t quite symmetrical. Movable requests
+&gt; &gt; are allowed to look for movables in unmovable blocks once they become
+&gt; &gt; sync (high-effort, low-result). Non-movable requests are finally
+&gt; &gt; allowed to empty movable blocks once they become sync; they *start*
+&gt; &gt; with the high-effort, low-result mode to avoid block contamination but
+&gt; &gt; are allowed to escalate when that doesn&#x27;t produce results.
+&gt; 
+&gt; Hm, true!
+&gt; 
+&gt; I was also thinking, if defrag mode doesn&#x27;t allow that escalation ever
+&gt; (IIRC?), should it be reflected here as well even with sync compaction?
+
+Ok I made a clarification regarding defrag_mode in the other comment.
+
+How about this?
+
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 7df3a85d43af..a12a49eefe85 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -1399,13 +1399,24 @@ static bool suitable_migration_source(struct compact_control *cc,
+ 	if (is_migrate_cma(block_mt) &amp;&amp; !(cc-&gt;alloc_flags &amp; ALLOC_CMA))
+ 		return false;
+ 
++	/*
++	 * Per default, scans are restricted to blocks compatible with
++	 * the request, to prevent cross-contamination. Once
++	 * compaction priority escalates to synchronous scans, though,
++	 * scan all blocks to try to make forward progress. For
++	 * movable request, this likely helps little: there shouldn&#x27;t
++	 * be many migratable pages inside non-movable blocks besides
++	 * allocator fallbacks. For non-movable requests, this helps a
++	 * lot, as they can finally scan movable blocks.
++	 */
+ 	if (cc-&gt;mode != MIGRATE_ASYNC)
+ 		return true;
+ 
+ 	/*
+ 	 * Prevent small unmovable/reclaimable requests from polluting
+-	 * movable blocks through fallbacks. Whole-block production is
+-	 * exempt as the allocator claims and converts these.
++	 * movable blocks through fallbacks. Whole-block production
++	 * (directly requested, or defrag_mode) is exempt as the
++	 * allocator claims and converts these.
+ 	 */
+ 	if (cc-&gt;migratetype == MIGRATE_MOVABLE || cc-&gt;order &gt;= pageblock_order)
+ 		return is_migrate_movable(block_mt);
+
+---
+
+On Wed, Jul 01, 2026 at 09:47:21PM -0400, Zi Yan wrote:
+&gt; On Fri Jun 26, 2026 at 2:21 PM EDT, Johannes Weiner wrote:
+&gt; &gt; While trying to fix a reclaim storm in defrag_mode, I noticed that
+&gt; &gt; non-movable direct compaction is extremely inefficient.
+&gt; &gt;
+&gt; &gt; When searching for space to evacuate, compaction only allows blocks of
+&gt; &gt; the same type as the incoming request. This is to prevent migratetype
+&gt; &gt; pollution, where a small non-movable request frees space in a movable
+&gt; &gt; block and provokes the allocator to fall back and pollute it.
+&gt; &gt;
+&gt; &gt; This protection is reasonable on one hand, but the downside is that it
+&gt; &gt; makes non-movable direct compaction nearly useless: if we get the type
+&gt; &gt; annotations right, by definition there aren&#x27;t any movable pages inside
+&gt; &gt; the non-movable blocks it is allowed to scan.
+&gt; &gt;
+&gt; &gt; With defrag_mode, the goal is the production of whole blocks, which
+&gt; &gt; are essentially type neutral: __rmqueue_claim() will convert them
+&gt; &gt; wholesale on alloc. This makes type mixing and pollution a non-issue.
+&gt; &gt;
+&gt; &gt; Fix the pollution gates to take the requested order into account, and
+&gt; &gt; allow whole-block requests to scan blocks of other types.
+&gt; &gt;
+&gt; &gt; The only exception is CMA blocks. That type is sticky and these blocks
+&gt; &gt; cannot be claimed to other types. Continue to be strict with them, and
+&gt; &gt; allow only explicit ALLOC_CMA requests and kcompactd to evacuate them.
+&gt; &gt;
+&gt; &gt; Signed-off-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+&gt; &gt; ---
+&gt; &gt;  mm/compaction.c | 35 ++++++++++++++++++++++++++++-------
+&gt; &gt;  1 file changed, 28 insertions(+), 7 deletions(-)
+&gt; &gt;
+&gt; 
+&gt; &lt;snip&gt;
+&gt; 
+&gt; &gt; +
+&gt; &gt; +	/*
+&gt; &gt; +	 * Prevent small unmovable/reclaimable requests from polluting
+&gt; 
+&gt; &quot;small&quot; here means smaller than pageblock_order requests? If yes, it is
+&gt; better to spell it out to prevent confusion.
+
+Ah, I thought the order &lt; pageblock_order in the code would make it
+clear. But I don&#x27;t mind spelling it out.
+
+I will change this to &quot;&lt;pageblock_order&quot;. Shout if you prefer
+something else :)
+
+&gt; 
+&gt; &gt; +	 * movable blocks through fallbacks. Whole-block production is
+&gt; &gt; +	 * exempt as the allocator claims and converts these.
+&gt; &gt; +	 */
+&gt; &gt; +	if (cc-&gt;migratetype == MIGRATE_MOVABLE || cc-&gt;order &gt;= pageblock_order)
+&gt; &gt;  		return is_migrate_movable(block_mt);
+&gt; &gt;  	else
+&gt; &gt;  		return block_mt == cc-&gt;migratetype;
+&gt; &gt; @@ -1974,12 +1995,12 @@ static unsigned long fast_find_migrateblock(struct compact_control *cc)
+&gt; &gt;  		return pfn;
+&gt; &gt;  
+&gt; &gt;  	/*
+&gt; &gt; -	 * Only allow kcompactd and direct requests for movable pages to
+&gt; &gt; -	 * quickly clear out a MOVABLE pageblock for allocation. This
+&gt; &gt; -	 * reduces the risk that a large movable pageblock is freed for
+&gt; &gt; -	 * an unmovable/reclaimable small allocation.
+&gt; &gt; +	 * Prevent small unmovable/reclaimable requests from polluting
+&gt; 
+&gt; This &quot;small&quot; as well.
+
+Yep, will keep these in sync.
+
+---
+
+On Thu, Jul 02, 2026 at 12:20:48PM +0200, Vlastimil Babka (SUSE) wrote:
+&gt; Now my version (only compile tested):
+
+Ah, now I get it. Thanks.
+
+&gt; diff --git a/include/linux/compaction.h b/include/linux/compaction.h
+&gt; index f29ef0653546..66a2f70e9e01 100644
+&gt; --- a/include/linux/compaction.h
+&gt; +++ b/include/linux/compaction.h
+&gt; @@ -58,6 +58,7 @@ enum compact_result {
+&gt;  };
+&gt;  
+&gt;  struct alloc_context; /* in mm/internal.h */
+&gt; +struct capture_control; /* in mm/internal.h */
+&gt;  
+&gt;  /*
+&gt;   * Number of free order-0 pages that should be available above given watermark
+&gt; @@ -92,7 +93,7 @@ extern int fragmentation_index(struct zone *zone, unsigned int order);
+&gt;  extern enum compact_result try_to_compact_pages(gfp_t gfp_mask,
+&gt;  		unsigned int order, unsigned int alloc_flags,
+&gt;  		const struct alloc_context *ac, enum compact_priority prio,
+&gt; -		struct page **page);
+&gt; +		struct capture_control *capc);
+&gt;  extern void reset_isolation_suitable(pg_data_t *pgdat);
+&gt;  extern bool compaction_suitable(struct zone *zone, int order,
+&gt;  				unsigned long watermark, int highest_zoneidx);
+&gt; diff --git a/mm/compaction.c b/mm/compaction.c
+&gt; index b7878e4a2c4b..902573797f99 100644
+&gt; --- a/mm/compaction.c
+&gt; +++ b/mm/compaction.c
+&gt; @@ -2792,7 +2792,7 @@ compact_zone(struct compact_control *cc, struct capture_control *capc)
+&gt;  static enum compact_result compact_zone_order(struct zone *zone, int order,
+&gt;  		gfp_t gfp_mask, enum compact_priority prio,
+&gt;  		unsigned int alloc_flags, int highest_zoneidx,
+&gt; -		struct page **capture)
+&gt; +		struct capture_control *capc)
+&gt;  {
+&gt;  	enum compact_result ret;
+&gt;  	struct compact_control cc = {
+&gt; @@ -2809,36 +2809,8 @@ static enum compact_result compact_zone_order(struct zone *zone, int order,
+&gt;  		.ignore_skip_hint = (prio == MIN_COMPACT_PRIORITY),
+&gt;  		.ignore_block_suitable = (prio == MIN_COMPACT_PRIORITY)
+&gt;  	};
+&gt; -	struct capture_control capc = {
+&gt; -		.cc = &amp;cc,
+&gt; -		.page = NULL,
+&gt; -	};
+&gt; -
+&gt; -	/*
+&gt; -	 * Make sure the structs are really initialized before we expose the
+&gt; -	 * capture control, in case we are interrupted and the interrupt handler
+&gt; -	 * frees a page.
+&gt; -	 */
+&gt; -	barrier();
+&gt; -	WRITE_ONCE(current-&gt;capture_control, &amp;capc);
+&gt;  
+&gt; -	ret = compact_zone(&amp;cc, &amp;capc);
+&gt; -
+&gt; -	/*
+&gt; -	 * Make sure we hide capture control first before we read the captured
+&gt; -	 * page pointer, otherwise an interrupt could free and capture a page
+&gt; -	 * and we would leak it.
+&gt; -	 */
+&gt; -	WRITE_ONCE(current-&gt;capture_control, NULL);
+&gt; -	*capture = READ_ONCE(capc.page);
+&gt; -	/*
+&gt; -	 * Technically, it is also possible that compaction is skipped but
+&gt; -	 * the page is still captured out of luck(IRQ came and freed the page).
+&gt; -	 * Returning COMPACT_SUCCESS in such cases helps in properly accounting
+&gt; -	 * the COMPACT[STALL|FAIL] when compaction is skipped.
+&gt; -	 */
+&gt; -	if (*capture)
+&gt; -		ret = COMPACT_SUCCESS;
+&gt; +	ret = compact_zone(&amp;cc, capc);
+
+&amp;capc, and I switched it to just return compact_zone(&amp;cc, &amp;capc);
+
+But otherwise it looks clean to me. I&#x27;d just take this as-is with your
+From: if you don&#x27;t mind. Can I add your S-O-B?
+
+---
+
+On Wed, Jul 01, 2026 at 05:31:11PM -0700, Shakeel Butt wrote:
+&gt; On Fri, Jun 26, 2026 at 02:21:16PM -0400, Johannes Weiner wrote:
+&gt; &gt; As we deployed vm.defrag_mode=1 into Meta production, some workloads
+&gt; &gt; regressed with recurring pressure spikes and swap storms (which in turn
+&gt; &gt; triggered userspace OOM rules on pressure and swap utilization levels).
+&gt; &gt; 
+&gt; &gt; Tracing pinned this to non-movable 
+&gt; 
+&gt; allocation?
+&gt; 
+&gt; &gt; requests spinning and reclaiming
+
+    ^^^
+
+non-movable requests :)
+
+&gt; &gt; unproductively when kswapd/kcompactd are overwhelmed. Direct reclaim
+&gt; &gt; predominantly frees up pages in movable blocks, but those requests
+&gt; &gt; cannot use that space under defrag_mode rules; 
+&gt; 
+&gt; Do we have these rules documented somewhere?
+
+Kind of. The crux is that defrag_mode enforces ALLOC_NOFRAGMENT in the
+slowpath as well (whereas vanilla just does it in the fastpath). So
+it&#x27;s documented to the extent that ALLOC_NOFRAGMENT is.
+
+&gt; &gt; and it is unlikely to
+&gt; &gt; free up whole blocks incidentally for __rmqueue_claim() to work.
+&gt; &gt; 
+&gt; &gt; This series fixes it by making non-movable requests participate in
+&gt; &gt; pageblock production in the allocator slowpath.
+&gt; 
+&gt; Sorry after reading above sentence I didn&#x27;t get what those allocators will do
+&gt; things differently after the series (I still have to go through the series).
+
+Let me add:
+
+[...] - meaning, they will invoke direct reclaim and direct compaction
+with pageblock_order.
+
+Does that clarify it a bit?</pre>
+</details>
+<a href="https://lore.kernel.org/r/ak_c1HH72sJDmaSZ@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix, agreed to change</div>
 </div>
 </div>
 </div>

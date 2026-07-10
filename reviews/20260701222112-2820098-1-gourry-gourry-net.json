@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260701222112.2820098-1-gourry@gourry.net",
+  "subject": "[PATCH 0/2] mm: don't apply task mempolicy to unmovable kernel allocations",
+  "url": "https://lore.kernel.org/all/20260701222112.2820098-1-gourry@gourry.net/",
+  "dates": {
+    "2026-07-09": {
+      "report_file": "2026-07-09_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Huang, Ying",
+          "summary": "Theoretically, the change is correct, but practical issues may arise that need to be addressed.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "practical issues may arise"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Gregory Price <gourry@gourry.net> writes:\n\n> This series stops a task's NUMA mempolicy from steering incidental,\n> global kernel allocations that have no real relationship to the task.\n>\n> VMA-less allocations (alloc_pages(), folio_alloc(), vmalloc(), slab\n> refils) - fall back to the current task's mempolicy as their only\n> placement hint.\n>\n> This sweeps in kernel memory that is not the task's:\n>   - unaccounted slab\n>   - kernel page tables\n>   - driver GFP_KERNEL buffers\n>   - one-off global structures\n>   - etc\n>\n> On a uniform multi-socket system this is not implicitly harmful.\n> On a tiered-memory system a task's interleave/bind can push these\n> incidental allocations onto slower tiers and cause regressions.\n>\n> The memory may outlive the task, or be shared by others, yet a single\n> task's policy dictated where it landed.  \n>\n> The fix is to only follow the task policy for allocations that are\n> plausibly the task's:\n>\n>   - movable allocations (mostly user data), and\n>   - allocations explicitly tied to the task via __GFP_ACCOUNT.\n>\n> Everything else (unmovable and unaccounted) prefers node-local.\n>\n> Cpuset still enforces any hard confinements (ALLOC_CPUSET), and\n> fallback allocations may still cause spillage, but this at least\n> prevents interleave policies from making poor placements.\n>\n> Patch 1 makes page-cache placement explicit in filemap to retain\n> existing behavior (pagecache and metadata still end up following\n> the task mempolicy).  Since the metadata can be significant on\n> some systems, retaining this behavior will ensure there are no\n> surprises for existing users.\n>\n> If we want to change this behavior, this patch is droppable.\n>\n> Patch 2 adds the alloc_task_policy() filter for bare allocations.\n>\n> Test 1: Page cache follows the task policy (unchanged)\n> ======\n> A process running on node0 but bound to node1:\n>    (numactl --cpunodebind=0 --membind=1) writes a 1.2G file.\n>\n>   membind=1 (non-local):  FilePages  node0 +0MB     node1 +1200MB\n>   membind=0 (control):    FilePages  node0 +1200MB  node1 +0MB \n>\n>\n> Test 2: Incidental kernel allocations no longer follow it (changed)\n> ======\n> Added a debugfs interface to do movable and kernel allocations:\n>\n>  w/ --cpunodebind=0\n>  numactl ... --membind=1      echo 100000 > .../alloc_kernel\n>  numactl ... --membind=1      echo 100000 > .../alloc_movable\n>  numactl ... --interleave=all echo 100000 > .../alloc_kernel\n>\n>                        GFP_KERNEL          GFP_HIGHUSER_MOVABLE\n> membind=1    base:     node1 (follows)     node1\n>              patched:  node0 (local)       node1 (follows)\n>\n> interleave   base:     50/50 (follows)     50/50\n>              patched:  node0 (local)       50/50 (follows)\n>\n> Movable (user) allocations are unaffected in every case.\n>\n> The unmovable unaccounted kernel allocations stop following the\n> task policy and place node-local. With no policy set, both place\n> node-local as before.\n\nPersonally, I think this should be the right thing to do theoretically.\nHowever, you may need to find some practical issues that this resolves.\n\n> Suggested-by: Johannes Weiner <hannes@cmpxchg.org>\n>\n> Gregory Price (2):\n>   mm/filemap: place page-cache folios via an explicit mempolicy\n>   mm/mempolicy: skip task mempolicy for unmovable unaccounted kernel\n>     allocations\n>\n>  mm/filemap.c   |  5 ++++-\n>  mm/mempolicy.c | 40 ++++++++++++++++++++++++++++------------\n>  2 files changed, 32 insertions(+), 13 deletions(-)\n\n---\nBest Regards,\nHuang, Ying\n",
+          "reply_to": "",
+          "message_date": "2026-07-09",
+          "message_id": "",
+          "email": "ying.huang@linux.alibaba.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price",
+          "summary": "Provided a specific example of an improvement this patch would bring on systems with BIOS-configured CXL memory and ZONE_NORMAL.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "improvement"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Thu, Jul 09, 2026 at 07:09:29PM +0800, Huang, Ying wrote:\n> Gregory Price <gourry@gourry.net> writes:\n> \n> > The unmovable unaccounted kernel allocations stop following the\n> > task policy and place node-local. With no policy set, both place\n> > node-local as before.\n> \n> Personally, I think this should be the right thing to do theoretically.\n> However, you may need to find some practical issues that this resolves.\n> \n\nI don't entirely disagree, but there is at least one scenario where this\nis an obvious improvement:\n\n  BIOS-configured CXL memory brought up in ZONE_NORMAL. \n\nAn task interleave policy on such a system will end up with unaccounted\nkernel allocations landing on the remote node, which is just not\npreferable at all (and uncorrectable).\n\nIt's not a complete fix (fallbacks can still occur under pressure), but\nit's one piece of the puzzle.\n\n\nForward looking:  This patch makes private-node's with ZONE_NORMAL\nreliably hot-un-pluggable.  But that improvement is obviously predicated\non work that isn't upstream (yet :] ).\n\nI need to send a v2 of this with SLAB_ACCOUNT fixed up, and some numbers\nto justify dropping the pagecache fix.  But I will probably sandbag this\na bit until i finally send out v5 of private nodes.\n\n~Gregory\n\n",
+          "reply_to": "Huang, Ying",
+          "message_date": "2026-07-09",
+          "message_id": "",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series modifies the behavior of task mempolicy to not apply to unmovable kernel allocations, instead preferring node-local placement for such allocations. The change is motivated by potential regressions on tiered-memory systems where a task's interleave/bind can push incidental allocations onto slower tiers."
+    }
+  }
+}

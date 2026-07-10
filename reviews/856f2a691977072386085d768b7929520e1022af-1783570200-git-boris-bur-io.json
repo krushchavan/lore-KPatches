@@ -1,0 +1,179 @@
+{
+  "thread_id": "856f2a691977072386085d768b7929520e1022af.1783570200.git.boris@bur.io",
+  "subject": "[PATCH] btrfs: write-protect folios during data writeback",
+  "url": "https://lore.kernel.org/all/856f2a691977072386085d768b7929520e1022af.1783570200.git.boris@bur.io/",
+  "dates": {
+    "2026-07-09": {
+      "report_file": "2026-07-09_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer Qu Wenruo suggested a potential long-term solution by extracting the real work of btrfs_invalidate_folio() into a helper function, which would allow reverting back to folio_clear_dirty_for_io().\n\nReviewer Qu Wenruo questioned the necessity of calling folio_mkclean() in this specific location, suggesting it may be too early and potentially unnecessary if the folio is truncated before writeback.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "NEEDS_WORK",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Just to mention, we can workaround the problem, by extracting the real \nwork of btrfs_invalidate_folio() into a helper, with a bool parameter to \nindicate if we're called from the writeback path.\n\nThen we would have a better chance to rever to \nfolio_clear_dirty_for_io(), but there could be other things involved.\nSo I'm totally fine with the current hot fix, but eventually we will \nstill revert back to folio_clear_dirty_for_io(), to align the code to iomap.\n\n[...]\n\n---\n\nMy question is, why we need the call here?\n\nIsn't folio_mkclean() called during extent_write_cache_pages() when \nwe're writing back the folio?\nCalling it here looks a little too early, as the folio may not even go \nthrough writeback later (e.g. being truncated).\n\nOtherwise looks good to me.\n\nThanks,\nQu",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-07-09",
+          "message_id": "27264cb6-3172-4cb5-819a-705a3d607cb9@suse.com",
+          "email": "wqu@suse.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer Qu Wenruo noted that the problem still occurs because folio_clear_dirty_for_io() is called at a later timing, and provided an example of a scenario where the issue happens: when a large folio is split into multiple bios, and the first half is submitted without being write-protected. They also suggested a way to craft a more reliable reproducer.\n\nReviewer Qu Wenruo noted that the current implementation of clearing the block dirty flag in extent_clear_unlock_delalloc() is too late, as data has already been copied into metadata without write-protecting the folio using folio_mkclean().\n\nReviewer Qu Wenruo noted that compression corruption only occurs in the first and last folios of a contiguous compression range, not in the middle folios, which are cleared by extent_range_clear_dirty_for_io().\n\nReviewer Qu Wenruo noted that the patch is mostly for compression and suggested calling folio_mkclean() inside extent_range_clear_dirty_for_io() instead of too early, citing inline folios and regular COW/NOCOW writes as examples where folio_mkclean() is already called.\n\nReviewer Qu Wenruo noted that they were unaware of the importance of folio_mkclean() in relation to mmaped writes, implying a lack of prior knowledge about this specific aspect of the patch.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "provided example",
+            "late clear of block dirty flag",
+            "data copied into metadata without write-protection",
+            "clarification",
+            "additional information",
+            "lack of prior knowledge",
+            "acknowledgment of own ignorance"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Just want to make the cause more clear, and also explain under what \nexact situation the problem can happen.\n\nFirstly, we still call folio_clear_dirty_for_io(), but at a much later \ntiming, now it's only called when the last dirty block got its dirty \nflag cleared, instead of just before extent_writepage().\n\nThis means, if there is only a single contig dirty range inside a folio, \nand we can submit that contig range in one go, then the problem will not \nhappen.\n\nE.g. a 32K folio with 4K block size, and inside the folio the dirty \nrange looks like this:\n\n     0     8K     16K     24K    32K\n     |     |//////////////|      |\n\nThen during writeback, we clear the block dirty and mark writeback, \nqueue that block into a bbio (but not yet submitted).\n\nFinally at the last block [20K, 24K), we cleared the last dirty block, \nthus will call folio_clear_dirty_for_io() for the whole folio, then \nsubmit the bio for range [8K, 24K), and everything is still safe.\n\nBut another commit, \"btrfs: limit size of bios submitted from \nwriteback\", is making the situation worse, as if we get a very large \nfolio, e.g. 128KiB one, even if the whole range is dirty, it will still \nbe submitted as two 64K bios, in that case, the first half will be \nsubmitted without folio_mkclean() called, thus causing the problems \nyou're describing.\n\n\nWith all these said, this may help you to craft a more reliable \nreproducer, by:\n\n1. Allocate a large folio (e.g, 64KiB on 4K ps systems)\n    By doing a 64KiB sized buffered write at file offset 0.\n\n2. Mmap range [4K, 8K) and [16K, 20K)\n\n3. Trigger writeback with mmaped range being modified\n\n---\n\nInline is indeed affected, as we only rely on the final \nextent_clear_unlock_delalloc() -> process_one_folio() -> \nbtrfs_folio_clamp_clear_dirty() to clear the block dirty, which is too late.\n\nAs the data is already copied into metadata without folio_mkclean().\n\n---\n\nYes, compression corruption is still true, but only for the last/first \nfolio.\n\nFirstly compression range is always contig, only the first and last \nfolio can have other dirty ranges out of the compression range.\n\nSo the middle folios will always have their folio dirty flags cleared by \nextent_range_clear_dirty_for_io() -> btrfs_folio_clamp_clear_dirty().\n\n---\n\nI believe this is mostly for compression.\n\nAs inline folio is already cleaned by folio_mkclean() before \nextent_writepage().\nThe same for regular COW/NOCOW writes.\n\nIn that case, as I mentioned in another thread, I'd prefer not to call \nfolio_mkclean() too early.\n\nI'd prefer to call folio_mkclean() inside \nextent_range_clear_dirty_for_io() instead.\n\n---\n\nAnd I'm a total idiot not noticing this existing comment...\n\nOtherwise it looks good to me.\n\nThanks a lot of pinning down a bug that I'm completely unfamiliar with.\nDidn't notice folio_mkclean() has such an important role related to \nmmaped writes.\n\nThanks,\nQu",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-07-09",
+          "message_id": "bc4b48c4-9d3e-40ac-82f6-d01df950443f@suse.com",
+          "email": "wqu@suse.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer Qu Wenruo noted that without synchronization, a later mapped write can cause two different dirty ranges, and requested additional synchronization to prevent this issue.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "missing sync"
+          ],
+          "has_inline_review": true,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "My bad, missing a sync here.\nOther wise the later mmaped write will not cause two different dirty ranges.",
+          "reply_to": "",
+          "message_date": "2026-07-09",
+          "message_id": "220e9095-7eae-4129-a36f-53403df6fc8a@suse.com",
+          "email": "wqu@suse.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author addressed Qu Wenruo's concern about the timing of calling folio_mkclean() and its coverage of various writeback scenarios by explaining that the patch calls it early when locking to prevent late calls, and that it provides a unified spot for compression and zoned batch writes with a describable invariant.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "author provided explanation",
+            "author offered alternatives"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "The idea is:\n1. call it early when you lock to not call it too late\n2. it covers compression and zoned batch write in one unified spot with\n   a describable invariant (locked for delalloc <-> cleaned) so its more\n   future proof against future refactors or writing models.\n\nThis patch says v1 but on my git tree it's more like v6 :). Including\nvariants where I tried to do it last second at every relevant callsite\n(basically where I put the asserts) if you want that instead, it's fine\nwith me, but I personally liked this the best.",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-09",
+          "message_id": "20260709164947.GA1552049@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author acknowledged a concern about the patch's commit message and agreed to clarify its relevance.\n\nThe author is addressing Qu Wenruo's concern about zoned folios submitted by run_delalloc_range with pages_dirty=true. The author explains that these folios need to be cleaned in a specific way, and proposes using lock_delalloc_folios() to cover the last two cases in a more principled way.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged",
+            "agreed",
+            "still making sure all of this reproduces exactly as I understand it"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Well said, thanks. I'll make the relevance of the \"bio doesn't cover folio\"\naspect more clear in the commit description.\n\n---\n\nThe idea is the zoned folios submitted by run_delalloc_range with\npages_dirty=true. Only the one main folio will be cleaned in\nextent_writepage but several get submitted in this loop while locked\n(which is asserted by the pages_dirty check).\n\nSo assuming we want to clean those folios (which I think we do)\nthen we need:\nextent_writepage (main one covers usual large folios and inline)\nextent_range_clear_dirty_for_io (covers compression stability)\nextent_write_locked_range pages_dirty = true (zoned batch)\n\nlock_delalloc_folios() covers the last two in a single more\nprincipled way, IMO.\n\nI am still making sure all of this reproduces exactly as I understand\nit, though, to be as convincing as possible :)",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-09",
+          "message_id": "20260709171804.GB1552049@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        },
+        {
+          "author": "Boris Burkov (author)",
+          "summary": "Author acknowledged that Qu Wenruo's feedback was helpful in improving the reproducer scripts and no specific technical issue or concern was addressed.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged reviewer's contribution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "No worries, your notes already helped me a lot with improving the\nreproducer scripts that I'm working on.",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-09",
+          "message_id": "20260709171835.GC1552049@zen.localdomain",
+          "email": "boris@bur.io",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer Hellwig noted that the patch's approach is unrelated to iomap and suggested using the generic code in mm/page-writeback.c instead of btrfs' outdated forked version.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "This has nothing to do with iomap.  Normally the dirty clearing is done\nby the generic code in mm/page-writeback.c.  Gettind btrfs to use that\ninstead of the horribly outdated forked version would be a really good\nthing.",
+          "reply_to": "Qu Wenruo",
+          "message_date": "2026-07-09",
+          "message_id": "alBw1EEcqAVuD8zo@infradead.org",
+          "email": "hch@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a problem where, due to a recent change in the Btrfs kernel module, folios (large blocks of data) are not being properly write-protected during data writeback operations. This can lead to corruption and bugs when processes try to modify sectors while they're being used by writeback. The patch reintroduces the necessary write-protection mechanism without dropping the dirty flag on the folio, which would cause other issues. It also adds a debug warning to help prevent similar regressions in the future."
+    },
+    "2026-07-10": {
+      "report_file": "2026-07-09_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Qu Wenruo",
+          "summary": "Reviewer noted that zoned cases were not initially considered in the patch, but after being reminded, they agreed that lock_delalloc_folios() is the correct location to cover all necessary folio cleaning operations.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "agreement"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Oh I forgot zoned cases. In that case indeed lock_delalloc_folios() is \nthe location that covers all.\n\nThen the code looks good to me now.\n\nThanks,\nQu",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-07-10",
+          "message_id": "ba111df7-4017-4336-ae3b-ba9bc9c53306@gmx.com",
+          "email": "quwenruo.btrfs@gmx.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces a new function called lock_delalloc_folios() that write-protects folios during data writeback in Btrfs. The goal is to ensure that multiple zoned folios submitted by run_delalloc_range are properly cleaned, which was previously not guaranteed due to the way extent_writepage and other functions handled dirty pages. By locking these folios, the patch prevents them from being modified or accessed until they are fully written back, thereby maintaining data integrity."
+    }
+  }
+}
