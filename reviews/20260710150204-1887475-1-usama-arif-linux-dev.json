@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260710150204.1887475-1-usama.arif@linux.dev",
+  "subject": "[PATCH v2 06/10] memory-failure: Prevent UAF in raw_hwp_page list",
+  "url": "https://lore.kernel.org/all/20260710150204.1887475-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-07-10": {
+      "report_file": "2026-07-10_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif",
+          "summary": "Raised a potential issue with lockdep_assert_held(&mf_mutex) and pointed out that the wrapper can sleep while its external caller is the hugetlb free path, which may lead to GFP_ATOMIC usage.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "CONTROVERSIAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Matthew Wilcox",
+          "summary": "Acknowledged the issue and proposed several alternative solutions, including adding a global spinlock or using RCU to protect the list.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Fri, Jul 10, 2026 at 08:02:03AM -0700, Usama Arif wrote:\n> > +void folio_clear_hugetlb_hwpoison(struct folio *folio)\n> > +{\n> > +\tmutex_lock(&mf_mutex);\n> \n> This wrapper can now sleep, but its external caller is the hugetlb free\n> path.  __update_and_free_hugetlb_folio() is reached from\n> update_and_free_hugetlb_folio(), which has a comment saying\n> \"Defer freeing to avoid using GFP_ATOMIC\"\n\nYeah, Sashiko also pointed this out.\n\nI think I'm going to have to change how we track hwpoison in hugetlb\nin order to make this work.  Let me think out loud here:\n\nis_page_hwpoison() can be called without a reference on the folio\ncontaining the page.  The answer can be wrong in this case, but any\nUAF must be benign.\n\nGrabbing the mf_mutex inside hugetlb_page_hwpoison() is insufficient\nbecause we can't protect against folio_clear_hugetlb_hwpoison() (the\napproach attempted in this patch).\n\nWe could add a spinlock for protecting freeing & checking of the list.\nThat's probably simplest.\n\nIt'd be better to protect the list with RCU.  But then we'd need to\nput an RCU head inside raw_hwp_page, doubling its size from 2 pointers\nto 4.\n\nWe could completely change how we do this; instead of having an llist,\nwe could have an array of 32-bit page indices.  Reallocate it when we\nrun out, doubling its size each time, and put an rcu head in that.\nThat'd give us 32-bytes the first time, space for 4 indices, then double\nto 64 (space for 12 indices), double again to 128 (28 indices), etc.\n\nWe could also RCU-free the folio if it's hwpoisoned.  We'd need to\nclear the hugetlb flag before asking RCU to cover up this problem\nto ensure that any reader that saw the hugetlb flag set started its\ngrace period before.\n\nProbably all too much trouble.  I think I'll add a global spinlock.\n\n> > +\t__folio_clear_hugetlb_hwpoison(folio);\n> > +\tmutex_unlock(&mf_mutex);\n> > +}\n> > +\n> >  static int get_huge_page_for_hwpoison(unsigned long pfn, int flags,\n> >  \t\t\t\t bool *migratable_cleared)\n> >  {\n> > @@ -2051,7 +2058,7 @@ static int try_memory_failure_hugetlb(unsigned long pfn, int flags)\n> >  \tfolio_lock(folio);\n> >  \n> >  \tif (hwpoison_filter(p)) {\n> > -\t\tfolio_clear_hugetlb_hwpoison(folio);\n> > +\t\t__folio_clear_hugetlb_hwpoison(folio);\n> >  \t\tif (migratable_cleared)\n> >  \t\t\tfolio_set_hugetlb_migratable(folio);\n> >  \t\tfolio_unlock(folio);\n> > -- \n> > 2.47.3\n> > \n> > \n",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-07-10",
+          "message_id": "",
+          "email": "willy@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "The patch aims to prevent use-after-free (UAF) in the raw_hwp_page list, but Usama Arif pointed out a potential issue with lockdep_assert_held(&mf_mutex)."
+    }
+  }
+}

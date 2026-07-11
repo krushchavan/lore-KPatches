@@ -239,7 +239,7 @@
     <h1>[PATCH] btrfs: write-protect folios during data writeback</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/856f2a691977072386085d768b7929520e1022af.1783570200.git.boris@bur.io/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-07-09</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-10</strong><div class="date-range-nav">Active on: <a href="#2026-07-10">2026-07-10</a> &bull; <a href="#2026-07-09">2026-07-09</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new function called lock_delalloc_folios() that write-protects folios during data writeback in Btrfs. The goal is to ensure that multiple zoned folios submitted by run_delalloc_range are properly cleaned, which was previously not guaranteed due to the way extent_writepage and other functions handled dirty pages. By locking these folios, the patch prevents them from being modified or accessed until they are fully written back, thereby maintaining data integrity.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a problem where, due to a recent change in the Btrfs kernel module, folios (large blocks of data) are not being properly write-protected during data writeback operations. This can lead to corruption and bugs when processes try to modify sectors while they&#x27;re being used by writeback. The patch reintroduces the necessary write-protection mechanism without dropping the dirty flag on the folio, which would cause other issues. It also adds a debug warning to help prevent similar regressions in the future.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0">
 <div class="review-comment">
@@ -412,6 +412,60 @@ thing.</pre>
 <a href="https://lore.kernel.org/r/alBw1EEcqAVuD8zo@infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes</div>
 </div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Qu Wenruo</span>
+<a class="date-chip" href="../2026-07-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-10">2026-07-10</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Qu Wenruo noted that two paths, compression and zoned write, lock a delalloc range covering part of a folio, causing issues when calling folio_clear_dirty_for_io() for all folios inside the range, as it would leave the tailing folio&#x27;s remaining part unwritten. He expressed concerns about the complexity of per-block dirty tracking and suggested that there is a lot of work to be done before existing technical debts can be resolved.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This involves a lot of technical debts, the main reason is that we have 
+two paths that can writeback part of a folio:
+
+- Compression
+   AKA, the async submission.
+
+   I had a series converting it to regular submission, but still under
+   review, and the current version is still a little complex on the
+   OE handling part.
+
+- Zoned write
+   I have no idea why we have to do it in the first place.
+   I believe WDC people hit some problems with the regular writeback
+   path.
+
+The above two paths all lock a delalloc range that can cover part of the 
+tailing folio.
+
+If we call folio_clear_dirty_for_io() for all folios inside the range, 
+then the tailing folio will not got its remaining part written back, 
+because the folio is no longer dirty.
+
+That&#x27;s why we have to do all the complex per-block dirty tracking, and 
+only call folio_clear_dirty_for_io() when there is no dirty block left 
+in a folio.
+
+But as Boris pointed out, the delayed timing is already problematic. And 
+the current solution is the manual folio_mkclean() calls.
+
+So I&#x27;m afraid there are a lot of work to do before we can get rid of the 
+existing technical debts.
+
+Thanks,
+Qu</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Christoph Hellwig</div>
+<a href="https://lore.kernel.org/r/6a027681-7ad1-4dc9-b713-07f79eb0c0c9@suse.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: technical debt, complexity</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -533,12 +587,12 @@ Qu</pre>
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Qu Wenruo</span>
-<a class="date-chip" href="../2026-07-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-10">2026-07-10</a>
+<a class="date-chip" href="../2026-07-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-10">2026-07-10</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that zoned cases were not initially considered in the patch, but after being reminded, they agreed that lock_delalloc_folios() is the correct location to cover all necessary folio cleaning operations.</div>
+<div class="review-comment-text">Reviewer noted that the patch missed zoned cases, but after reevaluation, the code looks good and the issue is covered by lock_delalloc_folios()</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Oh I forgot zoned cases. In that case indeed lock_delalloc_folios() is 
@@ -551,7 +605,7 @@ Qu</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Boris Burkov</div>
 <a href="https://lore.kernel.org/r/ba111df7-4017-4336-ae3b-ba9bc9c53306@gmx.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: clarification, agreement</div>
+<div class="review-comment-signals">Signals: revised opinion, patch now acceptable</div>
 </div>
 </div>
 </div>
