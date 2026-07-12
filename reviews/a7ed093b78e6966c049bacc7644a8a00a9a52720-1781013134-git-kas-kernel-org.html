@@ -238,119 +238,10 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 3/3] arm64: escalate smp_send_stop() to an SDEI NMI as a last resort</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/a7ed093b78e6966c049bacc7644a8a00a9a52720.1781013134.git.kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-10</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a> &bull; <a href="#2026-06-11">2026-06-11</a> &bull; <a href="#2026-06-10">2026-06-10</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-06-11</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-06-12</strong><div class="date-range-nav">Active on: <a href="#2026-06-12">2026-06-12</a> &bull; <a href="#2026-06-11">2026-06-11</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds an additional escalation path to the smp_send_stop() function on arm64 architecture, which is used to stop a CPU that has become wedged and is ignoring interrupts. When the regular IPI (Inter-Processor Interrupt) and pseudo-NMI paths fail, the patch triggers an SDEI (System Description Event Interface) NMI (Non-Maskable Interrupt) as a last resort. This allows the system to recover from the wedged CPU by sending it an SDEI event that will eventually lead to its shutdown. The patch also introduces new functions and modifications to existing code to support this escalation path.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-06-10">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Doug Anderson</span>
-<a class="date-chip" href="../2026-06-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-10">2026-06-10</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Doug Anderson noted that the patch does not handle the case where the SDEI event is already pending when trying to escalate to it, and requested a check for this condition before triggering the SDEI event.
-
-Reviewer Doug Anderson suggested combining the stop functionality into a single function arm64_nmi_cpu_stop() to avoid synchronization issues across different stop paths, and provided an example implementation.
-
-Reviewer Doug Anderson suggested that the patch could be improved by separately testing for SDEI availability before attempting to use it, and proposed modifying sdei_nmi_stop_cpus() to return void instead of printing a message.
-
-Reviewer Doug Anderson questioned the shared EVENT ID for &#x27;backtrace&#x27; and &#x27;stop&#x27;, suggesting separate IDs would improve code understandability and allow elimination of the sdei_nmi_stop_mask variable.
-
-Reviewer Doug Anderson questioned the use of &#x27;or&#x27; instead of &#x27;copy&#x27; in sdei_nmi_stop_mask, suggesting a potential issue with the logic</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Hi,
-
-On Tue, Jun 9, 2026 at 6:58 AM Kiryl Shutsemau &lt;kirill@shutemov.name&gt; wrote:
-
----
-
-Can we combine everything into one function so we don&#x27;t have to keep
-all the different stop functionality in sync? Like this (untested):
-
-void __noreturn arm64_nmi_cpu_stop(struct pt_regs *regs, bool die_on_crash)
-{
-  unsigned int cpu = smp_processor_id();
-  bool crash = IS_ENABLED(CONFIG_KEXEC_CORE) &amp;&amp; crash_stop;
-
-  /*
-   * Use local_daif_mask() instead of local_irq_disable() to make sure
-   * that pseudo-NMIs are disabled. The &quot;stop&quot; code starts with
-   * an IRQ and falls back to NMI (which might be pseudo). If the IRQ
-   * finally goes through right as we&#x27;re timing out then the NMI could
-   * interrupt us. It&#x27;s better to prevent the NMI and let the IRQ
-   * finish since the pt_regs will be better.
-   */
-  local_daif_mask();
-
-  if (crash)
-    crash_save_cpu(regs, cpu);
-
-  set_cpu_online(cpu, false);
-
-  sdei_mask_local_cpu();
-
-  if (crash &amp;&amp; die_on_crash)
-    __cpu_try_die(cpu);
-
-  /* just in case */
-  cpu_park_loop();
-}
-
-Then in do_handle_IPI(), it&#x27;s just:
-
-  case IPI_CPU_STOP:
-  case IPI_CPU_STOP_NMI:
-    arm64_nmi_cpu_stop(get_irq_regs(), true);
-    break;
-
-...and from the SDEI code you pass &quot;false&quot; for &quot;die_on_crash&quot;.
-
-Perhaps when doing that you&#x27;d stop unconditionally getting the cpu in
-do_handle_IPI() and just call it for `IPI_KGDB_ROUNDUP` since it would
-now be the only consumer of that local variable.
-
-FWIW, I&#x27;m not totally sure I followed the logic for why &quot;die_on_crash&quot;
-needs to be &quot;false&quot; for the SDEI case, but I also am not terribly
-familiar with KEXEC and crash-dumping kernels, since I&#x27;ve never
-attempted to get that feature to work.
-
----
-
-Perhaps it&#x27;s being a bit pedantic, but it&#x27;s a little weird that you&#x27;re
-printing a message that sounds like &quot;I&#x27;m going to retry with SDEI&quot;
-after you&#x27;ve already done it. It feels like it would be nominally
-cleaner (and more parellel with the pseudo-NMI case) if you could
-separately test if SDEI is available. Then sdei_nmi_stop_cpus() would
-just return void?
-
----
-
-Do you have any reasoning for why you don&#x27;t pick a separate EVENT ID
-for &quot;backtrace&quot; vs. &quot;stop&quot;. If you absolutely have to share an ID
-because they&#x27;re a limited resource then I guess it&#x27;s fine, but it
-would make the code easier to understand / reason about if they were
-separate IDs.
-
-If you had a separate EVENT ID, then it seems like you could
-completely eliminate the (potentially large) `sdei_nmi_stop_mask`
-variable, right? Any time a &quot;STOP&quot; event fires you can unconditionally
-consider it to be a stop w/ no globals needed, right?
-
----
-
-As per above, hopefully we can get rid of `sdei_nmi_stop_mask`. ...but
-if we keep it, I&#x27;m curious why &quot;or&quot; and not &quot;copy&quot;?</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/CAD=FV=VLoJBMhDjb=3XAOCZWDBACn_=KdnkL0J6-Ch4uKrHjNA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, pedantic</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-06-11">
+<div class="thread-node depth-0" id="2026-06-11">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Kiryl Shutsemau (author)</span>
@@ -798,7 +689,7 @@ index a82776e7b55a..b2a69be6008f 100644
 <div class="review-comment-signals">Signals: agreed, see the patch below, clarification</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-2" id="2026-06-12">
+<div class="thread-node depth-1" id="2026-06-12">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Doug Anderson</span>
@@ -826,8 +717,6 @@ down the line won&#x27;t be left wondering.</pre>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/CAD=FV=WVvhTY9NC3jZirrkfCMCs-=fFv2T3G1TxJ7cDat0jENw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: potential bug, concern about system state, requested clarification</div>
-</div>
-</div>
 </div>
 </div>
 </div>
