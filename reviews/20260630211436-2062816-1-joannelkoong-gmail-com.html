@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v5 0/6] fuse: add io-uring buffer pools and zero-copy</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260630211436.2062816-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-01</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-02</strong><div class="date-range-nav">Active on: <a href="#2026-07-02">2026-07-02</a> &bull; <a href="#2026-07-01">2026-07-01</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-07-01</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-13</strong><div class="date-range-nav">Active on: <a href="#2026-07-13">2026-07-13</a> &bull; <a href="#2026-07-02">2026-07-02</a> &bull; <a href="#2026-07-01">2026-07-01</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds support for io-uring buffer pools and zero-copy to the FUSE file system. The current implementation tightly couples entries and buffers, requiring a dedicated payload buffer for each entry. This patch decouples them by allowing servers to pass in a buffer pool that the kernel can use as needed. Additionally, it introduces zero-copy functionality, which allows servers to directly access client pages or page cache folios without copying data through an intermediary buffer. The benefits of this patch include reduced memory usage requirements and improved throughput, particularly when backing I/O is not the bottleneck.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-01">
@@ -367,6 +367,119 @@ Amir.</pre>
 </div>
 </div>
 </div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-07-13">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-07-13_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-13">2026-07-13</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed concerns about potential buffer leaks, head-of-line blocking, and resource management in the zero-copy patch. They explained that there is no buffer leak as the buffers are allocated by userspace and released when the ring is torn down. They also stated that the decoupling of ents and buffers under buffer pools does not introduce additional head-of-line blocking and that buffer recycling does not need to check for stalled requests or idle entries. The author agreed to add a barrier pairing in v6 for robustness and dropped the WARN_ON_ONCE warning.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Sashiko had some comments [1]. These are the replies to Sashiko&#x27;s comments:
+
+Patch 1/6:
+1) Will add missing smp_rmb() in v6. Fix for pre-existing missing
+smp_rmb() is submitted in [2].
+
+2) Pre-existing issue, fix is submitted in [3].
+
+Patch 2/6:
+1) Pre-existing issue, fix is submitted in [3].
+
+Patch 3/6:
+1) -&gt;uring_cmd() cancellation happens when a task exits or when a ring
+is torn down. In both cases, the buffer is not marked as available
+again in the bitmap, but this doesn&#x27;t matter since the task/ring is
+torn down. There&#x27;s no buffer leak anywhere - the buffer was allocated
+by userspace.
+
+2) This introduces no additional head-of-line blocking than what
+currently exists when there&#x27;s no ent/buffer available for a request.
+If a server wants to preserve memory and allocate fewer buffers than
+entries, then requests have to wait until there are available buffers.
+With ents and buffers decoupled under buffer pools, this also opens an
+optimization where non-payload requests which require no buffer can
+still be serviced when entries are free, but that can be a future
+patch.
+Buffer recycling does not need to check for stalled requests or idle
+entries. The buffer is returned back when an in-flight request
+completes, and each completion (commit-and-fetch) automatically
+assigns the free buffer to any request waiting to be serviced.
+
+3) It is safe (and expected) to read directly from cmd-&gt;sqe. uring_cmd
+has different SQE-stability semantics than non-cmd io-uring ops.
+
+4) A payload carrying request is added to the tail of the queue and
+does not jump ahead of other payload carrying requests. Only
+payloadless requests would get serviced first in the case of
+bufferpool exhaustion, which is safe since the requests that can be
+reordered are independent.
+
+Patch 4/6:
+1) It is safe (and expected) to read directly from cmd-&gt;sqe. uring_cmd
+has different SQE-stability semantics than non-cmd io-uring ops.
+
+2) This race is not reachable on a correct server. For a
+buggy/malicious server that fires COMMIT_AND_FETCH concurrently with
+ADD_BUFPOOL, this is safe since this returns an error regardless.
+There&#x27;s no regression introduced, but the barrier pairing should be
+added anyways for robustness. I&#x27;ll add this in for v6.
+
+3) No, this is not necessary. See answer to 1)
+
+Patch 5/6:
+
+1) I&#x27;ll drop the WARN_ON_ONCE. I don&#x27;t think loopback mount can
+trigger the warning, but I think other cases that go through the
+kernel_read()/kernel_write() path on a direct-io zero-copy-enabled
+fuse file potentially could.
+
+2) This compiles, it is just currently flagged as broken because it
+requires the io-uring bvec changes queued up in Jens&#x27;s tree being
+available [4].
+
+3) same answer as above for 2)
+
+4) same answer as the answer for 2) in patch 4.
+
+5) There is no permanent leak - all resources are released when the
+ring is torn down. This scenario is only possible if a server
+deliberately tries to manufacture it by crossing rings. The worst case
+that happens here is that the index in the buffer table of the
+original ring remains reserved still and the folios are pinned, until
+the ring is torn down. There&#x27;s no use after free, as io-uring&#x27;s node
+refcount protects against this. Given that zero-copy is already gated
+only to privileged servers and all resources are cleaned up when the
+ring is torn down, this is not worth fixing, as the server would have
+to deliberately self-inflict this.
+
+6) No, this analysis is wrong. io_uring&#x27;s teardown logic keeps
+retrying cancellation until the ctx&#x27;s references are all dropped (see
+io_ring_exit_work()). This is the same in the task exit path as well
+(io_uring_cancel_generic()).
+
+Patch 6/6:
+1) Will fix the typo for v6.
+
+2) This is fine. It is safe (and expected) to read directly from
+cmd-&gt;sqe. uring_cmd has different SQE-stability semantics than non-cmd
+io-uring ops.
+
+Thanks,
+Joanne
+
+[1] https://sashiko.dev/#/patchset/20260630211436.2062816-1-joannelkoong%40gmail.com
+[2] https://lore.kernel.org/fuse-devel/20260713175345.2542331-1-joannelkoong@gmail.com/T/#mab904e0a63035e094c18184930284727399174be
+[3] https://lore.kernel.org/fuse-devel/20260713175345.2542331-1-joannelkoong@gmail.com/T/#m00c29b80ce418d05a791e330be7a9b9530e4ba99
+[4] https://lore.kernel.org/io-uring/20260612184840.4058966-1-joannelkoong@gmail.com/T/#t</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAJnrk1Y2tiwCecH-HVyaP79kcmBoEYu--mmwRKzp=9uZNaiSUA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged potential issues, explained reasoning</div>
 </div>
 </div>
 </div>

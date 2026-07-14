@@ -1,0 +1,64 @@
+{
+  "thread_id": "alTn7NguEW_4bodu@thinkstation",
+  "subject": "[PATCH mm-hotfixes v2 0/4] mm: fix UAF caused by race between ptdump and vmap pgtable freeing",
+  "url": "https://lore.kernel.org/all/alTn7NguEW_4bodu@thinkstation/",
+  "dates": {
+    "2026-07-13": {
+      "report_file": "2026-07-13_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "Reviewer Lorenzo expressed concerns about backporting a fix that involves RCU-deferring page table freeing, citing potential subtleties and maintenance issues. He also noted that the ptdump walker on x86 needs to take the mmap write lock to exclude munmap operations, making it incompatible with an RCU-free approach.\n\nReviewer noted that the patch's locking scheme is inverted from normal expectations, which led to an arm64 deadlock and ifdeffery, and suggested using RCU-deferred freeing for ptdump like GUP-fast does\n\nReviewer noted that the locking scheme in the patch is inverted from what's normally expected, which led to an arm64 deadlock and ifdeffery, and suggested using RCU-deferred free and making ptdump a lockless walker\n\nReviewer suggested using call_rcu() instead of synchronize_rcu(), citing it as a 'bug hammer', and noted that CPA doesn't mark page tables as kernel\n\nReviewer noted that the current locking scheme in ptdump is inverted from normal expectations, which led to an arm64 deadlock and ifdeffery, and suggested revisiting the approach by using RCU-deferred free and making ptdump a lockless walker.\n\nThe reviewer is concerned that ptdump's walk may stall due to RCU, especially considering vmap can span PUDs and P4Ds, and also worries about the validity of page table entries when read by the walker. They suggest making changes across the kernel for all kernel page table users.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "prefers current fix",
+            "suggested alternative solution",
+            "concerned",
+            "worry"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Overall I like the idea of eventually moving this to _all_ being\nRCU-free-able :)\n\nBUT... I don't like it as a fix for this bug that has to be backported.\n\nI think there's a lot of subtleties to worry about and I don't want to\nworry about having to maintain tht as a backport.\n\nBut also, we have an unfortunate situation with ptdump where it also walks\nuserland ranges on x86 (and ranges for efi_mm on both x86 and arm64).\n\nAnd for userland ranges you have to have the mmap write lock to exclude a\ndowngraded mmap read lock munmap() operation (which gives rise to the weird\ninversion you mention).\n\nSo the walker still has to take the write lock in this case.\n\nI spoke a bit about it overall at [0].\n\nWe already have this mmap lock convention as a requirement for kernel\nranges, and it was being violated by CPA and vmalloc.\n\nSo I'd prefer we keep this as the proximate fix to solve the bug here, and\nthen revisit this later (alongside moving to RCU page table freeing\n_overall_, though one doesn't have to block the other).\n\nI believe Suren is looking at this (and I'm happy to look if Suren is tied\nup with other things also!)\n\n---\n\nYeah :) this is a direct result of the munmap() thing mentioned above\n(because ptdump can read non-kernel ranges).\n\nBecause you _have_ to take the mmap write lock there, so you _may as well_\nexclude with a read lock and then get to do an mmap read trylock as an\nadded bonus on vmap huge page promotion.\n\n---\n\nWell everybody who does things with shared resources should be aware of\nlocking requirements.\n\n---\n\nWell I did want to say btw that CPA doesn't actually mark the page tables\nas kernel, was going to chase up with something on that when I got a chance\n:)\n\nsynchronize_rcu() is a very bug hammer, you can just use call_rcu() (and\nthe ptdesc already has an rcu_head I think).\n\n---\n\nYeah it all sucks, but you're really making my point that this is better to\nrevisit and consider carefully rather than doing as a fix.\n\n---\n\nYes - as above obviously I'd definitely prefer to defer this to a\nfollow-up.\n\nThe main concern for ptdump is properly slicing its walk to avoid\nRCU stalls.\n\nKeeping in mind that vmap can (in theory) span PUDs and even P4Ds it\nbecomes a bit tricky.\n\nBut also I worry about whether the entries in the page table will actually\nbe valid at the point the walker reads them.\n\nFor vmap/CPA pretty much yes they are, but if something was to actually\nunmap them in future then that might no longer be the case. RCU will only\nguarantee that the page tables stick around, not that they contain anything\nvalid.\n\nIn userland a lot of this is solved already by the leaf page table entry's\nPTL.\n\nKernel page tables are a bit of a weird case, because mostly we solve\nthings through exclusive owners, ptdump being the weirdo outlier.\n\nAnyway TL;DR is that - I think we need to be careful and think this through\nand make changes across the board for all kernel page table users and\nupdate the page walkers.\n\nI'm happy to spin up an RFC for this when I get a moment :)\n\nBut in general I'd like us to solve the problem as a whole across the\nkernel for both userland and kernel page table allocations, ideally!",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-13",
+          "message_id": "alTq4V50767L-s5H@lucifer",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author addressed Lorenzo's concern about the inverted locking scheme in ptdump, explaining that walking user page tables under RCU can make the mmap lock unnecessary and proposing to remove it for all ranges, including kernel ones.\n\nAuthor agrees to restructure the patch in a follow-up series to address concerns about inverted locking and potential deadlocks, and promises to properly review the current patchset.\n\nAuthor acknowledged that CPA allocates split tables directly and thus skips IOMMU SVA KVA invalidation, which is an independent issue from the original patch.\n\nAuthor acknowledged a potential issue with bounding read-side sections during ptdump walks, agreeing it's the part that needs the most care and implying further work is needed.\n\nThe author addressed Lorenzo's concern about stale page table entries being accessed by the walker, explaining that since frees are RCU-deferred, the walker can only reach a table via an entry it read within its RCU section and freeing requires unlinking that entry first. The author acknowledged that this approach is sufficient for ptdump but agreed that more care is needed for general cases.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "clarification",
+            "explanation",
+            "acknowledges fix needed",
+            "promises revision",
+            "independent issue",
+            "no clear resolution signal",
+            "acknowledged a potential issue",
+            "agreed it's the part that needs the most care",
+            "acknowledged a valid concern",
+            "provided an explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I think the userland side is fixable too.\n\nMy first thought was to walk only VMA-backed ranges, which would make\nthe mmap read lock sufficient: munmap() detaches VMAs under the write\nlock before downgrading, and free_pgtables() only frees tables\nexclusively covering the detached range.\n\nBut that is an unnecessary limitation on MMU_GATHER_RCU_TABLE_FREE\narchitectures -- which is every architecture with generic ptdump\nsupport. There, user page table freeing is already RCU-deferred; it is\nwhat GUP-fast relies on to walk user page tables blindly with no mmap\nlock. khugepaged retracting PTE tables under the pmd lock is likewise\ncovered by pte_free_defer().\n\nSo the downgraded munmap() teardown you mention is already safe to race\nwith -- for a walker inside an RCU read-side section. The write lock is\nonly needed today because ptdump walks outside of one, so the deferred\nfreeing does nothing for it.\n\nThat would make the end state: the whole of ptdump -- userland, efi_mm\nand kernel ranges -- walks under RCU with no mmap lock taken at all,\nand the kernel-side freeing conversion we discussed is the only\nmissing piece.\n\n---\n\nNo argument, let's do it as a follow-up.\n\nI will give the current patchset a proper review.\n\n---\n\nYou are right. CPA allocates the split tables with bare\npagetable_alloc(), so ptdesc_test_kernel() is false and collapse frees\nthem via __pagetable_free() directly. Note this also means they skip\nthe IOMMU SVA KVA invalidation that ASYNC_KERNEL_PGTABLE_FREE is there\nfor -- that looks like a bug today, independent of ptdump.\n\n---\n\nSince the walker only reads, I think it is enough to re-descend from\nthe pgd with fresh READ_ONCE() at each level after dropping RCU --\nwhatever level got promoted in the meantime, we see either the new leaf\nor the old table. But agreed this is the part that needs the most care.\n\n---\n\nFor a walker that only reads, I don't think staleness is a problem as\nlong as frees are RCU-deferred: the walker can only reach a table via\nan entry it read within its RCU section, and freeing requires unlinking\nthat entry first, so the grace period covers any walker that saw the\nold pointer. Stale leaf contents are harmless for a dumper. It does\nbecome a problem for anything that dereferences through leaf entries --\nagreed that the general case needs more care than ptdump does.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-07-13",
+          "message_id": "alUNiWcygLd4rqBo@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series addresses an out-of-bounds memory access (UAF) caused by a race between the ptdump and vmap pgtable freeing mechanisms in the Linux kernel. The issue arises from inverted locking, where the walker takes the write lock and mutators take read locks, which is subtle and prone to deadlocks. To fix this, the patch proposes deferring the free of page tables using RCU (Read-Copy Update) and making ptdump a lockless walker. This approach would eliminate the need for inverted locking and prevent potential deadlocks, while also improving performance by reducing the load on the init_mm mmap write lock."
+    }
+  }
+}

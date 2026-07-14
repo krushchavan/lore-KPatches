@@ -1,0 +1,84 @@
+{
+  "thread_id": "20260713144557.3845941-1-joshua.hahnjy@gmail.com",
+  "subject": "[PATCH] mm/hugetlb: restore failed global reservations to subpool in alloc_hugetlb_folio",
+  "url": "https://lore.kernel.org/all/20260713144557.3845941-1-joshua.hahnjy@gmail.com/",
+  "dates": {
+    "2026-07-13": {
+      "report_file": "2026-07-13_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "Ackerley Tng",
+          "summary": "reviewer suggests centralizing the fix for HugeTLB reservations into the subpool, which would allow cleaning up existing codepaths and potentially simplify tracking availability instead of reservations, reducing possible races",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Thanks for connecting us!\n\nI'd like to make a pitch for centralizing the fix into the subpool [1]\n:) I think it will also let us clean up the existing codepaths where\neach path does its own open-coding and reaching into the subpool. Also,\nif that cleanup is centralized into the subpool, we might be able to\ntrack availability instead of reservations [4], which I think simplifies\nHugeTLB reservations and removes some possible races (for keeping\nrsv_hpages and resv_huge_pages in sync) completely.\n\n[4] https://lore.kernel.org/all/CAEvNRgGN0HSJ2iLSDD2haSKOxifa-uhkO9Hwossh0+Q_d9fzOw@mail.gmail.com/\n\nI understand the above solution is a deeper change, does anyone have any\nthoughts on the approach, or existing tests other than libhugetlbfs and\ntools/testing/selftests/mm/ksft_hugetlb.sh (which pass) that I could use\nto prove this works?",
+          "reply_to": "Joshua Hahn",
+          "message_date": "2026-07-13",
+          "message_id": "CAEvNRgHMsva75JcJBEw2UdmNwAvKOZb44w0-Z_dq14D8QT2LAQ@mail.gmail.com",
+          "email": "ackerleytng@google.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch aims to restore failed global reservations to a subpool in the alloc_hugetlb_folio function, addressing an issue where hugetlb folios are not being properly allocated due to incorrect handling of subpools. The problem arises from competing fixes being proposed for this codepath, and this patch seeks to resolve it by restoring failed reservations to their original subpool. The approach taken involves revisiting the logic surrounding subpool locking and release to ensure correct behavior."
+    },
+    "2026-07-14": {
+      "report_file": "2026-07-13_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "Song Hu",
+          "summary": "Reviewer Song Hu noted that the patch's codepath is problematic due to multiple competing fixes being discussed, and specifically questioned why the subpool is unlocked or released in this particular code location.\n\nReviewer Song Hu noted that unlock_or_release_subpool() should not be used in this error path because it may drop the subpool's last reference, which is not necessary since spool->count is never touched; instead, a plain spin_unlock_irqrestore() is sufficient and clearer.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "multiple competing fixes",
+            "questioning code logic",
+            "requested changes",
+            "suggested alternative solution"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Joshua,\n\nThanks for the review and for bringing the authors together.\n\nFirst, apologies for the duplicate submission \\u2014 when I sent this I was not\naware of the other proposals on the list ([1][2][3]). I ran into this leak\nwhile looking at the subpool accounting and simply wanted to share a fix;\nI did not mean to add noise to an ongoing discussion.\n\n---\n\nGood catch \\u2014 it does not belong here. unlock_or_release_subpool() is meant\nfor paths that may drop the subpool's last reference (e.g.\nhugepage_subpool_put_pages(), after which the subpool can become free). In\nthis error path we only adjust used_hpages and never touch spool->count, so\nthe subpool cannot be released here; a plain\nspin_unlock_irqrestore(&spool->lock, flags) is sufficient and clearer. I\ncopied it from the hugetlb_reserve_pages() sibling fix (1d3f9bb4c8af), but\nit is not the right helper here either; I will switch to\nspin_unlock_irqrestore() in v2.\n\nOne thing that may be worth keeping in mind for the discussion:\na833a693a490 is already in 6.x -stable, so the leak is present in those\ntrees as well, and a backportable fix will be needed there regardless of\nwhich direction is chosen for mainline.\n\nFor what it is worth, I verified the behavior with a small reproducer (a\nsize= hugetlbfs mount with nr_hugepages churned 10 -> 2 -> 10: unpatched,\nthe subpool only maps 2/10 pages after the leak; patched, 10/10), in case\nit is useful to whoever ends up shaping the final fix.\n\nHappy to help with whatever direction people want to take.\n\nThanks,\nSong",
+          "reply_to": "Joshua Hahn",
+          "message_date": "2026-07-14",
+          "message_id": "45e2e42c-73c0-4d2b-9b4b-bd44730c2378@kylinos.cn",
+          "email": "husong@kylinos.cn",
+          "is_maintainer": false
+        },
+        {
+          "author": "Song Hu",
+          "summary": "Reviewer Song Hu noted that the subpool permanently loses capacity without a fix, and provided a reproducer test to demonstrate this issue. He also suggested that a minimal fix may still be wanted on stable branches even if centralization goes in for mainline.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested patch"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Ackerley,\n\nThanks for the write-up. The centralization reads cleanly, and tracking\navailability instead of reservations does look like it would remove a real\nclass of the rsv_hpages / resv_huge_pages sync races, so I don't have an\nobjection to that direction for mainline.\n\nOn tests \\u2014 I put together a small reproducer while debugging this, which\nmight be useful regardless of which fix lands: a size= hugetlbfs mount (so\nthe subpool has a max_hpages), with nr_hugepages churned 10 -> 2 -> 10\naround a MAP_NORESERVE fault loop. Without a fix the subpool permanently\nloses capacity (it maps 2/10 pages even with 10 global pages free); with a\nfix it recovers to 10/10.\n\nOne thing worth flagging for -stable: a833a693a490 is already in 6.x\n-stable, so the leak is live there too, and a larger refactor probably is\nnot backportable \\u2014 so a minimal fix may still be wanted on the stable\nbranches even if centralization goes in for mainline.\n\nThanks,\nSong",
+          "reply_to": "Ackerley Tng",
+          "message_date": "2026-07-14",
+          "message_id": "515454fa-9be7-4537-87b3-1fd6ee364ccc@kylinos.cn",
+          "email": "husong@kylinos.cn",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch aims to restore failed global reservations to a subpool in the alloc_hugetlb_folio function, addressing an issue where hugetlb folios are not being properly allocated due to incorrect handling of subpools. The problem arises from competing fixes being proposed for this codepath, and this patch seeks to resolve it by restoring failed reservations to their original subpool. The approach taken involves revisiting the logic surrounding subpool locking and release to ensure correct behavior."
+    }
+  }
+}
