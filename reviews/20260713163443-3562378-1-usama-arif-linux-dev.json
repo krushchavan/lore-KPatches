@@ -1,40 +1,34 @@
 {
-  "thread_id": "20260713163443.3562378-3-usama.arif@linux.dev",
-  "subject": "[PATCH v2 2/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost",
-  "url": "https://lore.kernel.org/all/20260713163443.3562378-3-usama.arif@linux.dev/",
+  "thread_id": "20260713163443.3562378-1-usama.arif@linux.dev",
+  "subject": "[PATCH v2 0/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost",
+  "url": "https://lore.kernel.org/all/20260713163443.3562378-1-usama.arif@linux.dev/",
   "dates": {
-    "2026-07-13": {
-      "report_file": "2026-07-13_ollama_llama3.1-8b.html",
-      "developer": "Usama Arif",
-      "reviews": [],
-      "analysis_source": "llm-chunked-no-replies",
-      "patch_summary": "This patch reduces contention on the lru_lock by moving the accumulation of scan balance costs from the producer side to a read-side accumulator fed from per-LRU vmstat counters. The old approach had multiple lock acquisitions for cost updates, which was causing contention on memory-heavy workloads. The new approach uses explicit node_stat counters and recomputes the cost signal lock-free in prepare_scan_control(). This change also improves the cost model across reclaim gaps."
-    },
     "2026-07-14": {
       "report_file": "2026-07-15_ollama_llama3.1-8b.html",
       "developer": "Usama Arif",
       "reviews": [
         {
           "author": "Usama Arif (author)",
-          "summary": "The author acknowledged a need to fix the counters for MGLRU so they increment correctly and thanked reviewers for pointing it out.\n\nThe author addressed a concern that the patch was not correctly incrementing pgreclaim_pageout_* and pgrotate_* counters in MGLRU reclaim paths, which caused misreporting of observability metrics. The author confirmed that this fix is necessary to expose these counters directly through /proc/vmstat and memory.stat, and provided a patch with the necessary changes.",
-          "sentiment": "NEEDS_WORK",
+          "summary": "The author acknowledged a need to modify the patch to increment counters for MGLRU as well, but noted that these counters are not used by MGLRU and is only for observability.\n\nThe author addressed a concern that the patch was missing updates to pgreclaim_pageout_* and pgrotate_* counters in MGLRU reclaim paths, which would misreport observability. The author confirmed this is indeed an issue and provided a fix by incrementing these counters in evict_folios().",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "acknowledged a need for a fix",
-            "thanks for pointing it out",
+            "acknowledged a fix is needed",
             "acknowledged fix needed",
-            "provided patch"
+            "provided patch with fix"
           ],
           "has_inline_review": false,
           "tags_given": [],
+          "analysis_source": "llm",
           "raw_body": "The patch will need the below fixlet so that the counters keep incrementing\nfor MGLRU as well. The counters themselves are not actually used by MGLRU,\nso this is just for observability. This was reported by sashiko, Thanks\nAndrew for pointing this out!\n\n---\n\nFrom: Usama Arif <usama.arif@linux.dev>\nDate: Tue, 14 Jul 2026 05:18:16 -0700\nSubject: [PATCH] [fixlet] mm/vmscan: increment pgreclaim_pageout_* and\n pgrotate_* for MGLRU\n\n/proc/vmstat and per-memcg memory.stat expose pgreclaim_pageout_*\nand pgrotate_* directly (memcg_node_stat_items in memcontrol.c\nforwards them per-memcg). Without this fix they stay at 0 whenever\nreclaim runs through MGLRU, misreporting observability.\n\nUnder pure MGLRU the scan-balance signal itself is not consumed (both\nprepare_scan_control() and get_scan_count() are short-circuited on the\nMGLRU paths, and MGLRU's own type/tier selection comes from\nread_ctrl_pos() on lrugen->{avg_refaulted,avg_total,refaulted,evicted},\nnot from anon_cost/file_cost), so this fix is about observability.\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n mm/vmscan.c | 13 ++++++++++++-\n 1 file changed, 12 insertions(+), 1 deletion(-)\n\ndiff --git a/mm/vmscan.c b/mm/vmscan.c\nindex 279f78b7a0e4..2da36374bb4a 100644\n--- a/mm/vmscan.c\n+++ b/mm/vmscan.c\n@@ -4867,7 +4867,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,\n \tstruct reclaim_stat stat;\n \tstruct lru_gen_mm_walk *walk;\n \tint scanned, reclaimed;\n-\tint isolated = 0, type, type_scanned;\n+\tint isolated = 0, nr_isolated = 0, type, type_scanned;\n+\tunsigned long total_reclaimed = 0, total_pageout = 0;\n \tbool skip_retry = false;\n \tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n \tstruct pglist_data *pgdat = lruvec_pgdat(lruvec);\n@@ -4879,6 +4880,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,\n \n \tscanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness,\n \t\t\t\t &list, &isolated, &type, &type_scanned);\n+\tnr_isolated = isolated;\n \n \t/* Scanning may have emptied the oldest gen, flush it */\n \tif (scanned)\n@@ -4891,6 +4893,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,\n retry:\n \treclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);\n \tsc->nr_reclaimed += reclaimed;\n+\ttotal_reclaimed += reclaimed;\n+\ttotal_pageout += stat.nr_pageout;\n \t/* Retry pass is only meant for clean folios without new isolation */\n \tif (isolated)\n \t\thandle_reclaim_writeback(isolated, pgdat, sc, &stat);\n@@ -4944,6 +4948,13 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,\n \t\tgoto retry;\n \t}\n \n+\tif (total_pageout)\n+\t\tmod_lruvec_state(lruvec, PGRECLAIM_PAGEOUT_ANON + type,\n+\t\t\t\t total_pageout);\n+\tif (nr_isolated > total_reclaimed)\n+\t\tmod_lruvec_state(lruvec, PGROTATE_ANON + type,\n+\t\t\t\t nr_isolated - total_reclaimed);\n+\n \treturn scanned;\n }\n \n-- \n2.53.0-Meta",
           "reply_to": "",
           "message_date": "2026-07-14",
           "message_id": "25a94af5-1dbe-4ab4-b47d-fb49987bfcd4@linux.dev",
-          "analysis_source": "llm"
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
         }
       ],
       "analysis_source": "llm-per-reviewer",
-      "patch_summary": "This patch reduces contention on the lru_lock by moving the accumulation of scan costs from the producer side to a read-side accumulator fed from per-LRU vmstat counters. The old approach had multiple acquisitions of the lru_lock for trivial operations, causing contention with actual LRU manipulation. The new approach uses explicit node_stat counters and recomputes the cost signal lock-free in prepare_scan_control(). This improves the cost model across reclaim gaps and reduces contention on memory-heavy workloads."
+      "patch_summary": "This patch reduces contention on the lru_lock by moving the cost-recording work to the reclaim side, where it is done lock-free using per-LRU vmstat counters and a dedicated cost_lock. The producer-side acquisitions of lru_lock are removed, reducing contention on memory-pressured workloads. The new scheme also improves the cost model across reclaim gaps by observing the whole between-reclaim delta and decaying anon and file proportionally."
     },
     "2026-07-15": {
       "report_file": "2026-07-15_ollama_llama3.1-8b.html",
@@ -42,8 +36,28 @@
       "reviews": [
         {
           "author": "Johannes Weiner",
-          "summary": "The reviewer pointed out that reclaim operations no longer write files, and suggested using NR_VMSCAN_WRITE for anon counts instead of file counts.",
-          "sentiment": "NEEDS_WORK",
+          "summary": "Reviewer Johannes Weiner noted that using vm_event_state for tracking monotonic events is not feasible due to global events and lack of per-node tracking, but considers the current patch as a suitable solution.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "considered-as-suitable",
+            "acknowledged-as-best-solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Acked-by: Johannes Weiner <hannes@cmpxchg.org>\n\nIt's unfortunate that we mix state counts with monotonic events in\nnode_stat_item. We have vm_event_state for monotonics, but they aren't\ntracked per-node (which we need here and for other places in vmscan),\nand they can't easily be made so because there are \"global\" events in\nthere that don't easily map to a specific node.\n\nSo this seems like the best solution for now.",
+          "reply_to": "",
+          "message_date": "2026-07-15",
+          "message_id": "20260715141015.GP276793@cmpxchg.org",
+          "email": "hannes@cmpxchg.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Johannes Weiner",
+          "summary": "The reviewer pointed out that reclaim operations no longer write to file counters, suggesting using NR_VMSCAN_WRITE for anon counts instead.",
+          "sentiment": "needs_work",
           "sentiment_signals": [
             "requested changes"
           ],
@@ -51,15 +65,17 @@
           "tags_given": [
             "Reviewed-by"
           ],
+          "analysis_source": "llm",
           "raw_body": "Reclaim generally doesn't write files (anymore).\n\nYou can use NR_VMSCAN_WRITE for the anon counts.",
-          "reply_to": "Usama Arif",
+          "reply_to": "",
           "message_date": "2026-07-15",
           "message_id": "20260715141643.GQ276793@cmpxchg.org",
-          "analysis_source": "llm"
+          "email": "hannes@cmpxchg.org",
+          "is_maintainer": false
         }
       ],
       "analysis_source": "llm-per-reviewer",
-      "patch_summary": "This patch reduces contention on the lru_lock by moving the accumulation of scan costs from the producer side to a read-side accumulator fed from per-LRU vmstat counters. The old approach had multiple acquisitions of the lru_lock for trivial operations, causing contention with actual LRU manipulation. The new approach uses explicit node_stat counters and recomputes the cost signal lock-free in prepare_scan_control(). This improves the cost model across reclaim gaps and reduces contention on memory-heavy workloads."
+      "patch_summary": "This patch reduces contention on the lru_lock by moving the cost-recording work to the reclaim side, where it is done lock-free using per-LRU vmstat counters and a dedicated cost_lock. The producer-side acquisitions of lru_lock are removed, reducing contention on memory-pressured workloads. The new scheme also improves the cost model across reclaim gaps by observing the whole between-reclaim delta and decaying anon and file proportionally."
     }
   }
 }

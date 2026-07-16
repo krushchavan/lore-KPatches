@@ -1,0 +1,197 @@
+{
+  "thread_id": "20260714122344.351895-2-kirill@shutemov.name",
+  "subject": "[PATCH v2 1/5] mm/memory-failure: keep the folio, not the poisoned subpage, locked across split",
+  "url": "https://lore.kernel.org/all/20260714122344.351895-2-kirill@shutemov.name/",
+  "dates": {
+    "2026-07-14": {
+      "report_file": "2026-07-15_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) noted that using split_folio_to_order() could reintroduce a lock ordering issue due to non-uniform splitting, which would result in the other folio pages being minimal and potentially causing issues.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "lock ordering issue",
+            "non-uniform splitting"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "With a non-uniform split it would actually make a difference: we'd want to split\nsuch that we the other folio pages minimal.\n\n split_folio_to_order() always seems to end up in\n__split_huge_page_to_list_to_order() where we do a SPLIT_TYPE_UNIFORM.\n\nI recall discussing with Zi and Willy that in the future we'd want to convert\nmore places to do a non-uniform split.\n\nSo I'm afraid that would just re-introduce the problem then.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-14",
+          "message_id": "c4aa63df-30ab-464d-bd0b-48dc37c8e6ba@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Reviewer strongly disagreed with the patch and requested it be ignored, citing that it is broken",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "strong disagreement",
+            "patch is broken"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Ughh.. This patch is broken, sorry.\n\nPlease ignore the patchset. Will follow up.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-14",
+          "message_id": "alYzJ9-zsTuQl08J@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledges that their original patch is broken due to code expectations and proposes a fix in a different part of the code (2/5), which would change the behavior of memory_failure() and introduce an -EBUSY guard in __folio_split().",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledges patch is broken",
+            "proposes alternative fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Right. Non-uniform split can be useful.\n\nBut my patch is completely broken because code expects the pin to be on the\n@page, not on the head. put_page() few lines down can explode already.\n\nSo the fix does not belong in memory_failure(). It belongs in\n__folio_split(), and it is really just 2/5: refuse the split with -EBUSY\nwhen @lock_at is at or beyond the sampled EOF.\n\nThe safety then sits in __folio_split() regardless of caller or split type,\nwhich should also cover your non-uniform worry.\n\nThe behavioural change is that memory_failure() reports a beyond-EOF\npoisoned tail as unsplit (MF_FAILED) instead of recovered, and kills the\nmappers instead of splitting the page off. What we give up is salvaging\nthe folio's healthy pages and the clean unmap -- both low value for a page\nthat is beyond EOF and getting truncated away. Containment is unaffected:\nPageHWPoison is set before the split and free_pages_prepare() keeps a\npoisoned page out of the buddy allocator, so the bad page never comes back\nregardless.\n\nThe alternative, if we would rather keep the recovered outcome, is to leave\n@lock_at as the poisoned page and move i_mmap_unlock_read() (and\nshmem_uncharge()) ahead of the after-split unlock loop, so every mapping\ndereference happens while @folio -- the head, within EOF -- still pins the\ninode. That is close to Hao's original patch. It works, but it rests on \"no\nmapping dereference after the unlock loop\", which is its own fragility.\n\nI lean towards the -EBUSY guard.\n\nComments?\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-07-14",
+          "message_id": "alZNYYsybKZA0eJb@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Zi Yan",
+          "summary": "Reviewer Zi Yan suggested an alternative approach to handle the locking of @lock_at, proposing to only use igrab() when @lock_at is at or beyond EOF, and raised concerns about the complexity of determining the index of the after-split folio containing @lock_at for non-uniform splits.\n\nReviewer Zi Yan noted that the patch introduces another implicit synchronization in the folio split process, requiring documentation of this new requirement, and acknowledged that it works without changing existing behavior.\n\nReviewer Yan prefers moving i_mmap_unlock_read() before the unlock loop in __folio_split(), but is open to alternative solutions such as returning -EBUSY",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "alternative approach",
+            "complexity of calculation",
+            "acknowledged",
+            "requirement",
+            "open to alternative solutions",
+            "prefers a different approach"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "There is an alternative, only igrab() when @lock_at is at or beyond the EOF,\nas I was bouncing ideas with Codex.\n\nSome subtlety exists in these two “@lock_at at or beyond EOF” approaches.\nWhen @lock_at can be a tail page of an after-split folio, Patch 2 returns\n-EBUSY unnecessarily, since the after-split folio containing @lock_at will\nbe still in xarray, preventing inode going away. To make a precise decision,\nwe will need to determine the index of the after-split folio containing @lock_at\nwhen checking against end. It is easy for uniform split, namely\n\nlock_at_folio_index =\n\tfolio->index + round_down(lock_at - &folio->page, 1UL << new_order);\n\nbut for non-uniform split, the calculation is more involved and I have not\nfigured it out yet.\n\nIf we go “return -EBUSY if @lock_at index is at or beyond EOF”, are we OK\nwith not being able to split a folio when it is actually splittable?\n\n---\n\nThis approach works without changing existing behavior, as long as we document\nthe requirement well.\n\nI admit that this is another implicit synchronization in folio split process,\nin addition to\n1) keeping original folio frozen until xarray is updated and\n2) do not update xarray with after-split folios until after-split folios are\nunfrozen.\n\n---\n\nI prefer moving i_mmap_unlock_read() before the unlock loop (shmem_uncharge()\nis already before the loop), but I am more than happy to be convinced that\n“return -EBUSY” is better or something else.\n\nBest Regards,\nYan, Zi",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-07-14",
+          "message_id": "66A57599-EDA0-4E99-B073-F2AE0B2ED708@nvidia.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author pushed back against the suggestion of using a different approach to handle inode eviction, citing concerns about introducing additional filesystem complexity and locking issues.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "pushed back",
+            "don't think we want to think about"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I saw this option too, but I wound rather not go this path.\n\niput() still can lead to inode eviction an bunch of random filesystem\ncomplexity under us. I don't think we want to think about other\nfs-related locking issues in split context.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Zi Yan",
+          "message_date": "2026-07-14",
+          "message_id": "alZljHr4Nk3FOpCP@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Zi Yan",
+          "summary": "Reviewer Yan suggested two alternative approaches to avoid rejecting splits: one involves adjusting the lock_at_index based on the split type and offset, while the other uses a new function split_lock_at_index to calculate a safe index for locking.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Your reasoning makes sense to me. Let's ignore this option.\n\nFor your patch 2, we might want something like below to avoid over\nrejecting splits. WDYT?\n\noffset = folio_page_idx(folio, lock_at);\n\nif (split_type == SPLIT_TYPE_UNIFORM)\n\tlock_at_index = folio->index + round_down(offset, 1UL << new_order);\nelse\n\t/* @lock_at in non uniform split is always @folio */\n\tlock_at_index = folio->index;\n\nif (lock_at_index >= end) {\n\tret = -EBUSY;\n\tgoto out_unlock;\n}\n\n\nAlso to keep a record in case we want to have @lock_at pointing to any\ntail page for non uniform split in the future, something like below is\ngoing to be useful (assisted by Codex).\n\nstatic pgoff_t split_lock_at_index(struct folio *folio,\n\t\tunsigned int new_order, struct page *split_at,\n\t\tstruct page *lock_at, enum split_type split_type)\n{\n\tunsigned long lock = folio_page_idx(folio, lock_at);\n\tunsigned long split = folio_page_idx(folio, split_at);\n\tint order;\n\n\tif (split_type == SPLIT_TYPE_UNIFORM)\n\t\treturn folio->index + round_down(lock, 1UL << new_order);\n\n\tfor (order = folio_order(folio) - 1; order >= new_order; order--) {\n\t\tunsigned long size = 1UL << order;\n\t\tunsigned long lock_base = round_down(lock, size);\n\t\tunsigned long split_base = round_down(split, size);\n\n\t\t/* folio containing @lock_at will not be split any more */\n\t\tif (lock_base != split_base)\n\t\t\treturn folio->index + lock_base;\n\t}\n\t\n\treturn folio->index + round_down(lock, 1UL << new_order);\n}\n\nif (split_lock_at_index(folio, new_order, split_at, lock_at, split_type) >= end) {\n\tret = -EBUSY;\n\tgoto out_unlock;\n}\n\n-- \nBest Regards,\nYan, Zi",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-14",
+          "message_id": "DJYH202OLKZF.432DAJWF2MGA@nvidia.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the memory-failure module where a poisoned subpage was being locked across a split operation, leading to a use-after-free error when the inode was evicted while __folio_split() was still running. The fix is to lock and split the folio as a whole, rather than just the poisoned subpage, so that the head of the folio remains locked and pinned in the page cache until the end of the operation."
+    },
+    "2026-07-15": {
+      "report_file": "2026-07-15_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author addressed a concern about the order of unlocking and freeing after-split folios, agreeing that i_mmap_unlock_read() should be moved out of the window to avoid slab-use-after-free bugs. The author plans to restructure in v3.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Right. With the -EBUSY condition growing this hairy -- and having to stay\ncorrect for non-uniform splits too -- just moving i_mmap_unlock_read() out\nof the window looks more attractive.\n\nThis is really Hao's original patch with the reasoning corrected, so I kept\nhim as author. v3 below.\n\n----------------------------------------------------------------------\n\nFrom: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\nSubject: [PATCH v3] mm/huge_memory: unlock i_mmap_rwsem before releasing\n after-split folios\n\n__folio_split() keeps dereferencing the mapping after the split:\nshmem_uncharge(mapping->host) and remap_page() while the folios are still\nfrozen/locked, and i_mmap_unlock_read(mapping) at the very end, after the\nafter-split folios have been unlocked and freed.\n\nNothing holds an inode reference across that. The split relies on @folio\n-- which the beyond-EOF drop loop never removes, as it starts at\nfolio_next(folio) -- staying locked and in the page cache to hold off\neviction. But the unlock loop unlocks @folio before i_mmap_unlock_read()\nruns. If the caller's @lock_at is a tail beyond EOF, as memory_failure()\npasses when splitting a poisoned tail of a shmem THP that reaches past\ni_size during truncation, it too is gone from the page cache; so once\n@folio is unlocked no locked, in-cache folio pins the inode, and a\nconcurrent final iput() can evict and RCU-free it before\ni_mmap_unlock_read() touches i_mmap_rwsem:\n\n  BUG: KASAN: slab-use-after-free in __up_read+0x634/0x790\n   i_mmap_unlock_read include/linux/fs.h:537 [inline]\n   __folio_split+0x732/0x1640 mm/huge_memory.c:4100\n   try_to_split_thp_page+0xab/0x390 mm/memory-failure.c:1675\n   memory_failure+0x1394/0x26e0 mm/memory-failure.c:2470\n\n  Freed by task 4601:\n   shmem_free_in_core_inode+0x54/0xb0 mm/shmem.c:5177\n   evict+0x57f/0xac0 fs/inode.c:870\n\nDo every mapping dereference while @folio still pins the inode: drop\ni_mmap_rwsem right after remap_page(), before the loop that unlocks and\nfrees the after-split folios, and clear @mapping so the exit path does not\nunlock it again. shmem_uncharge() and remap_page() already run before that\npoint, so after this nothing past the unlock loop touches the inode or the\nmapping.\n\nThis is now a rule the split depends on, alongside keeping @folio frozen\nuntil the page cache is updated: no inode or mapping dereference once the\nafter-split folios start being unlocked.\n\nReported-by: Hao Zhang <zhanghao1@kylinos.cn>\nCloses: https://lore.kernel.org/linux-mm/20260710071344.GA106129@zh-pc\nFixes: baa355fd3314 (\"thp: file pages support for split_huge_page()\")\nCc: <stable@vger.kernel.org>\nCo-developed-by: Hao Zhang <zhanghao1@kylinos.cn>\nSigned-off-by: Hao Zhang <zhanghao1@kylinos.cn>\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n mm/huge_memory.c | 12 ++++++++++++\n 1 file changed, 12 insertions(+)\n\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex 2bccb0a53a0a..abaea34ef558 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -4109,6 +4109,18 @@ static int __folio_split(struct folio *folio, unsigned int new_order,\n\n \tremap_page(folio, 1 << old_order, ttu_flags);\n\n+\t/*\n+\t * Drop the mapping while the inode is still pinned. @folio stays\n+\t * locked and present in the page cache until the loop below, so\n+\t * eviction cannot free the inode yet; @lock_at is not enough, it may\n+\t * be a tail beyond EOF that the split already dropped from the page\n+\t * cache. Nothing past this point may touch the inode or the mapping.\n+\t */\n+\tif (mapping) {\n+\t\ti_mmap_unlock_read(mapping);\n+\t\tmapping = NULL;\n+\t}\n+\n \t/*\n \t * Unlock all after-split folios except the one containing\n \t * @lock_at page. If @folio is not split, it will be kept locked.\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Zi Yan",
+          "message_date": "2026-07-15",
+          "message_id": "aldjhtfVByHDQXe6@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Gave Acked-by",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "raw_body": "",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-15",
+          "message_id": "feaa5d7f-0717-4309-be90-7fd99ea525c1@kernel.org",
+          "analysis_source": "heuristic"
+        },
+        {
+          "author": "Zi Yan",
+          "summary": "Reviewer noted that the patch LGTM and approved it, also giving a Reviewed-by tag.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "LGTM. Thanks.\n\nReviewed-by: Zi Yan <ziy@nvidia.com>\n\nBest Regards,\nYan, Zi",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-15",
+          "message_id": "E93921CF-F1AF-4B60-8640-72FF2755DCE4@nvidia.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the memory-failure module where a poisoned subpage was being locked across a split operation, leading to a use-after-free error when the inode was evicted while __folio_split() was still running. The fix is to lock and split the folio as a whole, rather than just the poisoned subpage, so that the head of the folio remains locked and pinned in the page cache until the end of the operation."
+    },
+    "2026-07-16": {
+      "report_file": "2026-07-15_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Baolin Wang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-07-16",
+          "message_id": "c7b29638-69c9-45f9-a9cd-21dea1460848@linux.alibaba.com",
+          "analysis_source": "heuristic"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the memory-failure module where a poisoned subpage was being locked across a split operation, leading to a use-after-free error when the inode was evicted while __folio_split() was still running. The fix is to lock and split the folio as a whole, rather than just the poisoned subpage, so that the head of the folio remains locked and pinned in the page cache until the end of the operation."
+    }
+  }
+}

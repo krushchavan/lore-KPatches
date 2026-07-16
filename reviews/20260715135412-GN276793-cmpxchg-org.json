@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260715135412.GN276793@cmpxchg.org",
+  "subject": "[PATCH] sched/psi: use for_each_set_bit() in psi_group_change() task-count walk",
+  "url": "https://lore.kernel.org/all/20260715135412.GN276793@cmpxchg.org/",
+  "dates": {
+    "2026-07-15": {
+      "report_file": "2026-07-15_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Johannes Weiner",
+          "summary": "Identified potential performance issues with the patch and suggested revisiting the optimization, noting that gcc produces more code with the new implementation.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "WAITING_FOR_REVIEW"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Provided benchmark results showing that the new implementation outperforms the original in most cases, reducing code size by 67 bytes.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "BENCHMARK_RESULTS"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "\n\nOn 15/07/2026 14:54, Johannes Weiner wrote:\n> On Tue, Jul 14, 2026 at 07:20:57AM -0700, Usama Arif wrote:\n>> psi_group_change() walks the @clear and @set bitmasks to\n>> decrement/increment groupc->tasks[t]. Both masks are at most\n>> NR_PSI_TASK_COUNTS (=4) wide, dense at [0, 4), and typically\n>> sparse. Today's form visits every position up to the highest set\n>> bit:\n>>\n>> \tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n>> \t\tif (!(m & (1 << t)))\n>> \t\t\tcontinue;\n>> \t\t...\n>> \t}\n>>\n>> so a mask with only bit 3 set still spins four times; the same\n>> open-coded shape repeats for @set. The code is also unnecessarily\n>> hard to read.\n>>\n>> Switch both walks to for_each_set_bit() which is easier to read\n>> and also more efficient. As NR_PSI_TASK_COUNTS is a compile-time\n>> constant <= BITS_PER_LONG, find_next_bit() folds into its\n>> small_const_nbits() fast path (single load + GENMASK + __ffs), lowering\n>> to a bit-scan where one exists (x86 TZCNT/BSF, arm64 RBIT+CLZ).\n>>\n>> psi_group_change() runs from psi_task_switch() and psi_task_change()\n>> once per ancestor psi_group per event, so the saved iterations\n>> multiply out on any hot scheduler workload.\n>>\n>> No functional change intended.\n> \n> This actually started out using ffs. Because the performance is so\n> sensitive in this path, this was handtuned to scheduler benchmarks.\n> \n> https://lore.kernel.org/all/20180718120318.GC2476@hirez.programming.kicks-ass.net/\n> \n> Not the worst idea to revisit this, but you have to be careful, look\n> at the asm, and benchmark it. gcc is producing more code for me with\n> your patch.\n\n\nSo I tried with claude to create a kernel module that benchmarks the 3\nimplementations, the current one, for_each_set_bit and __ffs [1]:\n__ffs actually performs best. \n\npsi_bench: running on cpu 1, iters=2000000, trials=10\npsi_bench empty            (clear=0x0, set=0x0)     original=3.68  foreach=3.81  ffs=3.68   (for=+3%  ffs=+0%)\npsi_bench sleep            (clear=0x4, set=0x0)     original=9.60  foreach=5.18  ffs=3.74   (for=-46%  ffs=-61%)\npsi_bench iowait-sleep     (clear=0x4, set=0x1)     original=12.32  foreach=6.90  ffs=4.45   (for=-43%  ffs=-63%)\npsi_bench memstall-sleep   (clear=0xc, set=0x0)     original=11.87  foreach=5.98  ffs=5.54   (for=-49%  ffs=-53%)\npsi_bench wake             (clear=0x0, set=0x4)     original=7.10  foreach=5.17  ffs=3.70   (for=-27%  ffs=-47%)\npsi_bench iowait-wake      (clear=0x1, set=0x4)     original=10.83  foreach=6.91  ffs=4.48   (for=-36%  ffs=-58%)\npsi_bench: done\npsi_bench: unloaded\n\n[1] https://gist.github.com/uarif1/e1bf78b54f50099b354b84684f880fda\n\n\nI built the below patch and the code size reduces as well by\n67 bytes from 756B to 689B. If it looks ok, I can send it as v2?\n\n\n>From 052c845707f65d58d5cf8cb1da6515e268159e83 Mon Sep 17 00:00:00 2001\nFrom: Usama Arif <usama.arif@linux.dev>\nDate: Sat, 11 Jul 2026 03:57:01 -0700\nSubject: [PATCH] sched/psi: use __ffs() to walk task-count bitmasks in\n psi_group_change()\n\npsi_group_change() walks the @clear and @set bitmasks to\ndecrement/increment groupc->tasks[t]. Both masks are at most\nNR_PSI_TASK_COUNTS (=4) wide and typically have one or two bits\nset. Today's form visits every position up to the highest set bit:\n\n\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n\t\tif (!(m & (1 << t)))\n\t\t\tcontinue;\n\t\t...\n\t}\n\nso a mask with only bit 3 set still spins four times through the\nskip path. Switch both walks to __ffs() + m &= m-1 form:\n\n\twhile (clear) {\n\t\tt = __ffs(clear);\n\t\tclear &= clear - 1;\n\t\t...\n\t}\n\nwhich iterates only over the set bits and terminates naturally on\nm == 0. m & (m - 1) clears the lowest set bit. This code is easier\nto read as well.\n\nAn in-kernel microbench (noinline, same body, IRQs off, pinned CPU\non Zen4c/Bergamo, min-of-10 cyc/call) over mask distributions\nproduced by common scheduler PSI paths:\n\n  mask pattern                        old    new    delta\n  empty          (clear=0x0, set=0x0)  3.68   3.68    +0%\n  sleep          (clear=0x4, set=0x0)  9.60   3.74   -61%\n  iowait-sleep   (clear=0x4, set=0x1) 12.32   4.45   -63%\n  memstall-sleep (clear=0xc, set=0x0) 11.87   5.54   -53%\n  wake           (clear=0x0, set=0x4)  7.10   3.70   -47%\n  iowait-wake    (clear=0x1, set=0x4) 10.83   4.48   -58%\n\nEvery non-empty case wins 47-63%: old cost tracks the highest set bit\n(linear walk), new cost tracks the count of set bits (skip zeros via\nTZCNT). Single-bit patterns run at the empty-case floor.\n\nThe generated psi_group_change() text also shrinks by 67 bytes under\n-O2 -march=x86-64 (756 -> 689): no scratch register for a \"constant 1\"\n(only __ffs's operand is needed), simpler bit-clear (LEA+AND vs\nSHL+NOT+AND after the test), and no skip-if-unset check per position.\n\nNo functional change intended.\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n kernel/sched/psi.c | 20 ++++++++++++--------\n 1 file changed, 12 insertions(+), 8 deletions(-)\n\ndiff --git a/kernel/sched/psi.c b/kernel/sched/psi.c\nindex d9c9d9480a45..2951614cae17 100644\n--- a/kernel/sched/psi.c\n+++ b/kernel/sched/psi.c\n@@ -798,7 +798,7 @@ static void psi_group_change(struct psi_group *group, int cpu,\n \t\t\t     u64 now, bool wake_clock)\n {\n \tstruct psi_group_cpu *groupc;\n-\tunsigned int t, m;\n+\tunsigned int t, clear_orig;\n \tu32 state_mask;\n \n \tlockdep_assert_rq_held(cpu_rq(cpu));\n@@ -820,27 +820,31 @@ static void psi_group_change(struct psi_group *group, int cpu,\n \t\tstate_mask = groupc->state_mask & PSI_ONCPU;\n \t}\n \n+\tclear_orig = clear;\n+\n \t/*\n \t * The rest of the state mask is calculated based on the task\n \t * counts. Update those first, then construct the mask.\n \t */\n-\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n-\t\tif (!(m & (1 << t)))\n-\t\t\tcontinue;\n+\twhile (clear) {\n+\t\tt = __ffs(clear);\n+\t\tclear &= clear - 1;\n \t\tif (groupc->tasks[t]) {\n \t\t\tgroupc->tasks[t]--;\n \t\t} else if (!psi_bug) {\n \t\t\tprintk_deferred(KERN_ERR \"psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u] clear=%x set=%x\\n\",\n \t\t\t\t\tcpu, t, groupc->tasks[0],\n \t\t\t\t\tgroupc->tasks[1], groupc->tasks[2],\n-\t\t\t\t\tgroupc->tasks[3], clear, set);\n+\t\t\t\t\tgroupc->tasks[3], clear_orig, set);\n \t\t\tpsi_bug = 1;\n \t\t}\n \t}\n \n-\tfor (t = 0; set; set &= ~(1 << t), t++)\n-\t\tif (set & (1 << t))\n-\t\t\tgroupc->tasks[t]++;\n+\twhile (set) {\n+\t\tt = __ffs(set);\n+\t\tset &= set - 1;\n+\t\tgroupc->tasks[t]++;\n+\t}\n \n \tif (!group->enabled) {\n \t\t/*\n-- \n2.53.0-Meta\n\n\n\n\n\n",
+          "reply_to": "",
+          "message_date": "2026-07-15",
+          "message_id": "",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Usama Arif's patch aims to improve performance in psi_group_change() by switching from a linear walk to using __ffs() and m &= m-1, which iterates only over set bits."
+    }
+  }
+}

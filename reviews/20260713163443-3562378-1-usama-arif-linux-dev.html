@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH v2 1/2] mm/vmstat, mm/memcontrol: add _monotonic vmstat readers</title>
+    <title>Review Comments: [PATCH v2 0/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,11 +236,104 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH v2 1/2] mm/vmstat, mm/memcontrol: add _monotonic vmstat readers</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260713163443.3562378-2-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-13</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-15</strong><div class="date-range-nav">Active on: <a href="#2026-07-15">2026-07-15</a> &bull; <a href="#2026-07-13">2026-07-13</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds new functions to the Linux kernel that allow reading monotonic, incrementing event counters without clamping negative values. This is necessary because clamped reads can lead to incorrect results when computing deltas across signed-long wraparounds. The new functions are only safe for monotonically-incremented counters and do not change the behavior of non-monotonic page-count readers. The patch also adds a prerequisite for replacing producer-side accumulators with read-side accumulators in the following patch.</div></div>
+    <h1>[PATCH v2 0/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/20260713163443.3562378-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-07-14</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-15</strong><div class="date-range-nav">Active on: <a href="#2026-07-15">2026-07-15</a> &bull; <a href="#2026-07-14">2026-07-14</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch reduces contention on the lru_lock by moving the cost-recording work to the reclaim side, where it is done lock-free using per-LRU vmstat counters and a dedicated cost_lock. The producer-side acquisitions of lru_lock are removed, reducing contention on memory-pressured workloads. The new scheme also improves the cost model across reclaim gaps by observing the whole between-reclaim delta and decaying anon and file proportionally.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-07-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-07-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-14">2026-07-14</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledged a need to modify the patch to increment counters for MGLRU as well, but noted that these counters are not used by MGLRU and is only for observability.
+
+The author addressed a concern that the patch was missing updates to pgreclaim_pageout_* and pgrotate_* counters in MGLRU reclaim paths, which would misreport observability. The author confirmed this is indeed an issue and provided a fix by incrementing these counters in evict_folios().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The patch will need the below fixlet so that the counters keep incrementing
+for MGLRU as well. The counters themselves are not actually used by MGLRU,
+so this is just for observability. This was reported by sashiko, Thanks
+Andrew for pointing this out!
+
+---
+
+From: Usama Arif &lt;usama.arif@linux.dev&gt;
+Date: Tue, 14 Jul 2026 05:18:16 -0700
+Subject: [PATCH] [fixlet] mm/vmscan: increment pgreclaim_pageout_* and
+ pgrotate_* for MGLRU
+
+/proc/vmstat and per-memcg memory.stat expose pgreclaim_pageout_*
+and pgrotate_* directly (memcg_node_stat_items in memcontrol.c
+forwards them per-memcg). Without this fix they stay at 0 whenever
+reclaim runs through MGLRU, misreporting observability.
+
+Under pure MGLRU the scan-balance signal itself is not consumed (both
+prepare_scan_control() and get_scan_count() are short-circuited on the
+MGLRU paths, and MGLRU&#x27;s own type/tier selection comes from
+read_ctrl_pos() on lrugen-&gt;{avg_refaulted,avg_total,refaulted,evicted},
+not from anon_cost/file_cost), so this fix is about observability.
+
+Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+---
+ mm/vmscan.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 279f78b7a0e4..2da36374bb4a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4867,7 +4867,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 	struct reclaim_stat stat;
+ 	struct lru_gen_mm_walk *walk;
+ 	int scanned, reclaimed;
+-	int isolated = 0, type, type_scanned;
++	int isolated = 0, nr_isolated = 0, type, type_scanned;
++	unsigned long total_reclaimed = 0, total_pageout = 0;
+ 	bool skip_retry = false;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+@@ -4879,6 +4880,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 
+ 	scanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness,
+ 				 &amp;list, &amp;isolated, &amp;type, &amp;type_scanned);
++	nr_isolated = isolated;
+ 
+ 	/* Scanning may have emptied the oldest gen, flush it */
+ 	if (scanned)
+@@ -4891,6 +4893,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ retry:
+ 	reclaimed = shrink_folio_list(&amp;list, pgdat, sc, &amp;stat, false, memcg);
+ 	sc-&gt;nr_reclaimed += reclaimed;
++	total_reclaimed += reclaimed;
++	total_pageout += stat.nr_pageout;
+ 	/* Retry pass is only meant for clean folios without new isolation */
+ 	if (isolated)
+ 		handle_reclaim_writeback(isolated, pgdat, sc, &amp;stat);
+@@ -4944,6 +4948,13 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 		goto retry;
+ 	}
+ 
++	if (total_pageout)
++		mod_lruvec_state(lruvec, PGRECLAIM_PAGEOUT_ANON + type,
++				 total_pageout);
++	if (nr_isolated &gt; total_reclaimed)
++		mod_lruvec_state(lruvec, PGROTATE_ANON + type,
++				 nr_isolated - total_reclaimed);
++
+ 	return scanned;
+ }
+ 
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/25a94af5-1dbe-4ab4-b47d-fb49987bfcd4@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed, acknowledged fix needed, provided patch with fix</div>
+</div>
+</div>
 <div class="thread-node depth-0" id="2026-07-15">
 <div class="review-comment">
 <div class="review-comment-header">
@@ -250,7 +343,7 @@
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Johannes Weiner noted that the current implementation mixes state counts and monotonic events in node_stat_item, which can&#x27;t be easily made per-node due to &#x27;global&#x27; events; he considered this patch a good solution for now.</div>
+<div class="review-comment-text">Reviewer Johannes Weiner noted that using vm_event_state for tracking monotonic events is not feasible due to global events and lack of per-node tracking, but considers the current patch as a suitable solution.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Acked-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
@@ -263,9 +356,28 @@ there that don&#x27;t easily map to a specific node.
 
 So this seems like the best solution for now.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
 <a href="https://lore.kernel.org/r/20260715141015.GP276793@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: considered-this-patch-a-good-solution-for-now</div>
+<div class="review-comment-signals">Signals: considered-as-suitable, acknowledged-as-best-solution</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-07-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-15">2026-07-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer pointed out that reclaim operations no longer write to file counters, suggesting using NR_VMSCAN_WRITE for anon counts instead.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Reclaim generally doesn&#x27;t write files (anymore).
+
+You can use NR_VMSCAN_WRITE for the anon counts.</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260715141643.GQ276793@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>

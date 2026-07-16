@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH v2 2/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost</title>
+    <title>Review Comments: [PATCH] fuse: disable default bdi strictlimiting</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,123 +236,150 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH v2 2/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260713163443.3562378-3-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-13</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-15</strong><div class="date-range-nav">Active on: <a href="#2026-07-15">2026-07-15</a> &bull; <a href="#2026-07-14">2026-07-14</a> &bull; <a href="#2026-07-13">2026-07-13</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch reduces contention on the lru_lock by moving the accumulation of scan costs from the producer side to a read-side accumulator fed from per-LRU vmstat counters. The old approach had multiple acquisitions of the lru_lock for trivial operations, causing contention with actual LRU manipulation. The new approach uses explicit node_stat counters and recomputes the cost signal lock-free in prepare_scan_control(). This improves the cost model across reclaim gaps and reduces contention on memory-heavy workloads.</div></div>
+    <h1>[PATCH] fuse: disable default bdi strictlimiting</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/CAJnrk1b65ypz4bdtd1rTQBYOpOEP+DcoZJUSL87jVDssW1A+pw@mail.gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-07-15</strong><div class="date-range-nav">Active on: <a href="#2026-07-15">2026-07-15</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch disables the default strictlimiting of block device I/O (bdi) for FUSE file systems, which can lead to inaccurate dirty page statistics and excessive writeback. The issue arises from periodic flushing of memory cgroup stats, causing lagging values that result in under-reporting of dirty pages. This can cause writers to exceed the limit by more than 2x before throttling kicks in. The patch aims to address this problem by disabling strictlimiting for FUSE file systems.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-07-14">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Usama Arif (author)</span>
-<a class="date-chip" href="../2026-07-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-14">2026-07-14</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author acknowledged a need to fix the counters for MGLRU so they increment correctly and thanked reviewers for pointing it out.
-
-The author addressed a concern that the patch was not correctly incrementing pgreclaim_pageout_* and pgrotate_* counters in MGLRU reclaim paths, which caused misreporting of observability metrics. The author confirmed that this fix is necessary to expose these counters directly through /proc/vmstat and memory.stat, and provided a patch with the necessary changes.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">The patch will need the below fixlet so that the counters keep incrementing
-for MGLRU as well. The counters themselves are not actually used by MGLRU,
-so this is just for observability. This was reported by sashiko, Thanks
-Andrew for pointing this out!
-
----
-
-From: Usama Arif &lt;usama.arif@linux.dev&gt;
-Date: Tue, 14 Jul 2026 05:18:16 -0700
-Subject: [PATCH] [fixlet] mm/vmscan: increment pgreclaim_pageout_* and
- pgrotate_* for MGLRU
-
-/proc/vmstat and per-memcg memory.stat expose pgreclaim_pageout_*
-and pgrotate_* directly (memcg_node_stat_items in memcontrol.c
-forwards them per-memcg). Without this fix they stay at 0 whenever
-reclaim runs through MGLRU, misreporting observability.
-
-Under pure MGLRU the scan-balance signal itself is not consumed (both
-prepare_scan_control() and get_scan_count() are short-circuited on the
-MGLRU paths, and MGLRU&#x27;s own type/tier selection comes from
-read_ctrl_pos() on lrugen-&gt;{avg_refaulted,avg_total,refaulted,evicted},
-not from anon_cost/file_cost), so this fix is about observability.
-
-Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
----
- mm/vmscan.c | 13 ++++++++++++-
- 1 file changed, 12 insertions(+), 1 deletion(-)
-
-diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 279f78b7a0e4..2da36374bb4a 100644
---- a/mm/vmscan.c
-+++ b/mm/vmscan.c
-@@ -4867,7 +4867,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
- 	struct reclaim_stat stat;
- 	struct lru_gen_mm_walk *walk;
- 	int scanned, reclaimed;
--	int isolated = 0, type, type_scanned;
-+	int isolated = 0, nr_isolated = 0, type, type_scanned;
-+	unsigned long total_reclaimed = 0, total_pageout = 0;
- 	bool skip_retry = false;
- 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
- 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
-@@ -4879,6 +4880,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
- 
- 	scanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness,
- 				 &amp;list, &amp;isolated, &amp;type, &amp;type_scanned);
-+	nr_isolated = isolated;
- 
- 	/* Scanning may have emptied the oldest gen, flush it */
- 	if (scanned)
-@@ -4891,6 +4893,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
- retry:
- 	reclaimed = shrink_folio_list(&amp;list, pgdat, sc, &amp;stat, false, memcg);
- 	sc-&gt;nr_reclaimed += reclaimed;
-+	total_reclaimed += reclaimed;
-+	total_pageout += stat.nr_pageout;
- 	/* Retry pass is only meant for clean folios without new isolation */
- 	if (isolated)
- 		handle_reclaim_writeback(isolated, pgdat, sc, &amp;stat);
-@@ -4944,6 +4948,13 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
- 		goto retry;
- 	}
- 
-+	if (total_pageout)
-+		mod_lruvec_state(lruvec, PGRECLAIM_PAGEOUT_ANON + type,
-+				 total_pageout);
-+	if (nr_isolated &gt; total_reclaimed)
-+		mod_lruvec_state(lruvec, PGROTATE_ANON + type,
-+				 nr_isolated - total_reclaimed);
-+
- 	return scanned;
- }
- 
--- 
-2.53.0-Meta</pre>
-</details>
-<a href="https://lore.kernel.org/r/25a94af5-1dbe-4ab4-b47d-fb49987bfcd4@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged a need for a fix, thanks for pointing it out, acknowledged fix needed</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-07-15">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Johannes Weiner</span>
+<span class="review-author">Jan Kara</span>
 <a class="date-chip" href="../2026-07-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-15">2026-07-15</a>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The reviewer pointed out that reclaim operations no longer write files, and suggested using NR_VMSCAN_WRITE for anon counts instead of file counts.</div>
+<div class="review-comment-text">Reviewer Jan Kara pointed out that the patch description does not provide a clear explanation for why the default bdi strictlimiting is being disabled and requested more context.
+
+Reviewer Jan Kara acknowledged that the issue of overrunning the dirty limit is explained by the periodic flushing of memcg stats, and noted that this could be addressed by modifying the throttle path to use page count instead of time elapsed.
+
+Reviewer noted that Shakeel&#x27;s recent change to use mem_cgroup_flush_stats_ratelimited() in mem_cgroup_wb_stats() results in applications overshooting memcg dirty limits by several gigabytes, particularly for small memcgs. He suggested reverting the change and also proposed modifying the ratelimiting to take into account the size of the memcg or its dirty limit.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Reclaim generally doesn&#x27;t write files (anymore).
+<pre class="raw-body-text">[resending once more, this time with correct Shakeel&#x27;s address]
 
-You can use NR_VMSCAN_WRITE for the anon counts.</pre>
+On Tue 14-07-26 18:21:57, Joanne Koong wrote:
+
+---
+
+I see. That would indeed explain why we can overrun the dirty limit so
+much.
+
+---
+
+Checking some git history, this actually seems to be a relatively recent
+change from Shakeel (added to CC) - d9b3ce8769e3 (&quot;mm: writeback: ratelimit
+stat flush from mem_cgroup_wb_stats&quot;). So you can check whether reverting
+that change makes dirty throttling not overshoot so much.
+
+Shakeel, your change to use mem_cgroup_flush_stats_ratelimited() in
+mem_cgroup_wb_stats() results in applications overshooting memcg dirty
+limits by several gigabytes which for small memcgs (with 8GB memory in this
+case, which means a dirty limit of ~1.5GB) is a considerable issue. I guess
+the ratelimiting should take into account the size of memcg (or ideally the
+dirty limit in the case of mem_cgroup_wb_stats()) as well. Using
+somewhat outdated numbers for dirty throttling is fine but when we can
+overshoot the dirty limit more than three times, it leads to rather long
+stalls in dirty throttling and similar issues...
+
+								Honza
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/20260715141643.GQ276793@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<a href="https://lore.kernel.org/r/ue5xd6f4nfggwodfhbqaispmr5aq2dyszezvy26bl4rtsk6xii@uceqazdioj3o" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lack of clarity, request for more information, acknowledgment</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-07-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-15">2026-07-15</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed Jan Kara&#x27;s concern about high dirty page counts exceeding limits by reverting a specific commit (d9b3ce8769e3) which fixes the issue, resulting in bounded dirty pages and reduced latency.
+
+Author acknowledges that reverting commit d9b3ce8769e3 might be the simplest fix due to reduced global lock contention, but is open to exploring alternative solutions if reverting does not address the issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Reverting d9b3ce8769e3 fixes the issue. On xfs, I&#x27;m now seeing the
+number of dirty pages stays bounded by the limit instead of going 2x+
+over, and the max latency is now around ~0.33s instead of ~4s.
+
+---
+
+It looks like commit d9b3ce8769e3 was landed in Feb 2024 when rstat
+was still using the single global lock. I see commit 748922dcfabd
+(&quot;cgroup: use subsystem-specific rstat locks to avoid contention&quot;)
+later in the tree, which was landed around May 2025 and reduces that
+global lock contention. That might make the cost of the flush a lot
+lower than what it was when the ratelimit was needed in d9b3ce8769e3,
+so maybe reverting d9b3ce8769e3 wouldn&#x27;t make much of a difference for
+write-heavy workloads and would be the simplest fix? If it does still
+regress, I&#x27;d be happy to look into making the flush based on how many
+pages have been dirtied and scaled to the dirty limit, if that sounds
+like the best way forward. I tried running the sysbench
+oltp_write_only benchmark mentioned in d9b3ce8769e3 on my setup but
+couldn&#x27;t get the database to dirty pages fast enough to trigger the
+balance dirty pages logic to see how it performs without the
+ratelimiting. If you still have the script for how you ran the test
+back in 2024, I&#x27;m happy to give it a go on my local machine.
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jan Kara</div>
+<a href="https://lore.kernel.org/r/CAJnrk1bwabyWY+rzzSKfKWp3rivcQm=zae3xzNSZc2hnLj6-Aw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: fix_applied, acknowledges a potential fix, open to further investigation</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-07-15">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jan Kara</span>
+<a class="date-chip" href="../2026-07-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-15">2026-07-15</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the balance_dirty_pages() code uses lagging memcg stats, leading to under-reported values and potential overrunning of the dirty limit, suggesting a possible solution to flush based on the number of pages getting dirtied instead of elapsed time.
+
+Reviewer noted that the recent change to use mem_cgroup_flush_stats_ratelimited() in mem_cgroup_wb_stats() causes applications to overshoot memcg dirty limits by several gigabytes, particularly for small memcgs, and suggested reverting this change or taking into account the size of memcg when ratelimiting.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I see. That would indeed explain why we can overrun the dirty limit so
+much.
+
+---
+
+Checking some git history, this actually seems to be a relatively recent
+change from Shakeel (added to CC) - d9b3ce8769e3 (&quot;mm: writeback: ratelimit
+stat flush from mem_cgroup_wb_stats&quot;). So you can check whether reverting
+that change makes dirty throttling not overshoot so much.
+
+Shakeel, your change to use mem_cgroup_flush_stats_ratelimited() in
+mem_cgroup_wb_stats() results in applications overshooting memcg dirty
+limits by several gigabytes which for small memcgs (with 8GB memory in this
+case, which means a dirty limit of ~1.5GB) is a considerable issue. I guess
+the ratelimiting should take into account the size of memcg (or ideally the
+dirty limit in the case of mem_cgroup_wb_stats()) as well. Using
+somewhat outdated numbers for dirty throttling is fine but when we can
+overshoot the dirty limit more than three times, it leads to rather long
+stalls in dirty throttling and similar issues...
+
+								Honza
+-- 
+Jan Kara &lt;jack@suse.com&gt;
+SUSE Labs, CR</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/nv2h2dd2xoj4zjfvnhsxud2p5e2uw3og22ovqureik4pey72qb@i75tn5ttavfo" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 </div>
 </div>
 </div>
