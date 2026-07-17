@@ -1,0 +1,87 @@
+{
+  "thread_id": "20260715144234.442721-1-kirill@shutemov.name",
+  "subject": "[PATCH v5 0/2] fs/proc/task_mmu: fix PAGEMAP_SCAN written state for PMD holes",
+  "url": "https://lore.kernel.org/all/20260715144234.442721-1-kirill@shutemov.name/",
+  "dates": {
+    "2026-07-16": {
+      "report_file": "2026-07-16_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Gave Acked-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-07-16",
+          "message_id": "ee67ea61-a9ab-4d7d-a090-0297c4382a26@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David suggested reusing code from unpopulated_scan_test() in unpopulated_thp_scan_test(), proposing either adding a 'use_thp' parameter or factoring out common functionality into a helper function.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "suggestion",
+            "question"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Sorry if I wasn't clear. I think unpopulated_thp_scan_test() can actually reuse\nbits of unpopulated_scan_test().\n\nEither by having a magical \"use_thp\" parameter or by factoring stuff out into a\nhelper.\n\nOr am I missing an important point why that would not work or be really ugly?\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "",
+          "message_date": "2026-07-16",
+          "message_id": "714bdcbb-92cd-4dde-820c-e3761cbbaf07@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Muhammad Anjum",
+          "summary": "Gave Tested-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Tested-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-07-16",
+          "message_id": "17fa8583-07c9-4a0d-b428-102bd169ee8f@arm.com",
+          "email": "usama.anjum@arm.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author responded to David's review by agreeing that the patch looks good and making no changes or promises for further revision.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "author agreed with reviewer",
+            "no mention of fix needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Ah. Make sense.\n\nHere's my take on this. Looks good?\n\n-- >8 --\nDate: Thu, 16 Jul 2026 13:24:29 +0100\nSubject: [PATCH v6 2/2] selftests/mm: add PAGEMAP_SCAN test for THP PMD holes\n\nAdd coverage for the PMD-hole case fixed by \"fs/proc/task_mmu: fix\nPAGEMAP_SCAN written state for PMD holes\": a MAP_PRIVATE|MAP_ANON THP that\nis uffd-wp'd and then dropped with MADV_DONTNEED leaves a pmd_none hole\nwith no page table, which PAGEMAP_SCAN must still report as written.\n\nFactor the populate/drop/scan-both-paths sequence out of\nunpopulated_scan_test() into a helper, and add unpopulated_thp_scan_test()\nthat reuses it with a THP.\n\nInclude <linux/mman.h> for MADV_COLLAPSE; <sys/mman.h> lacks it on older\nglibc (e.g. 2.34). Same approach as commit fd5295afae91 (\"selftests/mm:\nhmm-tests: include linux/mman.h to access MADV_COLLAPSE\").\n\nCc: Muhammad Usama Anjum <usama.anjum@arm.com>\nCc: Peter Xu <peterx@redhat.com>\nCc: Zenghui Yu <zenghui.yu@linux.dev>\nSigned-off-by: Kiryl Shutsemau <kas@kernel.org>\nAssisted-by: Claude:claude-fable-5\n---\n tools/testing/selftests/mm/pagemap_ioctl.c | 118 +++++++++++++++------\n 1 file changed, 83 insertions(+), 35 deletions(-)\n\ndiff --git a/tools/testing/selftests/mm/pagemap_ioctl.c b/tools/testing/selftests/mm/pagemap_ioctl.c\nindex 550d1f2c059b..693030f1e631 100644\n--- a/tools/testing/selftests/mm/pagemap_ioctl.c\n+++ b/tools/testing/selftests/mm/pagemap_ioctl.c\n@@ -8,6 +8,7 @@\n #include <errno.h>\n #include <malloc.h>\n #include <linux/types.h>\n+#include <linux/mman.h>\n #include <linux/memfd.h>\n #include <linux/userfaultfd.h>\n #include <linux/fs.h>\n@@ -1058,50 +1059,96 @@ static void test_simple(void)\n  * the generic path (reached e.g. via category_anyof_mask) must report every\n  * page written.\n  */\n+/*\n+ * Populate @mem (optionally collapsing it into a THP first), drop it with\n+ * MADV_DONTNEED, then check PAGEMAP_SCAN reports the whole range written via\n+ * both the fast and generic query paths. A dropped THP leaves a pmd_none hole\n+ * with no page table, exercising pagemap_scan_pte_hole(); a base-page range\n+ * leaves pte_none entries.\n+ */\n+static void unpopulated_written_test(const char *name, char *mem, long size,\n+\t\t\t\t     bool use_thp)\n+{\n+\tlong npages = size / page_size, fast = 0, slow = 0, ret;\n+\tstruct page_region regions[16];\n+\tint i;\n+\n+\twp_init(mem, size);\n+\n+\t/* Populate, optionally collapse to a THP, then drop it. */\n+\tmemset(mem, 1, size);\n+\tif (use_thp &&\n+\t    (madvise(mem, size, MADV_COLLAPSE) ||\n+\t     !check_huge_anon(mem, size / hpage_size, hpage_size))) {\n+\t\tksft_test_result_skip(\"%s could not form a THP\\n\", name);\n+\t\tgoto out;\n+\t}\n+\tif (madvise(mem, size, MADV_DONTNEED)) {\n+\t\tksft_test_result_fail(\"%s MADV_DONTNEED failed\\n\", name);\n+\t\tgoto out;\n+\t}\n+\n+\t/* Fast path: category_mask == return_mask == PAGE_IS_WRITTEN. */\n+\tret = pagemap_ioctl(mem, size, regions, ARRAY_SIZE(regions), 0, 0,\n+\t\t\t    PAGE_IS_WRITTEN, 0, 0, PAGE_IS_WRITTEN);\n+\tfor (i = 0; ret > 0 && i < ret; i++)\n+\t\tfast += LEN(regions[i]);\n+\n+\t/* Generic path: same query expressed via category_anyof_mask. */\n+\tret = pagemap_ioctl(mem, size, regions, ARRAY_SIZE(regions), 0, 0,\n+\t\t\t    0, PAGE_IS_WRITTEN, 0, PAGE_IS_WRITTEN);\n+\tfor (i = 0; ret > 0 && i < ret; i++)\n+\t\tslow += LEN(regions[i]);\n+\n+\tksft_test_result(fast == npages && slow == npages,\n+\t\t\t \"%s unpopulated range reported written by both paths (%ld, %ld of %ld)\\n\",\n+\t\t\t name, fast, slow, npages);\n+out:\n+\twp_free(mem, size);\n+}\n+\n static void unpopulated_scan_test(void)\n {\n-\tint npages = 16, i;\n-\tlong mem_size = npages * page_size;\n-\tstruct page_region regions[16];\n-\tlong fast = 0, slow = 0, ret;\n+\tlong mem_size = 16 * page_size;\n \tchar *mem;\n \n \tmem = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,\n \t\t   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n-\tif (mem == MAP_FAILED)\n-\t\tksft_exit_fail_msg(\"%s mmap failed\\n\", __func__);\n+\tif (mem == MAP_FAILED) {\n+\t\tksft_test_result_skip(\"%s mmap failed\\n\", __func__);\n+\t\treturn;\n+\t}\n \n-\twp_init(mem, mem_size);\n-\n-\t/* Populate, then drop: the ptes become pte_none without a marker. */\n-\tmemset(mem, 1, mem_size);\n-\tif (madvise(mem, mem_size, MADV_DONTNEED))\n-\t\tksft_exit_fail_msg(\"%s MADV_DONTNEED failed\\n\", __func__);\n-\n-\t/* Fast path: category_mask == return_mask == PAGE_IS_WRITTEN. */\n-\tret = pagemap_ioctl(mem, mem_size, regions, npages, 0, 0,\n-\t\t\t    PAGE_IS_WRITTEN, 0, 0, PAGE_IS_WRITTEN);\n-\tif (ret < 0)\n-\t\tksft_exit_fail_msg(\"%s fast scan failed\\n\", __func__);\n-\tfor (i = 0; i < ret; i++)\n-\t\tfast += LEN(regions[i]);\n-\n-\t/* Generic path: same query expressed via category_anyof_mask. */\n-\tret = pagemap_ioctl(mem, mem_size, regions, npages, 0, 0,\n-\t\t\t    0, PAGE_IS_WRITTEN, 0, PAGE_IS_WRITTEN);\n-\tif (ret < 0)\n-\t\tksft_exit_fail_msg(\"%s generic scan failed\\n\", __func__);\n-\tfor (i = 0; i < ret; i++)\n-\t\tslow += LEN(regions[i]);\n-\n-\tksft_test_result(fast == npages && slow == npages,\n-\t\t\t \"%s unpopulated ptes reported written by both paths (%ld, %ld of %d)\\n\",\n-\t\t\t __func__, fast, slow, npages);\n-\n-\twp_free(mem, mem_size);\n+\tunpopulated_written_test(__func__, mem, mem_size, false);\n \tmunmap(mem, mem_size);\n }\n \n+/*\n+ * Same as unpopulated_scan_test(), but the range is a THP: a full-PMD\n+ * MADV_DONTNEED leaves a pmd_none hole with no page table.\n+ */\n+static void unpopulated_thp_scan_test(void)\n+{\n+\tchar *area, *mem;\n+\n+\tif (!hpage_size) {\n+\t\tksft_test_result_skip(\"%s THP not supported\\n\", __func__);\n+\t\treturn;\n+\t}\n+\n+\t/* Over-allocate so a PMD-aligned, THP-sized range fits inside. */\n+\tarea = mmap(NULL, 2 * hpage_size, PROT_READ | PROT_WRITE,\n+\t\t    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n+\tif (area == MAP_FAILED) {\n+\t\tksft_test_result_skip(\"%s mmap failed\\n\", __func__);\n+\t\treturn;\n+\t}\n+\tmem = (char *)(((unsigned long)area + hpage_size - 1) & ~(hpage_size - 1));\n+\n+\tunpopulated_written_test(__func__, mem, hpage_size, true);\n+\tmunmap(area, 2 * hpage_size);\n+}\n+\n int sanity_tests(void)\n {\n \tunsigned long long mem_size, vec_size;\n@@ -1610,7 +1657,7 @@ int main(int __attribute__((unused)) argc, char *argv[])\n \tif (!hugetlb_setup_default(4))\n \t\tksft_print_msg(\"HugeTLB test will be skipped\\n\");\n \n-\tksft_set_plan(118);\n+\tksft_set_plan(119);\n \n \tpage_size = getpagesize();\n \thpage_size = read_pmd_pagesize();\n@@ -1790,6 +1837,7 @@ int main(int __attribute__((unused)) argc, char *argv[])\n \n \t/* 18. Unpopulated pte scan-path consistency */\n \tunpopulated_scan_test();\n+\tunpopulated_thp_scan_test();\n \n \tclose(pagemap_fd);\n \tksft_finished();\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-07-16",
+          "message_id": "aljWYfPRCVc6IB2b@thinkstation",
+          "email": "kirill@shutemov.name",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the PAGEMAP_SCAN functionality, which incorrectly reports PMD holes as not-written in uffd-wp VMAs. The fix involves updating the code to correctly report the written state of PMD holes. A selftest is also added to verify the correctness of the fix."
+    }
+  }
+}

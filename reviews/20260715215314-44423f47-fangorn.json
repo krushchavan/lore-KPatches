@@ -1,0 +1,82 @@
+{
+  "thread_id": "20260715215314.44423f47@fangorn",
+  "subject": "[PATCH + QUESTION] bpf: use cond_resched_tasks_rcu_qs in bpf_fd_array_map_clear() loop",
+  "url": "https://lore.kernel.org/all/20260715215314.44423f47@fangorn/",
+  "dates": {
+    "2026-07-15": {
+      "report_file": "2026-07-16_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Paul McKenney",
+          "summary": "Reviewer confirmed that rcu_tasks_qs() is a cheap operation and only involves checking flags in task_struct, but did not address the original patch's suggestion to use it instead of cond_resched()",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "no clear signal",
+            "confirmation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Just confirming that rcu_tasks_qs() is quite cheap:  Check a constant,\ncheck a flag in the task_struct structure, and, if set, set another flag\nin this same structure.  If there is no RCU Tasks grace period in effect,\nthe first flag will always be zero.\n\n\t\t\t\t\t\t\tThanx, Paul",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-07-15",
+          "message_id": "0e7a80ea-2051-4aff-9d94-fd0a16a99bfa@paulmck-laptop",
+          "email": "paulmck@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the bpf_fd_array_map_clear function to use cond_resched_tasks_rcu_qs instead of cond_resched, which allows RCU tasks QS to be reported independently of the preemption model. This prevents a deadlock caused by a hung task detector when perf tracepoint open close is triggered in parallel with a PROG_ARRAY with huge max_entries. The change fixes two previous patches that addressed similar issues."
+    },
+    "2026-07-16": {
+      "report_file": "2026-07-16_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Rik Riel (author)",
+          "summary": "The author acknowledges that the patch does not address the root issue, and instead describes a complex problem involving hung tasks due to RCU stalls in perf_event_open() and ftrace_shutdown(). They express uncertainty about the best approach to solve this problem, suggesting multiple possible solutions. No fix is planned.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "uncertainty",
+            "multiple possible solutions"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "OK, this is more interesting than it looked at first,\nand this patch does not look like the right approach,\nbut I'm also not sure what other approach would work :(\n\nThe actual error being thrown is a hung task:\n\n\n\nThe syzkaller kernel failure is a tragedy in 3 parts.\n\nFirst, we have perf_event_open() waiting on the event_mutex:\n\n   syz.7.35551 (pid 31354, state D): perf_event_open \n  -> perf_tp_event_init\n   -> perf_trace_init\n    -> __mutex_lock\n     -> blocked on event_mutex.\n\n\nSecond, we have perf_trace_destroy() indirectly\nwaiting in synchronize_rcu_tasks(), with the\nevent_mutex held.\n\n    syz.5.35491 (state:I)  do_exit \n  -> task_work_run \n   -> __fput \n    -> perf_release\n     -> perf_event_release_kernel\n      -> __free_event\n       -> perf_trace_destroy\n        -> perf_trace_event_close\n         -> reg(TRACE_REG_PERF_CLOSE)\n          -> perf_ftrace_event_register\n           -> perf_ftrace_function_unregister\n            -> unregister_ftrace_function \n             -> ftrace_shutdown\n              -> synchronize_rcu_tasks()   <-- BLOCKS HERE, forever,\nholding event_mutex\n\nTasks RCU waits for every task to have gone through\na voluntary reschedule, before the grace period can\nbe advanced. A preemption does not count.\n\n\nThird, we have a kworker looping for a very long time:\n \n  kworker/0:0 (pid 9, TASK_RUNNING, on CPU0): process_one_work\n  -> prog_array_map_clear_deferred\n   -> bpf_fd_array_map_clear\n    -> __fd_array_map_delete_elem. Looping over a huge PROG_ARRAY\nmax_entries.\n\nWith CONFIG_PREEMPT_LAZY=y this gets preempted,\nbut since involuntary preemptions do not count\nfor tasks RCU, that does nothnig to help\nftrace_shutdown() get unstuck.\n\n\nHow do we solve this?\n\nDo we actually need to have cond_resched() points\nquiesce the task RCU state when running with lazy\npreempt, since those are points where we could\npreempt voluntarily?\n\nDo we need to prohibit calling synchronize_rcu_tasks()\nwhile holding a mutex?\n\nDo we need to do something else?\n\nWhat is the best way forward here?\n\n-- \nAll Rights Reversed.",
+          "reply_to": "",
+          "message_date": "2026-07-16",
+          "message_id": "be9c5707e2d83090de28e4b0ce3bc43c67f423af.camel@surriel.com",
+          "email": "riel@surriel.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Paul McKenney",
+          "summary": "Paul McKenney noted that synchronize_rcu_tasks() latency can be many minutes, which is undesirable when blocking on a mutex, and suggested considering a way to sleep on a mutex at TASK_IDLE.\n\nreviewer suggested using cond_resched_tasks_rcu_qs instead of cond_resched() to unblock RCU in preempt configurations where cond_resched() is a noop",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "considering alternative approach",
+            "question",
+            "suggestion"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The traditional approach is cond_resched_tasks_rcu_qs(), which is to\nsynchronize_rcu_tasks() as cond_resched() is to synchronize_rcu().\n\nBut if we can avoid holding mutexes across synchronize_rcu_tasks(), that\nwould be a very good thing.  The synchronize_rcu_tasks() latency can be\nmany minutes, which isn't usually what you want when blocking on a mutex.\n\nOr maybe we want a way of sleeping on a mutex at TASK_IDLE.\n\n---\n\nExcellent question!!!\n\n\t\t\t\t\t\t\tThanx, Paul",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-07-16",
+          "message_id": "9d444098-7c03-4163-af12-bd0a79a51443@paulmck-laptop",
+          "email": "paulmck@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the bpf_fd_array_map_clear function to use cond_resched_tasks_rcu_qs instead of cond_resched, which allows RCU tasks QS to be reported independently of the preemption model. This prevents a deadlock caused by a hung task detector when perf tracepoint open close is triggered in parallel with a PROG_ARRAY with huge max_entries. The change fixes two previous patches that addressed similar issues."
+    }
+  }
+}
