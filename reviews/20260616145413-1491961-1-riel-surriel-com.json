@@ -3,53 +3,6 @@
   "subject": "[PATCH] mm: khugepaged: free xarray nodes left behind by failed collapse_file()",
   "url": "https://lore.kernel.org/all/20260616145413.1491961-1-riel@surriel.com/",
   "dates": {
-    "2026-06-16": {
-      "report_file": "2026-06-16_ollama_llama3.1-8b.html",
-      "developer": "Rik van Riel",
-      "reviews": [
-        {
-          "author": "Zi Yan",
-          "summary": "Reviewer Zi Yan mentioned a prior report from Jinjiang about the xarray node leak, but did not provide further technical details or suggestions for improvement.",
-          "sentiment": "neutral",
-          "sentiment_signals": [
-            "lack of specific feedback"
-          ],
-          "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "IIRC, there was a report[1] from Jinjiang (cc'd) about this leak.\n\n[1] https://lore.kernel.org/all/86834731-02ba-43ea-9def-8b8ca156ec4a@huawei.com/",
-          "reply_to": "Rik Riel",
-          "message_date": "2026-06-16",
-          "message_id": "80270584-A7A0-4E0B-8D64-4EFDE046F0BA@nvidia.com",
-          "email": "ziy@nvidia.com",
-          "is_maintainer": false
-        },
-        {
-          "author": "Matthew Wilcox",
-          "summary": "Reviewer Matthew Wilcox suggested deferring the cleanup of xarray nodes left behind by failed collapse_file() to clear_inode(), citing that such scenarios are rare and unlikely, and arguing that it's not worth the level of cleanup proposed.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "suggested alternative approach",
-            "questioned necessity of cleanup"
-          ],
-          "has_inline_review": true,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "I think the ways to produce this problem are sufficiently rare/unlikely\nto not merit this level of cleanup.  Why don't we defer it to\nclear_inode() instead?\n\nreasons not to:\n\n1. the page cache is not the only user of xarrays and\ntheoretically either of these things could happen elsewhere\n\n2. can a user do this on purpose to screw other users over?  i don't\nthink so, any more than they can dos the system by bringing a lot of\ninodes into memory; we have cgroups and ulimits to protect against that\n\ndiff --git a/fs/inode.c b/fs/inode.c\nindex 6a3cbc7dcd28..d92c5a296504 100644\n--- a/fs/inode.c\n+++ b/fs/inode.c\n@@ -779,21 +779,20 @@ void clear_inode(struct inode *inode)\n \t\tfsverity_cleanup_inode(inode);\n \n \t/*\n-\t * We have to cycle the i_pages lock here because reclaim can be in the\n-\t * process of removing the last page (in __filemap_remove_folio())\n-\t * and we must not free the mapping under it.\n+\t * We have to cycle the i_pages lock here because reclaim\n+\t * can be in the process of removing the last page (in\n+\t * __filemap_remove_folio()) and we must not free the mapping\n+\t * under it.  We also remove nodes which are empty; these\n+\t * can occur in two different ways.  The first is that radix\n+\t * tree expansion can fail partway and the second is that THP\n+\t * collapse_file() can allocate some temporary nodes and not\n+\t * clean them up.\n \t */\n \txa_lock_irq(&inode->i_data.i_pages);\n \tBUG_ON(inode->i_data.nrpages);\n-\t/*\n-\t * Almost always, mapping_empty(&inode->i_data) here; but there are\n-\t * two known and long-standing ways in which nodes may get left behind\n-\t * (when deep radix-tree node allocation failed partway; or when THP\n-\t * collapse_file() failed). Until those two known cases are cleaned up,\n-\t * or a cleanup function is called here, do not BUG_ON(!mapping_empty),\n-\t * nor even WARN_ON(!mapping_empty).\n-\t */\n+\t__xa_destroy(&inode->i_data.i_pages);\n \txa_unlock_irq(&inode->i_data.i_pages);\n+\n \tBUG_ON(!(inode_state_read_once(inode) & I_FREEING));\n \tBUG_ON(inode_state_read_once(inode) & I_CLEAR);\n \tBUG_ON(!list_empty(&inode->i_wb_list));\ndiff --git a/include/linux/xarray.h b/include/linux/xarray.h\nindex be850174e802..d776a6e9ad18 100644\n--- a/include/linux/xarray.h\n+++ b/include/linux/xarray.h\n@@ -571,6 +571,7 @@ int __must_check __xa_alloc_cyclic(struct xarray *, u32 *id, void *entry,\n \t\tstruct xa_limit, u32 *next, gfp_t);\n void __xa_set_mark(struct xarray *, unsigned long index, xa_mark_t);\n void __xa_clear_mark(struct xarray *, unsigned long index, xa_mark_t);\n+void __xa_destroy(struct xarray *);\n \n /**\n  * xa_store_bh() - Store this entry in the XArray.\ndiff --git a/lib/xarray.c b/lib/xarray.c\nindex 9a8b4916540c..ee2459ecdc9b 100644\n--- a/lib/xarray.c\n+++ b/lib/xarray.c\n@@ -2370,6 +2370,21 @@ void xa_delete_node(struct xa_node *node, xa_update_node_t update)\n }\n EXPORT_SYMBOL_GPL(xa_delete_node);\t/* For the benefit of the test suite */\n \n+void __xa_destroy(struct xarray *xa)\n+{\n+\tXA_STATE(xas, xa, 0);\n+\tvoid *entry;\n+\n+\txas.xa_node = NULL;\n+\tentry = xa_head_locked(xa);\n+\tRCU_INIT_POINTER(xa->xa_head, NULL);\n+\txas_init_marks(&xas);\n+\tif (xa_zero_busy(xa))\n+\t\txa_mark_clear(xa, XA_FREE_MARK);\n+\tif (xa_is_node(entry))\n+\t\txas_free_nodes(&xas, xa_to_node(entry));\n+}\n+\n /**\n  * xa_destroy() - Free all internal data structures.\n  * @xa: XArray.\n@@ -2382,21 +2397,11 @@ EXPORT_SYMBOL_GPL(xa_delete_node);\t/* For the benefit of the test suite */\n  */\n void xa_destroy(struct xarray *xa)\n {\n-\tXA_STATE(xas, xa, 0);\n \tunsigned long flags;\n-\tvoid *entry;\n \n-\txas.xa_node = NULL;\n-\txas_lock_irqsave(&xas, flags);\n-\tentry = xa_head_locked(xa);\n-\tRCU_INIT_POINTER(xa->xa_head, NULL);\n-\txas_init_marks(&xas);\n-\tif (xa_zero_busy(xa))\n-\t\txa_mark_clear(xa, XA_FREE_MARK);\n-\t/* lockdep checks we're still holding the lock in xas_free_nodes() */\n-\tif (xa_is_node(entry))\n-\t\txas_free_nodes(&xas, xa_to_node(entry));\n-\txas_unlock_irqrestore(&xas, flags);\n+\txa_lock_irqsave(xa, flags);\n+\t__xa_destroy(xa);\n+\txa_unlock_irqrestore(xa, flags);\n }\n EXPORT_SYMBOL(xa_destroy);",
-          "reply_to": "Rik Riel",
-          "message_date": "2026-06-16",
-          "message_id": "ajFrxhGf7loEHUeX@casper.infradead.org",
-          "email": "willy@infradead.org",
-          "is_maintainer": false
-        }
-      ],
-      "analysis_source": "llm-per-reviewer",
-      "patch_summary": "This patch addresses a memory leak issue in the khugepaged code, specifically when collapse_file() fails and leaves behind empty xarray nodes. These nodes are not freed on error paths, leading to their leakage until the inode is evicted. The patch introduces a mechanism to prune these empty nodes by storing an XA_RETRY_ENTRY into each slot and immediately clearing it, allowing the node and its ancestors to be freed."
-    },
     "2026-06-17": {
       "report_file": "2026-06-17_ollama_llama3.1-8b.html",
       "developer": "Rik van Riel",
