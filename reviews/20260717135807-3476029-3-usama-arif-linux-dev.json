@@ -1,0 +1,35 @@
+{
+  "thread_id": "20260717135807.3476029-3-usama.arif@linux.dev",
+  "subject": "[PATCH v3 2/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost",
+  "url": "https://lore.kernel.org/all/20260717135807.3476029-3-usama.arif@linux.dev/",
+  "dates": {
+    "2026-07-17": {
+      "report_file": "2026-07-17_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Johannes Weiner",
+          "summary": "Reviewer requested that the patch description be rewritten to focus on explaining the existing code, rather than providing an in-depth explanation of its functionality.\n\nReviewer Johannes Weiner suggested simplifying the delta extraction in cost_accum[] and performing weight calculations directly on the extracted delta to ensure correct overflow behavior.\n\nReviewer Johannes Weiner questioned the need to check individual vmstat counters between reclaim cycles, citing that there are no scans->rotations and refault events cannot exceed ULONG_MAX\n\nReviewer Johannes Weiner suggested a rewritten version of the code, proposing to use a struct lru_cost to accumulate rotation and IO costs for anon and file LRUs, and then halve the accumulated counts until they are within a certain bound.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "request for clarity",
+            "suggestion to stick closer to original comments",
+            "requested changes",
+            "requested clarification on patch logic"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "IMO that's a lot of describing what the code does. Why not stick\ncloser to the original comments?\n\n---\n\nIt's hard to prove overflow behavior is correct. I would keep the\ndelta extraction dead simple, then do the weight math on the delta.\n\n---\n\nWhy do you need to check them individually? Between reclaim cycles,\nthere are no scans->rotations. And I don't see how you could get\nrefault events several times the size of the LRU, let alone in excess\nof ULONG_MAX.\n\n---\n\nI realize these long descriptor names make it hard, but I think this\ncan be cleaned up a bit and written in a more idiomatic way.\n\nHow about this (totally untested):\n\nstruct lru_cost {\n\tunsigned long count;\n\tunsigned long last_rotated;\n\tunsigned long last_io;\n};\n\nstruct lruvec {\n\tstruct lru_cost cost[2];\n};\n\n\tstruct lru_cost *anon_cost, *file_cost;\n\tunsigned long lrusize;\n\t\n\t/*\n\t * Determine the scan balance between anon and file LRUs.\n\t *\n\t * The cost model is based on rotations, refaults and\n\t * reclaim-driven writes (anon only) on each side.\n\t *\n\t * These event counters are monotonic, so each reclaim cycle\n\t * the delta since the last scan is extracted and incorporated\n\t * into a decaying average. This ensures currency, as workloads\n\t * change over time, and avoids overflow in the calculations.\n\t */\n\tspin_lock_irq(&target_lruvec->cost_lock);\n\n\tfor (file = 0; file <= 1; file++) {\n\t\tstruct lru_cost *cost = &target_lruvec->cost[file];\n\t\tunsigned long rotated, io, nr_rotated, nr_io;\n\n\t\trotated = lruvec_page_state_monotonic(target_lruvec,\n\t\t\t\t\t\tPGROTATE_ANON + file);\n\t\tio = lruvec_page_state_monotonic(target_lruvec,\n\t\t\t\t\t\tWORKINGSET_RESTORE_BASE + file);\n\t\tif (!file)\n\t\t\tio += lruvec_page_state_monotonic(target_lruvec,\n\t\t\t\t\t\tNR_VMSCAN_WRITE);\n\n\t\tnr_rotated = rotated - cost->last_rotated;\n\t\tnr_io = io - cost->last_io;\n\n\t\t/*\n\t\t * Reflect the relative cost of incurring IO and spending CPU\n\t\t * time on rotations. This doesn't attempt to make a precise\n\t\t * comparison, it just says: if reloads are about comparable\n\t\t * between the LRU lists, or rotations are overwhelmingly\n\t\t * different between them, adjust scan balance for CPU work.\n\t\t */\n\t\tcost->count += nr_io * SWAP_CLUSTER_MAX + nr_rotated;\n\n\t\tcost->last_rotated = rotated;\n\t\tcost->last_io = io;\n\t}\n\n\tanon_cost = &target_lruvec->cost[WORKINGSET_ANON];\n\tfile_cost = &target_lruvec->cost[WORKINGSET_FILE];\n\n\tlrusize = lruvec_page_state(target_lruvec, NR_INACTIVE_ANON) +\n\t\t  lruvec_page_state(target_lruvec, NR_ACTIVE_ANON) +\n\t\t  lruvec_page_state(target_lruvec, NR_INACTIVE_FILE) +\n\t\t  lruvec_page_state(target_lruvec, NR_ACTIVE_FILE);\n\n\twhile (anon_cost->count + file_cost->count > lrusize / 4) {\n\t\tanon_cost->count /= 2;\n\t\tfile_cost->count /= 2;\n\t}\n\n\tsc->anon_cost = anon_cost->count;\n\tsc->file_cost = file_cost->count;\n\n\tspin_unlock(&target_lruvec->cost_lock);",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-07-17",
+          "message_id": "20260717210808.GI6843@cmpxchg.org",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch reduces contention on the lru_lock by replacing producer-side accumulators with a read-side accumulator fed from per-LRU vmstat counters. The old system used two scalars in struct lruvec to accumulate costs, which was causing heavy contention on memory-heavy workloads. The new approach uses existing vmstat counters and adds explicit node_stat counters for the remaining inputs. This change allows the cost signals to be recomputed without holding the lru_lock, reducing contention and improving performance."
+    }
+  }
+}

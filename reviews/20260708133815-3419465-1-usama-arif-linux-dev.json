@@ -8,25 +8,109 @@
       "developer": "Usama Arif",
       "reviews": [
         {
-          "author": "Eric Dumazet",
-          "summary": "Raised concerns about the impact of sync wakeups on certain workloads and suggested making it a per-socket choice to allow applications to decide what is best for them.",
+          "author": "Breno Leitao",
+          "summary": "reviewer suspects that many calls to sock_def_error_report() are not actual socket errors, and requested the full call stack above this function",
           "sentiment": "needs_work",
           "sentiment_signals": [
-            "concerns about workload impact"
+            "suspicion of unnecessary wakeups",
+            "request for additional information"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Wed, Jul 8, 2026 at 6:09 PM Usama Arif <usama.arif@linux.dev> wrote:\n>\n>\n>\n> On 08/07/2026 16:25, Breno Leitao wrote:\n> > On Wed, Jul 08, 2026 at 06:38:15AM -0700, Usama Arif wrote:\n> >> Measured on a 176-core EPYC 9D64 host running a Meta production\n> >> workload, bpftrace on tracepoint:ipi:ipi_send_cpu with a kstack filter\n> >> attributed the sock_def_error_report -> ep_poll_callback ->\n> >> try_to_wake_up -> ttwu_queue_wakelist -> __smp_call_single_queue\n> >> chain to 16,326 IPIs/min.\n> >\n> > I am interested in why so many sock_def_error_report().\n> >\n> > That's seems a lot for genuine socket errors (RST/ICMP) on a healthy\n> > host, so I suspect these aren't errors at all?\n> >\n> > Can you share the full stack above sock_def_error_report()?\n>\n>\n> I ran this bpftrace script the host now (results added at the end):\n>\n> sudo bpftrace -e '\n>   kprobe:sock_def_error_report\n>   {\n>     @wake_src[kstack()] = count();\n>   }\n>   interval:s:60\n>   {\n>     print(@wake_src, 5);\n>     exit();\n>   }'\n>\n>\n> The biggest source is tcp_sendmsg -> __skb_tstamp_tx, which as you said\n> is not an actual error. __skb_tstamp_tx clones the outgoing skb, tags it\n> with ee_origin = SO_EE_ORIGIN_TIMESTAMPING and ee_errno = ENOMSG, enqueues\n> it on sk->sk_error_queue via sock_queue_err_skb, and calls sk_error_report\n> so epoll raises EPOLLERR. Userspace then reads it with recvmsg(MSG_ERRQUEUE)\n> to get the SND/ACK timestamp.\n>\n> So the workload has SO_TIMESTAMPING enabled on its TCP sockets, and every\n> packet completion and every ACK triggers a timestamp delivery through the\n> error-queue path, which is why sock_def_error_report fires.\n>\n\nIt seems we can not please everyone.\n\nhttps://lore.kernel.org/netdev/20260526063650.952-1-xuewen.yan@unisoc.com/\n\nPerhaps this SYNC heuristic should be a per-socket choice so that\napplications can decide what is best for them.\n\n",
+          "raw_body": "I am interested in why so many sock_def_error_report().\n\nThat's seems a lot for genuine socket errors (RST/ICMP) on a healthy\nhost, so I suspect these aren't errors at all?\n\nCan you share the full stack above sock_def_error_report()?",
           "reply_to": "Usama Arif",
           "message_date": "2026-07-08",
-          "message_id": "",
+          "message_id": "ak5rH-SWjiqR6MVe@gmail.com",
+          "email": "leitao@debian.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "The author is addressing Breno Leitao's feedback that the patch may not be effective in reducing IPIs due to a large number of false error reports triggered by SO_TIMESTAMPING on TCP sockets. The author ran bpftrace and found that indeed, __skb_tstamp_tx is the biggest source of wakeups, which is not an actual error but rather a timestamp delivery through the error-queue path.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I ran this bpftrace script the host now (results added at the end):\n\nsudo bpftrace -e '\n  kprobe:sock_def_error_report\n  {\n    @wake_src[kstack()] = count();\n  }\n  interval:s:60\n  {\n    print(@wake_src, 5);\n    exit();\n  }'\n\n\nThe biggest source is tcp_sendmsg -> __skb_tstamp_tx, which as you said\nis not an actual error. __skb_tstamp_tx clones the outgoing skb, tags it\nwith ee_origin = SO_EE_ORIGIN_TIMESTAMPING and ee_errno = ENOMSG, enqueues\nit on sk->sk_error_queue via sock_queue_err_skb, and calls sk_error_report\nso epoll raises EPOLLERR. Userspace then reads it with recvmsg(MSG_ERRQUEUE)\nto get the SND/ACK timestamp.\n\nSo the workload has SO_TIMESTAMPING enabled on its TCP sockets, and every\npacket completion and every ACK triggers a timestamp delivery through the\nerror-queue path, which is why sock_def_error_report fires.\n\n\n\nAttached 2 probes\n@wake_src[\n        sock_def_error_report+1\n        sk_error_report+17\n        sock_queue_err_skb+285\n        __skb_tstamp_tx+903\n        tcp_ack+3399\n        tcp_rcv_established+1630\n        tcp_v6_do_rcv+372\n        tcp_v6_rcv+4748\n        ip6_protocol_deliver_rcu+653\n        ip6_input_finish+79\n        ip6_input+43\n        ipv6_list_rcv+4339\n        __netif_receive_skb_list_core+244\n        netif_receive_skb_list_internal+433\n        napi_complete_done+149\n        bnxt_poll_p5+499\n        net_rx_action+513\n        irq_exit_rcu+312\n        common_interrupt+62\n        asm_common_interrupt+34\n]: 1812\n@wake_src[\n        sock_def_error_report+1\n        sk_error_report+17\n        sock_dequeue_err_skb+194\n        ipv6_recv_error+74\n        bpf_trampoline_6442598004+73\n        ____sys_recvmsg.llvm.18251018526254450710+168\n        ___sys_recvmsg+312\n        __x64_sys_recvmsg+95\n        do_syscall_64+316\n        entry_SYSCALL_64_after_hwframe+75\n]: 8045\n@wake_src[\n        sock_def_error_report+1\n        sk_error_report+17\n        sock_queue_err_skb+285\n        __skb_tstamp_tx+903\n        tcp_ack+3399\n        tcp_rcv_established+1258\n        tcp_v6_do_rcv+372\n        tcp_v6_rcv+4748\n        ip6_protocol_deliver_rcu+653\n        ip6_input_finish+79\n        ip6_input+43\n        ipv6_list_rcv+4339\n        __netif_receive_skb_list_core+244\n        netif_receive_skb_list_internal+433\n        napi_complete_done+149\n        bnxt_poll_p5+499\n        net_rx_action+513\n        irq_exit_rcu+312\n        common_interrupt+125\n        asm_common_interrupt+34\n        cpuidle_enter_state+202\n        cpuidle_enter+40\n        cpu_startup_entry+497\n        ap_starting+0\n        common_startup_64+318\n]: 12603\n@wake_src[\n        sock_def_error_report+1\n        sk_error_report+17\n        sock_queue_err_skb+285\n        __skb_tstamp_tx+903\n        tcp_ack+3399\n        tcp_rcv_established+1258\n        tcp_v6_do_rcv+372\n        tcp_v6_rcv+4748\n        ip6_protocol_deliver_rcu+653\n        ip6_input_finish+79\n        ip6_input+43\n        ipv6_list_rcv+4339\n        __netif_receive_skb_list_core+244\n        netif_receive_skb_list_internal+433\n        napi_complete_done+149\n        bnxt_poll_p5+499\n        net_rx_action+513\n        irq_exit_rcu+312\n        common_interrupt+62\n        asm_common_interrupt+34\n]: 19314\n@wake_src[\n        sock_def_error_report+1\n        sk_error_report+17\n        sock_queue_err_skb+285\n        __skb_tstamp_tx+903\n        bnxt_start_xmit+1769\n        dev_hard_start_xmit+160\n        sch_direct_xmit+165\n        __qdisc_run+714\n        __dev_queue_xmit+2052\n        skb_do_redirect+2531\n        netkit_xmit+715\n        dev_hard_start_xmit+160\n        __dev_queue_xmit+1049\n        ip6_finish_output2+848\n        ip6_finish_output+213\n        ip6_output+86\n        ip6_xmit+933\n        inet6_csk_xmit+163\n        __tcp_transmit_skb+2733\n        tcp_write_xmit+2948\n        __tcp_push_pending_frames+46\n        tcp_sendmsg_locked+4187\n        tcp_sendmsg+40\n        __x64_sys_sendmsg+567\n        do_syscall_64+316\n        entry_SYSCALL_64_after_hwframe+75\n]: 33514",
+          "reply_to": "Breno Leitao",
+          "message_date": "2026-07-08",
+          "message_id": "bc16e45e-32ef-45d8-99af-14f088733ab3@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Eric Dumazet",
+          "summary": "Reviewer Eric Dumazet suggested making the sync wakeups a per-socket choice, allowing applications to decide whether to use sync or async wakeups based on their specific needs.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "It seems we can not please everyone.\n\nhttps://lore.kernel.org/netdev/20260526063650.952-1-xuewen.yan@unisoc.com/\n\nPerhaps this SYNC heuristic should be a per-socket choice so that\napplications can decide what is best for them.",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-07-08",
+          "message_id": "CANn89iLc1Bv_wmKvr_9mtGRM3gL7kgoy2Prr2SgtHY4C=ZgfBg@mail.gmail.com",
           "email": "edumazet@google.com",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "The patch aims to use sync wakeups for socket error reports, but the discussion reveals concerns about its impact on certain workloads."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the Linux kernel to use synchronous wakeups for socket error reports. The change affects the sock_def_error_report function, which is responsible for waking up tasks waiting on socket errors. By using synchronous wakeups, the patch aims to reduce the number of inter-processor interrupts (IPIs) generated by these wakeups. This should improve performance in high-core-count systems, where IPIs can become a bottleneck."
+    },
+    "2026-07-17": {
+      "report_file": "2026-07-17_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Breno Leitao",
+          "summary": "Reviewer noted that the patch's change to wake up EPOLLERR waiters using wake_up_interruptible_sync_poll() may not be sufficient, as there are different requirements for async error reporting, and suggested adding an option for applications to choose per socket whether to use sync or async wakeups by introducing a new socket flag SO_ERR_WAKE_SYNC.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Something like this?\n\n    net: add SO_ERR_WAKE_SYNC for sync error-report wakeups\n    \n    sock_def_error_report() wakes EPOLLERR waiters with\n    wake_up_interruptible_poll(), while sock_def_readable() and\n    sock_def_write_space() already pass the sync hint. A socket with\n    SO_TIMESTAMPING enabled delivers every TX and ACK timestamp through\n    sk_error_queue and raises EPOLLERR, so the error path wakes a sleeping\n    consumer very often.\n    \n    Without the sync hint the scheduler often places the woken consumer on a\n    remote CPU, which costs a rescheduling IPI. Usama Arif measured 16,326\n    such IPIs/min on a 176-core host running a production workload with\n    SO_TIMESTAMPING enabled. [1]\n    \n    Switching the error path to a sync wakeup unconditionally is not the\n    right fix, as there are different requirements for it to be async, see\n    [2].\n    \n    Eric suggested that an options is to add SO_ERR_WAKE_SYNC so\n    applications choose per socket, so a consumer draining a high-rate error\n    queue can opt in to keep the wakeup local and drop the IPI, using socket\n    flag SO_ERR_WAKE_SYNC.\n    \n    Link: https://lore.kernel.org/all/CANn89iLc1Bv_wmKvr_9mtGRM3gL7kgoy2Prr2SgtHY4C=ZgfBg@mail.gmail.com/ [1]\n    Link: https://lore.kernel.org/netdev/20260526063650.952-1-xuewen.yan@unisoc.com/ [2]\n    Suggested-by: Eric Dumazet <edumazet@google.com>\n    Signed-off-by: Breno Leitao <leitao@debian.org>\n\ndiff --git a/arch/alpha/include/uapi/asm/socket.h b/arch/alpha/include/uapi/asm/socket.h\nindex 5ef57f88df6b3..2a3c27aaf4e95 100644\n--- a/arch/alpha/include/uapi/asm/socket.h\n+++ b/arch/alpha/include/uapi/asm/socket.h\n@@ -155,6 +155,8 @@\n #define SO_INQ\t\t\t84\n #define SCM_INQ\t\t\tSO_INQ\n \n+#define SO_ERR_WAKE_SYNC\t85\n+\n #if !defined(__KERNEL__)\n \n #if __BITS_PER_LONG == 64\ndiff --git a/arch/mips/include/uapi/asm/socket.h b/arch/mips/include/uapi/asm/socket.h\nindex 72fb1b006da93..00f31c74a63df 100644\n--- a/arch/mips/include/uapi/asm/socket.h\n+++ b/arch/mips/include/uapi/asm/socket.h\n@@ -166,6 +166,8 @@\n #define SO_INQ\t\t\t84\n #define SCM_INQ\t\t\tSO_INQ\n \n+#define SO_ERR_WAKE_SYNC\t85\n+\n #if !defined(__KERNEL__)\n \n #if __BITS_PER_LONG == 64\ndiff --git a/arch/parisc/include/uapi/asm/socket.h b/arch/parisc/include/uapi/asm/socket.h\nindex c16ec36dfee6b..db5b6cad17d49 100644\n--- a/arch/parisc/include/uapi/asm/socket.h\n+++ b/arch/parisc/include/uapi/asm/socket.h\n@@ -147,6 +147,8 @@\n #define SO_INQ\t\t\t0x4052\n #define SCM_INQ\t\t\tSO_INQ\n \n+#define SO_ERR_WAKE_SYNC\t0x4053\n+\n #if !defined(__KERNEL__)\n \n #if __BITS_PER_LONG == 64\ndiff --git a/arch/sparc/include/uapi/asm/socket.h b/arch/sparc/include/uapi/asm/socket.h\nindex 71befa109e1cf..5e9ff3634265c 100644\n--- a/arch/sparc/include/uapi/asm/socket.h\n+++ b/arch/sparc/include/uapi/asm/socket.h\n@@ -148,6 +148,8 @@\n #define SO_INQ                   0x005d\n #define SCM_INQ                  SO_INQ\n \n+#define SO_ERR_WAKE_SYNC         0x005e\n+\n #if !defined(__KERNEL__)\n \n \ndiff --git a/include/net/sock.h b/include/net/sock.h\nindex 51185222aac29..d8ee1dae8ecaf 100644\n--- a/include/net/sock.h\n+++ b/include/net/sock.h\n@@ -1022,6 +1022,7 @@ enum sock_flags {\n \tSOCK_RCVMARK, /* Receive SO_MARK  ancillary data with packet */\n \tSOCK_RCVPRIORITY, /* Receive SO_PRIORITY ancillary data with packet */\n \tSOCK_TIMESTAMPING_ANY, /* Copy of sk_tsflags & TSFLAGS_ANY */\n+\tSOCK_ERR_WAKE_SYNC, /* Sync wakeup on error report, %SO_ERR_WAKE_SYNC */\n };\n \n #define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))\ndiff --git a/include/uapi/asm-generic/socket.h b/include/uapi/asm-generic/socket.h\nindex 53b5a8c002b1e..5527c9318b40e 100644\n--- a/include/uapi/asm-generic/socket.h\n+++ b/include/uapi/asm-generic/socket.h\n@@ -150,6 +150,8 @@\n #define SO_INQ\t\t\t84\n #define SCM_INQ\t\t\tSO_INQ\n \n+#define SO_ERR_WAKE_SYNC\t85\n+\n #if !defined(__KERNEL__)\n \n #if __BITS_PER_LONG == 64 || (defined(__x86_64__) && defined(__ILP32__))\ndiff --git a/net/core/sock.c b/net/core/sock.c\nindex 498a57f34f5b5..59caab6a7223a 100644\n--- a/net/core/sock.c\n+++ b/net/core/sock.c\n@@ -1557,6 +1557,10 @@ int sk_setsockopt(struct sock *sk, int level, int optname,\n \t\tsock_valbool_flag(sk, SOCK_SELECT_ERR_QUEUE, valbool);\n \t\tbreak;\n \n+\tcase SO_ERR_WAKE_SYNC:\n+\t\tsock_valbool_flag(sk, SOCK_ERR_WAKE_SYNC, valbool);\n+\t\tbreak;\n+\n \tcase SO_PASSCRED:\n \t\tif (sk_may_scm_recv(sk))\n \t\t\tsk->sk_scm_credentials = valbool;\n@@ -2064,6 +2068,10 @@ int sk_getsockopt(struct sock *sk, int level, int optname,\n \t\tv.val = sock_flag(sk, SOCK_SELECT_ERR_QUEUE);\n \t\tbreak;\n \n+\tcase SO_ERR_WAKE_SYNC:\n+\t\tv.val = sock_flag(sk, SOCK_ERR_WAKE_SYNC);\n+\t\tbreak;\n+\n #ifdef CONFIG_NET_RX_BUSY_POLL\n \tcase SO_BUSY_POLL:\n \t\tv.val = READ_ONCE(sk->sk_ll_usec);\n@@ -3641,8 +3649,12 @@ static void sock_def_error_report(struct sock *sk)\n \n \trcu_read_lock();\n \twq = rcu_dereference(sk->sk_wq);\n-\tif (skwq_has_sleeper(wq))\n-\t\twake_up_interruptible_poll(&wq->wait, EPOLLERR);\n+\tif (skwq_has_sleeper(wq)) {\n+\t\tif (sock_flag(sk, SOCK_ERR_WAKE_SYNC))\n+\t\t\twake_up_interruptible_sync_poll(&wq->wait, EPOLLERR);\n+\t\telse\n+\t\t\twake_up_interruptible_poll(&wq->wait, EPOLLERR);\n+\t}\n \tsk_wake_async_rcu(sk, SOCK_WAKE_IO, POLL_ERR);\n \trcu_read_unlock();\n }",
+          "reply_to": "Eric Dumazet",
+          "message_date": "2026-07-17",
+          "message_id": "alodxQoCH5A5iVGG@gmail.com",
+          "email": "leitao@debian.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Matthew Wilcox",
+          "summary": "reviewer suggested using SO_TIMESTAMPING to decide whether to use sync wakeups or not, and proposed testing on this specific socket option first",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Instead of adding a new socket option, perhaps use SO_TIMESTAMPING to\ndecide whether to use sync or not?  There could be other socket options\nwhich also report a high rate of \"errors\", but until those show up I\nthink just testing on this one socket option should be fine.",
+          "reply_to": "Eric Dumazet",
+          "message_date": "2026-07-17",
+          "message_id": "aloyifAWjpPlyja2@casper.infradead.org",
+          "email": "willy@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the Linux kernel to use synchronous wakeups for socket error reports. The change affects the sock_def_error_report function, which is responsible for waking up tasks waiting on socket errors. By using synchronous wakeups, the patch aims to reduce the number of inter-processor interrupts (IPIs) generated by these wakeups. This should improve performance in high-core-count systems, where IPIs can become a bottleneck."
     }
   }
 }
