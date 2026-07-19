@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH] smp: Use release stores for csd_lock_record() state</title>
+    <title>Review Comments: [PATCH 0/2] mm: zswap: free cold writeback folios promptly</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,39 +236,136 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH] smp: Use release stores for csd_lock_record() state</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260617212001.3658605-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-06-18</strong><div class="date-range-nav">Active on: <a href="#2026-06-18">2026-06-18</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the csd_lock_record() function in the kernel&#x27;s SMP (Symmetric Multi-Processing) code to use release stores for updating the cur_csd state. The change ensures that any preceding CSD callback or unlock is ordered before a remote reader observes the updated cur_csd pointer, preventing potential data corruption issues. The patch pairs with a corresponding load-acquire operation in csd_lock_wait_toolong() to guarantee visibility of the updated cur_csd state.</div></div>
+    <h1>[PATCH 0/2] mm: zswap: free cold writeback folios promptly</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/20260718093723.153324-1-alex@ghiti.fr/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-07-18</strong><div class="date-range-nav">Active on: <a href="#2026-07-18">2026-07-18</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to improve the performance of zswap by freeing cold writeback folios promptly after writeback completion, reducing unnecessary reclaim scans and keeping cold memory resident for shorter periods.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-06-18">
+<div class="thread-node depth-0" id="2026-07-18">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Paul McKenney</span>
-<a class="date-chip" href="../2026-06-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-06-18">2026-06-18</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-07-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-18">2026-07-18</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Paul McKenney noted that adding a comment to pair with smp_load_acquire() in csd_lock_wait_toolong() is sufficient for tools like checkpatch, and suggested this as an alternative to the original patch
-
-Reviewer noted that the patch&#x27;s use of smp_store_release() for csd_lock_record() state is unnecessary because it pairs with a preceding smp_load_acquire(), and suggested removing it to simplify the code.</div>
+<div class="review-comment-text">Suggested using a bool skip_lru instead of freeing the folio directly, and proposed renaming swap_cache_alloc_folio to __swap_cache_alloc_folio with updated kdoc.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">smp_store_release(this_cpu_ptr(&amp;cur_csd), NULL); /* ^^^ */
+<pre class="raw-body-text">On Sat, Jul 18, 2026 at 11:36:39AM +0800, Alexandre Ghiti wrote:
+&gt; When zswap writes an entry back, it allocates a swap cache folio,
+&gt; decompresses the entry into it and writes it out. That folio is cold by
+&gt; construction, but it is currently left on the LRU for page reclaim to find
+&gt; and free later. This wastes a reclaim scan and keeps cold memory resident
+&gt; longer than necessary.
+&gt; 
+&gt; For synchronous-IO swap devices writeback completes in the calling context,
+&gt; so the folio can be freed right after the write rather than left behind; do
+&gt; that. Because it is freed directly rather than through reclaim, it is
+&gt; allocated off the LRU: dropping the last reference on a folio still on the
+&gt; LRU would trip the free-time page-flag checks. A folio that a concurrent
+&gt; swapin has meanwhile claimed is left in place and reclaimed as usual.
+&gt; 
+&gt; Asynchronous and filesystem-backed swap complete writeback in interrupt
+&gt; context, where the folio cannot be freed; they are handled in a later
+&gt; change.
+&gt; 
+&gt; Signed-off-by: Alexandre Ghiti &lt;alex@ghiti.fr&gt;
+&gt; ---
+&gt;  mm/swap.h       |  3 ++-
+&gt;  mm/swap_state.c | 17 +++++++++++------
+&gt;  mm/zswap.c      | 36 ++++++++++++++++++++++++++++++++++--
+&gt;  3 files changed, 47 insertions(+), 9 deletions(-)
+&gt; 
+&gt; diff --git a/mm/swap.h b/mm/swap.h
+&gt; index 77d2d14eda42..c617e5a0257f 100644
+&gt; --- a/mm/swap.h
+&gt; +++ b/mm/swap.h
+&gt; @@ -306,7 +306,8 @@ void *swap_cache_get_shadow(swp_entry_t entry);
+&gt;  void swap_cache_del_folio(struct folio *folio);
+&gt;  struct folio *swap_cache_alloc_folio(swp_entry_t target_entry, gfp_t gfp_mask,
+&gt;  				     unsigned long orders, struct vm_fault *vmf,
+&gt; -				     struct mempolicy *mpol, pgoff_t ilx);
+&gt; +				     struct mempolicy *mpol, pgoff_t ilx,
+&gt; +				     bool skip_lru);
+&gt;  /* Below helpers require the caller to lock and pass in the swap cluster. */
+&gt;  void __swap_cache_add_folio(struct swap_cluster_info *ci,
+&gt;  			    struct folio *folio, swp_entry_t entry);
+&gt; diff --git a/mm/swap_state.c b/mm/swap_state.c
+&gt; index 9c3a5cf99778..048efc7ca612 100644
+&gt; --- a/mm/swap_state.c
+&gt; +++ b/mm/swap_state.c
+&gt; @@ -403,7 +403,8 @@ void __swap_cache_replace_folio(struct swap_cluster_info *ci,
+&gt;  static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt;  					swp_entry_t targ_entry, gfp_t gfp,
+&gt;  					unsigned int order, struct vm_fault *vmf,
+&gt; -					struct mempolicy *mpol, pgoff_t ilx)
+&gt; +					struct mempolicy *mpol, pgoff_t ilx,
+&gt; +					bool skip_lru)
+&gt;  {
+&gt;  	int err;
+&gt;  	swp_entry_t entry;
+&gt; @@ -484,7 +485,8 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt;  	lruvec_stat_mod_folio(folio, NR_SWAPCACHE, nr_pages);
+&gt;  
+&gt;  	/* Caller will initiate read into locked new_folio */
+&gt; -	folio_add_lru(folio);
+&gt; +	if (!skip_lru)
+&gt; +		folio_add_lru(folio);
+&gt;  	return folio;
+&gt;  }
+&gt;  
+&gt; @@ -507,7 +509,8 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt;   */
+&gt;  struct folio *swap_cache_alloc_folio(swp_entry_t targ_entry, gfp_t gfp,
+&gt;  				     unsigned long orders, struct vm_fault *vmf,
+&gt; -				     struct mempolicy *mpol, pgoff_t ilx)
+&gt; +				     struct mempolicy *mpol, pgoff_t ilx,
+&gt; +				     bool skip_lru)
 
-Adding the comment as show above will satisfy tools such as checkpatch.
+Compared to the bool skip_lru here, will this work better? (not tested)
 
----
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 8afd0b2d7c27..7ff5254b6ff8 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -487,9 +487,6 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+ 
+        node_stat_mod_folio(folio, NR_FILE_PAGES, nr_pages);
+        lruvec_stat_mod_folio(folio, NR_SWAPCACHE, nr_pages);
+-
+-       /* Caller will initiate read into locked new_folio */
+-       folio_add_lru(folio);
+        return folio;
+ }
+ 
+@@ -651,6 +648,8 @@ static struct folio *swap_cache_read_folio(swp_entry_t entry, gfp_t gfp,
+                if (folio)
+                        return folio;
+                folio = swap_cache_alloc_folio(entry, gfp, orders, NULL, mpol, ilx);
++               if (!IS_ERR(folio))
++                       folio_add_lru(folio);
+        } while (PTR_ERR(folio) == -EEXIST);
+ 
+        if (IS_ERR_OR_NULL(folio))
+@@ -692,6 +691,8 @@ struct folio *swapin_sync(swp_entry_t entry, gfp_t gfp,
+                if (folio)
+                        return folio;
+                folio = swap_cache_alloc_folio(entry, gfp, orders, vmf, mpol, ilx);
++               if (!IS_ERR(folio))
++                       folio_add_lru(folio);
+        } while (PTR_ERR(folio) == -EEXIST);
 
-The comments look good to me, but I must defer to Alan and Randy.
+It&#x27;s identical code wise, just fewer arguments and changes.
 
-						Thanx, Paul</pre>
+Prehaps also rename swap_cache_alloc_folio to __swap_cache_alloc_folio
+and update kdoc that caller need to ensure the folio won&#x27;t be leaked off-LRU
+and unreclaimable now.
+
+</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/cf092a63-a9bd-4ecd-8276-d4736a37d3ee@paulmck-laptop" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: alternative solution, tool compliance, unnecessary</div>
+<div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
+<div class="review-comment-signals">Signals: no clear signal</div>
 </div>
 </div>
 </div>
