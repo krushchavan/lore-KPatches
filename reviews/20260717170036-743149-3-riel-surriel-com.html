@@ -238,19 +238,431 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH RFC v3 2/6] riscv/mm: add untagged_addr_remote_unlocked()</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260717170036.743149-3-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-17</strong><div class="date-range-nav">Active on: <a href="#2026-07-17">2026-07-17</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds support for untagged addresses in the RISC-V architecture, specifically addressing a bug where __access_remote_vm() would untag the remote address using the wrong mask due to reading current-&gt;mm instead of the target mm. The patch introduces a new function, untagged_addr_remote_unlocked(), which correctly handles pointer masking and annotates accesses to context.pmlen with READ_ONCE() and WRITE_ONCE() for KCSAN cleanliness.</div></div>
+    <div class="date-range">Submitted: <strong>2026-07-17</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-20</strong><div class="date-range-nav">Active on: <a href="#2026-07-20">2026-07-20</a> &bull; <a href="#2026-07-17">2026-07-17</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a new function called untagged_addr_remote_unlocked() to the RISC-V architecture&#x27;s memory management code. The function is used to untage addresses in a remote process without holding the mmap lock, which was previously not possible due to incorrect handling of pointer masking. The patch also annotates accesses to mm-&gt;context.pmlen with READ_ONCE() and WRITE_ONCE() macros to make lockless reads explicit and KCSAN-clean. This change is necessary because current-&gt;mm is used instead of the target mm in the generic version, leading to incorrect untagging when using pointer masking for remote access.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-17">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Rik van Riel</span>
-<a class="date-chip" href="../2026-07-17_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-17">2026-07-17</a>
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-17">2026-07-17</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">This patch series addresses a bug in __access_remote_vm() where the wrong mask is used for pointer masking due to reading current-&gt;mm instead of the target mm. The new function, untagged_addr_remote_unlocked(), correctly handles this and annotates accesses to context.pmlen with READ_ONCE() and WRITE_ONCE().</div>
-<div class="review-comment-signals">Signals: patch looks good</div>
+<div class="review-comment-text">The author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2, but did not provide a clear resolution or timeline for addressing this issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">__access_remote_vm() untags the remote address before looking up the VMA,
+now without holding the mmap lock. riscv defines untagged_addr_remote() but
+not untagged_addr_remote_unlocked(), so it falls back to the generic
+version, which untags with untagged_addr().
+
+That reads current-&gt;mm, not the target mm, so a remote access to a process
+using pointer masking would untag with the wrong mask.
+
+mm-&gt;context.pmlen is set only through PR_SET_TAGGED_ADDR_CTRL and is stable
+afterwards, so it can be read without the mmap lock, as it already is from
+untagged_addr() and mm_untag_mask().
+
+Add untagged_addr_remote_unlocked(), which untags against the target mm,
+and annotate context.pmlen accesses with READ_ONCE() and WRITE_ONCE() so
+the lockless reads are explicit and KCSAN-clean. untagged_addr_remote()
+keeps its mmap_assert_locked() and shares the code.
+
+Assisted-by: Claude:claude-opus-4.8
+Signed-off-by: Rik van Riel &lt;riel@surriel.com&gt;
+---
+ arch/riscv/include/asm/mmu_context.h |  4 ++--
+ arch/riscv/include/asm/uaccess.h     | 10 +++++++---
+ arch/riscv/kernel/process.c          | 12 +++++++-----
+ 3 files changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/arch/riscv/include/asm/mmu_context.h b/arch/riscv/include/asm/mmu_context.h
+index dbf27a78df6c..3ce16796e5a2 100644
+--- a/arch/riscv/include/asm/mmu_context.h
++++ b/arch/riscv/include/asm/mmu_context.h
+@@ -21,7 +21,7 @@ static inline void activate_mm(struct mm_struct *prev,
+ 			       struct mm_struct *next)
+ {
+ #ifdef CONFIG_RISCV_ISA_SUPM
+-	next-&gt;context.pmlen = 0;
++	WRITE_ONCE(next-&gt;context.pmlen, 0);
+ #endif
+ 	switch_mm(prev, next, NULL);
+ }
+@@ -44,7 +44,7 @@ DECLARE_STATIC_KEY_FALSE(use_asid_allocator);
+ #define mm_untag_mask mm_untag_mask
+ static inline unsigned long mm_untag_mask(struct mm_struct *mm)
+ {
+-	return -1UL &gt;&gt; mm-&gt;context.pmlen;
++	return -1UL &gt;&gt; READ_ONCE(mm-&gt;context.pmlen);
+ }
+ #endif
+ 
+diff --git a/arch/riscv/include/asm/uaccess.h b/arch/riscv/include/asm/uaccess.h
+index 5d4ec15584cf..53806e0f7dcf 100644
+--- a/arch/riscv/include/asm/uaccess.h
++++ b/arch/riscv/include/asm/uaccess.h
+@@ -16,7 +16,7 @@
+ static inline unsigned long __untagged_addr_remote(struct mm_struct *mm, unsigned long addr)
+ {
+ 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SUPM)) {
+-		u8 pmlen = mm-&gt;context.pmlen;
++		u8 pmlen = READ_ONCE(mm-&gt;context.pmlen);
+ 
+ 		/* Virtual addresses are sign-extended; physical addresses are zero-extended. */
+ 		if (IS_ENABLED(CONFIG_MMU))
+@@ -33,12 +33,16 @@ static inline unsigned long __untagged_addr_remote(struct mm_struct *mm, unsigne
+ 	(__force __typeof__(addr))__untagged_addr_remote(current-&gt;mm, __addr);	\
+ })
+ 
+-#define untagged_addr_remote(mm, addr) ({					\
++#define untagged_addr_remote_unlocked(mm, addr) ({				\
+ 	unsigned long __addr = (__force unsigned long)(addr);			\
+-	mmap_assert_locked(mm);							\
+ 	(__force __typeof__(addr))__untagged_addr_remote(mm, __addr);		\
+ })
+ 
++#define untagged_addr_remote(mm, addr) ({					\
++	mmap_assert_locked(mm);							\
++	untagged_addr_remote_unlocked(mm, addr);				\
++})
++
+ #define access_ok(addr, size) likely(__access_ok(untagged_addr(addr), size))
+ #else
+ #define untagged_addr(addr) (addr)
+diff --git a/arch/riscv/kernel/process.c b/arch/riscv/kernel/process.c
+index b2df7f72241a..6ae7552fed09 100644
+--- a/arch/riscv/kernel/process.c
++++ b/arch/riscv/kernel/process.c
+@@ -357,13 +357,15 @@ long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg)
+ 	if (mmap_write_lock_killable(mm))
+ 		return -EINTR;
+ 
+-	if (test_bit(MM_CONTEXT_LOCK_PMLEN, &amp;mm-&gt;context.flags) &amp;&amp; mm-&gt;context.pmlen != pmlen) {
+-		mmap_write_unlock(mm);
+-		return -EBUSY;
++	if (test_bit(MM_CONTEXT_LOCK_PMLEN, &amp;mm-&gt;context.flags)) {
++		if (READ_ONCE(mm-&gt;context.pmlen) != pmlen) {
++			mmap_write_unlock(mm);
++			return -EBUSY;
++		}
+ 	}
+ 
+ 	envcfg_update_bits(task, ENVCFG_PMM, pmm);
+-	mm-&gt;context.pmlen = pmlen;
++	WRITE_ONCE(mm-&gt;context.pmlen, pmlen);
+ 
+ 	mmap_write_unlock(mm);
+ 
+@@ -394,7 +396,7 @@ long get_tagged_addr_ctrl(struct task_struct *task)
+ 		break;
+ 	}
+ 
+-	if (task-&gt;mm-&gt;context.pmlen)
++	if (READ_ONCE(task-&gt;mm-&gt;context.pmlen))
+ 		ret |= PR_TAGGED_ADDR_ENABLE;
+ 
+ 	return ret;
+-- 
+2.53.0-Meta
+
+
+_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260717170036.743149-3-riel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix is needed, agreed to restructure</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Usama Arif noted that a tagged pointer can become invalid if PMLEN changes before the old mmap-locked lookup, and requested input from RISC-V folks to confirm it&#x27;s safe for all cases; he suggested removing the claim about pmlen stability in the commit message
+
+Reviewer noted that the new function untagged_addr_remote_unlocked() does not handle the case where the target mm&#x27;s context.pmlen is being updated concurrently, and requested the use of a lock to protect against this</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">So I think the above question is what needs to be
+answered.
+A tagged pointer can become invalid if PMLEN changes
+before the old mmap-locked lookup too.
+The mmap lock only defined whether the lookup observed
+the old or new mode.
+
+For VMA as you said, it should be ok. I don&#x27;t know about
+others. I think it would be best to get input from
+RISC-V folks for this. Hopefully its ok..
+If it is ok, then all that would be need to be done
+is to just remove in the commit message that pmlen
+is stable.
+
+---
+
+_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/e010eb53-2a7c-46e5-9049-0afc47b09a61@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested_changes, uncertainty, concurrency issue</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author is seeking clarification on potential failures and edge cases when using untagged_addr_remote_unlocked(), specifically considering scenarios where a tagged address might be passed to the function, and whether it could lead to incorrect behavior or failure.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I suppose it could, but what are the possible outcomes here?
+
+- We fail to untag the address, the vma lookup
+  fails, and we fail to access memory.
+
+- The address is already untagged, maps to a
+  VMA, and the access succeeds.
+
+Are there any others?
+
+The VMAs of the process need to be in the bottom
+part of the address space, right? The part where
+untagged addresses sit.
+
+For things like /proc/&lt;pid&gt;/cmdline we should
+automatically get an address without any of the
+high bits set.
+
+For things like ptrace peek / poke, BPF process
+accesses, and others, I really do not know if
+those could get tagged addresses...
+
+What are the failures we need to protect against?
+
+What if something comes in with a tagged address,
+but the process disables tagging while that
+something waits for the mmap_lock?
+
+Does that reproduce the failure case, without
+any locking changes?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/f32b1d2d272e9eafaf0a68be236c84a0585a62e3.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarifying question, exploring edge cases</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the new untagged_addr_remote_unlocked() function reads pmlen without holding the mmap lock, allowing concurrent PMLEN changes between reading pmlen and attempting per-VMA lookup, potentially leading to incorrect address untagging.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">So my understanding from exploring this code is, and hopefully someone
+in CC from riscv can correct me, for example:
+
+Tagged pointer:  0xabcd000012345678
+PMLEN 16:        0x0000000012345678
+PMLEN 7:         0xffcd000012345678
+
+The target VMA might be at 0x12345678, but applying PMLEN 7
+to that tagged pointer does not produce that address.
+
+Previously, the order was:
+
+Take mmap read lock.
+Read pmlen.
+Untag the address.
+Look up the VMA.
+
+Changing PMLEN takes the mmap write lock. The read and write
+operations were therefore serialized.
+
+The new order is:
+
+Read pmlen without mmap lock.
+Untag the address.
+Attempt the per-VMA lookup.
+Possibly take mmap lock later.
+Continue using the already-untagged address.
+
+A concurrent PMLEN change can occur between those operations?
+
+
+
+_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/e9703d2e-f815-4d96-b5ce-074aba281f76@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: concurrent PMLEN change, incorrect address untagging</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that RISCV&#x27;s address masking is dynamic, but questioned the need for untagged_addr_remote_unlocked() as a remote process would already have valid addresses in the masked-off area.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Ugh, I looked at the wrong one.  RISCV is like
+x86, with a dynamic (though a limited number
+of options?) mask.
+
+Having said that, won&#x27;t a process have all of
+its VMAs in the masked-off area, so coming in
+from a remote process to a valid memory address
+should already give us a valid address?
+
+-- 
+All Rights Reversed.
+
+_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/51c0025d2eb885ff1f4775e4d9ffcf34f478f378.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: questioning, uncertainty</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch does not handle the case where the target mm has a different pmlen value than the current mm, which could lead to incorrect pointer masking and potential security issues.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/46dc1b58-f2de-492a-9da5-a5c429c19a10@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: potential security issue, incorrect pointer masking</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that ARM tagged addresses work differently from x86 LAM, and is considering the implications for accessing process memory on ARM with MTE.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">You&#x27;re right, ARM tagged addresses seem to work a
+little differently from x86 LAM.
+
+It looks like on ARM with MTE, the top 8 bits of
+the virtual address are available as tags, meaning
+that address space cannot be used for VMAs.
+
+For purposes of accessing process memory, this
+is a little more stable than LAM, because the
+number of bits we need to mask out of the address
+is always the same when MTE is in use.
+
+At least, I think so. Am I overlooking anything?
+
+I will clean up the changelog like you suggested.
+
+-- 
+All Rights Reversed.
+
+_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/13ec2603d5cbfdc493939f182b71e5133c26af54.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, acknowledgment of difference</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-07-20">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-07-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-20">2026-07-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer pointed out that the behavior described in the comment does not apply to this patch, as it introduces a change where __access_remote_vm() still acquires the mmap_lock before untagging the address.
+
+Reviewer noted that the value of mm-&gt;context.pmlen is not stable because set_tagged_addr_ctrl() can change it repeatedly until a CLONE_VM operation sets MM_CONTEXT_LOCK_PMLEN, and requested the use of READ_ONCE() to ensure a consistent read.
+
+Reviewer noted that the new function untagged_addr_remote_unlocked() does not handle the case where the target mm&#x27;s context.pmlen is being updated concurrently, and requested the use of READ_ONCE() to ensure a consistent value.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This describes behavior introduced in a later patch, not by this patch.
+At this point, __access_remote_vm() still acquires mmap_lock before
+untagging the address.
+
+---
+
+I think it might not be stable? set_tagged_addr_ctrl() can change it
+repeatedly until a CLONE_VM operation sets MM_CONTEXT_LOCK_PMLEN.
+
+---
+
+_______________________________________________
+linux-riscv mailing list
+linux-riscv@lists.infradead.org
+http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/20260720115741.239657-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, patch-specific, stability concern</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>

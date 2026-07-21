@@ -9,24 +9,94 @@
       "reviews": [
         {
           "author": "Kairui Song",
-          "summary": "Suggested using a bool skip_lru instead of freeing the folio directly, and proposed renaming swap_cache_alloc_folio to __swap_cache_alloc_folio with updated kdoc.",
-          "sentiment": "neutral",
+          "summary": "Reviewer Kairui Song questioned whether the patch's approach of adding a new argument to swap_cache_alloc_folio and then calling folio_add_lru() would be more effective than simply using the existing bool skip_lru, without testing it.",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "no clear signal"
+            "requested changes",
+            "uncertainty about patch's effectiveness"
           ],
-          "has_inline_review": false,
-          "tags_given": [],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
           "analysis_source": "llm",
-          "raw_body": "On Sat, Jul 18, 2026 at 11:36:39AM +0800, Alexandre Ghiti wrote:\n> When zswap writes an entry back, it allocates a swap cache folio,\n> decompresses the entry into it and writes it out. That folio is cold by\n> construction, but it is currently left on the LRU for page reclaim to find\n> and free later. This wastes a reclaim scan and keeps cold memory resident\n> longer than necessary.\n> \n> For synchronous-IO swap devices writeback completes in the calling context,\n> so the folio can be freed right after the write rather than left behind; do\n> that. Because it is freed directly rather than through reclaim, it is\n> allocated off the LRU: dropping the last reference on a folio still on the\n> LRU would trip the free-time page-flag checks. A folio that a concurrent\n> swapin has meanwhile claimed is left in place and reclaimed as usual.\n> \n> Asynchronous and filesystem-backed swap complete writeback in interrupt\n> context, where the folio cannot be freed; they are handled in a later\n> change.\n> \n> Signed-off-by: Alexandre Ghiti <alex@ghiti.fr>\n> ---\n>  mm/swap.h       |  3 ++-\n>  mm/swap_state.c | 17 +++++++++++------\n>  mm/zswap.c      | 36 ++++++++++++++++++++++++++++++++++--\n>  3 files changed, 47 insertions(+), 9 deletions(-)\n> \n> diff --git a/mm/swap.h b/mm/swap.h\n> index 77d2d14eda42..c617e5a0257f 100644\n> --- a/mm/swap.h\n> +++ b/mm/swap.h\n> @@ -306,7 +306,8 @@ void *swap_cache_get_shadow(swp_entry_t entry);\n>  void swap_cache_del_folio(struct folio *folio);\n>  struct folio *swap_cache_alloc_folio(swp_entry_t target_entry, gfp_t gfp_mask,\n>  \t\t\t\t     unsigned long orders, struct vm_fault *vmf,\n> -\t\t\t\t     struct mempolicy *mpol, pgoff_t ilx);\n> +\t\t\t\t     struct mempolicy *mpol, pgoff_t ilx,\n> +\t\t\t\t     bool skip_lru);\n>  /* Below helpers require the caller to lock and pass in the swap cluster. */\n>  void __swap_cache_add_folio(struct swap_cluster_info *ci,\n>  \t\t\t    struct folio *folio, swp_entry_t entry);\n> diff --git a/mm/swap_state.c b/mm/swap_state.c\n> index 9c3a5cf99778..048efc7ca612 100644\n> --- a/mm/swap_state.c\n> +++ b/mm/swap_state.c\n> @@ -403,7 +403,8 @@ void __swap_cache_replace_folio(struct swap_cluster_info *ci,\n>  static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n>  \t\t\t\t\tswp_entry_t targ_entry, gfp_t gfp,\n>  \t\t\t\t\tunsigned int order, struct vm_fault *vmf,\n> -\t\t\t\t\tstruct mempolicy *mpol, pgoff_t ilx)\n> +\t\t\t\t\tstruct mempolicy *mpol, pgoff_t ilx,\n> +\t\t\t\t\tbool skip_lru)\n>  {\n>  \tint err;\n>  \tswp_entry_t entry;\n> @@ -484,7 +485,8 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n>  \tlruvec_stat_mod_folio(folio, NR_SWAPCACHE, nr_pages);\n>  \n>  \t/* Caller will initiate read into locked new_folio */\n> -\tfolio_add_lru(folio);\n> +\tif (!skip_lru)\n> +\t\tfolio_add_lru(folio);\n>  \treturn folio;\n>  }\n>  \n> @@ -507,7 +509,8 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n>   */\n>  struct folio *swap_cache_alloc_folio(swp_entry_t targ_entry, gfp_t gfp,\n>  \t\t\t\t     unsigned long orders, struct vm_fault *vmf,\n> -\t\t\t\t     struct mempolicy *mpol, pgoff_t ilx)\n> +\t\t\t\t     struct mempolicy *mpol, pgoff_t ilx,\n> +\t\t\t\t     bool skip_lru)\n\nCompared to the bool skip_lru here, will this work better? (not tested)\n\ndiff --git a/mm/swap_state.c b/mm/swap_state.c\nindex 8afd0b2d7c27..7ff5254b6ff8 100644\n--- a/mm/swap_state.c\n+++ b/mm/swap_state.c\n@@ -487,9 +487,6 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n \n        node_stat_mod_folio(folio, NR_FILE_PAGES, nr_pages);\n        lruvec_stat_mod_folio(folio, NR_SWAPCACHE, nr_pages);\n-\n-       /* Caller will initiate read into locked new_folio */\n-       folio_add_lru(folio);\n        return folio;\n }\n \n@@ -651,6 +648,8 @@ static struct folio *swap_cache_read_folio(swp_entry_t entry, gfp_t gfp,\n                if (folio)\n                        return folio;\n                folio = swap_cache_alloc_folio(entry, gfp, orders, NULL, mpol, ilx);\n+               if (!IS_ERR(folio))\n+                       folio_add_lru(folio);\n        } while (PTR_ERR(folio) == -EEXIST);\n \n        if (IS_ERR_OR_NULL(folio))\n@@ -692,6 +691,8 @@ struct folio *swapin_sync(swp_entry_t entry, gfp_t gfp,\n                if (folio)\n                        return folio;\n                folio = swap_cache_alloc_folio(entry, gfp, orders, vmf, mpol, ilx);\n+               if (!IS_ERR(folio))\n+                       folio_add_lru(folio);\n        } while (PTR_ERR(folio) == -EEXIST);\n\nIt's identical code wise, just fewer arguments and changes.\n\nPrehaps also rename swap_cache_alloc_folio to __swap_cache_alloc_folio\nand update kdoc that caller need to ensure the folio won't be leaked off-LRU\nand unreclaimable now.\n\n",
-          "reply_to": "Alexandre Ghiti",
+          "raw_body": "Compared to the bool skip_lru here, will this work better? (not tested)\n\ndiff --git a/mm/swap_state.c b/mm/swap_state.c\nindex 8afd0b2d7c27..7ff5254b6ff8 100644\n--- a/mm/swap_state.c\n+++ b/mm/swap_state.c\n@@ -487,9 +487,6 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n \n        node_stat_mod_folio(folio, NR_FILE_PAGES, nr_pages);\n        lruvec_stat_mod_folio(folio, NR_SWAPCACHE, nr_pages);\n-\n-       /* Caller will initiate read into locked new_folio */\n-       folio_add_lru(folio);\n        return folio;\n }\n \n@@ -651,6 +648,8 @@ static struct folio *swap_cache_read_folio(swp_entry_t entry, gfp_t gfp,\n                if (folio)\n                        return folio;\n                folio = swap_cache_alloc_folio(entry, gfp, orders, NULL, mpol, ilx);\n+               if (!IS_ERR(folio))\n+                       folio_add_lru(folio);\n        } while (PTR_ERR(folio) == -EEXIST);\n \n        if (IS_ERR_OR_NULL(folio))\n@@ -692,6 +691,8 @@ struct folio *swapin_sync(swp_entry_t entry, gfp_t gfp,\n                if (folio)\n                        return folio;\n                folio = swap_cache_alloc_folio(entry, gfp, orders, vmf, mpol, ilx);\n+               if (!IS_ERR(folio))\n+                       folio_add_lru(folio);\n        } while (PTR_ERR(folio) == -EEXIST);\n\nIt's identical code wise, just fewer arguments and changes.\n\nPrehaps also rename swap_cache_alloc_folio to __swap_cache_alloc_folio\nand update kdoc that caller need to ensure the folio won't be leaked off-LRU\nand unreclaimable now.",
+          "reply_to": "",
           "message_date": "2026-07-18",
-          "message_id": "",
+          "message_id": "altSA1zXhzvHPJYe@KASONG-MC4",
           "email": "ryncsn@gmail.com",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series aims to improve the performance of zswap by freeing cold writeback folios promptly after writeback completion, reducing unnecessary reclaim scans and keeping cold memory resident for shorter periods."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch improves the performance of zswap by freeing cold writeback folios promptly after writeback completion, reducing unnecessary reclaim scans and keeping memory resident for shorter periods. The patch consists of two parts: one for synchronous-IO devices (zram, brd, pmem) that can free the folio directly in the calling context, and another for asynchronous block devices and filesystem-backed swap that allocate the folio off the LRU and defer the free to a workqueue. The results show significant improvements in performance metrics such as page rotations, steals, scans, and build times, with most folios being freed promptly on writeback completion."
+    },
+    "2026-07-20": {
+      "report_file": "2026-07-20_ollama_llama3.1-8b.html",
+      "developer": "Alexandre Ghiti",
+      "reviews": [
+        {
+          "author": "Nhat Pham",
+          "summary": "Reviewer Nhat Pham noted that the patch may incorrectly free a folio if it has been dirtied and swapped out again, suggesting additional checks be added to ensure the folio is not being reused before freeing it.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "additional testing"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hmm I think you also have to test for writeback and dirty here right?\n\nAfter a racing swapin freed the swap slot, the folio might be dirtied\nand swapped out again. We probably shouldn't try to remove_mapping()\nsuch a folio?\n\nWe also do similar check for zswap/sync-io devices in pageout handling\n(mm/vmscan.c, shrink_folio_list()), and the other dropbehind handler\n(filemap_end_dropbehind()).\n\nWhen I was playing with this, I also tested the folio with\nfolio_test_active() and folio_mapped(), but I must admit - I do not\nremember why I did it. Could just be me making sure we dont get rid of\nfrequently used folio rather than for strict correctness. :)",
+          "reply_to": "",
+          "message_date": "2026-07-20",
+          "message_id": "CAKEwX=Nn0dMc1K9drXFVMwt7wMZ2P6KToeh7T3rE1+Xq5yrCFw@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Nhat Pham",
+          "summary": "Reviewer Nhat Pham made a lighthearted comment about not being included in the Suggested-by list, but did not raise any technical concerns or suggestions.\n\nReviewer Nhat Pham suggested batching the free step after remove_mapping() succeeds for each folio, proposing to add the folio to a batch and then call folios_put_refs() in the entire batch.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "No Suggested-by for poor Nhat? :(\n\nJust kidding, of course - thanks for working on this cool idea :)\n\n---\n\nnit: I wonder if it's worth doing some batching here for the free step.\n\ni.e, after remove_mapping() succeeds for a folio, we can just add the\nfolio to a batch, then call folios_put_refs() in the entire batch :-?",
+          "reply_to": "",
+          "message_date": "2026-07-20",
+          "message_id": "CAKEwX=NY=Uvcfm2BT-HGqu8B3OaoC0eePW1M7fW1qH4wpjQ8gw@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer Yosry Ahmed noted that the implementation is too specific to zswap and suggested adding general support for swap-backed pages in folio_end_dropbehind() before having zswap opt into it, also pointing out a challenge of handling interrupt context.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "generalization needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I took a quick look through the patches and the implementation seems\ntoo zswap-specific.\n\nI am not super familiar with how the drop-behind mechanism works in\ngeneral, but it seems like it's currently intended for file pages and\nnot swap-backed pages. From a high-level perspective, it seems like we\nshould add support for swap dropbehind in general first (regardless of\nzswap), e.g. by making folio_end_dropbehind() properly handle them,\nand then have zswap opt into this?\n\nI guess one of the challenges is that folio_end_dropbehind() only\nfrees folios in task context while we need to support interrupt\ncontext, but this also doesn't seem like something that should be\nhandled in zswap.\n\nIn theory, there may be a use case for doing dropbehind for swap in\ngeneral, right?",
+          "reply_to": "Alexandre Ghiti",
+          "message_date": "2026-07-20",
+          "message_id": "CAO9r8zM9SQR97cAJ2wLuJKjgi4oYatPP=3B6j=-hUhNFiGHDFA@mail.gmail.com",
+          "email": "yosry@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch improves the performance of zswap by freeing cold writeback folios promptly after writeback completion, reducing unnecessary reclaim scans and keeping memory resident for shorter periods. The patch consists of two parts: one for synchronous-IO devices (zram, brd, pmem) that can free the folio directly in the calling context, and another for asynchronous block devices and filesystem-backed swap that allocate the folio off the LRU and defer the free to a workqueue. The results show significant improvements in performance metrics such as page rotations, steals, scans, and build times, with most folios being freed promptly on writeback completion."
     }
   }
 }
