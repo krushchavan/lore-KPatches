@@ -1,0 +1,84 @@
+{
+  "thread_id": "a16279675545df12a15c2c6ccc8deee1164d6d57.camel@kernel.org",
+  "subject": "[syzbot] [nfs?] INFO: task hung in nfsd_nl_cache_flush_doit",
+  "url": "https://lore.kernel.org/all/a16279675545df12a15c2c6ccc8deee1164d6d57.camel@kernel.org/",
+  "dates": {
+    "2026-07-22": {
+      "report_file": "2026-07-21_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "NeilBrown",
+          "summary": "reviewer questioned the one-minute timeout for rpcbind registration, suggesting it's too long and that a network-level error should be returned instead; they also proposed making rpc_ping fail more quickly or doing the ping asynchronously",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested alternative approach"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Why are we waiting a whole minute for a local service to respond?  If it\nhasn't responded in 1 second, is it ever really likely to?\nIf rcpbind is down, we should be getting a network-level error,\nshouldn't we?  Hmmm.  There is ENETUNREACH and EHOSTUNREACH but not\nEPORTUNREACH - I'm sure you get something if a UDP port isn't open, but\nICMP for remote hosts but rpcbind isn't remote.\n\nSo I would rather we find a way to make rpc_ping fail more quickly.\nBut failing that I think that doing the ping async makes sense.  nfsd\ndoesn't need the registration, only clients do.  So delaying it only\nmeans we don't get an error on startup which we currently do.  This is\nnot something that would be expected in practice.  Maybe a kernel\nwarning if registration fails, and hope the sysadmin notices?\n\nNeilBrown",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-07-22",
+          "message_id": "178467050196.3371781.3758158560019971518@noble.neil.brown.name",
+          "email": "neilb@ownmail.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "NeilBrown",
+          "summary": "NeilBrown questioned the need for a mutex across multiple netlink registrations, suggesting that it could cause issues with out-of-order requests and proposing an alternative solution using a queue of requests processed in order from a dedicated thread or by driving async RPC submissions serially.\n\nNeilBrown noted that svc_register() prints a warning and gives up on other versions/programs when registration fails, causing the listener not to get added if no listeners got registered, which prevents nfsd from starting; he suggested registering in a separate thread and retrying on failure following a normal rpc fail/retry pattern\n\nReviewer suggested using a single-threaded work-queue per net-namespace to handle listener registration and de-registration, noting that this approach is already used for sync-canceling the work-item before reusing it.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "mutex",
+            "out-of-order requests",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "A few hundred?  Is there a genuine use-case for that?\n\nWith the old /proc interface we could only add one at a time.\nThe new netlink one adds many at once.  Do we really need the mutex\nacross all of that?\n\nMaybe:\n\ndiff --git a/fs/nfsd/nfsctl.c b/fs/nfsd/nfsctl.c\nindex d0486f4a47ba..eb0f0bb1a77a 100644\n--- a/fs/nfsd/nfsctl.c\n+++ b/fs/nfsd/nfsctl.c\n@@ -2040,6 +2040,7 @@ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)\n \tif (delete)\n \t\tsvc_xprt_destroy_all(serv, net, false);\n \n+\tmutex_unlock(&nfsd_mutex);\n \t/* walk list of addrs again, open any that still don't exist */\n \tnlmsg_for_each_attr_type(attr, NFSD_A_SERVER_SOCK_ADDR, info->nlhdr,\n \t\t\t\t GENL_HDRLEN, rem) {\n@@ -2058,6 +2059,8 @@ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)\n \t\tif (nla_len(tb[NFSD_A_SOCK_ADDR]) < sizeof(*sa))\n \t\t\tcontinue;\n \n+\t\tmutex_lock(&nfsd_mutex);\n+\n \t\txcl_name = nla_data(tb[NFSD_A_SOCK_TRANSPORT_NAME]);\n \t\tsa = nla_data(tb[NFSD_A_SOCK_ADDR]);\n \n@@ -2067,14 +2070,16 @@ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)\n \t\t\t\tWARN_ONCE(1, \"Transport type=%s already exists\\n\",\n \t\t\t\t\t  xcl_name);\n \t\t\tsvc_xprt_put(xprt);\n-\t\t\tcontinue;\n-\t\t}\n+\t\t} else {\n \n-\t\tret = svc_xprt_create_from_sa(serv, xcl_name, net, sa, 0,\n-\t\t\t\t\t      current_cred());\n-\t\t/* always save the latest error */\n-\t\tif (ret < 0)\n-\t\t\terr = ret;\n+\t\t\tret = svc_xprt_create_from_sa(serv, xcl_name, net, sa, 0,\n+\t\t\t\t\t\t      current_cred());\n+\t\t\t/* always save the latest error */\n+\t\t\tif (ret < 0)\n+\t\t\t\terr = ret;\n+\t\t}\n+\t\tmutex_unlock(&nfsd_mutex);\n+\t\tcond_resched()\n \t}\n \n \tif (!serv->sv_nrthreads && list_empty(&nn->nfsd_serv->sv_permsocks))\n\n---\n\nsvc_register() prints a warning, then gives up on other\nversions/programs.\nif svc_setup_socket() get an error from svc_register() it aborts, which\nripples back to svc_addsock() aborting, so the listener doesn't get added.\n\nThen if no listeners got registered, nfsd refuses to start.\n\nIt would likely make sense for the registration to happen in a separate\nthread and to retry on failure following a normal rpc fail/retry\npattern.\n\nThen if the admin restarts rpcbind, it will start working without\nfurther intervention.\n\n---\n\nA single-threaded work-queue (per net-namespace) seems like a good\nsolution.  Each listener has a work_item that is used for registration\nand de-registration.  We sync-cancel it before re-using it.\n\nNeilBrown",
+          "reply_to": "Jeff Layton",
+          "message_date": "2026-07-22",
+          "message_id": "178467790539.3371781.5416276069181909219@noble.neil.brown.name",
+          "email": "neilb@ownmail.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses an issue where the nfsd_nl_cache_flush_doit function hangs, potentially causing a lockup warning. The problem is likely due to a large number of listeners, which can cause the registration process to take too long. To solve this, the patch proposes implementing a more structural solution, possibly involving asynchronous processing of registration requests or keeping a queue of requests and processing them in order from a dedicated thread."
+    },
+    "2026-07-21": {
+      "report_file": "2026-07-21_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Jeff Layton (author)",
+          "summary": "Author agrees that a smaller timeout would help but thinks it's not enough, and suggests a more fundamental change is needed to prevent lockups.\n\nAuthor acknowledged that the rpcbind registration failure is not fatal, but expressed concern about doing listener registration asynchronously due to potential issues with reg/unreg requests being out of order.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges need for fix",
+            "suggests alternative solution",
+            "acknowledged a technical issue",
+            "expressed concern"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I've been wondering that too. Is it a throwback to starting\nrpcbind/portmapper from inetd or something?\n\nIn any case, a smaller timeout would make sense, but even at 1s, you\ncould easily cause a lockup warning with just a few hundred listeners.\n\nI think we need a more structural solution as well.\n\n---\n\nWe already throw a printk() when registration fails for v2/3. IIRC,\nit's not considered fatal, so we just keep going anyway if that\nhappens.\n\nMy main concern with doing it async would be getting reg/unreg requests\nout of order and leaving rpcbind with a broken table, but I think we\ncould probably do something like keep a queue of requests and process\nthem in order from a dedicated thread or by driving async RPC\nsubmissions serially from callbacks.\n\n-- \nJeff Layton <jlayton@kernel.org>",
+          "reply_to": "NeilBrown",
+          "message_date": "2026-07-21",
+          "message_id": "0e9288a881c9fa6308cd607435192abb408a1dfb.camel@kernel.org",
+          "email": "jlayton@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses an issue where the nfsd_nl_cache_flush_doit function hangs, potentially causing a lockup warning. The problem is likely due to a large number of listeners, which can cause the registration process to take too long. To solve this, the patch proposes implementing a more structural solution, possibly involving asynchronous processing of registration requests or keeping a queue of requests and processing them in order from a dedicated thread."
+    }
+  }
+}
