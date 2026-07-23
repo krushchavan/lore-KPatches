@@ -9,6 +9,44 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch modifies the khugepaged daemon's behavior to base its decision on collapsing private nodes on the actor/capability bits. Specifically, it ensures that khugepaged does not silently collapse private node folios and allows MADV_COLLAPSE operations on private nodes opted into CAP_USER_NUMA. The changes are implemented through modifications to the folio_allows_collapse() function in mm/internal.h and its usage in mm/khugepaged.c."
+    },
+    "2026-07-22": {
+      "report_file": "2026-07-22_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Richard Cheng",
+          "summary": "Identified a potential issue in khugepaged's behavior regarding private node collapse, suggesting that collapse_scan_file() should also perform checks similar to folio_allows_collapse().",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "On Mon, Jul 20, 2026 at 03:34:26PM +0800, Gregory Price wrote:\n> Collapse can move base pages across nodes.  The khugepaged daemon does\n> this transparently, while MADV_COLLAPSE is a userland construct.\n> \n> Isolate private nodes from khugepaged exactly like ZONE_DEVICE.\n> Never collapse private node folios silently (the owner may not\n> support migration).\n> \n> MADV_COLLAPSE is user-initiated, so it is allowed on a private node\n> opted into CAP_USER_NUMA, consistent with other userspace interfaces.\n> \n> folio_allows_collapse() encodes this: false for khugepaged on a private\n> node, CAP_USER_NUMA for MADV_COLLAPSE.\n> \n> Signed-off-by: Gregory Price <gourry@gourry.net>\n> ---\n>  mm/internal.h   | 26 ++++++++++++++++++++++++++\n>  mm/khugepaged.c | 16 +++++++++++++---\n>  2 files changed, 39 insertions(+), 3 deletions(-)\n> \n> diff --git a/mm/internal.h b/mm/internal.h\n> index 9621eb127c28c..9dbc5752cd3fe 100644\n> --- a/mm/internal.h\n> +++ b/mm/internal.h\n> @@ -136,6 +136,32 @@ static inline bool folio_allows_numa_balance(struct folio *folio)\n>  \t       node_allows_numa_balancing(folio_nid(folio));\n>  }\n>  \n> +/*\n> + * folio_allows_collapse() - may collapse fold this folio into a THP?\n> + * @is_khugepaged: true for the khugepaged, false for MADV_COLLAPSE.\n> + *\n> + * Collapse is a residency operation gated by the actor calling it:\n> + *   - khugepaged never operates on private-node folios (like ZONE_DEVICE)\n> + *   - MADV_COLLAPSE is gated by CAP_USER_NUMA\n> + *\n> + * Never true for ZONE_DEVICE.\n> + */\n> +static inline bool folio_allows_collapse(struct folio *folio, bool is_khugepaged)\n> +{\n> +\tint nid = folio_nid(folio);\n> +\n> +\tif (folio_is_zone_device(folio))\n> +\t\treturn false;\n> +\tif (is_khugepaged)\n> +\t\treturn !node_is_private(nid);\n> +\treturn node_allows_user_numa(nid);\n> +}\n> +\n> +static inline bool page_allows_collapse(struct page *page, bool is_khugepaged)\n> +{\n> +\treturn folio_allows_collapse(page_folio(page), is_khugepaged);\n> +}\n> +\n>  /*\n>   * folio_allows_longterm_pin() - may this folio be long-term GUP-pinned?\n>   *\n> diff --git a/mm/khugepaged.c b/mm/khugepaged.c\n> index fb4378cc17b10..5f20839857738 100644\n> --- a/mm/khugepaged.c\n> +++ b/mm/khugepaged.c\n> @@ -700,7 +700,8 @@ static enum scan_result __collapse_huge_page_isolate(struct vm_area_struct *vma,\n>  \t\t\tgoto out;\n>  \t\t}\n>  \t\tpage = vm_normal_page(vma, addr, pteval);\n> -\t\tif (unlikely(!page) || unlikely(page_is_private_managed(page))) {\n> +\t\tif (unlikely(!page) ||\n> +\t\t    unlikely(!page_allows_collapse(page, cc->is_khugepaged))) {\n>  \t\t\tresult = SCAN_PAGE_NULL;\n>  \t\t\tgoto out;\n>  \t\t}\n> @@ -1241,9 +1242,17 @@ static enum scan_result alloc_charge_folio(struct folio **foliop, struct mm_stru\n>  \tgfp_t gfp = (cc->is_khugepaged ? alloc_hugepage_khugepaged_gfpmask() :\n>  \t\t     GFP_TRANSHUGE);\n>  \tint node = collapse_find_target_node(cc);\n> +\tunsigned int aflags;\n>  \tstruct folio *folio;\n> +\tbool allow;\n>  \n> -\tfolio = __folio_alloc(gfp, order, node, &cc->alloc_nmask, ALLOC_DEFAULT);\n> +\t/* Private node access: khugepaged never, madvise with CAP_USER_NUMA */\n> +\tallow = cc->is_khugepaged ? !node_is_private(node)\n> +\t\t\t\t  : node_allows_user_numa(node);\n> +\taflags = (allow && node_is_private(node)) ?\n> +\t\tALLOC_ZONELIST_PRIVATE : ALLOC_DEFAULT;\n> +\n> +\tfolio = __folio_alloc(gfp, order, node, &cc->alloc_nmask, aflags);\n>  \tif (!folio) {\n>  \t\t*foliop = NULL;\n>  \t\tif (is_pmd_order(order))\n> @@ -1687,7 +1696,8 @@ static enum scan_result collapse_scan_pmd(struct mm_struct *mm,\n>  \t\t}\n>  \n>  \t\tpage = vm_normal_page(vma, addr, pteval);\n> -\t\tif (unlikely(!page) || unlikely(page_is_private_managed(page))) {\n> +\t\tif (unlikely(!page) ||\n> +\t\t    unlikely(!page_allows_collapse(page, cc->is_khugepaged))) {\n\nI think collapse_scan_file() need something like folio_allows_collapse() check as well.\n\n--Richard\n\n>  \t\t\tresult = SCAN_PAGE_NULL;\n>  \t\t\tgoto out_unmap;\n>  \t\t}\n> -- \n> 2.53.0-Meta\n> \n> \n",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-07-22",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Gregory Price",
+          "summary": "Acknowledged Richard's suggestion and agreed that additional checks are necessary for collapse_scan_file().",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "AGREEMENT"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "On Wed, Jul 22, 2026 at 09:24:37PM +0800, Richard Cheng wrote:\n> On Mon, Jul 20, 2026 at 03:34:26PM +0800, Gregory Price wrote:\n> >  \n> >  \t\tpage = vm_normal_page(vma, addr, pteval);\n> > -\t\tif (unlikely(!page) || unlikely(page_is_private_managed(page))) {\n> > +\t\tif (unlikely(!page) ||\n> > +\t\t    unlikely(!page_allows_collapse(page, cc->is_khugepaged))) {\n> \n> I think collapse_scan_file() need something like folio_allows_collapse() check as well.\n> \n\nI believe you are correct, sashiko up some stuff here too.\n\nThanks!\n~Gregory\n",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-07-22",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series introduces changes to the khugepaged daemon's behavior regarding private node collapse eligibility, based on actor/cap bits. The goal is to isolate private nodes from khugepaged and prevent silent collapse of private node folios. The patch also updates the MADV_COLLAPSE userland construct to be consistent with other userspace interfaces."
     }
   }
 }

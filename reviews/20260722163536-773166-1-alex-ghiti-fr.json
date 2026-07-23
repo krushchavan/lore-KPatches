@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260722163536.773166-1-alex@ghiti.fr",
+  "subject": "[PATCH v2 0/3] mm: bypass swap readahead for zswap",
+  "url": "https://lore.kernel.org/all/20260722163536.773166-1-alex@ghiti.fr/",
+  "dates": {
+    "2026-07-22": {
+      "report_file": "2026-07-22_ollama_llama3.1-8b.html",
+      "developer": "Alexandre Ghiti",
+      "reviews": [
+        {
+          "author": "David Hildenbrand",
+          "summary": "Raised questions about the performance benefits and potential issues with the new approach. Suggested testing and validation before merging.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "NEEDS_TESTING"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Alexandre Ghiti",
+          "summary": "Addressed David's concerns by providing additional testing results and explaining the benefits of the new approach.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "LGTM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "A readahead neighbour on an SWP_SYNCHRONOUS_IO device (zram) has no\nasynchronous I/O to overlap either, exactly like a zswap-resident one.\nExtend swap_entry_synchronous() to take the swap device and also return\ntrue for such an entry, so it is deferred to the second pass too. A\nsame-type neighbour shares the target's device, which cannot be\nSWP_SYNCHRONOUS_IO here (do_swap_page() routes synchronous-device\ntargets through swapin_sync()), so @si is only non-NULL for cross-device\nneighbours, which is exactly where it matters.\n\nThis helps a mixed zram+disk workload when the faulting target is on\ndisk: that fault now overlaps its zram neighbours' reads behind its own\ndisk I/O, exactly as patch 1 does for zswap neighbours.\n\nResults [vm-scalability mix-rw-seq, 1G zram (SWP_SYNCHRONOUS_IO, high\nprio) + NVMe disk swap (~76% of swap-in from disk), zram=zstd, zswap\noff, 4G memcg / 8G region, unthrottled NVMe, n=3]. With zswap off\npatches 1-2 are inert, so the delta isolates this patch:\n\n  metric                  mm-new    +patch    delta\n  swap-in tput (KB/s)    171226    182046     +6.3%\n  major faults           431904    432657     +0.2%\n  swap-in pswpin (pages) 1778579   1778473     ~0%\n  swap_ra (pages)        1349299   1348382     -0.1%\n\nSigned-off-by: Alexandre Ghiti <alex@ghiti.fr>\n---\n include/linux/swap.h |  4 ++--\n mm/swap_state.c      | 10 +++++-----\n mm/swapfile.c        |  6 ++++--\n 3 files changed, 11 insertions(+), 9 deletions(-)\n\ndiff --git a/include/linux/swap.h b/include/linux/swap.h\nindex 6bb35c093d77..e6e0d07a4f19 100644\n--- a/include/linux/swap.h\n+++ b/include/linux/swap.h\n@@ -441,7 +441,7 @@ extern unsigned int count_swap_pages(int, int);\n extern sector_t swapdev_block(int, pgoff_t);\n extern int __swap_count(swp_entry_t entry);\n extern bool swap_entry_swapped(struct swap_info_struct *si, swp_entry_t entry);\n-extern bool swap_entry_synchronous(swp_entry_t entry);\n+extern bool swap_entry_synchronous(struct swap_info_struct *si, swp_entry_t entry);\n extern int swp_swapcount(swp_entry_t entry);\n struct backing_dev_info;\n extern struct swap_info_struct *get_swap_device(swp_entry_t entry);\n@@ -520,7 +520,7 @@ static inline bool swap_entry_swapped(struct swap_info_struct *si, swp_entry_t e\n \treturn false;\n }\n \n-static inline bool swap_entry_synchronous(swp_entry_t entry)\n+static inline bool swap_entry_synchronous(struct swap_info_struct *si, swp_entry_t entry)\n {\n \treturn false;\n }\ndiff --git a/mm/swap_state.c b/mm/swap_state.c\nindex 23137714d7cb..12fe86218557 100644\n--- a/mm/swap_state.c\n+++ b/mm/swap_state.c\n@@ -829,7 +829,7 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,\n \tblk_start_plug(&plug);\n \tfor (offset = start_offset; offset <= end_offset ; offset++) {\n \t\tra_entry = swp_entry(swp_type(entry), offset);\n-\t\tif (swap_entry_synchronous(ra_entry)) {\n+\t\tif (swap_entry_synchronous(si, ra_entry)) {\n \t\t\thas_sync = true;\n \t\t\tcontinue;\n \t\t}\n@@ -844,13 +844,13 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,\n \tblk_finish_plug(&plug);\n \tswap_read_unplug(splug);\n \n-\tif (!has_sync || swap_entry_synchronous(entry))\n+\tif (!has_sync || swap_entry_synchronous(si, entry))\n \t\tgoto drain;\n \n \t/* Overlap the in flight IOs with the synchronous neighbours reads */\n \tfor (offset = start_offset; offset <= end_offset; offset++) {\n \t\tra_entry = swp_entry(swp_type(entry), offset);\n-\t\tif (!swap_entry_synchronous(ra_entry))\n+\t\tif (!swap_entry_synchronous(si, ra_entry))\n \t\t\tcontinue;\n \n \t\tfolio = swap_cache_read_folio(ra_entry, gfp_mask, mpol, ilx,\n@@ -968,7 +968,7 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,\n \t\t\t\tcontinue;\n \t\t}\n \n-\t\tif (swap_entry_synchronous(entry)) {\n+\t\tif (swap_entry_synchronous(si, entry)) {\n \t\t\tsync_entries[nr_sync] = entry;\n \t\t\tsync_ilx[nr_sync] = ilx;\n \t\t\tnr_sync++;\n@@ -990,7 +990,7 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,\n \tblk_finish_plug(&plug);\n \tswap_read_unplug(splug);\n \n-\tif (!nr_sync || swap_entry_synchronous(targ_entry))\n+\tif (!nr_sync || swap_entry_synchronous(NULL, targ_entry))\n \t\tgoto drain;\n \n \t/* Overlap the in flight IOs with the synchronous neighbours reads */\ndiff --git a/mm/swapfile.c b/mm/swapfile.c\nindex ee2bbfdfc988..e8f88156b767 100644\n--- a/mm/swapfile.c\n+++ b/mm/swapfile.c\n@@ -1985,11 +1985,13 @@ bool swap_entry_swapped(struct swap_info_struct *si, swp_entry_t entry)\n \n /**\n  * swap_entry_synchronous - Check if @entry is served by a synchronous source.\n+ * @si: the swap device of @entry, or NULL if it is not needed/held.\n  * @entry: the swap entry.\n  */\n-bool swap_entry_synchronous(swp_entry_t entry)\n+bool swap_entry_synchronous(struct swap_info_struct *si, swp_entry_t entry)\n {\n-\treturn zswap_is_present(entry, 1);\n+\treturn zswap_is_present(entry, 1) ||\n+\t       (si && data_race(si->flags & SWP_SYNCHRONOUS_IO));\n }\n \n /*\n-- \n2.53.0-Meta\n\n\n",
+          "reply_to": "",
+          "message_date": "2026-07-22",
+          "message_id": "",
+          "email": "alex@ghiti.fr",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series aims to optimize swap readahead for zswap by splitting the window walk into two passes and reordering it around the distinction between synchronous and asynchronous device reads. The first pass overlaps the synchronous work with disk reads, while the second pass is skipped when the target needs no I/O. This approach helps mixed workloads (zswap + disk) and keeps synchronous-target page-fault latency low."
+    }
+  }
+}

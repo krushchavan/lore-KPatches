@@ -1,0 +1,82 @@
+{
+  "thread_id": "CAJnrk1a_cc55HcpRAi+H-mqOn7XUt_BxKJTre=Mw=xaE-5A5Rg@mail.gmail.com",
+  "subject": "[PATCH 2/3] iomap: decouple simple direct I/O reads from iomap_dio_rw",
+  "url": "https://lore.kernel.org/all/CAJnrk1a_cc55HcpRAi+H-mqOn7XUt_BxKJTre=Mw=xaE-5A5Rg@mail.gmail.com/",
+  "dates": {
+    "2026-07-23": {
+      "report_file": "2026-07-22_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [
+        {
+          "author": "changfengnan",
+          "summary": "Reviewer changfengnan noted that the inode_dio_end() call in the synchronization scenario is missing a goto label to properly handle errors, and suggested adding a goto out_dio_end label before calling inode_dio_end().",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes, there is an issue with the handling of the inode_dio_end event in the\nsynchronization scenario.\nHow about this ?\n\ndiff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c\nindex 3bdfbd0efa076..f6c8091a65ac9 100644\n--- a/fs/iomap/direct-io.c\n+++ b/fs/iomap/direct-io.c\n@@ -994,18 +994,22 @@ ssize_t __iomap_dio_simple(struct kiocb *iocb, struct iov_iter *iter,\n \n         if (iomi->iomap.type != IOMAP_MAPPED ||\n             iomi->iomap.offset + iomi->iomap.length < iomi->pos + iomi->len ||\n-            (iomi->iomap.flags & IOMAP_F_INTEGRITY))\n-                return -ENOTBLK;\n+            (iomi->iomap.flags & IOMAP_F_INTEGRITY)) {\n+                ret = -ENOTBLK;\n+                goto out_dio_end;\n+        }\n \n         alignment = iomap_dio_alignment(iomi->inode, iomi->iomap.bdev, 0);\n-        if ((iomi->pos | iomi->len) & (alignment - 1))\n-                return -EINVAL;\n+        if ((iomi->pos | iomi->len) & (alignment - 1)) {\n+                ret = -EINVAL;\n+                goto out_dio_end;\n+        }\n \n         if (unlikely(!iomi->inode->i_sb->s_dio_done_wq &&\n                         !is_sync_kiocb(iocb))) {\n                 ret = sb_init_dio_done_wq(iomi->inode->i_sb);\n                 if (ret < 0)\n-                        return ret;\n+                        goto out_dio_end;\n         }\n \n         trace_iomap_dio_rw_begin(iocb, iter, 0, 0);\n@@ -1013,8 +1017,10 @@ ssize_t __iomap_dio_simple(struct kiocb *iocb, struct iov_iter *iter,\n         bio = bio_alloc_bioset(iomi->iomap.bdev,\n                                bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n                                REQ_OP_READ, gfp, &iomap_dio_simple_pool);\n-        if (!bio)\n-                return -EAGAIN;\n+        if (!bio) {\n+                ret = -EAGAIN;\n+                goto out_dio_end;\n+        }\n         sr = container_of(bio, struct iomap_dio_simple, bio);\n         sr->iocb = iocb;\n         sr->dio_flags = 0;\n@@ -1060,6 +1066,8 @@ ssize_t __iomap_dio_simple(struct kiocb *iocb, struct iov_iter *iter,\n         bio_release_pages(bio, false);\n out_bio_put:\n         bio_put(bio);\n+out_dio_end:\n+        inode_dio_end(iomi->inode);\n         return ret;\n }\n EXPORT_SYMBOL_GPL(__iomap_dio_simple);\ndiff --git a/include/linux/iomap.h b/include/linux/iomap.h\nindex 810dc4b8dc94d..3cdf475059048 100644\n--- a/include/linux/iomap.h\n+++ b/include/linux/iomap.h\n@@ -732,11 +732,11 @@ static __always_inline ssize_t iomap_dio_read_simple(struct kiocb *iocb,\n         inode_dio_begin(iomi.inode);\n         ret = begin(iomi.inode, iomi.pos, iomi.len, iomi.flags, &iomi.iomap,\n                         &iomi.srcmap);\n-        if (!ret)\n-                ret = __iomap_dio_simple(iocb, iter, &iomi);\n-        if (ret <= 0 && ret != -EIOCBQUEUED)\n+        if (ret) {\n                 inode_dio_end(iomi.inode);\n-        return ret;\n+                return ret;\n+        }\n+        return __iomap_dio_simple(iocb, iter, &iomi);\n }\n \n #ifdef CONFIG_SWAP",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-07-23",
+          "message_id": "d9210bcdf73fbe1ac8b6ec132865609a3ed68688.fb281486.dc82.4049.92e1.5b912f7e663c@bytedance.com",
+          "email": "changfengnan@bytedance.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer noted that the new function __iomap_dio_simple() is not strictly limited to reads and suggested making its name more consistent by adding _read to it, similar to other functions in the implementation.\n\nReviewer noted that the patch was inadvertently sent to a limited audience instead of the intended recipients, causing confusion about its visibility.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "suggested improvement",
+            "consistent naming",
+            "confusion",
+            "limited audience"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yeah.  I wanted the read out of the guts of the implementation, as\nmost of the code is not strictly limited to reads.  But with the public\nAPI needing it, we might as well be consistent in the function naming.\n\n---\n\nYes.  Sashiko also reported that yesterday and I replied with a patch,\nbut I now noticed the report and thus my reply only went to me,\na sashiko-review list and Ted, but not everone else or the lists.\n\nWTF?",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-07-23",
+          "message_id": "20260723045347.GA6641@lst.de",
+          "email": "hch@lst.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Christoph Hellwig",
+          "summary": "Reviewer noted that the synchronous error handling in inode_dio_end() needs to be done by __iomap_dio_simple(), as it properly accounts for the synchronous case and calls iomap_dio_simple_complete() which then calls inode_dio_end() even on errors.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes, minus the label naming that is exactly what I came up with\nyesterday and it has survived testing over night.  Looks like xfstests\ncurrently never triggers the sychronous error return path, I'll see\nif I can increase coverage for that.",
+          "reply_to": "changfengnan",
+          "message_date": "2026-07-23",
+          "message_id": "20260723045517.GB6641@lst.de",
+          "email": "hch@lst.de",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch decouples simple direct I/O reads from the iomap_dio_rw function, making it cleaner and more modular. It introduces a new function __iomap_dio_simple() to handle these reads, which properly accounts for synchronous cases by calling inode_dio_end() even on errors."
+    },
+    "2026-07-22": {
+      "report_file": "2026-07-22_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch decouples simple direct I/O reads from the iomap_dio_rw function, making it cleaner and more modular. It introduces a new function __iomap_dio_simple() to handle these reads, which properly accounts for synchronous cases by calling inode_dio_end() even on errors."
+    }
+  }
+}
