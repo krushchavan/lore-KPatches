@@ -2,7 +2,7 @@
   "date": "2026-07-22",
   "report_file": "2026-07-22_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-07-23 06:07 UTC",
+  "last_updated": "2026-07-23 06:09 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -611,6 +611,107 @@
       ],
       "patches_reviewed": [],
       "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Boris Burkov",
+      "primary_email": "boris@bur.io",
+      "patches_submitted": [],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH 1/4] btrfs: zoned: flush active metadata block group at btree_writepages() start",
+          "message_id": "20260722190138.GA107842@zen.localdomain",
+          "url": "https://lore.kernel.org/all/20260722190138.GA107842@zen.localdomain/",
+          "date": "2026-07-22T19:01:49Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH 1/4] btrfs: zoned: flush active metadata block group at btree_writepages() start",
+          "message_id": "20260722170835.GB26033@zen.localdomain",
+          "url": "https://lore.kernel.org/all/20260722170835.GB26033@zen.localdomain/",
+          "date": "2026-07-22T17:08:46Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "Patch aims to flush active metadata block group at btree_writepages() start, but reviewer questions its necessity and suggests simplification.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Boris Burkov",
+              "summary": "Raised concerns about code duplication between btree_writepages() and flush_active_meta_bg(), suggested a more generic 'eb ordering' concept for zoned writeback, and questioned the necessity of this patch.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "CONTENTIOUS"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Wed, Jul 22, 2026 at 10:08:35AM -0700, Boris Burkov wrote:\n> On Wed, Jul 22, 2026 at 01:30:13PM +0200, Johannes Thumshirn wrote:\n> > On a zoned filesystem btree_writepages() writes metadata in ascending\n> \n> wording nit: isn't this true on non-zoned too? Maybe something like:\n> btree_writepages() writes metadata in ascending logical order. On a\n> zoned filsystem, which keeps a single .... <something terrible happens>\n> \n> > logical address order and keeps a single active metadata/system block group,\n> > pivoting it via btrfs_check_meta_write_pointer() -> check_bg_is_active() as\n> > writeback moves between block groups.\n> > \n> > If the active block group is at a higher address than another block group\n> > that also has dirty metadata, the walk reaches the lower one first and the\n> > pivot must finish the active block group. It cannot finish one that still has\n> > unsent IO, and refuses to wait for it during WB_SYNC_ALL commit writeback, so\n> \n> Can you add some more detail on why it refuses? Or why the pivot can't\n> be the one to do these submissions? I think that would help fully\n> motivate this change.\n> \n> > btrfs_check_meta_write_pointer() returns -EAGAIN and the transaction is\n> > aborted, forcing the filesystem read-only. This happens intermittently under\n> > metadata-heavy relocation (e.g. fstests btrfs/187).\n> > \n> > Flush the active metadata and system block groups at the start of\n> > btree_writepages(), under the fs_info->zoned_meta_io_lock it already holds, so\n> > they have no unsent IO and the later pivot can finish them.\n> > \n> > Fixes: 13bb483d32ab (\"btrfs: zoned: activate metadata block group on write time\")\n> > Assisted-by: LLM (debugging, commit message)\n> > Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>\n> > ---\n> >  fs/btrfs/extent_io.c | 62 ++++++++++++++++++++++++++++++++++++++++++++\n> >  1 file changed, 62 insertions(+)\n> > \n> > diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c\n> > index 97bd18d515af..bac3edabe7c9 100644\n> > --- a/fs/btrfs/extent_io.c\n> > +++ b/fs/btrfs/extent_io.c\n> > @@ -2383,6 +2383,52 @@ void btrfs_btree_wait_writeback_range(struct btrfs_fs_info *fs_info, u64 start,\n> >  \t}\n> >  }\n> >  \n> > +/* Write out the dirty metadata extent buffers of a single block group. */\n> \n> This comment is quite generic, and not zoned specific, but the function\n> name is much more zoned focused (and we assert zoned)\n> \n> I am also not a huge fan of this code mostly duplicating the loop in\n> btree_writepages while just leaving that spot open coded. Is that an\n> intentional decision because of important distinctions between the two?\n> Is there a variant we could lift to \"write a range\" and make\n> flush_active_meta_bg() and btree_writepages share it? (like the while\n> loop basically? or maybe the per-eb bit?)\n> \n> note the missing call to btrfs_schedule_zone_finish_bg() I noted inline\n> as a concrete reason it's helpful to not duplicate.\n> \n> > +static void flush_active_meta_bg(struct address_space *mapping,\n> > +\t\t\t\t struct writeback_control *wbc,\n> > +\t\t\t\t struct btrfs_eb_write_context *ctx,\n> > +\t\t\t\t struct btrfs_block_group *bg)\n> > +{\n> > +\tstruct btrfs_fs_info *fs_info = inode_to_fs_info(mapping->host);\n> > +\tunsigned long index = bg->start >> fs_info->nodesize_bits;\n> > +\tunsigned long end = (btrfs_block_group_end(bg) - 1) >> fs_info->nodesize_bits;\n> > +\tstruct eb_batch batch;\n> > +\tunsigned int nr_ebs;\n> > +\n> > +\tASSERT(btrfs_is_zoned(fs_info));\n> > +\tlockdep_assert_held(&fs_info->zoned_meta_io_lock);\n> > +\n> > +\teb_batch_init(&batch);\n> > +\twhile (index <= end &&\n> > +\t       (nr_ebs = buffer_tree_get_ebs_tag(fs_info, &index, end,\n> > +\t\t\t\t\t\t PAGECACHE_TAG_DIRTY, &batch))) {\n> > +\t\tstruct extent_buffer *eb;\n> > +\n> > +\t\twhile ((eb = eb_batch_next(&batch)) != NULL) {\n> > +\t\t\tctx->eb = eb;\n> > +\n> > +\t\t\t/*\n> > +\t\t\t * Best effort: if the eb is not writable at the write\n> > +\t\t\t * pointer (e.g. a hole), stop flushing this bg and let\n> > +\t\t\t * the main walk deal with it.\n> > +\t\t\t */\n> > +\t\t\tif (btrfs_check_meta_write_pointer(eb->fs_info, ctx)) {\n> > +\t\t\t\teb_batch_release(&batch);\n> > +\t\t\t\treturn;\n> > +\t\t\t}\n> > +\n> > +\t\t\tif (!lock_extent_buffer_for_io(eb, wbc))\n> > +\t\t\t\tcontinue;\n> > +\n> > +\t\t\tif (ctx->zoned_bg)\n> \n> the btree_writepages code also calls btrfs_schedule_zone_finish_bg()\n> here, is that intentionally omitted?\n> \n> > +\t\t\t\tctx->zoned_bg->meta_write_pointer += eb->len;\n> > +\t\t\twrite_one_eb(eb, wbc);\n> > +\t\t}\n> > +\t\teb_batch_release(&batch);\n> > +\t\tcond_resched();\n> > +\t}\n> > +}\n> > +\n> >  int btree_writepages(struct address_space *mapping, struct writeback_control *wbc)\n> >  {\n> >  \tstruct btrfs_eb_write_context ctx = { .wbc = wbc };\n> > @@ -2418,6 +2464,22 @@ int btree_writepages(struct address_space *mapping, struct writeback_control *wb\n> >  \telse\n> >  \t\ttag = PAGECACHE_TAG_DIRTY;\n> >  \tbtrfs_zoned_meta_io_lock(fs_info);\n> > +\n> > +\t/*\n> > +\t * On a zoned filesystem, flush the currently active metadata/system\n> > +\t * block group(s) first, under this same lock, so the ascending-address\n> > +\t * walk below can pivot the active block group instead of aborting the\n> > +\t * commit with -EAGAIN.\n> > +\t */\n> > +\tif (btrfs_is_zoned(fs_info) && wbc->sync_mode == WB_SYNC_ALL &&\n> > +\t    !wbc->for_sync) {\n> > +\t\tif (fs_info->active_meta_bg)\n> > +\t\t\tflush_active_meta_bg(mapping, wbc, &ctx,\n> > +\t\t\t\t\t     fs_info->active_meta_bg);\n> > +\t\tif (fs_info->active_system_bg)\n> > +\t\t\tflush_active_meta_bg(mapping, wbc, &ctx,\n> > +\t\t\t\t\t     fs_info->active_system_bg);\n> > +\t}\n> \n> I think this placement makes sense, but I also wouldn't mind just having\n> a more generic \"eb ordering\" concept that zoned could use to plug the\n> active ebs to the front of the list then fallback to the normal order,\n> or something. Not a deal breaker for me, just food for thought.\n> \n\nFurthermore, I feel like this is actually quite redundant with the whole\nEBUSY pivot logic.\n\nSo for random reclaim writeback, we walk the ebs in index order and skip\nany not in the active bg if the active bg has dirty ebs. Then we reach\nthe active bg and flush it, submitting everything. Subsequent tries to\nwriteback the non-active will now wait on that submitted IO and\nultimately win and get to become active, and do more submission.\n\nBut we could save the bother and make things more direct and simple if\nwe just had btree_writepages() always write out the active bg first then\nthe rest. I don't know if we could fully delete the EBUSY, though, maybe\nthere is some racy case where it would still happen a bit, even if\nmostly it didn't?\n\n> I think fewer \"tricks\" for zoned writeback and more \"it falls out\n> correctly from a generic form\" would make it easier to maintain in the\n> long run. Obviously there are real, important differences so this kind\n> of thing is never free...\n> \n> Thanks,\n> Boris\n> \n> >  retry:\n> >  \tif (wbc->sync_mode == WB_SYNC_ALL)\n> >  \t\tbuffer_tree_tag_for_writeback(fs_info, index, end);\n> > -- \n> > 2.54.0\n> > \n\n",
+              "reply_to": "",
+              "message_date": "2026-07-22",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "boris@bur.io"
+            },
+            {
+              "author": "Boris Burkov",
+              "summary": "Pointed out that the patch is redundant with EBUSY pivot logic, suggested simplifying btree_writepages() to write out active bg first and then the rest.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "CONTENTIOUS"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Wed, Jul 22, 2026 at 10:08:35AM -0700, Boris Burkov wrote:\n> On Wed, Jul 22, 2026 at 01:30:13PM +0200, Johannes Thumshirn wrote:\n> > On a zoned filesystem btree_writepages() writes metadata in ascending\n> \n> wording nit: isn't this true on non-zoned too? Maybe something like:\n> btree_writepages() writes metadata in ascending logical order. On a\n> zoned filsystem, which keeps a single .... <something terrible happens>\n> \n> > logical address order and keeps a single active metadata/system block group,\n> > pivoting it via btrfs_check_meta_write_pointer() -> check_bg_is_active() as\n> > writeback moves between block groups.\n> > \n> > If the active block group is at a higher address than another block group\n> > that also has dirty metadata, the walk reaches the lower one first and the\n> > pivot must finish the active block group. It cannot finish one that still has\n> > unsent IO, and refuses to wait for it during WB_SYNC_ALL commit writeback, so\n> \n> Can you add some more detail on why it refuses? Or why the pivot can't\n> be the one to do these submissions? I think that would help fully\n> motivate this change.\n> \n> > btrfs_check_meta_write_pointer() returns -EAGAIN and the transaction is\n> > aborted, forcing the filesystem read-only. This happens intermittently under\n> > metadata-heavy relocation (e.g. fstests btrfs/187).\n> > \n> > Flush the active metadata and system block groups at the start of\n> > btree_writepages(), under the fs_info->zoned_meta_io_lock it already holds, so\n> > they have no unsent IO and the later pivot can finish them.\n> > \n> > Fixes: 13bb483d32ab (\"btrfs: zoned: activate metadata block group on write time\")\n> > Assisted-by: LLM (debugging, commit message)\n> > Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>\n> > ---\n> >  fs/btrfs/extent_io.c | 62 ++++++++++++++++++++++++++++++++++++++++++++\n> >  1 file changed, 62 insertions(+)\n> > \n> > diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c\n> > index 97bd18d515af..bac3edabe7c9 100644\n> > --- a/fs/btrfs/extent_io.c\n> > +++ b/fs/btrfs/extent_io.c\n> > @@ -2383,6 +2383,52 @@ void btrfs_btree_wait_writeback_range(struct btrfs_fs_info *fs_info, u64 start,\n> >  \t}\n> >  }\n> >  \n> > +/* Write out the dirty metadata extent buffers of a single block group. */\n> \n> This comment is quite generic, and not zoned specific, but the function\n> name is much more zoned focused (and we assert zoned)\n> \n> I am also not a huge fan of this code mostly duplicating the loop in\n> btree_writepages while just leaving that spot open coded. Is that an\n> intentional decision because of important distinctions between the two?\n> Is there a variant we could lift to \"write a range\" and make\n> flush_active_meta_bg() and btree_writepages share it? (like the while\n> loop basically? or maybe the per-eb bit?)\n> \n> note the missing call to btrfs_schedule_zone_finish_bg() I noted inline\n> as a concrete reason it's helpful to not duplicate.\n> \n> > +static void flush_active_meta_bg(struct address_space *mapping,\n> > +\t\t\t\t struct writeback_control *wbc,\n> > +\t\t\t\t struct btrfs_eb_write_context *ctx,\n> > +\t\t\t\t struct btrfs_block_group *bg)\n> > +{\n> > +\tstruct btrfs_fs_info *fs_info = inode_to_fs_info(mapping->host);\n> > +\tunsigned long index = bg->start >> fs_info->nodesize_bits;\n> > +\tunsigned long end = (btrfs_block_group_end(bg) - 1) >> fs_info->nodesize_bits;\n> > +\tstruct eb_batch batch;\n> > +\tunsigned int nr_ebs;\n> > +\n> > +\tASSERT(btrfs_is_zoned(fs_info));\n> > +\tlockdep_assert_held(&fs_info->zoned_meta_io_lock);\n> > +\n> > +\teb_batch_init(&batch);\n> > +\twhile (index <= end &&\n> > +\t       (nr_ebs = buffer_tree_get_ebs_tag(fs_info, &index, end,\n> > +\t\t\t\t\t\t PAGECACHE_TAG_DIRTY, &batch))) {\n> > +\t\tstruct extent_buffer *eb;\n> > +\n> > +\t\twhile ((eb = eb_batch_next(&batch)) != NULL) {\n> > +\t\t\tctx->eb = eb;\n> > +\n> > +\t\t\t/*\n> > +\t\t\t * Best effort: if the eb is not writable at the write\n> > +\t\t\t * pointer (e.g. a hole), stop flushing this bg and let\n> > +\t\t\t * the main walk deal with it.\n> > +\t\t\t */\n> > +\t\t\tif (btrfs_check_meta_write_pointer(eb->fs_info, ctx)) {\n> > +\t\t\t\teb_batch_release(&batch);\n> > +\t\t\t\treturn;\n> > +\t\t\t}\n> > +\n> > +\t\t\tif (!lock_extent_buffer_for_io(eb, wbc))\n> > +\t\t\t\tcontinue;\n> > +\n> > +\t\t\tif (ctx->zoned_bg)\n> \n> the btree_writepages code also calls btrfs_schedule_zone_finish_bg()\n> here, is that intentionally omitted?\n> \n> > +\t\t\t\tctx->zoned_bg->meta_write_pointer += eb->len;\n> > +\t\t\twrite_one_eb(eb, wbc);\n> > +\t\t}\n> > +\t\teb_batch_release(&batch);\n> > +\t\tcond_resched();\n> > +\t}\n> > +}\n> > +\n> >  int btree_writepages(struct address_space *mapping, struct writeback_control *wbc)\n> >  {\n> >  \tstruct btrfs_eb_write_context ctx = { .wbc = wbc };\n> > @@ -2418,6 +2464,22 @@ int btree_writepages(struct address_space *mapping, struct writeback_control *wb\n> >  \telse\n> >  \t\ttag = PAGECACHE_TAG_DIRTY;\n> >  \tbtrfs_zoned_meta_io_lock(fs_info);\n> > +\n> > +\t/*\n> > +\t * On a zoned filesystem, flush the currently active metadata/system\n> > +\t * block group(s) first, under this same lock, so the ascending-address\n> > +\t * walk below can pivot the active block group instead of aborting the\n> > +\t * commit with -EAGAIN.\n> > +\t */\n> > +\tif (btrfs_is_zoned(fs_info) && wbc->sync_mode == WB_SYNC_ALL &&\n> > +\t    !wbc->for_sync) {\n> > +\t\tif (fs_info->active_meta_bg)\n> > +\t\t\tflush_active_meta_bg(mapping, wbc, &ctx,\n> > +\t\t\t\t\t     fs_info->active_meta_bg);\n> > +\t\tif (fs_info->active_system_bg)\n> > +\t\t\tflush_active_meta_bg(mapping, wbc, &ctx,\n> > +\t\t\t\t\t     fs_info->active_system_bg);\n> > +\t}\n> \n> I think this placement makes sense, but I also wouldn't mind just having\n> a more generic \"eb ordering\" concept that zoned could use to plug the\n> active ebs to the front of the list then fallback to the normal order,\n> or something. Not a deal breaker for me, just food for thought.\n> \n\nFurthermore, I feel like this is actually quite redundant with the whole\nEBUSY pivot logic.\n\nSo for random reclaim writeback, we walk the ebs in index order and skip\nany not in the active bg if the active bg has dirty ebs. Then we reach\nthe active bg and flush it, submitting everything. Subsequent tries to\nwriteback the non-active will now wait on that submitted IO and\nultimately win and get to become active, and do more submission.\n\nBut we could save the bother and make things more direct and simple if\nwe just had btree_writepages() always write out the active bg first then\nthe rest. I don't know if we could fully delete the EBUSY, though, maybe\nthere is some racy case where it would still happen a bit, even if\nmostly it didn't?\n\n> I think fewer \"tricks\" for zoned writeback and more \"it falls out\n> correctly from a generic form\" would make it easier to maintain in the\n> long run. Obviously there are real, important differences so this kind\n> of thing is never free...\n> \n> Thanks,\n> Boris\n> \n> >  retry:\n> >  \tif (wbc->sync_mode == WB_SYNC_ALL)\n> >  \t\tbuffer_tree_tag_for_writeback(fs_info, index, end);\n> > -- \n> > 2.54.0\n> > \n\n",
+              "reply_to": "",
+              "message_date": "2026-07-22",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "boris@bur.io"
+            }
+          ],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        }
+      ],
+      "patches_acked": [
+        {
+          "activity_type": "patch_acked",
+          "subject": "Re: [PATCH 0/7] btrfs: some optimizations and cleanups for log syncing",
+          "message_id": "20260722151949.GA26033@zen.localdomain",
+          "url": "https://lore.kernel.org/all/20260722151949.GA26033@zen.localdomain/",
+          "date": "2026-07-22T15:20:00Z",
+          "in_reply_to": null,
+          "ack_type": "Reviewed-by",
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-btrfs@vger.kernel.org"
+        }
+      ],
       "discussions_posted": [],
       "errors": []
     }
