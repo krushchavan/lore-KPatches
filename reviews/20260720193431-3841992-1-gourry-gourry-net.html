@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v5 00/36] Private Memory NUMA Nodes</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260720193431.3841992-1-gourry@gourry.net/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-22</strong><div class="date-range-nav">Active on: <a href="#2026-07-22">2026-07-22</a> &bull; <a href="#2026-07-21">2026-07-21</a> &bull; <a href="#2026-07-20">2026-07-20</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch series proposes introducing private memory NUMA nodes to allow devices to re-use mm services while ensuring their memory is not silently used under system pressure.</div></div>
+    <div class="date-range">Submitted: <strong>2026-07-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-23</strong><div class="date-range-nav">Active on: <a href="#2026-07-23">2026-07-23</a> &bull; <a href="#2026-07-22">2026-07-22</a> &bull; <a href="#2026-07-21">2026-07-21</a> &bull; <a href="#2026-07-20">2026-07-20</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces the concept of &#x27;Private Memory Nodes&#x27;, which are isolated by default and can be opted into specific services such as page allocation and OOM killing. The goal is to flip the current dynamic where NUMA-hosted memory is accessible by default, and instead isolate it and then opt-in to specific services that the device says is safe. This allows for more secure and efficient use of accelerators, special memory devices, network devices, and other types of memory. The patch reduces complexity and introduces a dedicated zonelist for private nodes, making it easier to manage and control memory access.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-20">
 <div class="review-comment">
@@ -3106,15 +3106,323 @@ SJ
 <div class="thread-node depth-0" id="2026-07-22">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Gregory Price</span>
+<span class="review-author">Gregory Price (author)</span>
 <a class="date-chip" href="../2026-07-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-22">2026-07-22</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Initially proposed zonelist isolation to prevent implicit opt-ins, but later walked back this approach due to complexity and potential issues with mempolicy and demotion. Now suggests including any CAP_USER_NUMA node in cpuset.mems for partitioning.</div>
+<div class="review-comment-text">The author is addressing concerns about the design of Private Memory NUMA Nodes, specifically the use of a dedicated zonelist and the implications for global zonelist iteration and fallback allocations. The author explains that having multiple private nodes in each other&#x27;s zonelists by default creates unclear implicit opt-ins and suggests isolating nodes in the zonelist instead. They acknowledge that this decision was intentional, but do not commit to revising the design.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Wed, Jul 22, 2026 at 11:40:06AM -0400, Gregory Price wrote:
+<pre class="raw-body-text">On Wed, Jul 22, 2026 at 10:20:00PM +0800, Richard Cheng wrote:
+&gt; On Mon, Jul 20, 2026 at 03:33:54PM +0800, Gregory Price wrote:
+&gt; Hi Gregory,
+&gt; 
+&gt; I applied your series on mm-next and give a quick review,
+&gt; not thoroughly, still I have some questions below regarding the design.
+&gt;  
+
+Hi Richard,
+
+Thank you for the read.
+
+Just a heads up, this was based on mm-new because of some recent work
+on Brendan&#x27;s page_alloc.h cleanup, but if you managed to get it applied
+then maybe that&#x27;s made its way forward already.
+
+&gt; &gt; The goal here is to flip that dynamic, isolate by default and then
+&gt; &gt; opt-in to specific services that the device says is safe.
+&gt; &gt; 
+&gt; &gt; Isolation at the NUMA/Zonelist layer provides a powerful mechanism for
+&gt; &gt; memory hosted on accelerators - re-use of the kernel mm/ code.
+&gt; &gt; 
+&gt; &gt;  - Accelerators (GPUs) can use demotion, numactl, and reclaim.
+&gt; &gt;  - Special memory devices (Compressed RAM) with special access controls
+&gt; &gt;    (promote-on-write) can have generic services written for them.
+&gt; &gt;  - Network devices with large memory regions intended for ring buffers
+&gt; &gt;    can use the buddy and standard networking stack.
+&gt; &gt;  - Slow, disaggregated memory pools which aren&#x27;t suitable as general
+&gt; &gt;    purpose memory get cleaner interfaces (no need to re-write the buddy
+&gt; &gt;    in userland, can use migration interface, etc).
+&gt; &gt;  - Per-workload dedicated memory nodes (disaggregated VM memory)
+&gt; &gt; 
+&gt; 
+&gt; For accelerator part, take CXL Type-2 as example, it has its own protocol
+&gt; CXL.cache, CXL.mem which is the rule they need to obey during memory transaction,
+&gt; Adding more rules for them since they are NUMA node confused me, I wonder the reason ?
+&gt; 
+
+CXL protocols simply state how to do the memory transaction at a
+physical / transport level.  It does not make any statement on how the
+operating systems are to make sense of these devices or what constructs
+/ abstractions to build to actually manage the devices themselves.
+
+This series is not necessarily attached to CXL in particular, you could
+just as easily carve out memory from the general pool onto a private
+node to ensure it only gets used for a particular use.
+
+In fact, that is how I have been testing this with dax/kmem:
+https://github.com/gourryinverse/linux/commit/f279e741d9c3643597525bfab916b29b95cb635b
+
+&gt; Because NUMA node, at least for me, representing topology/locality rather than
+&gt; something with ownership or capability or rules.
+&gt; 
+
+The NUMA abstraction representing topology/locality is a construct we
+(the OS developers) have decided on historically - but there&#x27;s nothing
+that dictates we can never create new useful abstractions with it.
+
+Consider:
+    N_NORMAL_MEMORY,        /* The node has regular memory */
+    N_HIGH_MEMORY,          /* The node has regular or high memory */
+
+These have nothing to do with topology or locality, they are node states
+that only have meaning in the context of linux mm/.
+
+
+To make something clear - there is no *requirement* for any particular
+device to use this abstraction.  It simply enables a cleaner way for
+devices carrying memory to re-utilize mm/ services while ensuring their
+memory does not silently get used under system pressure (or some vagrant
+in userspace doing `numactl --interleave all`).
+
+Ignoring all the CAP bits entirely, if you just took the base series
+your driver could re-use the buddy allocator without any special logic
+AND have confidence that your driver is the only possible user of that
+memory (barring some truly obscene bug).
+
+&gt; &gt;  - isolation via a dedicated zonelist:
+&gt; &gt;      - private nodes are omitted from FALLBACK/NOFALLBACK
+&gt; &gt;      - added ZONELIST_PRIVATE(_NOFALLBACK)
+&gt; 
+&gt; I saw the reply in patch 5, so in fact there&#x27;s not only one
+&gt; dedicate zonelist, but numerous ?
+&gt; I raise the question because zonelist was supposed to be a
+&gt; global, unbypasssable thing in MM design, but now what you
+&gt; are trying to do is to seperate the whole global list into several
+&gt; parts ?
+&gt; 
+&gt; Can you explain why in current design you don&#x27;t consider to support
+&gt; something like ZONELIST_PRIVATE[n]={0, .. ,n-1} ? that&#x27;s my imagination
+&gt; of what a global zonelist should look like, no matter private or non.
+&gt; 
+
+First let me say that there&#x27;s nothing that prevents us from doing this,
+and we *could* make this the default case - but this decision was
+intentional by me.
+
+Having them all present in each-other&#x27;s zonelists by default creates a
+number of implicit opt-ins that are unclear:
+
+  - any direct zonelist iterator now iterates all zones on all private
+    nodes, even those nodes do not opt into the same services
+
+    e.g. zonelist iteration in reclaim that targets Private Node A would
+    attempt to reclaim Private Node B as well.  That would require and
+    extra explicit filter.
+
+    I ask: Why do this? Just isolate in the zonelist, and if there is
+           a desire for intersections - make it explicit, not implicit.
+
+  - fallback allocations can now occur across private nodes, even
+    if those nodes are intended for different purposes.
+
+    Obviously you can use nodemask to tighten the allocation target, but
+    I use `numactl --interleave --all` as an example of a clear case
+    where intersected nodelists may not give you the behavior you want.
+
+
+So for consistency - everything including zonelists have full isolation.
+This way all interactions with a private node must be explicit - always.
+
+
+This is actually one of the problems with ZONE_DEVICE - and you can see
+it in this patch set.  Some of the hooks in mm/ for zone_device only
+apply to PTE cases, and are absent from PMD cases - only because PMD
+mappings in ZONE_DEVICE aren&#x27;t supported.
+
+That kind of implicit behavior is quite bad.
+
+That said, future improvements could include something like:
+
+for_reclaimable_zone(ZONELIST_PRIVATE) {}
+
+where we loosen this isolation, and formalize a filter, but I would
+like to see the usecase for it first.  Loosening the isolation defeats
+the entire purpose of the series, so there should be a strong reason to
+do so.
+
+&gt; &gt; Allocation Isolation
+&gt; &gt; ====================
+&gt; &gt; page_alloc presently controls whether a node&#x27;s memory can be allocated
+&gt; &gt; on a given call by 4 things (in order of authority)
+&gt; &gt; 
+&gt; &gt;   1) ZONELIST membership
+&gt; &gt;      If a node is not in the walked zonelist, it&#x27;s unreachable.
+&gt; &gt;
+&gt; 
+&gt; So a device gets hotplugged in the system will get a dedicated zonelist here ?
+
+Yes.
+
+&gt; And make sure it obeys the device&#x27;s own protocol if it has one ?
+&gt; 
+
+I&#x27;m not sure i follow this question, can you help me understand?
+
+If by protocol you mean the CAP bits (opting into reclaim, demotion,
+etc), then yes.  If you mean something else (CXL) then I think that&#x27;s
+orthogonal and unrelated.
+
+&gt; &gt; Private nodes:
+&gt; &gt;   1) Never appear in any ZONELIST_FALLBACK
+&gt; &gt;   2) Have an empty ZONELIST_NOFALLBACK
+&gt; &gt;   3) Only appear in their own ZONELIST_PRIVATE(_NOFALLBACK)
+&gt; &gt; 
+&gt; &gt; 1 &amp; 2 mean all existing in-tree callers to page_alloc can NEVER
+&gt; &gt; accidentally allocate from a private node.
+&gt; &gt; 
+&gt; &gt; An allocation must explicitly ask via a zonelist and a nodemask.
+&gt; &gt; 
+&gt; &gt;   alloc_flags |= ALLOC_ZONELIST_PRIVATE; /* use ZONELIST_PRIVATE */
+&gt; &gt;   __alloc_pages(..., nodemask);     /* with the private node set */
+&gt; &gt; 
+&gt; 
+&gt; As I stated above, NUMA concept was quite naive at first glance for my
+&gt; limited knowledge.
+&gt; 
+&gt; This is quite alot to add for NUMA node concept, I&#x27;ll want to see
+&gt; more explanation in v6 and learn from it, thanks.
+&gt; 
+
+Sure, I can expand on it.  I think it&#x27;s not as much to add as you think
+though - it&#x27;s simply adding the concept of isolation to a NUMA node.
+
+Some more explanation below, but if you think there is something i
+should explicit spell out in v6 cover, please let me know.
+
+---
+
+I agree that NUMA as a concept was best-effort for, comically enough,
+somewhat *Uniform* memory access - instead of *Non*-Uniform memory access.
+
+The current abstraction quite nicely handles the case where all memory
+on the system is roughly of the same calibre (DDR4, DDR5, etc) and
+roughly for the same purpose (general system memory).
+
+But it is quite incapable of handling truly heterogeneous memory systems
+(precious HBM attached to the CPU, GPU&#x27;s with HBM over a coherent link,
+hardware-compressed memory expansion, network devices w/ memory, etc).
+
+If you look at the history of ZONE_DEVICE, what it fundamentally does is
+slaps an isolation mechanism on top of NUMA nodes because the NUMA
+abstraction doesn&#x27;t provide one. 
+
+The problem with that approach is now you have to reason about a node
+having both fungible and non-fungible memory.  It creates the need for
+something like migrate_device.c when a properly isolated NUMA node could
+just use migrate.c directly (with a coherent link).
+
+
+One example of what isolation on the node enables:
+
+A Private Node can hotplug memory in ZONE_NORMAL - which means it
+can be GUP pinned.  That means driver support for GPU direct storage
+is simply `alloc_pages_node() + pin()`. The driver doesn&#x27;t have to
+worry about something like SLAB accidentally using that same memory.
+
+All without having to rewrite a bunch of mm/ in a driver, and with
+having to do some kind of heroics with ZONE_DEVICE that causes even
+more special mm/ interactions.
+
+That only comes from adding an isolation primitive to a NUMA node.
+
+
+&gt; &gt; Isolating private node folios from kernel services
+&gt; &gt; ==================================================
+&gt; &gt; We implement filter points in mm/ to prevent operations on
+&gt; &gt; private node memory.  Where possible, we even re-use existing
+&gt; &gt; filter points from ZONE_DEVICE.
+&gt; &gt; 
+&gt; &gt; Most filter points are one or two lines of code:
+&gt; &gt; 
+&gt; &gt; Combining ZONE_DEVICE and N_MEMORY_PRIVATE opt-out spots:
+&gt; &gt;   -     if (folio_is_zone_device(folio))
+&gt; &gt;   +     if (unlikely(folio_is_private_managed(folio)))
+&gt; &gt; 
+&gt; &gt; Disabling a service:
+&gt; &gt;   +  if (!node_is_private(nid)) {
+&gt; &gt;   +      kswapd_run(nid);
+&gt; &gt;   +      kcompactd_run(nid);
+&gt; &gt;   +  }
+&gt; &gt; 
+&gt; &gt; Disallowing a uapi interaction:
+&gt; &gt;   +  if (node_state(nid, N_MEMORY_PRIVATE))
+&gt; &gt;   +      return -EINVAL;
+&gt; &gt; 
+&gt; 
+&gt; I&#x27;m not sure of why do we re-implement more filter and basically
+&gt; doing the same thing ? Any unavoidable scenario ?
+&gt; 
+&gt; re-using the exisintg filter would be nice if that&#x27;s possible.
+&gt; 
+
+We re-use (combine) existing filters where possible.
+
+We add new ones where ZONE_DEVICE did not implement filters due to some
+*implicit* filter already existing.
+
+Two clear examples:
+   - reclaim does not target ZONE_DEVICE
+   - ZONE_DEVICE does not support PMD
+
+Both cases result in private-node filters that otherwise would have to
+exist for ZONE_DEVICE (and if ZONE_DEVICE ever grows PMD support, those
+filters will have to be added).
+
+&gt; &gt; Bonus Configuration: HBM device memory tiering
+&gt; &gt; ==============================================
+&gt; &gt; echo 1 &gt; dax0.0/private       # make the node private
+&gt; &gt; echo 0 &gt; dax0.0/adistance     # highest tier
+&gt; &gt; echo 1 &gt; dax0.0/reclaim       # reclaim active
+&gt; &gt; echo 1 &gt; dax0.0/demotion      # may demote from the node
+&gt; &gt; echo 1 &gt; dax0.0/user_numa     # mbind()
+&gt; &gt; echo online_movable &gt; dax0.0/state
+&gt; &gt; echo 1 &gt; numa/demotion_enabled
+&gt; &gt; 
+&gt; &gt; This is an HBM device which is treated as the top-tier in the
+&gt; &gt; system but for which memory can only enter via explicit mbind().
+&gt; &gt; 
+&gt; &gt; It can be overcommitted because it can be reclaimed (demotions
+&gt; &gt; go to CPU DRAM, and reclaim can swap from it).
+&gt; &gt; 
+&gt; &gt; If the HBM is managed by an accelerator (GPU), the mmu_notifier
+&gt; &gt; allows it to know when reclaim is moving memory out to do
+&gt; &gt; device-mmu invalidation prior to migration.
+&gt; &gt; 
+&gt; &gt; Prereqs, base commit, references
+&gt; &gt; ================================
+&gt; &gt; akpm/mm-new - for Brendan Jackman&#x27;s mm/page_alloc.h work[3]
+&gt; &gt; 
+&gt; 
+&gt; Still thanks for the work, I learn alot from your work as well, thanks.
+&gt; 
+
+Of course, and thank you for reading.
+
+If nothing else I hope this series helps folks understand the page
+allocator better (it certainly has helped me).  If there is anything
+you think I can improve or better explain, I am happy to discuss.
+
+I am planning a larger publication of all my research sometime in the
+future, but I think code is more impactful and useful - so I am
+prioritizing that for now :].
+
+~Gregory
+
+---
+
+On Wed, Jul 22, 2026 at 11:40:06AM -0400, Gregory Price wrote:
 &gt; On Wed, Jul 22, 2026 at 10:20:00PM +0800, Richard Cheng wrote:
 &gt; &gt; 
 &gt; &gt; I saw the reply in patch 5, so in fact there&#x27;s not only one
@@ -3185,9 +3493,1508 @@ I think this might be the last majority complexity falling out.
 Thank you for the questions - this has helped.
 
 ~Gregory
-</pre>
+
+---
+
+On Wed, Jul 22, 2026 at 05:19:42PM -0700, SJ Park wrote:
+&gt; On Wed, 22 Jul 2026 08:16:56 -0400 Gregory Price &lt;gourry@gourry.net&gt; wrote:
+&gt; 
+&gt; &gt; &gt; &quot;by default&quot;.  Does that mean it could be reclaimable in some situations?  If
+&gt; &gt; &gt; so, could we check if it is reclaimable?
+&gt; &gt; &gt; 
+&gt; &gt; 
+&gt; &gt; See the damon changes in:
+&gt; &gt; 
+&gt; &gt; https://lore.kernel.org/linux-mm/al-pkvmgIxGu3LzM@gourry-fedora-PF4VCD3F/T/#mfb99303c85dd9d4c3f58832dc28fc55583a7217a
+&gt; 
+&gt; Summarizing what you want to say, quoting something from the patch, or at least
+&gt; calling it &quot;26th patch of this series&quot; would have made reviewing much easier.
+&gt; Cc-ing damon@ for only patches that toucing DAMON source files and the cover
+&gt; letter of the series could also be helpful.  Please consider doing some of
+&gt; these for future replies.
+&gt; 
+
+I have been very much discouraged from this kind of trimming because it
+removes the context of the series from the individual patches - making it
+even more confusing.
+
+But I understand, I will try to remember to do this for you.
+
+&gt; So, I understand later patches will make it optionally reclaimable and update
+&gt; this restriction by the 26th patch?  That sounds fair.  But, could we drop &quot;by
+&gt; default&quot; from the above comment for reducing the confusion?
+
+Yes, but you bring up a good point - I think this two-step process is
+actually poor form and that I need to redo it.
+
+Maybe this can be redone as node states (features?) such as:
+
+   N_MEMORY_RECLAIMABLE
+   N_MEMORY_DEMOTABLE
+   N_MEMORY_TIERABLE
+
+so these damon changes will forego this confusing intermediate step of:
+
+   if (folio_is_private_node(folio))
+
+and go straight to
+
+   if (node_is_reclaimable(folio_nid(folio)))
+
+In the first patch - without ever having to revisit damon again.
+
+&gt; &gt; 
+&gt; &gt; Technically there is nothing in migration core to prevent migration
+&gt; &gt; operations, it&#x27;s done on a service basis - hotunplug, reclaim/demotion,
+&gt; &gt; user numa (mbind, migrate/move_pages) etc.
+&gt; &gt; 
+&gt; &gt; Operations on private nodes/private node folioes are refused if the
+&gt; &gt; capability bit is not set.
+&gt; 
+&gt; I haven&#x27;t had a chance to read the entire series, sorry about that.  So, do you
+&gt; mean the above blocking is not really needed, or that will conditionally be
+&gt; allowed by another later patch?
+&gt; 
+
+I will reduce this all to a single patch in v6, I see where things can
+be improved now based on a few pieces of feedback.
+
+Thanks SJ!
+~Gregory</pre>
 </details>
-<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+<a href="https://lore.kernel.org/r/amDVQopyvolxfX8K@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledging concerns, explaining reasoning</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Richard Cheng</span>
+<a class="date-chip" href="../2026-07-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-22">2026-07-22</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Richard Cheng noted that the patch does not isolate private-node allocations from falling back to non-private nodes, and requested that this be addressed.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Mon, Jul 20, 2026 at 03:33:59PM +0800, Gregory Price wrote:
+&gt; N_MEMORY_PRIVATE nodes must be invisible to ordinary allocation,
+&gt; no allocations may reach one unless explicitly called for.
+&gt; 
+&gt; Make this isolation structural in the zonelists: N_MEMORY_PRIVATE
+&gt; nodes are excluded from FALLBACK and NOFALLBACK entirely, making
+&gt; them effectively invisible to all normal callers of page_alloc.
+&gt; 
+&gt; Add ZONELIST_PRIVATE, which spans (N_MEMORY | N_MEMORY_PRIVATE).
+&gt; When !CONFIG_NUMA, it aliases ZONELIST_FALLBACK and compiles out.
+&gt; 
+&gt; Add ZONELIST_PRIVATE_NOFALLBACK as the __GFP_THISNODE target for
+&gt; private node allocations.
+&gt; 
+&gt; Zonelist selection rides the allocator&#x27;s alloc_flags.  Add
+&gt; ALLOC_ZONELIST_PRIVATE and resolve it in select_zonelist(), which
+&gt; prepare_alloc_pages() applies from ac-&gt;alloc_flags; the default
+&gt; (ALLOC_DEFAULT) keeps node_zonelist()&#x27;s gfp-based selection.
+&gt; 
+&gt; Add explicit private-node alloc() functions to prevent open-coding
+&gt; (both ride ALLOC_ZONELIST_PRIVATE through the alloc_flags-carrying
+&gt; entry points):
+&gt;    - alloc_pages_node_private_noprof()
+&gt;    - folio_alloc_node_private_noprof()
+&gt; 
+&gt; alloc_contig_range adds an explicit node_is_private() guard because
+&gt; it dervices its target zones from PFNs rather than zonelists. All
+&gt; in-tree callers use N_MEMORY ranges, but the check prevents future
+&gt; callers from violating node isolation.
+&gt; 
+&gt; Important note:  By design this zonelist isolates N_MEMORY_PRIVATE
+&gt; from unintentional allocations, but does NOT isolate private-node
+&gt; allocations from falling back to non-private nodes.
+&gt; 
+&gt; Signed-off-by: Gregory Price &lt;gourry@gourry.net&gt;
+&gt; ---
+&gt;  include/linux/gfp.h    | 11 ++++++++
+&gt;  include/linux/mmzone.h | 11 +++++++-
+&gt;  mm/mm_init.c           |  2 +-
+&gt;  mm/page_alloc.c        | 64 ++++++++++++++++++++++++++++++++++++++++--
+&gt;  mm/page_alloc.h        | 26 +++++++++++++++++
+&gt;  5 files changed, 109 insertions(+), 5 deletions(-)
+&gt; 
+&gt; diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+&gt; index a327e58c313f8..f3e867de744f6 100644
+&gt; --- a/include/linux/gfp.h
+&gt; +++ b/include/linux/gfp.h
+&gt; @@ -204,6 +204,17 @@ static inline void arch_free_page(struct page *page, int order) { }
+&gt;  static inline void arch_alloc_page(struct page *page, int order) { }
+&gt;  #endif
+&gt;  
+&gt; +/* Allocate from an N_MEMORY_PRIVATE node (selects the private zonelist). */
+&gt; +struct page *alloc_pages_node_private_noprof(gfp_t gfp, unsigned int order,
+&gt; +		int nid);
+&gt; +#define alloc_pages_node_private(...)				\
+&gt; +	alloc_hooks(alloc_pages_node_private_noprof(__VA_ARGS__))
+&gt; +
+&gt; +struct folio *folio_alloc_node_private_noprof(gfp_t gfp, unsigned int order,
+&gt; +		int nid);
+&gt; +#define folio_alloc_node_private(...)				\
+&gt; +	alloc_hooks(folio_alloc_node_private_noprof(__VA_ARGS__))
+&gt; +
+&gt;  unsigned long alloc_pages_bulk_noprof(gfp_t gfp, int preferred_nid,
+&gt;  				nodemask_t *nodemask, int nr_pages,
+&gt;  				struct page **page_array);
+&gt; diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+&gt; index 9815e48c03b97..654c5111f7cec 100644
+&gt; --- a/include/linux/mmzone.h
+&gt; +++ b/include/linux/mmzone.h
+&gt; @@ -1392,13 +1392,22 @@ enum {
+&gt;  #ifdef CONFIG_NUMA
+&gt;  	/*
+&gt;  	 * The NUMA zonelists are doubled because we need zonelists that
+&gt; -	 * restrict the allocations to a single node for __GFP_THISNODE.
+&gt; +	 * restrict the allocations to a single node for __GFP_THISNODE
+&gt; +	 * and N_MEMORY_PRIVATE nodes (isolated from default lists).
+&gt;  	 */
+&gt;  	ZONELIST_NOFALLBACK,	/* zonelist without fallback (__GFP_THISNODE) */
+&gt; +	ZONELIST_PRIVATE,	/* N_MEMORY_PRIVATE access, falls back to DRAM */
+&gt; +	ZONELIST_PRIVATE_NOFALLBACK, /* N_MEMORY_PRIVATE access, __GFP_THISNODE */
+&gt;  #endif
+&gt;  	MAX_ZONELISTS
+&gt;  };
+&gt;  
+&gt; +#ifndef CONFIG_NUMA
+&gt; +/* Without NUMA only ZONELIST_FALLBACK exists so everything collapses there */
+&gt; +#define ZONELIST_PRIVATE		ZONELIST_FALLBACK
+&gt; +#define ZONELIST_PRIVATE_NOFALLBACK	ZONELIST_FALLBACK
+&gt; +#endif
+&gt; +
+&gt;  /*
+&gt;   * This struct contains information about a zone in a zonelist. It is stored
+&gt;   * here to avoid dereferences into large structures and lookups of tables
+&gt; diff --git a/mm/mm_init.c b/mm/mm_init.c
+&gt; index 711f821f7b3c7..adb50647d29ca 100644
+&gt; --- a/mm/mm_init.c
+&gt; +++ b/mm/mm_init.c
+&gt; @@ -2701,7 +2701,7 @@ void __init mm_core_init(void)
+&gt;  	init_zero_page_pfn();
+&gt;  
+&gt;  	/* Initializations relying on SMP setup */
+&gt; -	BUILD_BUG_ON(MAX_ZONELISTS &gt; 2);
+&gt; +	BUILD_BUG_ON(MAX_ZONELISTS &gt; 4);
+&gt;  	build_all_zonelists(NULL);
+&gt;  	page_alloc_init_cpuhp();
+&gt;  	alloc_tag_sec_init();
+&gt; diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+&gt; index aa35bbe5d4c3e..78755a55b1540 100644
+&gt; --- a/mm/page_alloc.c
+&gt; +++ b/mm/page_alloc.c
+&gt; @@ -5040,7 +5040,7 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
+&gt;  		unsigned int *alloc_flags)
+&gt;  {
+&gt;  	ac-&gt;highest_zoneidx = gfp_zone(gfp_mask);
+&gt; -	ac-&gt;zonelist = node_zonelist(preferred_nid, gfp_mask);
+&gt; +	ac-&gt;zonelist = select_zonelist(preferred_nid, gfp_mask, ac-&gt;alloc_flags);
+&gt;  	ac-&gt;nodemask = nodemask;
+&gt;  	ac-&gt;migratetype = gfp_migratetype(gfp_mask);
+&gt;  
+&gt; @@ -5346,7 +5346,7 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
+&gt;  	unsigned int fastpath_alloc_flags = alloc_flags;
+&gt;  
+&gt;  	/* Other flags could be supported later if needed. */
+&gt; -	if (WARN_ON(alloc_flags &amp; ~(ALLOC_NOLOCK | ALLOC_NO_CODETAG)))
+&gt; +	if (WARN_ON(alloc_flags &amp; ~(ALLOC_NOLOCK | ALLOC_NO_CODETAG | ALLOC_ZONELIST_PRIVATE)))
+&gt;  		return NULL;
+&gt;  
+&gt;  	if (!alloc_order_allowed(gfp, order, alloc_flags))
+&gt; @@ -5457,6 +5457,22 @@ struct folio *__folio_alloc_node_noprof(gfp_t gfp, unsigned int order, int nid)
+&gt;  }
+&gt;  EXPORT_SYMBOL(__folio_alloc_node_noprof);
+&gt;  
+&gt; +struct page *alloc_pages_node_private_noprof(gfp_t gfp, unsigned int order,
+&gt; +		int nid)
+&gt; +{
+&gt; +	return __alloc_pages_noprof(gfp, order, nid, NULL,
+&gt; +				   ALLOC_ZONELIST_PRIVATE);
+&gt; +}
+&gt; +EXPORT_SYMBOL_GPL(alloc_pages_node_private_noprof);
+&gt; +
+&gt; +struct folio *folio_alloc_node_private_noprof(gfp_t gfp, unsigned int order,
+&gt; +		int nid)
+&gt; +{
+&gt; +	return __folio_alloc_noprof(gfp, order, nid, NULL,
+&gt; +				   ALLOC_ZONELIST_PRIVATE);
+&gt; +}
+&gt; +EXPORT_SYMBOL_GPL(folio_alloc_node_private_noprof);
+&gt; +
+&gt;  /*
+&gt;   * Common helper functions. Never use with __GFP_HIGHMEM because the returned
+&gt;   * address cannot represent highmem pages. Use alloc_pages and then kmap if
+&gt; @@ -5854,9 +5870,21 @@ static void build_zonelists_in_node_order(pg_data_t *pgdat, int *node_order,
+&gt;  static void build_thisnode_zonelists(pg_data_t *pgdat)
+&gt;  {
+&gt;  	struct zoneref *zonerefs;
+&gt; -	int nr_zones;
+&gt; +	int nr_zones = 0;
+&gt;  
+&gt; +	/*
+&gt; +	 * NOFALLBACK: the node&#x27;s own zones. EMPTY for private nodes so a
+&gt; +	 * stray __GFP_THISNODE allocation can&#x27;t violate isolation.
+&gt; +	 */
+&gt;  	zonerefs = pgdat-&gt;node_zonelists[ZONELIST_NOFALLBACK]._zonerefs;
+&gt; +	if (!node_is_private(pgdat-&gt;node_id))
+&gt; +		nr_zones = build_zonerefs_node(pgdat, zonerefs);
+&gt; +	zonerefs += nr_zones;
+&gt; +	zonerefs-&gt;zone = NULL;
+&gt; +	zonerefs-&gt;zone_idx = 0;
+&gt; +
+&gt; +	/* PRIVATE_NOFALLBACK: the node&#x27;s own zones, private nodes included. */
+&gt; +	zonerefs = pgdat-&gt;node_zonelists[ZONELIST_PRIVATE_NOFALLBACK]._zonerefs;
+&gt;  	nr_zones = build_zonerefs_node(pgdat, zonerefs);
+&gt;  	zonerefs += nr_zones;
+&gt;  	zonerefs-&gt;zone = NULL;
+&gt; @@ -5899,11 +5927,28 @@ static void build_node_zonelist(pg_data_t *pgdat, const nodemask_t *candidates,
+&gt;  static void build_zonelists(pg_data_t *pgdat)
+&gt;  {
+&gt;  	static int node_order[MAX_NUMNODES];
+&gt; +	nodemask_t tier_nodes;
+&gt;  	int local_node = pgdat-&gt;node_id;
+&gt;  	int node, nr_nodes = 0;
+&gt;  
+&gt;  	memset(node_order, 0, sizeof(node_order));
+&gt;  
+&gt; +	/*
+&gt; +	 * Zonelists: FALLBACK, NOFALLBACK, PRIVATE
+&gt; +	 *
+&gt; +	 * FALLBACK:   Allocation order for all nodes.  Private nodes have lists
+&gt; +	 *             but never appear as an entry in any list. Allocations
+&gt; +	 *             targeting a private node w/ FALLBACK land on N_MEMORY.
+&gt; +	 *
+&gt; +	 * NOFALLBACK: A list for each node containing only itself.
+&gt; +	 *             Allocations targeting a private node w/ NOFALLBACK
+&gt; +	 *             will always fail (their NOFALLBACK is empty)
+&gt; +	 *
+&gt; +	 * PRIVATE:    (N_MEMORY | N_MEMORY_PRIVATE) - allows access to
+&gt; +	 *             private nodes, and falls back to normal memory unless
+&gt; +	 *             __GFP_THISNODE otherwise constrains it.
+&gt; +	 */
+&gt; +
+&gt;  	build_node_zonelist(pgdat, &amp;node_states[N_MEMORY], ZONELIST_FALLBACK,
+&gt;  			    true, node_order, &amp;nr_nodes);
+&gt;  	build_thisnode_zonelists(pgdat);
+&gt; @@ -5912,6 +5957,10 @@ static void build_zonelists(pg_data_t *pgdat)
+&gt;  	for (node = 0; node &lt; nr_nodes; node++)
+&gt;  		pr_cont(&quot;%d &quot;, node_order[node]);
+&gt;  	pr_cont(&quot;\n&quot;);
+&gt; +
+&gt; +	nodes_or(tier_nodes, node_states[N_MEMORY], node_states[N_MEMORY_PRIVATE]);
+
+Hi Gregory,
+
+A question about this part, if my understanding is right,
+ZONELIST_PRIVATE contains all private nodes, should we use some explicit target
+nodemask here to make sure only the targeting owner&#x27;s private node can be touched?
+
+Otherwise it might fall back into a different owner&#x27;s private node.
+
+--Richard
+
+&gt; +	build_node_zonelist(pgdat, &amp;tier_nodes, ZONELIST_PRIVATE, false,
+&gt; +			    node_order, &amp;nr_nodes);
+&gt;  }
+&gt;  
+&gt;  #ifdef CONFIG_HAVE_MEMORYLESS_NODES
+&gt; @@ -7282,6 +7331,15 @@ int alloc_contig_frozen_range_noprof(unsigned long start, unsigned long end,
+&gt;  	if (__alloc_contig_verify_gfp_mask(gfp_mask, (gfp_t *)&amp;cc.gfp_mask))
+&gt;  		return -EINVAL;
+&gt;  
+&gt; +	/*
+&gt; +	 * Private nodes are kept unreachable via the zonelists, but
+&gt; +	 * alloc_contig works directly on a zone derived from the caller&#x27;s
+&gt; +	 * pfn range, bypassing that.  Reject this operation explicitly
+&gt; +	 * rather than silently carving memory out of an isolated node.
+&gt; +	 */
+&gt; +	if (unlikely(node_is_private(zone_to_nid(cc.zone))))
+&gt; +		return -EBUSY;
+&gt; +
+&gt;  	/*
+&gt;  	 * What we do here is we mark all pageblocks in range as
+&gt;  	 * MIGRATE_ISOLATE.  Because pageblock and max order pages may
+&gt; diff --git a/mm/page_alloc.h b/mm/page_alloc.h
+&gt; index 23fc79ce97b60..741448d83ce77 100644
+&gt; --- a/mm/page_alloc.h
+&gt; +++ b/mm/page_alloc.h
+&gt; @@ -57,6 +57,9 @@
+&gt;   */
+&gt;  #define ALLOC_NO_CODETAG       0x1000
+&gt;  
+&gt; +/* Select the N_MEMORY_PRIVATE zonelist family (see select_zonelist()). */
+&gt; +#define ALLOC_ZONELIST_PRIVATE 0x2000
+&gt; +
+&gt;  /* Flags that allow allocations below the min watermark. */
+&gt;  #define ALLOC_RESERVES (ALLOC_NON_BLOCK|ALLOC_MIN_RESERVE|ALLOC_HIGHATOMIC|ALLOC_OOM)
+&gt;  
+&gt; @@ -95,6 +98,29 @@ struct alloc_context {
+&gt;  	unsigned int alloc_flags;
+&gt;  };
+&gt;  
+&gt; +#ifdef CONFIG_NUMA
+&gt; +static_assert(ZONELIST_PRIVATE + 1 == ZONELIST_PRIVATE_NOFALLBACK);
+&gt; +#endif
+&gt; +
+&gt; +/*
+&gt; + * select_zonelist - resolve the zonelist for an allocation
+&gt; + *
+&gt; + * The default matches node_zonelist(); ALLOC_ZONELIST_PRIVATE selects the
+&gt; + * private-node family so an allocation may reach an N_MEMORY_PRIVATE node.
+&gt; + */
+&gt; +static inline struct zonelist *
+&gt; +select_zonelist(int nid, gfp_t gfp, unsigned int alloc_flags)
+&gt; +{
+&gt; +#ifdef CONFIG_NUMA
+&gt; +	if (alloc_flags &amp; ALLOC_ZONELIST_PRIVATE) {
+&gt; +		int idx = ZONELIST_PRIVATE + !!(gfp &amp; __GFP_THISNODE);
+&gt; +
+&gt; +		return &amp;NODE_DATA(nid)-&gt;node_zonelists[idx];
+&gt; +	}
+&gt; +#endif
+&gt; +	return node_zonelist(nid, gfp);
+&gt; +}
+&gt; +
+&gt;  /*
+&gt;   * This function returns the order of a free page in the buddy system. In
+&gt;   * general, page_zone(page)-&gt;lock must be held by the caller to prevent the
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+&gt;
+
+---
+
+On Mon, Jul 20, 2026 at 03:34:26PM +0800, Gregory Price wrote:
+&gt; Collapse can move base pages across nodes.  The khugepaged daemon does
+&gt; this transparently, while MADV_COLLAPSE is a userland construct.
+&gt; 
+&gt; Isolate private nodes from khugepaged exactly like ZONE_DEVICE.
+&gt; Never collapse private node folios silently (the owner may not
+&gt; support migration).
+&gt; 
+&gt; MADV_COLLAPSE is user-initiated, so it is allowed on a private node
+&gt; opted into CAP_USER_NUMA, consistent with other userspace interfaces.
+&gt; 
+&gt; folio_allows_collapse() encodes this: false for khugepaged on a private
+&gt; node, CAP_USER_NUMA for MADV_COLLAPSE.
+&gt; 
+&gt; Signed-off-by: Gregory Price &lt;gourry@gourry.net&gt;
+&gt; ---
+&gt;  mm/internal.h   | 26 ++++++++++++++++++++++++++
+&gt;  mm/khugepaged.c | 16 +++++++++++++---
+&gt;  2 files changed, 39 insertions(+), 3 deletions(-)
+&gt; 
+&gt; diff --git a/mm/internal.h b/mm/internal.h
+&gt; index 9621eb127c28c..9dbc5752cd3fe 100644
+&gt; --- a/mm/internal.h
+&gt; +++ b/mm/internal.h
+&gt; @@ -136,6 +136,32 @@ static inline bool folio_allows_numa_balance(struct folio *folio)
+&gt;  	       node_allows_numa_balancing(folio_nid(folio));
+&gt;  }
+&gt;  
+&gt; +/*
+&gt; + * folio_allows_collapse() - may collapse fold this folio into a THP?
+&gt; + * @is_khugepaged: true for the khugepaged, false for MADV_COLLAPSE.
+&gt; + *
+&gt; + * Collapse is a residency operation gated by the actor calling it:
+&gt; + *   - khugepaged never operates on private-node folios (like ZONE_DEVICE)
+&gt; + *   - MADV_COLLAPSE is gated by CAP_USER_NUMA
+&gt; + *
+&gt; + * Never true for ZONE_DEVICE.
+&gt; + */
+&gt; +static inline bool folio_allows_collapse(struct folio *folio, bool is_khugepaged)
+&gt; +{
+&gt; +	int nid = folio_nid(folio);
+&gt; +
+&gt; +	if (folio_is_zone_device(folio))
+&gt; +		return false;
+&gt; +	if (is_khugepaged)
+&gt; +		return !node_is_private(nid);
+&gt; +	return node_allows_user_numa(nid);
+&gt; +}
+&gt; +
+&gt; +static inline bool page_allows_collapse(struct page *page, bool is_khugepaged)
+&gt; +{
+&gt; +	return folio_allows_collapse(page_folio(page), is_khugepaged);
+&gt; +}
+&gt; +
+&gt;  /*
+&gt;   * folio_allows_longterm_pin() - may this folio be long-term GUP-pinned?
+&gt;   *
+&gt; diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+&gt; index fb4378cc17b10..5f20839857738 100644
+&gt; --- a/mm/khugepaged.c
+&gt; +++ b/mm/khugepaged.c
+&gt; @@ -700,7 +700,8 @@ static enum scan_result __collapse_huge_page_isolate(struct vm_area_struct *vma,
+&gt;  			goto out;
+&gt;  		}
+&gt;  		page = vm_normal_page(vma, addr, pteval);
+&gt; -		if (unlikely(!page) || unlikely(page_is_private_managed(page))) {
+&gt; +		if (unlikely(!page) ||
+&gt; +		    unlikely(!page_allows_collapse(page, cc-&gt;is_khugepaged))) {
+&gt;  			result = SCAN_PAGE_NULL;
+&gt;  			goto out;
+&gt;  		}
+&gt; @@ -1241,9 +1242,17 @@ static enum scan_result alloc_charge_folio(struct folio **foliop, struct mm_stru
+&gt;  	gfp_t gfp = (cc-&gt;is_khugepaged ? alloc_hugepage_khugepaged_gfpmask() :
+&gt;  		     GFP_TRANSHUGE);
+&gt;  	int node = collapse_find_target_node(cc);
+&gt; +	unsigned int aflags;
+&gt;  	struct folio *folio;
+&gt; +	bool allow;
+&gt;  
+&gt; -	folio = __folio_alloc(gfp, order, node, &amp;cc-&gt;alloc_nmask, ALLOC_DEFAULT);
+&gt; +	/* Private node access: khugepaged never, madvise with CAP_USER_NUMA */
+&gt; +	allow = cc-&gt;is_khugepaged ? !node_is_private(node)
+&gt; +				  : node_allows_user_numa(node);
+&gt; +	aflags = (allow &amp;&amp; node_is_private(node)) ?
+&gt; +		ALLOC_ZONELIST_PRIVATE : ALLOC_DEFAULT;
+&gt; +
+&gt; +	folio = __folio_alloc(gfp, order, node, &amp;cc-&gt;alloc_nmask, aflags);
+&gt;  	if (!folio) {
+&gt;  		*foliop = NULL;
+&gt;  		if (is_pmd_order(order))
+&gt; @@ -1687,7 +1696,8 @@ static enum scan_result collapse_scan_pmd(struct mm_struct *mm,
+&gt;  		}
+&gt;  
+&gt;  		page = vm_normal_page(vma, addr, pteval);
+&gt; -		if (unlikely(!page) || unlikely(page_is_private_managed(page))) {
+&gt; +		if (unlikely(!page) ||
+&gt; +		    unlikely(!page_allows_collapse(page, cc-&gt;is_khugepaged))) {
+
+I think collapse_scan_file() need something like folio_allows_collapse() check as well.
+
+--Richard
+
+&gt;  			result = SCAN_PAGE_NULL;
+&gt;  			goto out_unmap;
+&gt;  		}
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/amC-b5SIkxUCKQ7H@MWDK4CY14F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Richard Cheng</span>
+<a class="date-chip" href="../2026-07-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-22">2026-07-22</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that reclaim operations are highly integrated and requested that they be opted in/out together to prevent unpredictable behavior, suggesting that CAP_RECLAIM should gate both inter-node placement (compaction) and swap for folios on a private node.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Mon, Jul 20, 2026 at 03:34:20PM +0800, Gregory Price wrote:
+&gt; Provide a mechanism to opt private nodes into the reclaim process.
+&gt; 
+&gt; Reclaim as a &quot;singular service&quot; is actually made up of:
+&gt; 
+&gt;    - kswapd reclaim
+&gt;    - direct reclaim
+&gt;    - kcompactd compaction
+&gt;    - direct compaction
+&gt;    - both mglru / lru paths
+&gt;    - madvise reclaim hints
+&gt;    - damon reclaim operations
+&gt; 
+&gt; CAP_RECLAIM gates whether the kernel may do inter-node placement
+&gt; (compaction) or swap for the folios on that private node.
+&gt; 
+&gt; node_allows_reclaim() encapsulates the policy as a whole.  Ordinary
+&gt; nodes are always reclaimable, private nodes only when opted in.
+&gt; 
+&gt; With the exception of madvise and DAMON, reclaim operations are
+&gt; highly integrated with one another, so they are opted in/out of
+&gt; together - otherwise reclaim becomes unpredictable.
+&gt; 
+&gt; To prevent bisect debugging failures, this stays in a single commit.
+&gt; 
+&gt; For example: reclaim without compaction will OOM on high-order
+&gt; allocation failure despite a large amount of free memory. Normally
+&gt; compaction would (potentially) resolve this issue.
+&gt; 
+&gt; If a private node opts into reclaim, we create normal watermarks for
+&gt; that node - otherwise pgdat_balanced() is always true and reclaim
+&gt; thinks there is no work to do.
+&gt; 
+&gt; Cross-node operations (demotion, promotion, khugepaged) are NOT
+&gt; included in CAP_RECLAIM because some workflows may desire different
+&gt; behaviors for this kind of operation:
+&gt; 
+&gt;    - prefer direct-to-swap, do not demote
+&gt;    - remain resident and OOM
+&gt;    - __GFP_THISNODE: fail and let the driver augment reclaim
+&gt; 
+&gt; Normal swap-out is allowed because there are clear userland controls
+&gt; (not registering swap, cgroup.swap, etc) to control that per-workload.
+&gt; 
+&gt; Signed-off-by: Gregory Price &lt;gourry@gourry.net&gt;
+&gt; ---
+&gt;  include/linux/node_private.h | 33 +++++++++++++++++++++++++
+&gt;  mm/compaction.c              |  9 ++++---
+&gt;  mm/damon/paddr.c             |  4 +--
+&gt;  mm/huge_memory.c             |  2 +-
+&gt;  mm/internal.h                | 13 ++++++++++
+&gt;  mm/madvise.c                 |  6 ++---
+&gt;  mm/memory_hotplug.c          |  3 +--
+&gt;  mm/page_alloc.c              |  2 +-
+&gt;  mm/vmscan.c                  | 48 ++++++++++++++++++++++++++++++------
+&gt;  9 files changed, 100 insertions(+), 20 deletions(-)
+&gt; 
+&gt; diff --git a/include/linux/node_private.h b/include/linux/node_private.h
+&gt; index 475496c84249f..f7cbae1309904 100644
+&gt; --- a/include/linux/node_private.h
+&gt; +++ b/include/linux/node_private.h
+&gt; @@ -7,6 +7,13 @@
+&gt;  
+&gt;  struct page;
+&gt;  
+&gt; +/*
+&gt; + * Per-node service opt-ins (node_private.caps).  A private node is isolated
+&gt; + * from all general mm services by default; the registering driver sets these
+&gt; + * to let specific services operate on its node.
+&gt; + */
+&gt; +#define NODE_PRIVATE_CAP_RECLAIM	(1UL &lt;&lt; 0)	/* allow mm reclaim */
+&gt; +
+&gt;  /**
+&gt;   * struct node_private - Per-node container for N_MEMORY_PRIVATE nodes
+&gt;   *
+&gt; @@ -41,6 +48,27 @@ static inline bool node_is_private(int nid)
+&gt;  	return node_state(nid, N_MEMORY_PRIVATE);
+&gt;  }
+&gt;  
+&gt; +/**
+&gt; + * node_allows_reclaim - may the mm reclaim from this node?
+&gt; + * @nid: the node to test
+&gt; + *
+&gt; + * Only a private node is ever excluded.  Every other node can safely
+&gt; + * be operated on by reclaim.
+&gt; + */
+&gt; +static inline bool node_allows_reclaim(int nid)
+&gt; +{
+&gt; +	struct node_private *np;
+&gt; +	bool ret;
+&gt; +
+&gt; +	if (!node_state(nid, N_MEMORY_PRIVATE))
+&gt; +		return true;
+&gt; +	rcu_read_lock();
+&gt; +	np = rcu_dereference(NODE_DATA(nid)-&gt;node_private);
+&gt; +	ret = np &amp;&amp; (np-&gt;caps &amp; NODE_PRIVATE_CAP_RECLAIM);
+&gt; +	rcu_read_unlock();
+&gt; +	return ret;
+&gt; +}
+&gt; +
+&gt;  #else /* !CONFIG_NUMA */
+&gt;  
+&gt;  static inline bool folio_is_private_node(struct folio *folio)
+&gt; @@ -58,6 +86,11 @@ static inline bool node_is_private(int nid)
+&gt;  	return false;
+&gt;  }
+&gt;  
+&gt; +static inline bool node_allows_reclaim(int nid)
+&gt; +{
+&gt; +	return true;
+&gt; +}
+&gt; +
+&gt;  #endif /* CONFIG_NUMA */
+&gt;  
+&gt;  #if defined(CONFIG_NUMA) &amp;&amp; defined(CONFIG_MEMORY_HOTPLUG)
+&gt; diff --git a/mm/compaction.c b/mm/compaction.c
+&gt; index 8c1351cce7bcc..b9c25c599732f 100644
+&gt; --- a/mm/compaction.c
+&gt; +++ b/mm/compaction.c
+&gt; @@ -25,6 +25,7 @@
+&gt;  #include &lt;linux/psi.h&gt;
+&gt;  #include &lt;linux/cpuset.h&gt;
+&gt;  #include &quot;page_alloc.h&quot;
+&gt; +#include &lt;linux/node_private.h&gt;
+&gt;  #include &quot;internal.h&quot;
+&gt;  
+&gt;  #ifdef CONFIG_COMPACTION
+&gt; @@ -2462,7 +2463,7 @@ bool compaction_zonelist_suitable(struct alloc_context *ac, int order,
+&gt;  		    !__cpuset_zone_allowed(zone, gfp_mask))
+&gt;  			continue;
+&gt;  
+&gt; -		if (node_is_private(zone_to_nid(zone)))
+&gt; +		if (!node_allows_reclaim(zone_to_nid(zone)))
+&gt;  			continue;
+&gt;  
+&gt;  		/*
+&gt; @@ -2856,7 +2857,7 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
+&gt;  			!__cpuset_zone_allowed(zone, gfp_mask))
+&gt;  				continue;
+&gt;  
+&gt; -		if (node_is_private(zone_to_nid(zone)))
+&gt; +		if (!node_allows_reclaim(zone_to_nid(zone)))
+&gt;  			continue;
+&gt;  
+&gt;  		if (prio &gt; MIN_COMPACT_PRIORITY
+&gt; @@ -2928,7 +2929,7 @@ static int compact_node(pg_data_t *pgdat, bool proactive)
+&gt;  		.proactive_compaction = proactive,
+&gt;  	};
+&gt;  
+&gt; -	if (node_is_private(pgdat-&gt;node_id))
+&gt; +	if (!node_allows_reclaim(pgdat-&gt;node_id))
+&gt;  		return 0;
+&gt;  
+&gt;  	for (zoneid = 0; zoneid &lt; MAX_NR_ZONES; zoneid++) {
+&gt; @@ -3026,7 +3027,7 @@ static ssize_t compact_store(struct device *dev,
+&gt;  {
+&gt;  	int nid = dev-&gt;id;
+&gt;  
+&gt; -	if (node_is_private(nid))
+&gt; +	if (!node_allows_reclaim(nid))
+&gt;  		return -EINVAL;
+&gt;  
+&gt;  	if (nid &gt;= 0 &amp;&amp; nid &lt; nr_node_ids &amp;&amp; node_online(nid)) {
+&gt; diff --git a/mm/damon/paddr.c b/mm/damon/paddr.c
+&gt; index c741a94319750..b668cf55d1b67 100644
+&gt; --- a/mm/damon/paddr.c
+&gt; +++ b/mm/damon/paddr.c
+&gt; @@ -251,8 +251,8 @@ static unsigned long damon_pa_pageout(struct damon_region *r,
+&gt;  			continue;
+&gt;  		}
+&gt;  
+&gt; -		/* private node memory is not reclaimable by default */
+&gt; -		if (folio_is_private_node(folio))
+&gt; +		/* DAMOS pageout is reclaim; gate a private node on CAP_RECLAIM */
+&gt; +		if (!node_allows_reclaim(folio_nid(folio)))
+&gt;  			goto put_folio;
+&gt;  
+&gt;  		if (damos_pa_filter_out(s, folio))
+&gt; diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+&gt; index 1df91b4e5c2bc..cebc89eb0541f 100644
+&gt; --- a/mm/huge_memory.c
+&gt; +++ b/mm/huge_memory.c
+&gt; @@ -2340,7 +2340,7 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+&gt;  
+&gt;  	folio = pmd_folio(orig_pmd);
+&gt;  
+&gt; -	if (folio_is_private_node(folio))
+&gt; +	if (!node_allows_reclaim(folio_nid(folio)))
+&gt;  		goto out;
+&gt;  
+&gt;  	/*
+&gt; diff --git a/mm/internal.h b/mm/internal.h
+&gt; index 85c460296cea1..8329034ae561f 100644
+&gt; --- a/mm/internal.h
+&gt; +++ b/mm/internal.h
+&gt; @@ -110,6 +110,19 @@ static inline bool page_is_private_managed(struct page *page)
+&gt;  	return folio_is_private_managed(page_folio(page));
+&gt;  }
+&gt;  
+&gt; +/*
+&gt; + * folio_allows_madvise() - may madvise reclaim hints act on this folio?
+&gt; + *
+&gt; + * madvise reclaim hints (COLD/PAGEOUT/FREE) are userland-driven reclaim, so
+&gt; + * they follow reclaim opt-in: false for ZONE_DEVICE and for N_MEMORY_PRIVATE
+&gt; + * nodes without CAP_RECLAIM, true for all other normal folios.
+&gt; + */
+&gt; +static inline bool folio_allows_madvise(struct folio *folio)
+&gt; +{
+&gt; +	return !folio_is_zone_device(folio) &amp;&amp;
+&gt; +	       node_allows_reclaim(folio_nid(folio));
+&gt; +}
+&gt; +
+&gt;  /*
+&gt;   * folio_allows_longterm_pin() - may this folio be long-term GUP-pinned?
+&gt;   *
+&gt; diff --git a/mm/madvise.c b/mm/madvise.c
+&gt; index 29f35a23919a0..56ca974542707 100644
+&gt; --- a/mm/madvise.c
+&gt; +++ b/mm/madvise.c
+&gt; @@ -396,7 +396,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;  
+&gt;  		folio = pmd_folio(orig_pmd);
+&gt;  
+&gt; -		if (folio_is_private_node(folio))
+&gt; +		if (!node_allows_reclaim(folio_nid(folio)))
+&gt;  			goto huge_unlock;
+&gt;  
+&gt;  		/* Do not interfere with other mappings of this folio */
+&gt; @@ -478,7 +478,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;  			continue;
+&gt;  
+&gt;  		folio = vm_normal_folio(vma, addr, ptent);
+&gt; -		if (!folio || folio_is_private_managed(folio))
+&gt; +		if (!folio || !folio_allows_madvise(folio))
+&gt;  			continue;
+&gt;  
+&gt;  		/*
+&gt; @@ -707,7 +707,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+&gt;  		}
+&gt;  
+&gt;  		folio = vm_normal_folio(vma, addr, ptent);
+&gt; -		if (!folio || folio_is_private_managed(folio))
+&gt; +		if (!folio || !folio_allows_madvise(folio))
+&gt;  			continue;
+&gt;  
+&gt;  		/*
+&gt; diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+&gt; index be230ac9efe5a..1f42ed303366c 100644
+&gt; --- a/mm/memory_hotplug.c
+&gt; +++ b/mm/memory_hotplug.c
+&gt; @@ -1237,8 +1237,7 @@ int online_pages(unsigned long pfn, unsigned long nr_pages,
+&gt;  	/* reinitialise watermarks and update pcp limits */
+&gt;  	init_per_zone_wmark_min();
+&gt;  
+&gt; -	/* Private nodes opt-out of reclaim/compaction by default */
+&gt; -	if (!node_is_private(nid)) {
+&gt; +	if (node_allows_reclaim(nid)) {
+&gt;  		kswapd_run(nid);
+&gt;  		kcompactd_run(nid);
+&gt;  	}
+&gt; diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+&gt; index 2b08bea2379a9..2667a4564b7ac 100644
+&gt; --- a/mm/page_alloc.c
+&gt; +++ b/mm/page_alloc.c
+&gt; @@ -6667,7 +6667,7 @@ static void __setup_per_zone_wmarks(void)
+&gt;  		u64 tmp;
+&gt;  
+&gt;  		spin_lock_irqsave(&amp;zone-&gt;lock, flags);
+&gt; -		if (node_is_private(zone_to_nid(zone))) {
+&gt; +		if (!node_allows_reclaim(zone_to_nid(zone))) {
+&gt;  			zone-&gt;_watermark[WMARK_MIN] = 0;
+&gt;  			zone-&gt;_watermark[WMARK_LOW] = 0;
+&gt;  			zone-&gt;_watermark[WMARK_HIGH] = 0;
+&gt; diff --git a/mm/vmscan.c b/mm/vmscan.c
+&gt; index 86b2334c23b98..f1722693ac2db 100644
+&gt; --- a/mm/vmscan.c
+&gt; +++ b/mm/vmscan.c
+&gt; @@ -5396,6 +5396,21 @@ static const struct attribute_group lru_gen_attr_group = {
+&gt;   *                          debugfs interface
+&gt;   ******************************************************************************/
+&gt;  
+&gt; +/*
+&gt; + * Nodes the lru_gen debugfs interface lists: ordinary memory nodes plus any
+&gt; + * N_MEMORY_PRIVATE nodes opted into reclaim.  run_cmd() already accepts the
+&gt; + * latter, so keep the listing in sync with what it accepts.
+&gt; + */
+&gt; +static void lru_gen_seq_nodes(nodemask_t *nodes)
+&gt; +{
+&gt; +	int nid;
+&gt; +
+&gt; +	*nodes = node_states[N_MEMORY];
+&gt; +	for_each_node_state(nid, N_MEMORY_PRIVATE)
+&gt; +		if (node_allows_reclaim(nid))
+&gt; +			node_set(nid, *nodes);
+&gt; +}
+&gt; +
+&gt;  static void *lru_gen_seq_start(struct seq_file *m, loff_t *pos)
+&gt;  {
+&gt;  	struct mem_cgroup *memcg;
+&gt; @@ -5407,9 +5422,11 @@ static void *lru_gen_seq_start(struct seq_file *m, loff_t *pos)
+&gt;  
+&gt;  	memcg = mem_cgroup_iter(NULL, NULL, NULL);
+&gt;  	do {
+&gt; +		nodemask_t nodes;
+&gt;  		int nid;
+&gt;  
+&gt; -		for_each_node_state(nid, N_MEMORY) {
+&gt; +		lru_gen_seq_nodes(&amp;nodes);
+&gt; +		for_each_node_mask(nid, nodes) {
+&gt;  			if (!nr_to_skip--)
+&gt;  				return get_lruvec(memcg, nid);
+&gt;  		}
+&gt; @@ -5431,16 +5448,18 @@ static void *lru_gen_seq_next(struct seq_file *m, void *v, loff_t *pos)
+&gt;  {
+&gt;  	int nid = lruvec_pgdat(v)-&gt;node_id;
+&gt;  	struct mem_cgroup *memcg = lruvec_memcg(v);
+&gt; +	nodemask_t nodes;
+&gt;  
+&gt;  	++*pos;
+&gt;  
+&gt; -	nid = next_memory_node(nid);
+&gt; +	lru_gen_seq_nodes(&amp;nodes);
+&gt; +	nid = next_node(nid, nodes);
+&gt;  	if (nid == MAX_NUMNODES) {
+&gt;  		memcg = mem_cgroup_iter(NULL, memcg, NULL);
+&gt;  		if (!memcg)
+&gt;  			return NULL;
+&gt;  
+&gt; -		nid = first_memory_node;
+&gt; +		nid = first_node(nodes);
+&gt;  	}
+&gt;  
+&gt;  	return get_lruvec(memcg, nid);
+&gt; @@ -5509,10 +5528,12 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
+&gt;  	struct lru_gen_folio *lrugen = &amp;lruvec-&gt;lrugen;
+&gt;  	int nid = lruvec_pgdat(lruvec)-&gt;node_id;
+&gt;  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+&gt; +	nodemask_t nodes;
+&gt;  	DEFINE_MAX_SEQ(lruvec);
+&gt;  	DEFINE_MIN_SEQ(lruvec);
+&gt;  
+&gt; -	if (nid == first_memory_node) {
+&gt; +	lru_gen_seq_nodes(&amp;nodes);
+&gt; +	if (nid == first_node(nodes)) {
+&gt;  		const char *path = memcg ? m-&gt;private : &quot;&quot;;
+&gt;  
+&gt;  #ifdef CONFIG_MEMCG
+&gt; @@ -5612,7 +5633,9 @@ static int run_cmd(char cmd, u64 memcg_id, int nid, unsigned long seq,
+&gt;  	int err = -EINVAL;
+&gt;  	struct mem_cgroup *memcg = NULL;
+&gt;  
+&gt; -	if (nid &lt; 0 || nid &gt;= MAX_NUMNODES || !node_state(nid, N_MEMORY))
+&gt; +	if (nid &lt; 0 || nid &gt;= MAX_NUMNODES ||
+&gt; +	    !(node_state(nid, N_MEMORY) ||
+&gt; +	      (node_is_private(nid) &amp;&amp; node_allows_reclaim(nid))))
+&gt;  		return -EINVAL;
+&gt;  
+&gt;  	if (!mem_cgroup_disabled()) {
+&gt; @@ -6145,7 +6168,7 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+&gt;  	 * Private nodes do not support reclaim by default, filtering here
+&gt;  	 * captures all normal reclaim paths that may attempt eviction.
+&gt;  	 */
+&gt; -	if (node_is_private(pgdat-&gt;node_id))
+&gt; +	if (!node_allows_reclaim(pgdat-&gt;node_id))
+&gt;  		return;
+&gt;  
+&gt;  	if ((lru_gen_enabled() || lru_gen_switching()) &amp;&amp; root_reclaim(sc)) {
+&gt; @@ -6758,6 +6781,16 @@ unsigned long mem_cgroup_shrink_node(struct mem_cgroup *memcg,
+&gt;  	return sc.nr_reclaimed;
+&gt;  }
+&gt;  
+&gt; +static struct zonelist *memcg_reclaim_zonelist(int nid, gfp_t gfp_mask)
+&gt; +{
+&gt; +	unsigned int aflags = ALLOC_DEFAULT;
+&gt; +
+&gt; +	if (unlikely(!nodes_empty(node_states[N_MEMORY_PRIVATE])))
+&gt; +		aflags = ALLOC_ZONELIST_PRIVATE;
+&gt; +
+&gt; +	return select_zonelist(nid, gfp_mask, aflags);
+&gt; +}
+
+
+I applied this code change and notice in mem_cgroup_shrink_node(), it calls
+shrink_lruvec() directly and never passes through shrink_node().
+
+This patch makes private nodes reachable through memcg reclaim zonelist, but
+what prevents the direct per-node memcg path from reclaiming a private node
+that has not set NODE_PRIVATE_CAP_RECLAIM ?
+
+--Richard
+
+
+&gt; +
+&gt;  unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+&gt;  					   unsigned long nr_pages,
+&gt;  					   gfp_t gfp_mask,
+&gt; @@ -6784,7 +6817,8 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+&gt;  	 * equal pressure on all the nodes. This is based on the assumption that
+&gt;  	 * the reclaim does not bail out early.
+&gt;  	 */
+&gt; -	struct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);
+&gt; +	struct zonelist *zonelist = memcg_reclaim_zonelist(numa_node_id(),
+&gt; +							   sc.gfp_mask);
+&gt;  
+&gt;  	set_task_reclaim_state(current, &amp;sc.reclaim_state);
+&gt;  	trace_mm_vmscan_memcg_reclaim_begin(sc.gfp_mask, 0, memcg);
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/amDGXU94trqlXUgR@MWDK4CY14F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Richard Cheng</span>
+<a class="date-chip" href="../2026-07-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-22">2026-07-22</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Richard Cheng questioned the design of Private Memory Nodes, specifically for accelerator devices like CXL Type-2, which have their own protocol rules (CXL.cache and CXL.mem) that are not accounted for in the current implementation. He also expressed confusion about why multiple dedicated zonelists are being created instead of supporting a global zonelist with private nodes as a subset.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Mon, Jul 20, 2026 at 03:33:54PM +0800, Gregory Price wrote:
+&gt; This series introduces the concept of &quot;Private Memory Nodes&quot;, which
+&gt; are opted into two basic functionalities by default:
+&gt;   - page allocation (mm/page_alloc.c)
+&gt;   - OOM killing
+&gt; 
+&gt; All other features of mm/ are opted out of managing these NUMA
+&gt; nodes and its memory.  Then we add capability bits to allow node
+&gt; owners to opt back into those services (if supported).
+&gt; 
+&gt; NUMA-hosted memory is presently a most-privilege system (any memory on
+&gt; any node, except ZONE_DEVICE, is 100% fungible and accessible). We
+&gt; then slap restrictions on top of it (cpuset, mempolicy, ZONE type,
+&gt; page/folio flags, etc).
+&gt;
+
+Hi Gregory,
+
+I applied your series on mm-next and give a quick review,
+not thoroughly, still I have some questions below regarding the design.
+ 
+&gt; The goal here is to flip that dynamic, isolate by default and then
+&gt; opt-in to specific services that the device says is safe.
+&gt; 
+&gt; Isolation at the NUMA/Zonelist layer provides a powerful mechanism for
+&gt; memory hosted on accelerators - re-use of the kernel mm/ code.
+&gt; 
+&gt;  - Accelerators (GPUs) can use demotion, numactl, and reclaim.
+&gt;  - Special memory devices (Compressed RAM) with special access controls
+&gt;    (promote-on-write) can have generic services written for them.
+&gt;  - Network devices with large memory regions intended for ring buffers
+&gt;    can use the buddy and standard networking stack.
+&gt;  - Slow, disaggregated memory pools which aren&#x27;t suitable as general
+&gt;    purpose memory get cleaner interfaces (no need to re-write the buddy
+&gt;    in userland, can use migration interface, etc).
+&gt;  - Per-workload dedicated memory nodes (disaggregated VM memory)
+&gt; 
+
+For accelerator part, take CXL Type-2 as example, it has its own protocol
+CXL.cache, CXL.mem which is the rule they need to obey during memory transaction,
+Adding more rules for them since they are NUMA node confused me, I wonder the reason ?
+
+Because NUMA node, at least for me, representing topology/locality rather than
+something with ownership or capability or rules.
+
+
+&gt; And more use cases I have collected over the past few years.
+&gt; 
+&gt; Not included here is a dax-extension [1] that exposes all the internal
+&gt; bits as userland controls for testing - along with a pile of selftests
+&gt; that prove correctness.
+&gt; 
+&gt; Changes Since V4
+&gt; ================
+&gt;  - Massive reduction in complexity.
+&gt;      - no ops struct
+&gt;      - no callback functions
+&gt;      - no __GFP_PRIVATE
+&gt;      - no __GFP_THISNODE requirement
+&gt;      - no task flags (no PF_MEMALLOC_* in the alloc path)
+&gt;  - isolation via a dedicated zonelist:
+&gt;      - private nodes are omitted from FALLBACK/NOFALLBACK
+&gt;      - added ZONELIST_PRIVATE(_NOFALLBACK)
+
+I saw the reply in patch 5, so in fact there&#x27;s not only one
+dedicate zonelist, but numerous ?
+I raise the question because zonelist was supposed to be a
+global, unbypasssable thing in MM design, but now what you
+are trying to do is to seperate the whole global list into several
+parts ?
+
+Can you explain why in current design you don&#x27;t consider to support
+something like ZONELIST_PRIVATE[n]={0, .. ,n-1} ? that&#x27;s my imagination
+of what a global zonelist should look like, no matter private or non.
+
+
+&gt;  - ALLOC_ZONELIST_PRIVATE alloc_flag
+&gt;      - on top of Brendan Jackman&#x27;s recent mm/page_alloc.h work [3]
+&gt;      - Zonelist selection rides the allocator&#x27;s alloc_flags
+&gt;  - rename OPS -&gt; CAPS (capabilities)
+&gt;  - split base functionality (isolation) from opt-ins (CAPS)
+&gt;      - first half of series can be merged without CAPS
+&gt;  - dropped compressed ram example from series
+&gt;      - will submit separately if this moves forward
+&gt;  - Added KVM as first primary in-tree user (mempolicy / CAP_USER_NUMA)
+&gt;  - fully functional dax-kmem extension and huge suite of selftests
+&gt;    located at my github, to be discussed separately [1]
+&gt; 
+&gt; Patch Layout
+&gt; ============
+&gt; The series is broken into two sections:
+&gt; 
+&gt; 1) N_MEMORY_PRIVATE Introduction.
+&gt;    Introduce the node state.
+&gt;    Opt those nodes out of mm/ services.
+&gt; 
+&gt; 2) NODE_PRIVATE_CAP_* features
+&gt;    A set of mm/ service opt-in flags that augment private
+&gt;    nodes to make them more useful (i.e. reclaim = overcommit).
+&gt; 
+&gt;    NODE_PRIVATE_CAP_LTPIN for private node folio pinning
+&gt;    NODE_PRIVATE_CAP_NUMA_BALANCING for private-node NUMA balancing
+&gt;    NODE_PRIVATE_CAP_DEMOTION for private-node tiering demotion
+&gt;    NODE_PRIVATE_CAP_HOTUNPLUG for opted-in private nodes
+&gt;    NODE_PRIVATE_CAP_USER_NUMA for userland numa controls
+&gt;    NODE_PRIVATE_CAP_RECLAIM for opted-in private node reclaim
+&gt; 
+&gt; My hope is to merge at least #1 pulled ahead while #2 is debated.
+&gt; 
+&gt; Allocation Isolation
+&gt; ====================
+&gt; page_alloc presently controls whether a node&#x27;s memory can be allocated
+&gt; on a given call by 4 things (in order of authority)
+&gt; 
+&gt;   1) ZONELIST membership
+&gt;      If a node is not in the walked zonelist, it&#x27;s unreachable.
+&gt;
+
+So a device gets hotplugged in the system will get a dedicated zonelist here ?
+And make sure it obeys the device&#x27;s own protocol if it has one ?
+
+&gt;   2) __GFP_THISNODE
+&gt;      If this flag is set and the only node in the ZONELIST is the
+&gt;      singular preferred node (or the local node, for -1)
+&gt; 
+&gt;   3) cpuset.mems membership
+&gt;      cpuset trims any node in its allowed list
+&gt; 
+
+Sounds sane to me.
+
+&gt;   4) mempolicy nodemask
+&gt;      the allocator will skip any node not in the nodemask.
+&gt; 
+&gt; Except for #1 (Zonelist membership) there are all kinds of weird corner
+&gt; conditions in which 2-4 can be completely ignored (interrupt context,
+&gt; empty set because cpuset doesn&#x27;t intersect mempolicy, shared vma, ...)
+&gt; 
+&gt; But ZONELIST membership is *absolute*.  If a zone is not in the
+&gt; zonelist being walked, IT CANNOT BE ALLOCATED FROM. PERIOD.
+&gt; 
+&gt; The existing zonelists are constructed like so:
+&gt;   ZONELIST_FALLBACK    : All N_MEMORY nodes
+&gt;   ZONELIST_NOFALLBACK  : A singleton N_MEMORY node
+&gt; 
+&gt; Private node isolation is implemented via ZONELIST isolation:
+&gt;   ZONELIST_PRIVATE            : The private node + N_MEMORY
+&gt;   ZONELIST_PRIVATE_NOFALLBACK : The private node alone.
+&gt; 
+&gt; (mirrors exactly the fallback/nofallback for __GFP_THISNODE)
+&gt; 
+&gt; Private nodes:
+&gt;   1) Never appear in any ZONELIST_FALLBACK
+&gt;   2) Have an empty ZONELIST_NOFALLBACK
+&gt;   3) Only appear in their own ZONELIST_PRIVATE(_NOFALLBACK)
+&gt; 
+&gt; 1 &amp; 2 mean all existing in-tree callers to page_alloc can NEVER
+&gt; accidentally allocate from a private node.
+&gt; 
+&gt; An allocation must explicitly ask via a zonelist and a nodemask.
+&gt; 
+&gt;   alloc_flags |= ALLOC_ZONELIST_PRIVATE; /* use ZONELIST_PRIVATE */
+&gt;   __alloc_pages(..., nodemask);     /* with the private node set */
+&gt; 
+
+As I stated above, NUMA concept was quite naive at first glance for my
+limited knowledge.
+
+This is quite alot to add for NUMA node concept, I&#x27;ll want to see
+more explanation in v6 and learn from it, thanks.
+
+&gt; The page allocator keeps all its original interfaces which only
+&gt; ever touch the default zonelists - avoiding churn.
+&gt; 
+&gt; Making it accessible via Mempolicy: MPOL_F_PRIVATE and page_alloc
+&gt; =================================================================
+&gt; The vast majority of the kernel will never need to know about
+&gt; ZONELIST_PRIVATE, because we add MPOL_F_PRIVATE to mempolicy.
+&gt; 
+&gt; When a mempolicy has MPOL_F_PRIVATE, the alloc_mpol() interfaces
+&gt; do the zonelist selection for the source of the allocation.
+&gt; 
+&gt; That really is the whole explanation of the mechanism:
+&gt; 
+&gt;   alloc_flags = mpol_alloc_flags(pol);
+&gt;   page = __alloc_frozen_pages_noprof(..., alloc_flags);
+&gt; 
+&gt; On mm-new this rides the allocator&#x27;s existing alloc_flags plumbing:
+&gt; ALLOC_ZONELIST_PRIVATE is just another alloc_flag, so no new
+&gt; parameter, enum, or alloc_context change is required.
+&gt; 
+&gt; For modules that want to implement their own special handling, they
+&gt; get the _private variants for the page allocator.  This lets modules
+&gt; re-use the buddy instead of rewriting it.
+&gt; 
+&gt;    - alloc_pages_node_private_noprof()
+&gt;    - folio_alloc_node_private_noprof()
+&gt; 
+&gt; This keeps ALLOC_ flags mm/ internal (these functions add the flags).
+&gt; 
+&gt; Isolating private node folios from kernel services
+&gt; ==================================================
+&gt; We implement filter points in mm/ to prevent operations on
+&gt; private node memory.  Where possible, we even re-use existing
+&gt; filter points from ZONE_DEVICE.
+&gt; 
+&gt; Most filter points are one or two lines of code:
+&gt; 
+&gt; Combining ZONE_DEVICE and N_MEMORY_PRIVATE opt-out spots:
+&gt;   -     if (folio_is_zone_device(folio))
+&gt;   +     if (unlikely(folio_is_private_managed(folio)))
+&gt; 
+&gt; Disabling a service:
+&gt;   +  if (!node_is_private(nid)) {
+&gt;   +      kswapd_run(nid);
+&gt;   +      kcompactd_run(nid);
+&gt;   +  }
+&gt; 
+&gt; Disallowing a uapi interaction:
+&gt;   +  if (node_state(nid, N_MEMORY_PRIVATE))
+&gt;   +      return -EINVAL;
+&gt; 
+
+I&#x27;m not sure of why do we re-implement more filter and basically
+doing the same thing ? Any unavoidable scenario ?
+
+re-using the exisintg filter would be nice if that&#x27;s possible.
+
+&gt; In the second half of the series, we replace blanket N_MEMORY_PRIVATE
+&gt; filters with NODE_PRIVATE_CAP_* filters to opt those nodes into that
+&gt; interaction if CAP is set.
+&gt; 
+&gt; We abstract this with a nice clean interface to make it really clear
+&gt; what is happening (nodes have features!)
+&gt; 
+&gt;   -  if (node_state(pgdat-&gt;node_id, N_MEMORY_PRIVATE))
+&gt;   +  if (!node_allows_reclaim(pgdat-&gt;node_id))
+&gt; 
+&gt; NODE_PRIVATE_CAP_* features
+&gt; ===========================
+&gt; This series of commits opts private nodes into various mm/ services.
+&gt; 
+&gt; Capabilities:
+&gt;   NODE_PRIVATE_CAP_RECLAIM       - direct and kswapd reclaim
+&gt;   NODE_PRIVATE_CAP_USER_NUMA     - userland numa controls
+&gt;   NODE_PRIVATE_CAP_DEMOTION      - node is a demotion target
+&gt;   NODE_PRIVATE_CAP_HOTUNPLUG     - hotunplug may migrate
+&gt;   NODE_PRIVATE_CAP_NUMA_BALANCING - NUMAB may target node folios
+&gt;   NODE_PRIVATE_CAP_LTPIN         - Longterm pin operates normally
+&gt; 
+&gt; Some opt-in support is more intensive than others, so these features
+&gt; are broken out in a way that we can defer them as future work streams.
+&gt; 
+&gt; NODE_PRIVATE_CAP_RECLAIM:
+&gt;   Enabling reclaim for these nodes is actually surprisingly trivial.
+&gt; 
+&gt;   Without CAP_RECLAIM, when an allocation failure occurs, the system
+&gt;   will not attempt to swap the memory - and instead will OOM (typically
+&gt;   whatever task is using the most memory on *that* private node).
+&gt; 
+&gt;   This capability consists of:
+&gt;     1) enabling kswapd and kcompactd for that node at hotplug time.
+&gt;     2) formalizing opt-out hooks to node_allows_reclaim() opt-in hooks.
+&gt;     3) Sets normal watermarks for these nodes.
+&gt;     4) Allow madvise operations on that node (PAGEOUT).
+&gt;     5) A small tweak to how LRU decides which zones to visit.
+&gt; 
+&gt; NODE_PRIVATE_CAP_USER_NUMA
+&gt;   Enables the following userland interfaces to accept the node:
+&gt;     mbind()
+&gt;     set_mempolicy()
+&gt;     set_mempolicy_home_node()
+&gt;     move_pages()
+&gt;     migrate_pages()
+&gt; 
+&gt;   example:
+&gt;      buf = mmap(..., MAP_ANON);
+&gt;      mbind(buf, ..., {private_node});
+&gt;      buf[0] = 0xDEADBEEF; /* Page faults onto the private node */
+&gt; 
+&gt;   Later - the KVM example shows how in-kernel mempolicies can
+&gt;   also be bound by CAP_USER_NUMA.
+&gt; 
+&gt;   Otherwise, that&#x27;s it - it&#x27;s just a mempolicy with MPOL_F_PRIVATE.
+&gt; 
+&gt; NODE_PRIVATE_CAP_HOTUNPLUG
+&gt;   This is simple: allow hotunplug to migrate this nodes folios.
+&gt; 
+&gt;   Some devices may not be able to tolerate unexpected migrations,
+&gt;   so we prevent hotunplug from engaging in migration by default.
+&gt; 
+&gt;   Some devices may have an mmu_notifier in their driver that can
+&gt;   manage the migration and subsequent refault.
+&gt; 
+&gt;   CAP_HOTUNPLUG allows memory_hotplug.c to migrate normally.
+&gt; 
+&gt; NODE_PRIVATE_CAP_DEMOTION
+&gt;   This adds the private node as a valid demotion target, and allows
+&gt;   reclaim to demote memory from a private node to a demotion target.
+&gt; 
+&gt;   Requires:  NODE_PRIVATE_CAP_RECLAIM
+&gt; 
+&gt; NODE_PRIVATE_CAP_NUMA_BALANCING
+&gt;   This enables numa balancing to inject prot_none on private node
+&gt;   folio mappings and promote them when faults are taken.
+&gt; 
+&gt; NODE_PRIVATE_CAP_LTPIN
+&gt;   This allows GUP Longterm Pinning to operate normally.
+&gt; 
+&gt;   Normally, longterm pinning determines folio eligibility based
+&gt;   on its ZONE_* membership (among other things).
+&gt; 
+&gt;   ZONE_NORMAL is eligible, while ZONE_MOVABLE folios require
+&gt;   migration to ZONE_NORMAL before pinning.
+&gt; 
+&gt;   Neither operation is preferable by default on a private node,
+&gt;   so the base behavior of FOLL_LONGTERM is to FAIL.
+&gt; 
+&gt;   This capability allows longterm pinning to operate normally
+&gt;   based on the ZONE membership.  Private node memory may be
+&gt;   hotplugged as either ZONE_NORMAL or ZONE_MOVABLE.
+&gt; 
+&gt; In-tree User: KVM
+&gt; =================
+&gt; Dave Jiang proposed [2] dax-backed guest_memfd() memory as a way of
+&gt; enabling disaggregated memory pools to host dedicated KVM memory.
+&gt; 
+&gt; With private nodes, this is trivial (with a bit of basic plumbing):
+&gt; 
+&gt; static int kvm_gmem_bind_node(struct inode *inode, int node)
+&gt; {
+&gt; ...
+&gt;   /* Bind to a private node - gated on CAP_USER_NUMA */
+&gt;   pol = mpol_bind_node(node);
+&gt;   if (IS_ERR(pol))
+&gt;     return PTR_ERR(pol);
+&gt; 
+&gt;   /* Set the shared policy */
+&gt;   err = mpol_set_shared_policy_range(&amp;GMEM_I(inode)-&gt;policy, ..., pol);
+&gt; ...
+&gt; }
+&gt; 
+&gt; KVM doesn&#x27;t even need to know about private nodes at all, all it
+&gt; does is ask mempolicy whether the requested node is a valid bind.
+&gt; 
+&gt; mm/ component testing with dax driver
+&gt; =====================================
+&gt; The dax driver extensions[1] implements a simple interface to create
+&gt; a private node from a dax device created by any source.
+&gt; 
+&gt; I left the dax driver extensions out of this feature set because
+&gt; it locks in the CAP_ bits before anyone has input.  It&#x27;s there
+&gt; primarily for testing at this point.
+&gt; 
+&gt; The simplest way to get a dax device is with the memmap= boot arg.
+&gt;    e.g.: &quot;memmap=0x40000000!0x140000000&quot;
+&gt; 
+&gt; The dax driver extension has the following sysfs entries:
+&gt;   dax0.0/private         - set the node to private
+&gt;   dax0.0/dax_file        - make /dev/dax0.0 mmap&#x27;able in kmem mode
+&gt;   dax0.0/adistance       - dictate memory_tierN membership
+&gt;   dax0.0/reclaim         - CAP_RECLAIM
+&gt;   dax0.0/demotion        - CAP_DEMOTION
+&gt;   dax0.0/user_numa       - CAP_USER_NUMA
+&gt;   dax0.0/hotunplug       - CAP_HOTUNPLUG
+&gt;   dax0.0/numa_balancing  - CAP_NUMA_BALANCING
+&gt;   dax0.0/ltpin           - CAP_LTPIN
+&gt; 
+&gt; Now consider the following...
+&gt; 
+&gt; Single node reclaim + mbind support:
+&gt;   echo 1 &gt; dax0.0/private
+&gt;   echo 1 &gt; dax0.0/reclaim
+&gt;   echo 1 &gt; dax0.0/user_numa
+&gt;   echo online_movable &gt; dax0.0/state
+&gt; 
+&gt; Test program:
+&gt;    /* node1: 1GB Private Memory Node, 4GB swap */
+&gt;    buf = mmap(NULL, TWO_GB, PROT_READ | PROT_WRITE,
+&gt;               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+&gt;    sys_mbind(p, len, MPOL_BIND, mask, MAXNODE, MPOL_MF_STRICT);
+&gt;    memset(buf, 0xff, TWO_GB);
+&gt; 
+&gt; We can *guarantee* the ONLY reclaiming tasks are exactly:
+&gt;   - kswapdN (in theory we can even make this optional!)
+&gt;   - the memset task faulting pages in
+&gt; 
+&gt; This also means these are the only tasks capable of becoming
+&gt; locked up and OOMing (as long as it is not under pressure).
+&gt; 
+&gt; The rest of the system remains entirely functional for debugging.
+&gt; 
+&gt; It now becomes possible to micro-benchmark and A/B test reclaim
+&gt; changes with different scenarios (number of tasks, amount of
+&gt; memory, watermark targets, etc), because we have hard controls
+&gt; over exactly which tasks can access that node memory and how.
+&gt; 
+&gt; If we broke CAP_RECLAIM into subflags:
+&gt;   - CAP_RECLAIM_KSWAPD
+&gt;   - CAP_RECLAIM_DIRECT
+&gt;   - CAP_COMPACTION_KCOMPACTD
+&gt;   - CAP_COMPACTION_DIRECT
+&gt; 
+&gt; We can actually test the efficacy of each of these mechanisms in
+&gt; isolation to each other - something that is strictly impossible today.
+&gt; 
+&gt; Bonus Configuration: HBM device memory tiering
+&gt; ==============================================
+&gt; echo 1 &gt; dax0.0/private       # make the node private
+&gt; echo 0 &gt; dax0.0/adistance     # highest tier
+&gt; echo 1 &gt; dax0.0/reclaim       # reclaim active
+&gt; echo 1 &gt; dax0.0/demotion      # may demote from the node
+&gt; echo 1 &gt; dax0.0/user_numa     # mbind()
+&gt; echo online_movable &gt; dax0.0/state
+&gt; echo 1 &gt; numa/demotion_enabled
+&gt; 
+&gt; This is an HBM device which is treated as the top-tier in the
+&gt; system but for which memory can only enter via explicit mbind().
+&gt; 
+&gt; It can be overcommitted because it can be reclaimed (demotions
+&gt; go to CPU DRAM, and reclaim can swap from it).
+&gt; 
+&gt; If the HBM is managed by an accelerator (GPU), the mmu_notifier
+&gt; allows it to know when reclaim is moving memory out to do
+&gt; device-mmu invalidation prior to migration.
+&gt; 
+&gt; Prereqs, base commit, references
+&gt; ================================
+&gt; akpm/mm-new - for Brendan Jackman&#x27;s mm/page_alloc.h work[3]
+&gt; 
+
+Still thanks for the work, I learn alot from your work as well, thanks.
+
+Best regards,
+Richard Cheng.
+
+
+
+&gt; Prereqs (all already in akpm/mm-new; listed for out-of-tree application):
+&gt; 
+&gt; page_alloc.h split + alloc_flags plumbing this series rides on:
+&gt; commit e81fae43cd69 (&quot;mm: split out internal page_alloc.h&quot;)
+&gt; commit b4ff3b6d0a1d (&quot;mm: replace __GFP_NO_CODETAG with ALLOC_NO_CODETAG&quot;)
+&gt; 
+&gt; dax atomic whole-device hotplug (used by the dax extension [1]):
+&gt; commit d7aa81b9a919 (&quot;mm/memory: add memory_block_aligned_range() helper&quot;)
+&gt; commit 3b2f402a1754 (&quot;dax/kmem: add sysfs interface for atomic whole-device hotplug&quot;)
+&gt; 
+&gt; [1] https://github.com/gourryinverse/linux/tree/scratch/gourry/managed_nodes/dax_private-mm-new
+&gt; [2] https://lore.kernel.org/all/20260423170219.281618-1-dave.jiang@intel.com/
+&gt; [3] https://lore.kernel.org/all/20260702-alloc-trylock-v4-0-0af8ff387e80@google.com/
+&gt; 
+&gt; base-commit: c872b70f5d6c742ad34b8e838c92af81c8920b3e
+&gt; 
+&gt; Gregory Price (36):
+&gt;   mm: refactor find_next_best_node to find_next_best_node_in
+&gt;   mm/page_alloc: refactor build_node_zonelist() out of build_zonelists()
+&gt;   mm/page_alloc: let the bulk and folio allocators carry alloc_flags
+&gt;   numa: introduce N_MEMORY_PRIVATE
+&gt;   mm: add ZONELIST_PRIVATE(_NOFALLBACK) for N_MEMORY_PRIVATE nodes.
+&gt;   cpuset: exclude private nodes from cpuset.mems (default-open)
+&gt;   mm/memory_hotplug: disallow migration-driven private node hotunplug
+&gt;   mm/mempolicy: skip private node folios when queueing for migration
+&gt;   mm/migrate: disallow userland driven migration for private nodes
+&gt;   mm/madvise: disallow madvise operations on private node folios
+&gt;   mm/compaction: disallow compaction on private nodes
+&gt;   mm/page_alloc: clear private node watermarks and system reserves
+&gt;   mm/mempolicy: disallow NUMA Balancing prot_none on private nodes
+&gt;   mm/damon: skip private node memory in DAMON migration and pageout
+&gt;   mm/ksm: skip KSM for managed-memory folios
+&gt;   mm/khugepaged: skip private node folios when trying to collapse.
+&gt;   mm/vmscan: disallow reclaim of private node memory
+&gt;   mm/gup: disallow longterm pin of private node folios
+&gt;   proc: include N_MEMORY_PRIVATE nodes in numa_maps output
+&gt;   mm/memcontrol: account private-node memory in per-node stats
+&gt;   proc/kcore: include private-node RAM in the kcore RAM map
+&gt;   mm/mempolicy: add MPOL_F_PRIVATE and zonelist selection
+&gt;   mm/mempolicy: apply policy at the kernel zone for private-node binds
+&gt;   mm/mempolicy: add in-kernel MPOL_BIND interfaces for drivers/services
+&gt;   mm/memory_hotplug: support N_MEMORY_PRIVATE node hotplug
+&gt;   mm: add NODE_PRIVATE_CAP_RECLAIM for opted-in private node reclaim
+&gt;   mm: add NODE_PRIVATE_CAP_USER_NUMA for userland numa controls
+&gt;   mm: add NODE_PRIVATE_CAP_HOTUNPLUG for opted-in private nodes
+&gt;   mm: add NODE_PRIVATE_CAP_DEMOTION for private-node tiering demotion
+&gt;   mm: add NODE_PRIVATE_CAP_NUMA_BALANCING for private-node NUMA
+&gt;     balancing
+&gt;   mm: add NODE_PRIVATE_CAP_LTPIN for private node folio pinning
+&gt;   mm/khugepaged: base private node collapse eligiblity on actor/cap bits
+&gt;   Documentation/mm: describe private (N_MEMORY_PRIVATE) memory nodes
+&gt;   mm/mempolicy: add mpol_set_shared_policy_range()
+&gt;   KVM: guest_memfd: bind backing memory to a NUMA node at creation
+&gt;   KVM: selftests: add a guest_memfd FLAG_BIND_NODE test
+&gt; 
+&gt;  Documentation/ABI/stable/sysfs-devices-node   |  10 +
+&gt;  Documentation/mm/index.rst                    |   1 +
+&gt;  Documentation/mm/numa_private_nodes.rst       | 160 ++++++++++
+&gt;  drivers/base/node.c                           | 118 +++++++
+&gt;  drivers/dax/kmem.c                            |   2 +-
+&gt;  fs/proc/kcore.c                               |   5 +-
+&gt;  fs/proc/task_mmu.c                            |  10 +-
+&gt;  include/linux/gfp.h                           |  22 +-
+&gt;  include/linux/kvm_host.h                      |   3 +
+&gt;  include/linux/memory_hotplug.h                |   5 +-
+&gt;  include/linux/mempolicy.h                     |  16 +
+&gt;  include/linux/mmzone.h                        |  26 +-
+&gt;  include/linux/node_private.h                  | 262 ++++++++++++++++
+&gt;  include/linux/nodemask.h                      |   7 +-
+&gt;  include/uapi/linux/kvm.h                      |   5 +-
+&gt;  include/uapi/linux/mempolicy.h                |   1 +
+&gt;  kernel/cgroup/cpuset.c                        |  26 +-
+&gt;  mm/compaction.c                               |  13 +
+&gt;  mm/damon/paddr.c                              |   9 +
+&gt;  mm/gup.c                                      |  28 +-
+&gt;  mm/huge_memory.c                              |   5 +
+&gt;  mm/internal.h                                 |  97 +++++-
+&gt;  mm/khugepaged.c                               |  18 +-
+&gt;  mm/ksm.c                                      |   8 +-
+&gt;  mm/madvise.c                                  |   8 +-
+&gt;  mm/memcontrol-v1.c                            |   8 +-
+&gt;  mm/memcontrol.c                               |  13 +-
+&gt;  mm/memory-tiers.c                             |  40 ++-
+&gt;  mm/memory_hotplug.c                           | 119 +++++++-
+&gt;  mm/mempolicy.c                                | 288 +++++++++++++++---
+&gt;  mm/migrate.c                                  |  19 +-
+&gt;  mm/mm_init.c                                  |   2 +-
+&gt;  mm/page_alloc.c                               | 189 +++++++++---
+&gt;  mm/page_alloc.h                               |  34 +++
+&gt;  mm/vmscan.c                                   |  57 +++-
+&gt;  tools/testing/selftests/kvm/Makefile.kvm      |   2 +
+&gt;  .../kvm/guest_memfd_bind_node_test.c          | 213 +++++++++++++
+&gt;  virt/kvm/guest_memfd.c                        |  39 ++-
+&gt;  38 files changed, 1728 insertions(+), 160 deletions(-)
+&gt;  create mode 100644 Documentation/mm/numa_private_nodes.rst
+&gt;  create mode 100644 include/linux/node_private.h
+&gt;  create mode 100644 tools/testing/selftests/kvm/guest_memfd_bind_node_test.c
+&gt; 
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/amDL80BSEP6u9XfE@MWDK4CY14F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, design concerns</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-07-23">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Arun George</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Arun George questioned the testing plan for the patch series on CXL expander hardware, noting that since the compressed ram example (cram) is not included in this series, it&#x27;s unclear how to test its compatibility.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 21-07-2026 01:03 am, Gregory Price wrote:
+&gt; Changes Since V4
+&gt; ================
+&gt;   - dropped compressed ram example from series
+&gt;       - will submit separately if this moves forward
+
+We intend to test this series on a compression capable CXL expander 
+hardware. Since compressed ram example (cram) is not part of this 
+series, how do you suggest to do that? Do you have a version of cram 
+module compatible with this series?
+
+~Arun</pre>
+</details>
+<a href="https://lore.kernel.org/r/963815509.21784796303385.JavaMail.epsvc@epcpadp1new" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested clarification on testing plan</div>
 </div>
 </div>
 </div>

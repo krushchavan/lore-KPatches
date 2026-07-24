@@ -238,9 +238,123 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v5 02/11] mm: add PMD swap entry splitting support</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260722152043.2273289-3-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-22</strong><div class="date-range-nav">Active on: <a href="#2026-07-22">2026-07-22</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds support for splitting a PMD swap entry into 512 PTE swap entries in the Linux kernel&#x27;s memory management (mm) module. The patch introduces a new branch in the __split_huge_pmd_locked() function that handles PMD swap entries, which are used to represent large blocks of swap space. Unlike migration splits, no folio reference is needed for swap entries because they point to swap slots rather than pages. The patch also includes changes to handle the case where a present THP split has already cleared the pmd, and adds warnings to catch any future callers that break an invariant related to the freeze path.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-07-22</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-24</strong><div class="date-range-nav">Active on: <a href="#2026-07-24">2026-07-24</a> &bull; <a href="#2026-07-22">2026-07-22</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds support for splitting PMD swap entries into 512 PTE swap entries in the Linux kernel&#x27;s memory management (mm) subsystem. The goal is to improve performance and efficiency when handling large pages and swap operations.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-07-24">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dev Jain</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-24">2026-07-24</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Raised concerns about confusing wording regarding swap entries and folios. Suggested dropping the mention of migration in this context.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">
+
+On 22/07/26 8:49 pm, Usama Arif wrote:
+&gt; Add a swap branch in __split_huge_pmd_locked() that splits a PMD swap
+&gt; entry into 512 PTE swap entries.  Unlike migration splits, no folio
+&gt; reference is needed because swap entries point to swap slots, not
+
+Confusing wording. swap entries need reference of swap slots instead
+of folios. I would drop the mention of migration here.
+
+&gt; pages.  Each PTE inherits the correct sub-slot offset and preserves
+&gt; soft_dirty, uffd_wp, and exclusive flags.
+&gt; 
+&gt; The folio_remove_rmap_pmd() gate at the end must inspect old_pmd
+&gt; rather than *pmd: for a present THP split, *pmd has already been
+&gt; cleared by pmdp_invalidate(), and that invalidated bit pattern can
+&gt; decode as a plausible swap entry.
+&gt; 
+&gt; This branch is reached from the explicit __split_huge_pmd() callers
+&gt; that hit a non-present PMD: partial-range mprotect / munmap, the
+&gt; wp_huge_pmd() PMD-COW fallback, and the swap-in / swapoff fallbacks
+&gt; added in later patches when the cached folio is no longer PMD-sized.
+&gt; page_vma_mapped_walk() does not iterate PMD swap entries, so
+&gt; try_to_unmap_one() and try_to_migrate_one() do not reach this branch
+&gt; and freeze=true cannot occur in this branch today.  page and folio
+&gt; are therefore left uninitialized in the swap branch; a
+&gt; VM_WARN_ON_ONCE(freeze) catches any future caller that breaks this
+&gt; invariant before the freeze path dereferences page_to_pfn(page + i)
+&gt; or put_page(page).
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; ---
+&gt;  mm/huge_memory.c | 29 ++++++++++++++++++++++++++++-
+&gt;  1 file changed, 28 insertions(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+&gt; index 04e8a6b55343..9819c0ae228a 100644
+&gt; --- a/mm/huge_memory.c
+&gt; +++ b/mm/huge_memory.c
+&gt; @@ -3210,6 +3210,14 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+&gt;  			folio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,
+&gt;  						 vma, haddr, rmap_flags);
+&gt;  		}
+&gt; +	} else if (pmd_is_swap_entry(*pmd)) {
+&gt; +		VM_WARN_ON_ONCE(freeze);
+&gt; +		/* Swap entries have no page for the migration freeze path. */
+&gt; +		freeze = false;
+&gt; +		old_pmd = *pmd;
+&gt; +		soft_dirty = pmd_swp_soft_dirty(old_pmd);
+&gt; +		uffd_wp = pmd_swp_uffd(old_pmd);
+&gt; +		anon_exclusive = pmd_swp_exclusive(old_pmd);
+&gt;  	} else {
+&gt;  		/*
+&gt;  		 * Up to this point the pmd is present and huge and userland has
+&gt; @@ -3346,6 +3354,25 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+&gt;  			VM_WARN_ON(!pte_none(ptep_get(pte + i)));
+&gt;  			set_pte_at(mm, addr, pte + i, entry);
+&gt;  		}
+&gt; +	} else if (pmd_is_swap_entry(old_pmd)) {
+&gt; +		softleaf_t sl_entry = softleaf_from_pmd(old_pmd);
+&gt; +		pte_t swp_pte;
+&gt; +		swp_entry_t sub_entry;
+&gt; +
+&gt; +		for (i = 0, addr = haddr; i &lt; HPAGE_PMD_NR;
+&gt; +		     i++, addr += PAGE_SIZE) {
+&gt; +			sub_entry = swp_entry(swp_type(sl_entry),
+&gt; +					      swp_offset(sl_entry) + i);
+&gt; +			swp_pte = swp_entry_to_pte(sub_entry);
+&gt; +			if (soft_dirty)
+&gt; +				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+&gt; +			if (uffd_wp)
+&gt; +				swp_pte = pte_swp_mkuffd(swp_pte);
+&gt; +			if (anon_exclusive)
+&gt; +				swp_pte = pte_swp_mkexclusive(swp_pte);
+&gt; +			VM_WARN_ON(!pte_none(ptep_get(pte + i)));
+&gt; +			set_pte_at(mm, addr, pte + i, swp_pte);
+&gt; +		}
+
+All these for loops could later benefit from the set_softleaf_ptes() helper:
+https://lore.kernel.org/all/20260723070905.3422276-6-dev.jain@arm.com/
+
+
+&gt;  	} else {
+&gt;  		pte_t entry;
+&gt;  
+&gt; @@ -3373,7 +3400,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+&gt;  	}
+&gt;  	pte_unmap(pte);
+&gt;  
+&gt; -	if (!pmd_is_migration_entry(*pmd))
+&gt; +	if (!pmd_is_migration_entry(old_pmd) &amp;&amp; !pmd_is_swap_entry(old_pmd))
+&gt;  		folio_remove_rmap_pmd(folio, page, vma);
+&gt;  	if (freeze)
+&gt;  		put_page(page);
+
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

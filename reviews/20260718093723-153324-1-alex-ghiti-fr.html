@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/2] mm: zswap: free cold writeback folios promptly</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260718093723.153324-1-alex@ghiti.fr/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-22</strong><div class="date-range-nav">Active on: <a href="#2026-07-22">2026-07-22</a> &bull; <a href="#2026-07-21">2026-07-21</a> &bull; <a href="#2026-07-20">2026-07-20</a> &bull; <a href="#2026-07-18">2026-07-18</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-07-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-23</strong><div class="date-range-nav">Active on: <a href="#2026-07-23">2026-07-23</a> &bull; <a href="#2026-07-22">2026-07-22</a> &bull; <a href="#2026-07-21">2026-07-21</a> &bull; <a href="#2026-07-20">2026-07-20</a> &bull; <a href="#2026-07-18">2026-07-18</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch improves the performance of zswap by freeing cold writeback folios promptly after writeback completion, reducing unnecessary reclaim scans and keeping memory resident for shorter periods. The patch consists of two parts: one for synchronous-IO devices (zram, brd, pmem) that can free the folio directly in the calling context, and another for asynchronous block devices and filesystem-backed swap that allocate the folio off the LRU and defer the free to a workqueue. The results show significant improvements in performance metrics such as page rotations, steals, scans, and build times, with most folios being freed promptly on writeback completion.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-18">
@@ -670,6 +670,101 @@ reclaimer waits. And we already free them immediately after writeback.</pre>
 <div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-07-23">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Johannes Weiner noted that the patch does not store an eviction shadow like the reclaim path does, which means no refaults are detected from dropbehind pages, potentially altering reclaim decisions, zswap shrinker force, and pressure detection.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I just chatted with Alexandre off-list, but this path does not store
+an eviction shadow like the reclaim path does. That means no refaults
+are detected from dropbehind pages, which can fundamentally alter
+reclaim decisions, zswap shrinker force, and pressure detection.</pre>
+</details>
+<a href="https://lore.kernel.org/r/amIZp7Ual_6Gu86T@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: potential bug, concern about correctness</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Nhat Pham believes that zswap shrinker bug exists before this patch, citing an issue where allocating a new buffer for writeback erases the old shadow. He suggests saving the existing shadow and handing it to zswap when allocating a new buffer, which would require changes in various paths including swapin, remove_mapping, and zswap operations.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I think it&#x27;s a zswap shrinker bug even before this patch. When we
+allocate a new buffer for the writeback request and add to swap cache,
+we erase the old shadow :(
+
+I had a patch sometimes ago to fix this - basically, what it did is
+when we allocate the buffer for writeback and add it to swap cache, we
+save the existing shadow and hand that shadow to zswap. zswap will
+store it in the zswap tree tree (in place of the struct zswap entry
+that is being freed).
+
+Now you will have to juggle it a bit in various path:
+
+1. swapin has to check the zswap tree for refault.
+
+2. remove_mapping does not create a new shadow, but instead restore
+the zswap&#x27;s owned shadow, if there is one.
+
+3. zswap operations have to now handle shadows stored in its trees too.
+
+I think there is one edge case where we still lose the old shadow (I
+need to check), but the rest seems to work.
+
+It&#x27;s a bit complex, yes, but I managed to find more uses for this
+added complexity too. With this, I was able to add more monitoring to
+zswap shrinker - you can track how many shadows are being stored in
+the zswap tree, which gives you a per-cgroup counter of inflight zswap
+buffers. This helps with diagnosing when zswap writeback is generating
+too much memory pressure with these buffers. You can also use this
+counter it for zswap writeback heuristics (for instance, throttle
+writeback when there are too many inflight buffers already and we&#x27;re
+not freeing them fast enough).
+
+I have not had the chance to make it upstream-ready, given all of my
+attention being taken away by vswap and other endeavors, and the fact
+that swap architecture has changed quite a bit.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
+<a href="https://lore.kernel.org/r/CAKEwX=MxufM5aNw2xW0f1UcyfcCJbtXR_u3cK+coRaC+_bLspg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, patch suggestion</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Nhat Pham noted that the patch&#x27;s deferred dropbehind free of writeback folios can lead to inaccurate workingset tracking heuristics, incorrectly reporting refaults on cold pages.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">... and count it as a refault :| Which is even worse than just silent
+erasure. It throws off all our workingset tracking heuristics,
+inaccurately reporting refault on a really cold page (writeback
+candidate).</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAKEwX=NmAuo+-sXzQj51-sRGdfcjTb3_KaW2x_4DnjQM6n0piA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: inaccurate workingset tracking, incorrectly reporting refaults</div>
 </div>
 </div>
 </div>

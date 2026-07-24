@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v5 00/11] mm: PMD-level swap entries for anonymous THPs</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260722152043.2273289-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-22</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-23</strong><div class="date-range-nav">Active on: <a href="#2026-07-23">2026-07-23</a> &bull; <a href="#2026-07-22">2026-07-22</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-07-22</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-24</strong><div class="date-range-nav">Active on: <a href="#2026-07-24">2026-07-24</a> &bull; <a href="#2026-07-23">2026-07-23</a> &bull; <a href="#2026-07-22">2026-07-22</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces PMD-level swap entries for anonymous THPs, allowing huge mappings to survive the swap round-trip without needing khugepaged to collapse the range later. The PMD swap entry is a compact page-table encoding for HPAGE_PMD_NR consecutive swap slots and does not promise that the swap cache always contains one PMD-sized folio. When reclaim swaps out a PMD-mapped anonymous THP, it can now restore the PMD mapping directly on swap-in without waiting for khugepaged to collapse the range later. The series includes 11 patches that add support for PMD swap entry detection, splitting, and handling in various paths such as fork, zswap, and swap. This change aims to improve performance by reducing the overhead of split-THP and khugepaged.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-22">
@@ -536,11 +536,112 @@ index 8c093c119e5a..e10a7e91e426 100644
 <div class="review-comment-signals">Signals: no clear resolution signal, author is addressing a specific concern</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1" id="2026-07-23">
+<div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Yosry Ahmed</span>
-<a class="date-chip" href="../2026-07-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Yosry Ahmed suggested checking zswap range after allocating a folio in the swap cache, assuming that the folio is locked at this point and the result should be stable.
+
+Reviewer Yosry Ahmed pointed out that even with PMD zswap load support, there is still a case where some order-0 pages are in zswap and some are on disk, which would require handling the split-per-slot state, contrary to the claim made by the patch author.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Why don&#x27;t we check the zswap range after allocating a folio in the
+swap cache? I am assuming at this point we have the folio locked and
+the result should be stable?
+
+---
+
+Even with PMD zswap load support, we still have to deal with the case
+where some order-0 pages are in zswap and some are on disk, right? I
+don&#x27;t see how that would eliminate the case you mentioned above.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/CAO9r8zMzjCf620EHwzfosngc94fu=vAb=ukrtOi9Qf3rA3vv7w@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested change, requested clarification, disagreement with patch author&#x27;s claim</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledges a potential race condition in the presence of zswap writeback, where a PMD swap entry can be split into PTE-level entries while one slot is still in zswap, and proposes to reject PMD-order reads in such cases. The series size is a concern, but no fix is planned for this specific issue.
+
+Author acknowledges that the initial patch version has limitations and will stop working if zswap is enabled, but does not commit to a fix in this reply.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, so we can end up in a race, which should be handled gracefully.
+
+For example, lets say we have zswap writeback enabled, which means we
+can end up in a state where we have a PMD swap entry and 511 of the 512
+slots have been written to disk, but 1 slot (slot X) is still in zswap.
+
+We can then have the following race:
+
+
+  CPU A: PMD swap-in                  CPU B: split-PTE swap-in
+  ------------------                 ------------------------
+
+  Checks swap cache: empty
+
+                                       Faults slot X
+                                       Adds order-0 folio F
+                                       zswap_load(F):
+                                         removes X from zswap
+                                         marks F dirty
+
+  Checks zswap range: empty
+  A is preempted
+
+                                       Unmaps/reclaims F
+                                       zswap_store(F):
+                                         puts X back in zswap
+                                       Removes F from swap cache
+
+  A resumes
+  Allocates large swap-cache folio G
+  zswap_load(G) finds X in zswap
+
+
+
+The correct action would be to reject the PMD order read and fall back
+to per-page loading.
+
+I am bit torn about what to do for zswap here. The series is quite big
+already. Alexandre is looking at adding support for PMD swap, but will
+send patches once this series gets merged. My initial versions 1
+and 2, basically stopped installing PMD swap entry if zswap was ever enabled.
+
+---
+
+so that PMD swap entry can keep on working.
+
+Both of these paths are temporary till Alex sends his series. I
+do feel my initial version was simpler but will basically stop
+working if zswap is ever enabled. Do you have any suggestions on
+what your preference is for zswap?
+
+Thanks!
+Usama</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Yosry Ahmed</div>
+<a href="https://lore.kernel.org/r/ee172b01-54c3-47ef-9040-1342a1566796@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges potential race condition, proposes fallback plan, acknowledges limitation</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3" id="2026-07-23">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Yosry Ahmed</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
@@ -554,6 +655,92 @@ zswap_is_present() case)?</pre>
 <div class="reply-to-label">&#8627; replying to Usama Arif</div>
 <a href="https://lore.kernel.org/r/amFZmtGHEZjXEw5R@google.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested clarification</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Nhat Pham suggested moving a check from __do_huge_pmd_swap_page() to __swap_cache_add_check(), citing Kairui&#x27;s previous implementation for vswap, where the cluster lock is held until after the folio is locked-and-loaded into swap cache.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">+1. Is it possible to perform the check in __swap_cache_add_check?
+
+That&#x27;s what I did for vswap, per Kairui&#x27;s suggestions. The cluster
+lock is held from that point all the way to after the folio is
+locked-and-loaded into swap cache, at which point no one can change
+the backend under you.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Yosry Ahmed</div>
+<a href="https://lore.kernel.org/r/CAKEwX=OCdMoGh2bQJNORJ42w6wTMrXyzXNUZcfgJMehfQrKanw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-3" id="2026-07-24">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dev Jain</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-24">2026-07-24</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Dev Jain suggested renaming the function softleaf_to_folio() to something more descriptive, such as softleaf_pmd_to_folio() or pmd_softleaf_to_folio(), and requested a separate patch to make this change.
+
+Reviewer suggested adding a WARN_ON_ONCE() to prevent pmd_to_softleaf_folio() from being called on swap entries after later patches add swp support</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Nit: This function really should have been named &quot;softleaf_pmd_to_folio&quot;, or
+&quot;pmd_softleaf_to_folio&quot;, perhaps throw in a patch to rename?
+
+---
+
+I am guessing that after the later patches add swp support, we should
+never reach pmd_to_softleaf_folio() with a swap entry, in which case,
+we could add a WARN_ON_ONCE() here. (didn&#x27;t check if you have done that
+later, just writing this here)</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/a3f9dba0-8ec9-413e-82a2-75f4f90911c7@arm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: suggestion, nit, suggested improvement</div>
+</div>
+</div>
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Dev Jain</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-24">2026-07-24</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer pointed out confusing wording in the patch description, specifically that it should refer to &#x27;swap slots&#x27; instead of &#x27;folios&#x27;, and suggested dropping the mention of migration.
+
+Reviewer Dev Jain suggested that the for loops in the patch could be improved by using the set_softleaf_ptes() helper, providing a link to a previous discussion on this topic.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Confusing wording. swap entries need reference of swap slots instead
+of folios. I would drop the mention of migration here.
+
+---
+
+All these for loops could later benefit from the set_softleaf_ptes() helper:
+https://lore.kernel.org/all/20260723070905.3422276-6-dev.jain@arm.com/</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/7c8b0e38-f13e-449d-a2a7-de1032b831dd@arm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -2700,6 +2887,33 @@ index c64e11fc7180..f4ab24a49d0d 100644
 </details>
 <a href="https://lore.kernel.org/r/20260722152043.2273289-10-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: acknowledged a fix, agreed to restructure</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Matthew Wilcox</span>
+<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Matthew Wilcox expressed concern about adding complexity to try_to_unmap() by introducing PMD-level swap entries, suggesting instead that the code should handle folios of any size and only split them when necessary.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This makes me sad.  It feels like we&#x27;re bolting more complexity onto
+try_to_unmap() instead of removing TTU_SPLIT_HUGE_PMD entirely.
+
+Ideally we&#x27;d just cope with folios of whatever size (including
+PMD and PUD mapped folios) and only handle hugetlb weirdness when we
+absolutely have to.  Similarly, we could split PUDs to PMDs and
+PMDs to PTEs when we need to, without the caller specifying
+TTU_SPLIT_anything.
+
+Is there a reason we can&#x27;t do that?</pre>
+</details>
+<a href="https://lore.kernel.org/r/amJoe_iRHEaMdo9i@casper.infradead.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>
