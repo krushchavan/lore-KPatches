@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 2/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260720164207.450685-3-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-23</strong><div class="date-range-nav">Active on: <a href="#2026-07-23">2026-07-23</a> &bull; <a href="#2026-07-20">2026-07-20</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-07-20</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-24</strong><div class="date-range-nav">Active on: <a href="#2026-07-24">2026-07-24</a> &bull; <a href="#2026-07-23">2026-07-23</a> &bull; <a href="#2026-07-20">2026-07-20</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch reduces contention on the lru_lock by moving the calculation of scan balance costs from being accumulated under the lock to using per-LRU vmstat counters. The old approach was causing contention and overhead due to frequent lock acquisitions, especially in memory-heavy workloads. The new approach uses read-side accumulators fed from these counters, which are already incremented by various reclaim operations. This change should improve performance on systems with high memory usage.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-23">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Johannes Weiner</span>
-<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<a class="date-chip" href="../2026-07-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="review-tag-badge">Acked-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
@@ -288,7 +288,7 @@ This is overall cheaper and has fewer lock aquisition sites.
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Shakeel Butt</span>
-<a class="date-chip" href="../2026-07-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
+<a class="date-chip" href="../2026-07-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-23">2026-07-23</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
@@ -318,6 +318,189 @@ lock contention drastically.</pre>
 <div class="reply-to-label">&#8627; replying to Usama Arif</div>
 <a href="https://lore.kernel.org/r/amK-ApfqfwkPheC5@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, suggested delay</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-07-24">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-07-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-24">2026-07-24</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that exposing userspace counters for anon/file reclaim work has diagnostic value, but doesn&#x27;t have a concrete use case and wants to avoid creating another hidden lruvec rstat infrastructure. They proposed modifying the existing node.c code to make PGROTATE_ANON and PGROTATE_FILE counters public.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I do think the userspace counters have diagnostic value. They can be another metric
+to show how much anon/file reclaim work is spent on pages that are not immediately
+reclaimed, including pages retained on actie LRU. It could help explain if there
+is elevated reclaim CPU usage.
+
+But tbf, I don&#x27;t have a concrete usecase, and I wouldn&#x27;t put up a patch to expose
+them to userspace if it werent for this patch itself.
+
+I definitely dont want to create another hidden lruvec rstat infrastructure for this,
+it would be too much code churn. If the stats really shouldn&#x27;t be exposed to userspace,
+would something like below be acceptable?
+
+
+diff --git a/drivers/base/node.c b/drivers/base/node.c
+index 3da91929ad4e..3321d4e62234 100644
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@ -612,7 +612,7 @@ static ssize_t node_read_vmstat(struct device *dev,
+ 				     sum_zone_numa_event_state(nid, i));
+ 
+ #endif
+-	for (i = 0; i &lt; NR_VM_NODE_STAT_ITEMS; i++) {
++	for (i = 0; i &lt; NR_VM_NODE_STAT_ITEMS_PUBLIC; i++) {
+ 		unsigned long pages = node_page_state_pages(pgdat, i);
+ 
+ 		if (vmstat_item_print_in_thp(i))
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 85303c5867c8..ada3b136a65d 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -323,8 +323,6 @@ enum node_stat_item {
+ 	PGSCAN_PROACTIVE,
+ 	PGSCAN_ANON,
+ 	PGSCAN_FILE,
+-	PGROTATE_ANON,
+-	PGROTATE_FILE,
+ 	PGREFILL,
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	NR_HUGETLB,
+@@ -333,6 +331,10 @@ enum node_stat_item {
+ 	NR_KERNEL_FILE_PAGES,
+ 	NR_GPU_ACTIVE,	/* Pages assigned to GPU objects */
+ 	NR_GPU_RECLAIM,	/* Pages in shrinkable GPU pools */
++	NR_VM_NODE_STAT_ITEMS_PUBLIC,
++	/* Internal-only node stats must remain at the end. */
++	PGROTATE_ANON = NR_VM_NODE_STAT_ITEMS_PUBLIC,
++	PGROTATE_FILE,
+ 	NR_VM_NODE_STAT_ITEMS
+ };
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 8693aad26ca2..fd1960eed732 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -420,12 +420,12 @@ static const unsigned int memcg_node_stat_items[] = {
+ 	PGSCAN_PROACTIVE,
+ 	PGSCAN_ANON,
+ 	PGSCAN_FILE,
+-	PGROTATE_ANON,
+-	PGROTATE_FILE,
+ 	PGREFILL,
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	NR_HUGETLB,
+ #endif
++	PGROTATE_ANON,
++	PGROTATE_FILE,
+ };
+ 
+ static const unsigned int memcg_stat_items[] = {
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 87d4a6781367..6b14136a6e51 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1300,8 +1300,6 @@ const char * const vmstat_text[] = {
+ 	[I(PGSCAN_PROACTIVE)]			= &quot;pgscan_proactive&quot;,
+ 	[I(PGSCAN_ANON)]			= &quot;pgscan_anon&quot;,
+ 	[I(PGSCAN_FILE)]			= &quot;pgscan_file&quot;,
+-	[I(PGROTATE_ANON)]			= &quot;pgrotate_anon&quot;,
+-	[I(PGROTATE_FILE)]			= &quot;pgrotate_file&quot;,
+ 	[I(PGREFILL)]				= &quot;pgrefill&quot;,
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	[I(NR_HUGETLB)]				= &quot;nr_hugetlb&quot;,
+@@ -1310,6 +1308,8 @@ const char * const vmstat_text[] = {
+ 	[I(NR_KERNEL_FILE_PAGES)]		= &quot;nr_kernel_file_pages&quot;,
+ 	[I(NR_GPU_ACTIVE)]			= &quot;nr_gpu_active&quot;,
+ 	[I(NR_GPU_RECLAIM)]			= &quot;nr_gpu_reclaim&quot;,
++	[I(PGROTATE_ANON)]			= &quot;pgrotate_anon&quot;,
++	[I(PGROTATE_FILE)]			= &quot;pgrotate_file&quot;,
+ #undef I
+ 
+ 	/* system-wide enum vm_stat_item counters */
+@@ -1771,7 +1771,7 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
+ 	seq_printf(m, &quot;Node %d, zone %8s&quot;, pgdat-&gt;node_id, zone-&gt;name);
+ 	if (is_zone_first_populated(pgdat, zone)) {
+ 		seq_printf(m, &quot;\n  per-node stats&quot;);
+-		for (i = 0; i &lt; NR_VM_NODE_STAT_ITEMS; i++) {
++		for (i = 0; i &lt; NR_VM_NODE_STAT_ITEMS_PUBLIC; i++) {
+ 			unsigned long pages = node_page_state_pages(pgdat, i);
+ 
+ 			if (vmstat_item_print_in_thp(i))
+@@ -1948,6 +1948,11 @@ static int vmstat_show(struct seq_file *m, void *arg)
+ {
+ 	unsigned long *l = arg;
+ 	unsigned long off = l - (unsigned long *)m-&gt;private;
++	unsigned long node_off = NR_VM_ZONE_STAT_ITEMS + NR_VM_NUMA_EVENT_ITEMS;
++
++	if (off &gt;= node_off + NR_VM_NODE_STAT_ITEMS_PUBLIC &amp;&amp;
++	    off &lt; node_off + NR_VM_NODE_STAT_ITEMS)
++		return SEQ_SKIP;
+ 
+ 	seq_puts(m, vmstat_text[off]);
+ 	seq_put_decimal_ull(m, &quot; &quot;, *l);
+@@ -2025,7 +2030,7 @@ static int vmstat_refresh(const struct ctl_table *table, int write,
+ 				__func__, zone_stat_name(i), val);
+ 		}
+ 	}
+-	for (i = 0; i &lt; NR_VM_NODE_STAT_ITEMS; i++) {
++	for (i = 0; i &lt; NR_VM_NODE_STAT_ITEMS_PUBLIC; i++) {
+ 		/*
+ 		 * Skip checking stats known to go negative occasionally.
+ 		 */</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/32a85420-caac-477e-b371-8628ed28c428@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged, avoiding code churn</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-07-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-24">2026-07-24</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that the existing PGROTATED counter is not very useful as it only captures folios moved to the LRU tail for faster reclaim or retry, and suggested deriving the new counters from existing ones: drotated = (dPGSCAN_ANON - dPGSTEAL_ANON) + dPGDEACTIVATE_ANON. They also pointed out that maintaining counts for MADV_COLD driven deactivations is unnecessary and adds noise.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hm, this is an interesting discussion.
+
+The existing PGROTATED is kind of useless. When it&#x27;s bumped:
+
+- truncation fails and moves folios to the LRU tail for faster reclaim
+- writeback ends on folio that was tried to reclaim, moves to LRU tail for fast retry
+
+Ok, who needs to know this? The new counters you&#x27;re adding, on the
+other hand, they capture the information you frequently need for
+understanding reclaim behavior.
+
+That said, looking closer at this one more time, you can already
+(almost) derive them fully from existing counters:
+
+drotated = (dPGSCAN_ANON - dPGSTEAL_ANON) + dPGDEACTIVATE_ANON
+
+The first two are already split by anon and file. The third you&#x27;d have
+to (1) split by type and (2) stop counting, or have a separate event,
+for MADV_COLD driven deactivations.
+
+And (2) seems overdue anyway. There is no point in maintaining counts
+for what userspace madvises. And it adds noise when it gets conflated
+with a stat tracking kernel reclaim behavior.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/amOv0MlF1S-oFZHX@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested alternative</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
