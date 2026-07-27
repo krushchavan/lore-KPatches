@@ -238,38 +238,702 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH] btrfs: trigger cow fixup via dirty_folio()</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/6758d4f27be0bbdb865cee7dd5adc435c969f4a3.1784960646.git.boris@bur.io/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-26</strong><div class="date-range-nav">Active on: <a href="#2026-07-26">2026-07-26</a> &bull; <a href="#2026-07-25">2026-07-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the Btrfs file system to trigger cow (copy-on-write) fixup via dirty_folio(). The change aims to improve handling of delalloc lookup and reservation in the presence of subpage folios, which are not expected to have fixup bits. It also removes vestigial code related to ordered operations and reworks the implementation to handle potential TOCTOU (time-of-check-to-time-of-use) races. The patch introduces a new approach to reserve the whole range and then free parts that don&#x27;t end up in the &#x27;funded&#x27; bitmap, which is considered an improvement over the previous implementation.</div></div>
+    <div class="date-range">Submitted: <strong>2026-07-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-27</strong><div class="date-range-nav">Active on: <a href="#2026-07-27">2026-07-27</a> &bull; <a href="#2026-07-26">2026-07-26</a> &bull; <a href="#2026-07-25">2026-07-25</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch proposes a new approach to trigger the COW (Copy-On-Write) fixup in Btrfs via the dirty_folio() function, which is used to handle folios that have been improperly dirtied during writeback. The current implementation uses an asynchronous worker to catch and fix such cases, but this patch aims to simplify the process by leveraging the dirty_folio() function. This change addresses a long-standing issue where a dio read may skip dirtying a folio if it is already clean by the end of the I/O operation, leading to potential data corruption. The patch maintains three critical invariants to ensure that each block is written exactly once: any dirty block is covered by delalloc or an ordered extent, any dirty block submitted into an OE will be written back within that OE, and any dirty block already submitted into an OE will not be resubmitted. This change aims to demonstrate a more complex solution to the problem and highlight the issues it must address.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-07-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Qu Wenruo</span>
+<a class="date-chip" href="../2026-07-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-25">2026-07-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Qu Wenruo expressed concerns that the assumption in btrfs_folio_lock() about the relationship between dirty folios and ordered extents is incorrect, potentially causing false alerts when -&gt;dirty_folio() callback is triggered for properly dirtied blocks. He suggested simplifying the check to just verify if the fixup bit is not set.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">在 2026/7/25 15:54, Boris Burkov 写道:
+[...]&gt;
+&gt; Link: https://lore.kernel.org/linux-btrfs/20260721191152.101118-1-borntraeger@linux.ibm.com/
+&gt; Signed-off-by: Boris Burkov &lt;boris@bur.io&gt;
+&gt; Assisted-by: LLM
+
+Without LLM it&#x27;s very hard to come up with such huge change in such a 
+short time, especially considering this fix is a little urgent due to 
+both large folio and removal of cow fixup are in the same release.
+
+So I&#x27;m totally fine with the involvement of LLM, just we will spend 
+quite some time reworking/removing a lot of comments/commit message.
+
+Not because they are not not grammarly sound (unlike my replies), but a 
+lot of time they are too lengthy but brings not too much value compared 
+to the number of lines.
+
+But still, very impressed to see a working RFC this soon.
+
+&gt; ---
+&gt;   fs/btrfs/btrfs_inode.h       |   1 +
+&gt;   fs/btrfs/defrag.c            |   1 +
+&gt;   fs/btrfs/disk-io.c           |   6 +-
+&gt;   fs/btrfs/extent_io.c         | 127 +++++++++++++++++
+&gt;   fs/btrfs/file.c              |   2 +
+&gt;   fs/btrfs/fs.h                |  20 +++
+&gt;   fs/btrfs/inode.c             | 262 ++++++++++++++++++++++++++++++++++-
+&gt;   fs/btrfs/reflink.c           |   1 +
+&gt;   fs/btrfs/relocation.c        |   1 +
+&gt;   fs/btrfs/subpage.c           |  93 +++++++++++++
+&gt;   fs/btrfs/subpage.h           |  43 +++++-
+&gt;   include/trace/events/btrfs.h |  35 +++++
+&gt;   12 files changed, 585 insertions(+), 7 deletions(-)
+&gt; 
+&gt; diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+&gt; index 7fdc6c3fd066..037445586b31 100644
+&gt; --- a/fs/btrfs/btrfs_inode.h
+&gt; +++ b/fs/btrfs/btrfs_inode.h
+&gt; @@ -600,6 +600,7 @@ int btrfs_prealloc_file_range_trans(struct inode *inode,
+&gt;   				    loff_t actual_len, u64 *alloc_hint);
+&gt;   int btrfs_run_delalloc_range(struct btrfs_inode *inode, struct folio *locked_folio,
+&gt;   			     u64 start, u64 end, struct writeback_control *wbc);
+&gt; +int btrfs_queue_writepage_fixup(struct btrfs_inode *inode, struct folio *folio);
+&gt;   int btrfs_encoded_io_compression_from_extent(struct btrfs_fs_info *fs_info,
+&gt;   					     int compress_type);
+&gt;   int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+&gt; diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+&gt; index 6ec5dd760d42..7de5febee9d1 100644
+&gt; --- a/fs/btrfs/defrag.c
+&gt; +++ b/fs/btrfs/defrag.c
+&gt; @@ -1158,6 +1158,7 @@ static void defrag_one_locked_target(struct btrfs_inode *inode,
+&gt;   		    start + len &lt;= folio_pos(folio))
+&gt;   			continue;
+&gt;   		btrfs_folio_clamp_set_dirty(fs_info, folio, start, len);
+&gt; +		btrfs_folio_cancel_fixup(fs_info, folio, start, len);
+
+This call is very frequent, and to be honest, it&#x27;s redundant.
+
+We can merge the cancel into btrfs_folio*_set_dirty(), as the 
+btrfs_folio_*set_dirty() is the &quot;proper dirty&quot; entrance, so we know if 
+we&#x27;re going through that interface, we are ensured to cancel the fixup.
+
+&gt; +
+&gt; +	if (!folio_test_fixup_pending(folio))
+
+if (likely())
+
+&gt; +		return 0;
+&gt; +
+&gt; +	for_each_set_bit(bit, bio_ctrl-&gt;submit_bitmap, blocks_per_folio) {
+&gt; +		const u64 start = page_start + (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; +
+&gt; +		if (btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree, start,
+&gt; +						start + sectorsize - 1,
+&gt; +						EXTENT_DELALLOC))
+
+Can we simplify the check to just check if the fixup bit is not set?
+
+To me, without fixup bit it means it went through the regular write 
+preparation, thus should have EXTENT_DELALLOC.
+And checking a bit is way faster than check an extent range.
+
+&gt; +			continue;
+&gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize)) {
+
+Again, we prefer not to use btrfs_is_subpage() and btrfs_subpage_*() out 
+of subpage.c when possible.
+
+So just some helper, like btrfs_folio_test_fixup() would make it more 
+readable.
+
+&gt; +			struct btrfs_ordered_extent *ordered;
+&gt; +
+&gt; +			/*
+&gt; +			 * Not a suspect: the only legal explanation for a
+&gt; +			 * dirty, unfunded block is that it is pending its own
+&gt; +			 * submission into a covering ordered extent - punting
+&gt; +			 * it would starve that ordered extent forever, and
+&gt; +			 * the worker could not see it anyway (its work list
+&gt; +			 * is the fixup bits). Verify the ordered extent
+&gt; +			 * exists; if not, the invariant is broken - leave the
+&gt; +			 * block in the bitmap so submission fails loudly
+&gt; +			 * (EUCLEAN) instead of silently repairing.
+&gt; +			 */
+
+The block can be dirtied properly before, then -&gt;dirty_folio() callback 
+is triggered.
+
+In that case, we may have not run delalloc for the folio, thus there may 
+be no OE created yet.
+
+It looks like the assumption is not correct to me, and may cause false 
+alerts.
+
+But on the other hand, it&#x27;s already very hard to hit a case where we 
+have some proper dirty blocks, and -&gt;dirty_folio() is called.
+E.g. for the direct IO case, -&gt;dirty_folio() is only called when the 
+folio is clean.
+
+Thus this false alerts case is not easy to test.
+
+&gt; +			ordered = btrfs_lookup_ordered_range(inode, start,
+&gt; +							     sectorsize);
+
+Doing this is a little overkilled.
+
+As the recent patch &quot;btrfs: use ordered extent to grab the logical 
+address for submission&quot; will do it at submission time, with better 
+cached OE usage.
+
+I&#x27;d prefer skip the OE lookup completely, and let the final submission 
+path to grab the OE (which can reuse bbio-&gt;ordered when possible).
+&gt; +			if (unlikely(!ordered))
+&gt; +				DEBUG_WARN();
+&gt; +			else
+&gt; +				btrfs_put_ordered_extent(ordered);
+&gt; +			continue;
+&gt; +		}
+&gt; +		/*
+&gt; +		 * Block re-dirtied via dirty_folio(), requires async fixup.
+&gt; +		 * All other blocks in the folio should proceed as normal so
+&gt; +		 * that their OEs can make progress and complete.
+&gt; +		 */
+&gt; +		bitmap_clear(bio_ctrl-&gt;submit_bitmap, bit, 1);
+&gt; +		punt = true;
+
+The variable naming choice is definitely very LLM.
+
+Non-native speaker like me may need to google the word first...
+
+&gt; +	}
+&gt; +	if (punt) {
+&gt; +		btrfs_queue_writepage_fixup(inode, folio);
+&gt; +		/*
+&gt; +		 * Keep the folio dirty for the punted blocks.  If nothing
+&gt; +		 * is left to submit this pass, the folio is done and we own
+&gt; +		 * the unlock, matching the async-submission contract.
+&gt; +		 */
+&gt; +		folio_redirty_for_writepage(bio_ctrl-&gt;wbc, folio);
+
+We haven&#x27;t yet cleared any bit nor folio dirty in the first place.
+So not sure if this is really needed, nor the comment.
+
+&gt; +		if (bitmap_empty(bio_ctrl-&gt;submit_bitmap, blocks_per_folio)) {
+&gt; +			folio_unlock(folio);
+&gt; +			return 1;
+&gt; +		}
+&gt; +		return 0;
+&gt; +	}
+&gt; +	/* Every dirty block is now covered; the folio is ordinary again. */
+&gt; +	if (btrfs_is_subpage(fs_info, folio))
+&gt; +		btrfs_subpage_clear_fixup(fs_info, folio, page_start,
+&gt; +					  folio_size(folio));
+
+Again, a btrfs_folio_clear_fixup() is more helpful.
+
+[...]
+&gt; +/*
+&gt; + * The folio has (or, for single-block folios, is) dirty blocks that were
+&gt; + * dirtied without notifying the filesystem (e.g. set_page_dirty_lock() on a
+&gt; + * GUP pin) and carry no reservation.  Set by btrfs_data_dirty_folio(), which
+&gt; + * records the affected blocks in the subpage fixup bitmap; cleared when the
+&gt; + * writepage fixup has covered every dirty block, or by a reserving write
+&gt; + * that covers the whole folio.  Reuses the PG_owner_2 bit that the folio
+&gt; + * ordered flag occupied before it was removed.
+
+Again, very LLM comments. That&#x27;s why always delete all comments from LLM 
+by default.
+
+The older, removed comment is very simple for folio_ordered:
+
+  * We use folio flag owner_2 to indicate there is an ordered extent with
+  * unfinished IO.
+
+
+[...]
+&gt; +static void btrfs_writepage_fixup_worker(struct btrfs_work *work)
+&gt; +{
+&gt; +	struct btrfs_writepage_fixup *fixup =
+&gt; +		container_of(work, struct btrfs_writepage_fixup, work);
+&gt; +	struct extent_state *cached_state = NULL;
+&gt; +	struct extent_changeset *data_reserved = NULL;
+&gt; +	unsigned long funded[BITS_TO_LONGS(BTRFS_MAX_BLOCKS_PER_FOLIO)] = { 0 };
+&gt; +	struct folio *folio = fixup-&gt;folio;
+&gt; +	struct btrfs_inode *inode = fixup-&gt;inode;
+&gt; +	struct btrfs_fs_info *fs_info = inode-&gt;root-&gt;fs_info;
+&gt; +	const unsigned int blocks_per_folio = btrfs_blocks_per_folio(fs_info, folio);
+&gt; +	const u32 sectorsize = fs_info-&gt;sectorsize;
+&gt; +	const u64 page_start = folio_pos(folio);
+&gt; +	const u64 page_end = folio_next_pos(folio) - 1;
+&gt; +	unsigned int start_bit;
+&gt; +	unsigned int end_bit;
+&gt; +	unsigned int bit;
+&gt; +	bool reserved;
+&gt; +	int ret;
+&gt; +
+&gt; +	/*
+&gt; +	 * Reserve for the whole folio before taking the folio lock, like
+&gt; +	 * page_mkwrite: the reservation may flush, and flushing writeback
+&gt; +	 * takes folio locks.  Which blocks actually need funding is only
+&gt; +	 * knowable under the lock, so reserve the worst case and release
+&gt; +	 * the unused ranges once the funded set is known.
+&gt; +	 */
+&gt; +	ret = btrfs_delalloc_reserve_space(inode, &amp;data_reserved, page_start,
+&gt; +					   folio_size(folio));
+
+You fall into the same pitfall I&#x27;m worried about, but unfortunately or 
+fortunately, it&#x27;s very hard to hit.
+
+The problem here is, we can over-reserve, e.g. some range is already 
+properly dirtied, thus they have already space reserved.
+
+And you can not release the reserved space for them, because release 
+will also clear the qgroup reserved extent flag.
+
+This is the biggest problem that I have no way to fix.
+As there is no way to ensure the space we reserved is really needed 
+before holding the folio lock.
+
+
+But since it&#x27;s really hard to get a dirty folio to be called with 
+-&gt;dirty_folio(), thus it may not be exposed through tests.
+
+&gt; +	reserved = (ret == 0);
+&gt; +again:
+&gt; +	folio_lock(folio);
+&gt; +
+&gt; +	/*
+&gt; +	 * The queueing writeback pass took references on the folio and the
+&gt; +	 * inode, but nothing else is stable: an in-band write may have funded
+&gt; +	 * the blocks and cancelled the fixup state, or the folio may have
+&gt; +	 * been invalidated.  Then there is nothing left to do - and a failed
+&gt; +	 * reservation against a folio that no longer needs one is no error.
+&gt; +	 */
+&gt; +	if (!folio-&gt;mapping || !folio_test_dirty(folio) ||
+&gt; +	    !folio_test_fixup_pending(folio)) {
+&gt; +		ret = 0;
+&gt; +		goto out;
+&gt; +	}
+&gt; +
+&gt; +	/* The folio still needs funding we could not get. */
+&gt; +	if (ret)
+&gt; +		goto out_error;
+&gt; +
+&gt; +	btrfs_lock_extent(&amp;inode-&gt;io_tree, page_start, page_end, &amp;cached_state);
+&gt; +
+&gt; +	for (bit = 0; bit &lt; blocks_per_folio; bit++) {
+&gt; +		struct btrfs_ordered_extent *ordered;
+&gt; +		const u64 start = page_start + (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; +
+&gt; +		if (test_bit(bit, funded))
+&gt; +			continue;
+&gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize))
+&gt; +			continue;
+&gt; +		/* An in-band write may have funded the block while we waited. */
+&gt; +		if (btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree, start,
+&gt; +						start + sectorsize - 1,
+&gt; +						EXTENT_DELALLOC))
+&gt; +			continue;
+&gt; +		ordered = btrfs_lookup_ordered_range(inode, start, sectorsize);
+&gt; +		if (ordered) {
+&gt; +			trace_btrfs_writepage_fixup_defer(inode, ordered);
+&gt; +			btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start,
+&gt; +					    page_end, &amp;cached_state);
+&gt; +			folio_unlock(folio);
+&gt; +			btrfs_start_ordered_extent(ordered);
+&gt; +			btrfs_put_ordered_extent(ordered);
+&gt; +			goto again;
+&gt; +		}
+&gt; +		ret = btrfs_set_extent_delalloc(inode, start,
+&gt; +						start + sectorsize - 1, 0,
+&gt; +						&amp;cached_state);
+&gt; +		if (ret) {
+&gt; +			btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start,
+&gt; +					    page_end, &amp;cached_state);
+&gt; +			goto out_error;
+&gt; +		}
+&gt; +		trace_btrfs_writepage_fixup_reserve(inode, start, sectorsize);
+&gt; +		if (btrfs_is_subpage(fs_info, folio))
+&gt; +			btrfs_subpage_clear_fixup(fs_info, folio, start,
+&gt; +						  sectorsize);
+&gt; +		__set_bit(bit, funded);
+
+Why __set_bit() not set_bit()?
+
+&gt; +	}
+&gt; +
+&gt; +	/* Every fixup block is funded; the folio is ordinary again. */
+&gt; +	folio_clear_fixup_pending(folio);
+&gt; +	btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start, page_end, &amp;cached_state);
+&gt; +	goto out;
+&gt; +
+&gt; +out_error:
+&gt; +	/*
+&gt; +	 * The remaining unnotified blocks cannot be funded.  There is no
+&gt; +	 * syscall to return this through, so surface it the way a failed
+&gt; +	 * writeback would - record the error on the mapping - and drop the
+&gt; +	 * blocks, or writeback would find and requeue them forever.
+&gt; +	 */
+&gt; +	mapping_set_error(folio-&gt;mapping, ret);
+&gt; +	if (btrfs_is_subpage(fs_info, folio)) {
+&gt; +		bool last = false;
+&gt; +
+&gt; +		for (bit = 0; bit &lt; blocks_per_folio; bit++) {
+
+Again, a proper btrfs_folio_clear_fixup() and pass the folio range into 
+it should handle the loop.
+
+&gt; +			const u64 start = page_start +
+&gt; +					  (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; +
+&gt; +			if (!btrfs_subpage_test_fixup(fs_info, folio, start,
+&gt; +						      sectorsize))
+&gt; +				continue;
+&gt; +			last = btrfs_subpage_clear_and_test_dirty(fs_info,
+&gt; +							folio, start,
+&gt; +							sectorsize);
+&gt; +		}
+&gt; +		btrfs_folio_cancel_fixup(fs_info, folio, page_start,
+&gt; +					 folio_size(folio));
+&gt; +		if (last)
+&gt; +			folio_clear_dirty_for_io(folio);
+
+Again, the regular btrfs_folio_clear_dirty() is going to handle all 
+these, and no need for a special subpage branch.
+
+&gt; +	} else {
+&gt; +		folio_clear_dirty_for_io(folio);
+&gt; +	}
+&gt; +	folio_clear_fixup_pending(folio);
+&gt; +out:
+&gt; +	if (reserved) {
+&gt; +		btrfs_delalloc_release_extents(inode, folio_size(folio));
+&gt; +		for_each_clear_bitrange(start_bit, end_bit, funded,
+&gt; +					blocks_per_folio)
+&gt; +			btrfs_delalloc_release_space(inode, data_reserved,
+&gt; +				page_start + (start_bit &lt;&lt; fs_info-&gt;sectorsize_bits),
+&gt; +				(end_bit - start_bit) &lt;&lt; fs_info-&gt;sectorsize_bits,
+&gt; +				true);
+&gt; +	}
+&gt; +	folio_unlock(folio);
+&gt; +	folio_put(folio);
+&gt; +	kfree(fixup);
+&gt; +	extent_changeset_free(data_reserved);
+&gt; +	/*
+&gt; +	 * As a precaution, do a delayed iput in case it would be the last
+&gt; +	 * iput that could need flushing space. Recursing back to the fixup
+&gt; +	 * worker would deadlock.
+&gt; +	 */
+&gt; +	btrfs_add_delayed_iput(inode);
+&gt; +}
+[...]
+&gt; +static bool btrfs_data_dirty_folio(struct address_space *mapping,
+&gt; +				   struct folio *folio)
+&gt; +{
+&gt; +	struct btrfs_inode *inode = BTRFS_I(mapping-&gt;host);
+&gt; +	struct btrfs_fs_info *fs_info = inode-&gt;root-&gt;fs_info;
+&gt; +	bool marked = false;
+&gt; +
+&gt; +	if (btrfs_is_subpage(fs_info, folio)) {
+&gt; +		const struct btrfs_folio_state *bfs = folio_get_private(folio);
+&gt; +		const u64 page_start = folio_pos(folio);
+&gt; +		const u64 range_end = min_t(u64, page_start + folio_size(folio),
+&gt; +					    round_up(i_size_read(&amp;inode-&gt;vfs_inode),
+&gt; +						     fs_info-&gt;sectorsize));
+&gt; +
+&gt; +		if (!READ_ONCE(bfs-&gt;reserving_dirty) &amp;&amp;
+&gt; +		    folio_test_uptodate(folio) &amp;&amp; range_end &gt; page_start)
+&gt; +			marked = btrfs_subpage_set_fixup_dirty(fs_info, folio,
+&gt; +							       page_start,
+&gt; +							       range_end - page_start);
+&gt; +	} else if (!folio_test_dirty(folio) &amp;&amp;
+&gt; +		   !btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree,
+&gt; +						folio_pos(folio),
+&gt; +						folio_next_pos(folio) - 1,
+&gt; +						EXTENT_DELALLOC)) {
+
+Again, the same question why the folio_test_dirty() check is not enough.
+
+The subpage part has no such check.
+
+&gt; +		marked = true;
+&gt; +	}
+&gt; +	if (marked)
+&gt; +		folio_set_fixup_pending(folio);
+&gt; +	return filemap_dirty_folio(mapping, folio);
+&gt; +}
+&gt; +
+[..]
+&gt; --- a/fs/btrfs/subpage.c
+&gt; +++ b/fs/btrfs/subpage.c
+&gt; @@ -356,7 +356,17 @@ void btrfs_subpage_set_dirty(const struct btrfs_fs_info *fs_info,
+&gt;   	spin_lock_irqsave(&amp;bfs-&gt;lock, flags);
+&gt;   	bitmap_set(bfs-&gt;bitmaps, start_bit, len &gt;&gt; fs_info-&gt;sectorsize_bits);
+&gt;   	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; +	/*
+&gt; +	 * Every caller of this helper is a reserving write path dirtying
+&gt; +	 * exactly the range it reserved; the dirty_folio callback must not
+&gt; +	 * treat it as potentially unnotified and drag the folio&#x27;s clean
+&gt; +	 * sibling blocks into COW (that breaks reflink sharing of the
+&gt; +	 * untouched blocks, among other things).  Unnotified dirtiers call
+&gt; +	 * folio_mark_dirty() directly and never pass through here.
+&gt; +	 */
+&gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, true);
+&gt;   	folio_mark_dirty(folio);
+
+My solution in my initial patchset is to not call folio_mark_dirty() as 
+it will call back to the -&gt;dirty_folio() call back.
+
+So I implemented an local version which call back to 
+filemap_mark_dirty(), other than -&gt;dirty_folio() which sets the fixup bits.
+
+&gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, false);
+&gt;   }
+&gt;   
+&gt;   static void folio_clear_tags(struct folio *folio)
+&gt; @@ -457,6 +467,88 @@ void btrfs_subpage_clear_writeback(const struct btrfs_fs_info *fs_info,
+&gt;   	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt;   }
+&gt;   
+&gt; +void btrfs_subpage_clear_fixup(const struct btrfs_fs_info *fs_info,
+&gt; +			       struct folio *folio, u64 start, u32 len)
+&gt; +{
+&gt; +	struct btrfs_folio_state *bfs = folio_get_private(folio);
+&gt; +	unsigned int start_bit = subpage_calc_start_bit(fs_info, folio,
+&gt; +							fixup, start, len);
+&gt; +	unsigned long flags;
+&gt; +
+&gt; +	spin_lock_irqsave(&amp;bfs-&gt;lock, flags);
+&gt; +	bitmap_clear(bfs-&gt;bitmaps, start_bit, len &gt;&gt; fs_info-&gt;sectorsize_bits);
+&gt; +	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+
+Shouldn&#x27;t we also check if we have cleared the last fixup bit and clear 
+the folio fixup flag?
+[...]
+&gt; +void btrfs_folio_cancel_fixup(const struct btrfs_fs_info *fs_info,
+&gt; +			      struct folio *folio, u64 start, u32 len)
+
+Why not let IMPLEMNT_BTRFS_PAGE_OPS() to implement all the fixup helpers?
+
+[...]
+&gt;   
+&gt; @@ -50,6 +65,14 @@ enum {
+&gt;   struct btrfs_folio_state {
+&gt;   	/* Common members for both data and metadata pages */
+&gt;   	spinlock_t lock;
+&gt; +	/*
+&gt; +	 * Set across the folio_mark_dirty() that a reserving write path
+&gt; +	 * issues from btrfs_subpage_set_dirty(), so that the dirty_folio
+&gt; +	 * callback does not treat the dirtying as potentially unnotified
+&gt; +	 * and mark the folio&#x27;s still-clean sibling blocks.  Written under
+&gt; +	 * the folio lock, which every reserving path holds.
+&gt; +	 */
+&gt; +	bool reserving_dirty;
+
+As I mentioned, this is only for dirty_folio() to skip setting fixup bit.
+
+We can get rid of it, if the btrfs_folio_set_dirty() helper doesn&#x27;t go 
+through folio_mark_dirty().
+
+Thanks,
+Qu
+
+---
+
+在 2026/7/26 05:42, Boris Burkov 写道:
+&gt; On Sat, Jul 25, 2026 at 07:34:46PM +0930, Qu Wenruo wrote:
+[...]
+&gt;&gt;
+&gt;&gt; Can we simplify the check to just check if the fixup bit is not set?
+&gt;&gt;
+&gt;&gt; To me, without fixup bit it means it went through the regular write
+&gt;&gt; preparation, thus should have EXTENT_DELALLOC.
+&gt;&gt; And checking a bit is way faster than check an extent range.
+&gt;&gt;
+&gt; 
+&gt; the delalloc lookup is essential for bs == folio_size, to tell apart
+&gt; the case where you are submitting a folio that got redirtied behind you
+&gt; (don&#x27;t skip) and the case where it is a true fixup.
+&gt; 
+&gt; Thinking about it more, though, that re-dirty shouldn&#x27;t really be
+&gt; possible at least in typical cases, so maybe I can figure out how to
+&gt; remove this.
+
+In that case, I&#x27;d prefer to use folio-&gt;private to have one extra bit, to 
+indicate the folio is properly dirtied.
+
+E.g. this commit in my unfinished branch:
+https://github.com/adam900710/linux/commit/9a02921d348574573f1a6dbc50e54f993011e311
+
+Which acts like the subpage dirty bit for bs == folio size case.
+&gt; 
+&gt; I think for subpage it probably doesn&#x27;t matter, because those should not
+&gt; have fixup in their bitmaps.
+&gt; 
+&gt;&gt;&gt; +			continue;
+&gt;&gt;&gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt;&gt;&gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize)) {
+[...]
+&gt;&gt;
+&gt;&gt; This is the biggest problem that I have no way to fix.
+&gt;&gt; As there is no way to ensure the space we reserved is really needed before
+&gt;&gt; holding the folio lock.
+&gt; 
+&gt; I think this approach here seems correct to me, except for maybe a
+&gt; really mean case which calls aops-&gt;dirty_folio() without locking the folio
+&gt; (not the case for dio read at least).
+&gt; 
+&gt; Won&#x27;t any real reservation will cancel the fixup bits under the lock, so
+&gt; the way this implementation tries to handle it is to reserve the whole
+&gt; range then free the parts that don&#x27;t end up getting in the &quot;funded&quot;
+&gt; bitmap (also a bad LLM name...). This is checking the fixup bitmap under
+&gt; the lock, so should see correct cancellations. Do you see an obvious
+&gt; problem with that strategy, besides that it is kind of ugly and annoying
+&gt; to handle the &#x27;out:&#x27; path. Which feels similarly painful to a lot of our
+&gt; other delalloc/qgroup_rsv unwinding logic with data_reserveds on OE error
+&gt; or whatnot.
+
+No, I have no better solution at all. So it&#x27;s not an objection.
+
+&gt; 
+&gt; I think the clearer option of &quot;take the lock, observe the real set,
+&gt; release, then reserve, then take the lock and do all the work&quot; sounds
+&gt; appealing but almost certainly fails to some simple TOCTOU race.
+&gt; 
+&gt;&gt;
+&gt;&gt;
+[..]
+&gt;&gt;&gt; +	 */
+&gt;&gt;&gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, true);
+&gt;&gt;&gt;    	folio_mark_dirty(folio);
+&gt;&gt;
+&gt;&gt; My solution in my initial patchset is to not call folio_mark_dirty() as it
+&gt;&gt; will call back to the -&gt;dirty_folio() call back.
+&gt;&gt;
+&gt;&gt; So I implemented an local version which call back to filemap_mark_dirty(),
+&gt;&gt; other than -&gt;dirty_folio() which sets the fixup bits.
+&gt;&gt;
+&gt; 
+&gt; You mean to avoid the ugly bfs-&gt;reserving_dirty thing?
+&gt; That does sound appealing...
+
+Yep. However the ugly part is, we will need a local 
+&quot;btrfs_folio_mark_dirty_prepared()&quot;, which copies &quot;folio_mark_dirty()&quot;, 
+except call filemap_dirty_folio() instead of using aops-&gt;dirty_folio.
+
+Not sure if MM will be happy about that.
+
+Thanks,
+Qu</pre>
+</details>
+<a href="https://lore.kernel.org/r/dbb0e4ec-cdce-4852-9c1c-21634cc6fa4e@gmx.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Boris Burkov (author)</span>
 <a class="date-chip" href="../2026-07-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-25">2026-07-25</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Author acknowledged that some invariants were not properly trimmed from the LLM-generated code and agreed to rework them.
-
-Author acknowledged that the delalloc lookup is essential for distinguishing between re-dirtying and true fixups, but is considering simplifying the code by removing the possibility of re-dirtying in typical cases.
-
-Author acknowledged that the code to check if ordered extent is present is unnecessary and agreed to simplify the logic by removing or hiding it, depending on the configuration.
-
-The author acknowledged a minor issue with technical terminology and promised to correct it.
-
-Author acknowledged a concern about the complexity of the proposed fixup worker and its potential for &#x27;word salad&#x27; code, but did not indicate plans to revise or restructure the patch.
-
-Author acknowledged a potential issue where aops-&gt;dirty_folio() is called without locking the folio, but believes the current implementation&#x27;s strategy of reserving the whole range and then freeing parts that don&#x27;t get &#x27;funded&#x27; should handle cancellations correctly. However, they acknowledge it&#x27;s an ugly solution and consider an alternative approach with locking to be appealing but potentially flawed due to a TOCTOU race.
-
-Author acknowledges that avoiding the &#x27;bfs-&gt;reserving_dirty&#x27; approach is a good idea and seems open to revising their patch, but doesn&#x27;t explicitly state they will make changes.
-
-Author agrees that using dirty_folio() is an improvement, acknowledges current implementation as a &#x27;stupid way&#x27; that introduces unnecessary risk, but does not indicate plans to revise the patch.</div>
+<div class="review-comment-text">Author acknowledged that the delalloc lookup in btrfs_folio_cancel_fixup() can be simplified by checking if the fixup bit is not set, and agreed to rework it; also agreed to remove redundant comments and commit messages.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">100% agreed, I tried to trim them down and rewrite them in human but
+<pre class="raw-body-text">On Sat, Jul 25, 2026 at 07:34:46PM +0930, Qu Wenruo wrote:
+&gt; 
+&gt; 
+&gt; \u5728 2026/7/25 15:54, Boris Burkov \u5199\u9053:
+&gt; [...]&gt;
+&gt; &gt; Link: https://lore.kernel.org/linux-btrfs/20260721191152.101118-1-borntraeger@linux.ibm.com/
+&gt; &gt; Signed-off-by: Boris Burkov &lt;boris@bur.io&gt;
+&gt; &gt; Assisted-by: LLM
+&gt; 
+&gt; Without LLM it&#x27;s very hard to come up with such huge change in such a short
+&gt; time, especially considering this fix is a little urgent due to both large
+&gt; folio and removal of cow fixup are in the same release.
+&gt; 
+&gt; So I&#x27;m totally fine with the involvement of LLM, just we will spend quite
+&gt; some time reworking/removing a lot of comments/commit message.
+&gt; 
+&gt; Not because they are not not grammarly sound (unlike my replies), but a lot
+&gt; of time they are too lengthy but brings not too much value compared to the
+&gt; number of lines.
+
+100% agreed, I tried to trim them down and rewrite them in human but
 missed a bunch in the rush.
 
----
+&gt; 
+&gt; But still, very impressed to see a working RFC this soon.
+&gt; 
+
+Thank you for the rapid, helpful review.
+
+&gt; &gt; ---
+&gt; &gt;   fs/btrfs/btrfs_inode.h       |   1 +
+&gt; &gt;   fs/btrfs/defrag.c            |   1 +
+&gt; &gt;   fs/btrfs/disk-io.c           |   6 +-
+&gt; &gt;   fs/btrfs/extent_io.c         | 127 +++++++++++++++++
+&gt; &gt;   fs/btrfs/file.c              |   2 +
+&gt; &gt;   fs/btrfs/fs.h                |  20 +++
+&gt; &gt;   fs/btrfs/inode.c             | 262 ++++++++++++++++++++++++++++++++++-
+&gt; &gt;   fs/btrfs/reflink.c           |   1 +
+&gt; &gt;   fs/btrfs/relocation.c        |   1 +
+&gt; &gt;   fs/btrfs/subpage.c           |  93 +++++++++++++
+&gt; &gt;   fs/btrfs/subpage.h           |  43 +++++-
+&gt; &gt;   include/trace/events/btrfs.h |  35 +++++
+&gt; &gt;   12 files changed, 585 insertions(+), 7 deletions(-)
+&gt; &gt; 
+&gt; &gt; diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+&gt; &gt; index 7fdc6c3fd066..037445586b31 100644
+&gt; &gt; --- a/fs/btrfs/btrfs_inode.h
+&gt; &gt; +++ b/fs/btrfs/btrfs_inode.h
+&gt; &gt; @@ -600,6 +600,7 @@ int btrfs_prealloc_file_range_trans(struct inode *inode,
+&gt; &gt;   				    loff_t actual_len, u64 *alloc_hint);
+&gt; &gt;   int btrfs_run_delalloc_range(struct btrfs_inode *inode, struct folio *locked_folio,
+&gt; &gt;   			     u64 start, u64 end, struct writeback_control *wbc);
+&gt; &gt; +int btrfs_queue_writepage_fixup(struct btrfs_inode *inode, struct folio *folio);
+&gt; &gt;   int btrfs_encoded_io_compression_from_extent(struct btrfs_fs_info *fs_info,
+&gt; &gt;   					     int compress_type);
+&gt; &gt;   int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+&gt; &gt; diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+&gt; &gt; index 6ec5dd760d42..7de5febee9d1 100644
+&gt; &gt; --- a/fs/btrfs/defrag.c
+&gt; &gt; +++ b/fs/btrfs/defrag.c
+&gt; &gt; @@ -1158,6 +1158,7 @@ static void defrag_one_locked_target(struct btrfs_inode *inode,
+&gt; &gt;   		    start + len &lt;= folio_pos(folio))
+&gt; &gt;   			continue;
+&gt; &gt;   		btrfs_folio_clamp_set_dirty(fs_info, folio, start, len);
+&gt; &gt; +		btrfs_folio_cancel_fixup(fs_info, folio, start, len);
+&gt; 
+&gt; This call is very frequent, and to be honest, it&#x27;s redundant.
+&gt; 
+&gt; We can merge the cancel into btrfs_folio*_set_dirty(), as the
+&gt; btrfs_folio_*set_dirty() is the &quot;proper dirty&quot; entrance, so we know if we&#x27;re
+&gt; going through that interface, we are ensured to cancel the fixup.
+&gt; 
+&gt; &gt; +
+&gt; &gt; +	if (!folio_test_fixup_pending(folio))
+&gt; 
+&gt; if (likely())
+&gt; 
+&gt; &gt; +		return 0;
+&gt; &gt; +
+&gt; &gt; +	for_each_set_bit(bit, bio_ctrl-&gt;submit_bitmap, blocks_per_folio) {
+&gt; &gt; +		const u64 start = page_start + (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +
+&gt; &gt; +		if (btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree, start,
+&gt; &gt; +						start + sectorsize - 1,
+&gt; &gt; +						EXTENT_DELALLOC))
+&gt; 
+&gt; Can we simplify the check to just check if the fixup bit is not set?
+&gt; 
+&gt; To me, without fixup bit it means it went through the regular write
+&gt; preparation, thus should have EXTENT_DELALLOC.
+&gt; And checking a bit is way faster than check an extent range.
+&gt; 
 
 the delalloc lookup is essential for bs == folio_size, to tell apart
 the case where you are submitting a folio that got redirtied behind you
@@ -282,26 +946,178 @@ remove this.
 I think for subpage it probably doesn&#x27;t matter, because those should not
 have fixup in their bitmaps.
 
----
+&gt; &gt; +			continue;
+&gt; &gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt; &gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize)) {
+&gt; 
+&gt; Again, we prefer not to use btrfs_is_subpage() and btrfs_subpage_*() out of
+&gt; subpage.c when possible.
+&gt; 
+&gt; So just some helper, like btrfs_folio_test_fixup() would make it more
+&gt; readable.
+&gt; 
+&gt; &gt; +			struct btrfs_ordered_extent *ordered;
+&gt; &gt; +
+&gt; &gt; +			/*
+&gt; &gt; +			 * Not a suspect: the only legal explanation for a
+&gt; &gt; +			 * dirty, unfunded block is that it is pending its own
+&gt; &gt; +			 * submission into a covering ordered extent - punting
+&gt; &gt; +			 * it would starve that ordered extent forever, and
+&gt; &gt; +			 * the worker could not see it anyway (its work list
+&gt; &gt; +			 * is the fixup bits). Verify the ordered extent
+&gt; &gt; +			 * exists; if not, the invariant is broken - leave the
+&gt; &gt; +			 * block in the bitmap so submission fails loudly
+&gt; &gt; +			 * (EUCLEAN) instead of silently repairing.
+&gt; &gt; +			 */
+&gt; 
+&gt; The block can be dirtied properly before, then -&gt;dirty_folio() callback is
+&gt; triggered.
+&gt; 
+&gt; In that case, we may have not run delalloc for the folio, thus there may be
+&gt; no OE created yet.
+&gt; 
+&gt; It looks like the assumption is not correct to me, and may cause false
+&gt; alerts.
+&gt; 
+&gt; But on the other hand, it&#x27;s already very hard to hit a case where we have
+&gt; some proper dirty blocks, and -&gt;dirty_folio() is called.
+&gt; E.g. for the direct IO case, -&gt;dirty_folio() is only called when the folio
+&gt; is clean.
+&gt; 
+&gt; Thus this false alerts case is not easy to test.
+&gt; 
+&gt; &gt; +			ordered = btrfs_lookup_ordered_range(inode, start,
+&gt; &gt; +							     sectorsize);
+&gt; 
+&gt; Doing this is a little overkilled.
+&gt; 
+&gt; As the recent patch &quot;btrfs: use ordered extent to grab the logical address
+&gt; for submission&quot; will do it at submission time, with better cached OE usage.
+&gt; 
+&gt; I&#x27;d prefer skip the OE lookup completely, and let the final submission path
+&gt; to grab the OE (which can reuse bbio-&gt;ordered when possible).
 
 Agreed. This is vestigial from a long period where ordered was really
 important before I tightened the logic and left it as an assertion, but
 that is a big overkill for not DEBUG at least. I&#x27;ll either remove it or
 hide it behind CONFIG_BTRFS_DEBUG.
 
----
+&gt; &gt; +			if (unlikely(!ordered))
+&gt; &gt; +				DEBUG_WARN();
+&gt; &gt; +			else
+&gt; &gt; +				btrfs_put_ordered_extent(ordered);
+&gt; &gt; +			continue;
+&gt; &gt; +		}
+&gt; &gt; +		/*
+&gt; &gt; +		 * Block re-dirtied via dirty_folio(), requires async fixup.
+&gt; &gt; +		 * All other blocks in the folio should proceed as normal so
+&gt; &gt; +		 * that their OEs can make progress and complete.
+&gt; &gt; +		 */
+&gt; &gt; +		bitmap_clear(bio_ctrl-&gt;submit_bitmap, bit, 1);
+&gt; &gt; +		punt = true;
+&gt; 
+&gt; The variable naming choice is definitely very LLM.
+&gt; 
+&gt; Non-native speaker like me may need to google the word first...
+&gt; 
 
 Yes, I hate when they do that. This one was just natural enough to me
 that I let it go, but it is totally pointless jargon. I&#x27;ll fix it.
 
----
+&gt; &gt; +	}
+&gt; &gt; +	if (punt) {
+&gt; &gt; +		btrfs_queue_writepage_fixup(inode, folio);
+&gt; &gt; +		/*
+&gt; &gt; +		 * Keep the folio dirty for the punted blocks.  If nothing
+&gt; &gt; +		 * is left to submit this pass, the folio is done and we own
+&gt; &gt; +		 * the unlock, matching the async-submission contract.
+&gt; &gt; +		 */
+&gt; &gt; +		folio_redirty_for_writepage(bio_ctrl-&gt;wbc, folio);
+&gt; 
+&gt; We haven&#x27;t yet cleared any bit nor folio dirty in the first place.
+&gt; So not sure if this is really needed, nor the comment.
+&gt; 
+&gt; &gt; +		if (bitmap_empty(bio_ctrl-&gt;submit_bitmap, blocks_per_folio)) {
+&gt; &gt; +			folio_unlock(folio);
+&gt; &gt; +			return 1;
+&gt; &gt; +		}
+&gt; &gt; +		return 0;
+&gt; &gt; +	}
+&gt; &gt; +	/* Every dirty block is now covered; the folio is ordinary again. */
+&gt; &gt; +	if (btrfs_is_subpage(fs_info, folio))
+&gt; &gt; +		btrfs_subpage_clear_fixup(fs_info, folio, page_start,
+&gt; &gt; +					  folio_size(folio));
+&gt; 
+&gt; Again, a btrfs_folio_clear_fixup() is more helpful.
+&gt; 
+&gt; [...]
+&gt; &gt; +/*
+&gt; &gt; + * The folio has (or, for single-block folios, is) dirty blocks that were
+&gt; &gt; + * dirtied without notifying the filesystem (e.g. set_page_dirty_lock() on a
+&gt; &gt; + * GUP pin) and carry no reservation.  Set by btrfs_data_dirty_folio(), which
+&gt; &gt; + * records the affected blocks in the subpage fixup bitmap; cleared when the
+&gt; &gt; + * writepage fixup has covered every dirty block, or by a reserving write
+&gt; &gt; + * that covers the whole folio.  Reuses the PG_owner_2 bit that the folio
+&gt; &gt; + * ordered flag occupied before it was removed.
+&gt; 
+&gt; Again, very LLM comments. That&#x27;s why always delete all comments from LLM by
+&gt; default.
 
 yup, haha missed this one. You would have loved the ones that got
 deleted :D
 
 it was like scrolls full of word salad at every if(...)
 
----
+&gt; 
+&gt; The older, removed comment is very simple for folio_ordered:
+&gt; 
+&gt;  * We use folio flag owner_2 to indicate there is an ordered extent with
+&gt;  * unfinished IO.
+&gt; 
+&gt; 
+&gt; [...]
+&gt; &gt; +static void btrfs_writepage_fixup_worker(struct btrfs_work *work)
+&gt; &gt; +{
+&gt; &gt; +	struct btrfs_writepage_fixup *fixup =
+&gt; &gt; +		container_of(work, struct btrfs_writepage_fixup, work);
+&gt; &gt; +	struct extent_state *cached_state = NULL;
+&gt; &gt; +	struct extent_changeset *data_reserved = NULL;
+&gt; &gt; +	unsigned long funded[BITS_TO_LONGS(BTRFS_MAX_BLOCKS_PER_FOLIO)] = { 0 };
+&gt; &gt; +	struct folio *folio = fixup-&gt;folio;
+&gt; &gt; +	struct btrfs_inode *inode = fixup-&gt;inode;
+&gt; &gt; +	struct btrfs_fs_info *fs_info = inode-&gt;root-&gt;fs_info;
+&gt; &gt; +	const unsigned int blocks_per_folio = btrfs_blocks_per_folio(fs_info, folio);
+&gt; &gt; +	const u32 sectorsize = fs_info-&gt;sectorsize;
+&gt; &gt; +	const u64 page_start = folio_pos(folio);
+&gt; &gt; +	const u64 page_end = folio_next_pos(folio) - 1;
+&gt; &gt; +	unsigned int start_bit;
+&gt; &gt; +	unsigned int end_bit;
+&gt; &gt; +	unsigned int bit;
+&gt; &gt; +	bool reserved;
+&gt; &gt; +	int ret;
+&gt; &gt; +
+&gt; &gt; +	/*
+&gt; &gt; +	 * Reserve for the whole folio before taking the folio lock, like
+&gt; &gt; +	 * page_mkwrite: the reservation may flush, and flushing writeback
+&gt; &gt; +	 * takes folio locks.  Which blocks actually need funding is only
+&gt; &gt; +	 * knowable under the lock, so reserve the worst case and release
+&gt; &gt; +	 * the unused ranges once the funded set is known.
+&gt; &gt; +	 */
+&gt; &gt; +	ret = btrfs_delalloc_reserve_space(inode, &amp;data_reserved, page_start,
+&gt; &gt; +					   folio_size(folio));
+&gt; 
+&gt; You fall into the same pitfall I&#x27;m worried about, but unfortunately or
+&gt; fortunately, it&#x27;s very hard to hit.
+&gt; 
+&gt; The problem here is, we can over-reserve, e.g. some range is already
+&gt; properly dirtied, thus they have already space reserved.
+&gt; 
+&gt; And you can not release the reserved space for them, because release will
+&gt; also clear the qgroup reserved extent flag.
+&gt; 
+&gt; This is the biggest problem that I have no way to fix.
+&gt; As there is no way to ensure the space we reserved is really needed before
+&gt; holding the folio lock.
 
 I think this approach here seems correct to me, except for maybe a
 really mean case which calls aops-&gt;dirty_folio() without locking the folio
@@ -321,281 +1137,818 @@ I think the clearer option of &quot;take the lock, observe the real set,
 release, then reserve, then take the lock and do all the work&quot; sounds
 appealing but almost certainly fails to some simple TOCTOU race.
 
----
+&gt; 
+&gt; 
+&gt; But since it&#x27;s really hard to get a dirty folio to be called with
+&gt; -&gt;dirty_folio(), thus it may not be exposed through tests.
+&gt; 
+&gt; &gt; +	reserved = (ret == 0);
+&gt; &gt; +again:
+&gt; &gt; +	folio_lock(folio);
+&gt; &gt; +
+&gt; &gt; +	/*
+&gt; &gt; +	 * The queueing writeback pass took references on the folio and the
+&gt; &gt; +	 * inode, but nothing else is stable: an in-band write may have funded
+&gt; &gt; +	 * the blocks and cancelled the fixup state, or the folio may have
+&gt; &gt; +	 * been invalidated.  Then there is nothing left to do - and a failed
+&gt; &gt; +	 * reservation against a folio that no longer needs one is no error.
+&gt; &gt; +	 */
+&gt; &gt; +	if (!folio-&gt;mapping || !folio_test_dirty(folio) ||
+&gt; &gt; +	    !folio_test_fixup_pending(folio)) {
+&gt; &gt; +		ret = 0;
+&gt; &gt; +		goto out;
+&gt; &gt; +	}
+&gt; &gt; +
+&gt; &gt; +	/* The folio still needs funding we could not get. */
+&gt; &gt; +	if (ret)
+&gt; &gt; +		goto out_error;
+&gt; &gt; +
+&gt; &gt; +	btrfs_lock_extent(&amp;inode-&gt;io_tree, page_start, page_end, &amp;cached_state);
+&gt; &gt; +
+&gt; &gt; +	for (bit = 0; bit &lt; blocks_per_folio; bit++) {
+&gt; &gt; +		struct btrfs_ordered_extent *ordered;
+&gt; &gt; +		const u64 start = page_start + (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +
+&gt; &gt; +		if (test_bit(bit, funded))
+&gt; &gt; +			continue;
+&gt; &gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt; &gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize))
+&gt; &gt; +			continue;
+&gt; &gt; +		/* An in-band write may have funded the block while we waited. */
+&gt; &gt; +		if (btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree, start,
+&gt; &gt; +						start + sectorsize - 1,
+&gt; &gt; +						EXTENT_DELALLOC))
+&gt; &gt; +			continue;
+&gt; &gt; +		ordered = btrfs_lookup_ordered_range(inode, start, sectorsize);
+&gt; &gt; +		if (ordered) {
+&gt; &gt; +			trace_btrfs_writepage_fixup_defer(inode, ordered);
+&gt; &gt; +			btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start,
+&gt; &gt; +					    page_end, &amp;cached_state);
+&gt; &gt; +			folio_unlock(folio);
+&gt; &gt; +			btrfs_start_ordered_extent(ordered);
+&gt; &gt; +			btrfs_put_ordered_extent(ordered);
+&gt; &gt; +			goto again;
+&gt; &gt; +		}
+&gt; &gt; +		ret = btrfs_set_extent_delalloc(inode, start,
+&gt; &gt; +						start + sectorsize - 1, 0,
+&gt; &gt; +						&amp;cached_state);
+&gt; &gt; +		if (ret) {
+&gt; &gt; +			btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start,
+&gt; &gt; +					    page_end, &amp;cached_state);
+&gt; &gt; +			goto out_error;
+&gt; &gt; +		}
+&gt; &gt; +		trace_btrfs_writepage_fixup_reserve(inode, start, sectorsize);
+&gt; &gt; +		if (btrfs_is_subpage(fs_info, folio))
+&gt; &gt; +			btrfs_subpage_clear_fixup(fs_info, folio, start,
+&gt; &gt; +						  sectorsize);
+&gt; &gt; +		__set_bit(bit, funded);
+&gt; 
+&gt; Why __set_bit() not set_bit()?
+&gt; 
+&gt; &gt; +	}
+&gt; &gt; +
+&gt; &gt; +	/* Every fixup block is funded; the folio is ordinary again. */
+&gt; &gt; +	folio_clear_fixup_pending(folio);
+&gt; &gt; +	btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start, page_end, &amp;cached_state);
+&gt; &gt; +	goto out;
+&gt; &gt; +
+&gt; &gt; +out_error:
+&gt; &gt; +	/*
+&gt; &gt; +	 * The remaining unnotified blocks cannot be funded.  There is no
+&gt; &gt; +	 * syscall to return this through, so surface it the way a failed
+&gt; &gt; +	 * writeback would - record the error on the mapping - and drop the
+&gt; &gt; +	 * blocks, or writeback would find and requeue them forever.
+&gt; &gt; +	 */
+&gt; &gt; +	mapping_set_error(folio-&gt;mapping, ret);
+&gt; &gt; +	if (btrfs_is_subpage(fs_info, folio)) {
+&gt; &gt; +		bool last = false;
+&gt; &gt; +
+&gt; &gt; +		for (bit = 0; bit &lt; blocks_per_folio; bit++) {
+&gt; 
+&gt; Again, a proper btrfs_folio_clear_fixup() and pass the folio range into it
+&gt; should handle the loop.
+&gt; 
+&gt; &gt; +			const u64 start = page_start +
+&gt; &gt; +					  (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +
+&gt; &gt; +			if (!btrfs_subpage_test_fixup(fs_info, folio, start,
+&gt; &gt; +						      sectorsize))
+&gt; &gt; +				continue;
+&gt; &gt; +			last = btrfs_subpage_clear_and_test_dirty(fs_info,
+&gt; &gt; +							folio, start,
+&gt; &gt; +							sectorsize);
+&gt; &gt; +		}
+&gt; &gt; +		btrfs_folio_cancel_fixup(fs_info, folio, page_start,
+&gt; &gt; +					 folio_size(folio));
+&gt; &gt; +		if (last)
+&gt; &gt; +			folio_clear_dirty_for_io(folio);
+&gt; 
+&gt; Again, the regular btrfs_folio_clear_dirty() is going to handle all these,
+&gt; and no need for a special subpage branch.
+&gt; 
+&gt; &gt; +	} else {
+&gt; &gt; +		folio_clear_dirty_for_io(folio);
+&gt; &gt; +	}
+&gt; &gt; +	folio_clear_fixup_pending(folio);
+&gt; &gt; +out:
+&gt; &gt; +	if (reserved) {
+&gt; &gt; +		btrfs_delalloc_release_extents(inode, folio_size(folio));
+&gt; &gt; +		for_each_clear_bitrange(start_bit, end_bit, funded,
+&gt; &gt; +					blocks_per_folio)
+&gt; &gt; +			btrfs_delalloc_release_space(inode, data_reserved,
+&gt; &gt; +				page_start + (start_bit &lt;&lt; fs_info-&gt;sectorsize_bits),
+&gt; &gt; +				(end_bit - start_bit) &lt;&lt; fs_info-&gt;sectorsize_bits,
+&gt; &gt; +				true);
+&gt; &gt; +	}
+&gt; &gt; +	folio_unlock(folio);
+&gt; &gt; +	folio_put(folio);
+&gt; &gt; +	kfree(fixup);
+&gt; &gt; +	extent_changeset_free(data_reserved);
+&gt; &gt; +	/*
+&gt; &gt; +	 * As a precaution, do a delayed iput in case it would be the last
+&gt; &gt; +	 * iput that could need flushing space. Recursing back to the fixup
+&gt; &gt; +	 * worker would deadlock.
+&gt; &gt; +	 */
+&gt; &gt; +	btrfs_add_delayed_iput(inode);
+&gt; &gt; +}
+&gt; [...]
+&gt; &gt; +static bool btrfs_data_dirty_folio(struct address_space *mapping,
+&gt; &gt; +				   struct folio *folio)
+&gt; &gt; +{
+&gt; &gt; +	struct btrfs_inode *inode = BTRFS_I(mapping-&gt;host);
+&gt; &gt; +	struct btrfs_fs_info *fs_info = inode-&gt;root-&gt;fs_info;
+&gt; &gt; +	bool marked = false;
+&gt; &gt; +
+&gt; &gt; +	if (btrfs_is_subpage(fs_info, folio)) {
+&gt; &gt; +		const struct btrfs_folio_state *bfs = folio_get_private(folio);
+&gt; &gt; +		const u64 page_start = folio_pos(folio);
+&gt; &gt; +		const u64 range_end = min_t(u64, page_start + folio_size(folio),
+&gt; &gt; +					    round_up(i_size_read(&amp;inode-&gt;vfs_inode),
+&gt; &gt; +						     fs_info-&gt;sectorsize));
+&gt; &gt; +
+&gt; &gt; +		if (!READ_ONCE(bfs-&gt;reserving_dirty) &amp;&amp;
+&gt; &gt; +		    folio_test_uptodate(folio) &amp;&amp; range_end &gt; page_start)
+&gt; &gt; +			marked = btrfs_subpage_set_fixup_dirty(fs_info, folio,
+&gt; &gt; +							       page_start,
+&gt; &gt; +							       range_end - page_start);
+&gt; &gt; +	} else if (!folio_test_dirty(folio) &amp;&amp;
+&gt; &gt; +		   !btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree,
+&gt; &gt; +						folio_pos(folio),
+&gt; &gt; +						folio_next_pos(folio) - 1,
+&gt; &gt; +						EXTENT_DELALLOC)) {
+&gt; 
+&gt; Again, the same question why the folio_test_dirty() check is not enough.
+&gt; 
+&gt; The subpage part has no such check.
+&gt; 
+&gt; &gt; +		marked = true;
+&gt; &gt; +	}
+&gt; &gt; +	if (marked)
+&gt; &gt; +		folio_set_fixup_pending(folio);
+&gt; &gt; +	return filemap_dirty_folio(mapping, folio);
+&gt; &gt; +}
+&gt; &gt; +
+&gt; [..]
+&gt; &gt; --- a/fs/btrfs/subpage.c
+&gt; &gt; +++ b/fs/btrfs/subpage.c
+&gt; &gt; @@ -356,7 +356,17 @@ void btrfs_subpage_set_dirty(const struct btrfs_fs_info *fs_info,
+&gt; &gt;   	spin_lock_irqsave(&amp;bfs-&gt;lock, flags);
+&gt; &gt;   	bitmap_set(bfs-&gt;bitmaps, start_bit, len &gt;&gt; fs_info-&gt;sectorsize_bits);
+&gt; &gt;   	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; &gt; +	/*
+&gt; &gt; +	 * Every caller of this helper is a reserving write path dirtying
+&gt; &gt; +	 * exactly the range it reserved; the dirty_folio callback must not
+&gt; &gt; +	 * treat it as potentially unnotified and drag the folio&#x27;s clean
+&gt; &gt; +	 * sibling blocks into COW (that breaks reflink sharing of the
+&gt; &gt; +	 * untouched blocks, among other things).  Unnotified dirtiers call
+&gt; &gt; +	 * folio_mark_dirty() directly and never pass through here.
+&gt; &gt; +	 */
+&gt; &gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, true);
+&gt; &gt;   	folio_mark_dirty(folio);
+&gt; 
+&gt; My solution in my initial patchset is to not call folio_mark_dirty() as it
+&gt; will call back to the -&gt;dirty_folio() call back.
+&gt; 
+&gt; So I implemented an local version which call back to filemap_mark_dirty(),
+&gt; other than -&gt;dirty_folio() which sets the fixup bits.
+&gt; 
 
 You mean to avoid the ugly bfs-&gt;reserving_dirty thing?
 That does sound appealing...
 
----
+&gt; &gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, false);
+&gt; &gt;   }
+&gt; &gt;   static void folio_clear_tags(struct folio *folio)
+&gt; &gt; @@ -457,6 +467,88 @@ void btrfs_subpage_clear_writeback(const struct btrfs_fs_info *fs_info,
+&gt; &gt;   	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; &gt;   }
+&gt; &gt; +void btrfs_subpage_clear_fixup(const struct btrfs_fs_info *fs_info,
+&gt; &gt; +			       struct folio *folio, u64 start, u32 len)
+&gt; &gt; +{
+&gt; &gt; +	struct btrfs_folio_state *bfs = folio_get_private(folio);
+&gt; &gt; +	unsigned int start_bit = subpage_calc_start_bit(fs_info, folio,
+&gt; &gt; +							fixup, start, len);
+&gt; &gt; +	unsigned long flags;
+&gt; &gt; +
+&gt; &gt; +	spin_lock_irqsave(&amp;bfs-&gt;lock, flags);
+&gt; &gt; +	bitmap_clear(bfs-&gt;bitmaps, start_bit, len &gt;&gt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; 
+&gt; Shouldn&#x27;t we also check if we have cleared the last fixup bit and clear the
+&gt; folio fixup flag?
+&gt; [...]
 
 yes, that seems like an obvious improvement. I think we get away with it
 in a super stupid way that writepage_fixup will walk the bitmap and see
 all clear and clear it there. Complete waste and adds risk for no
-reason.</pre>
+reason.
+
+&gt; &gt; +void btrfs_folio_cancel_fixup(const struct btrfs_fs_info *fs_info,
+&gt; &gt; +			      struct folio *folio, u64 start, u32 len)
+&gt; 
+&gt; Why not let IMPLEMNT_BTRFS_PAGE_OPS() to implement all the fixup helpers?
+&gt; 
+&gt; [...]
+&gt; &gt; @@ -50,6 +65,14 @@ enum {
+&gt; &gt;   struct btrfs_folio_state {
+&gt; &gt;   	/* Common members for both data and metadata pages */
+&gt; &gt;   	spinlock_t lock;
+&gt; &gt; +	/*
+&gt; &gt; +	 * Set across the folio_mark_dirty() that a reserving write path
+&gt; &gt; +	 * issues from btrfs_subpage_set_dirty(), so that the dirty_folio
+&gt; &gt; +	 * callback does not treat the dirtying as potentially unnotified
+&gt; &gt; +	 * and mark the folio&#x27;s still-clean sibling blocks.  Written under
+&gt; &gt; +	 * the folio lock, which every reserving path holds.
+&gt; &gt; +	 */
+&gt; &gt; +	bool reserving_dirty;
+&gt; 
+&gt; As I mentioned, this is only for dirty_folio() to skip setting fixup bit.
+&gt; 
+&gt; We can get rid of it, if the btrfs_folio_set_dirty() helper doesn&#x27;t go
+&gt; through folio_mark_dirty().
+&gt; 
+&gt; Thanks,
+&gt; Qu</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Qu Wenruo</div>
 <a href="https://lore.kernel.org/r/20260725201256.GA3089100@zen.localdomain" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged a mistake, agreed to rework, considering simplification</div>
+<div class="review-comment-signals">Signals: acknowledged a simplification opportunity, agreed to rework</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-07-25">
+</div>
+<div class="thread-node depth-0" id="2026-07-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Boris Burkov (author)</span>
+<a class="date-chip" href="../2026-07-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-26">2026-07-26</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledged that Qu Wenruo&#x27;s suggestions for simplifying the code are valid and agreed to rework the patch to address these issues. Specifically, they accepted Qu&#x27;s proposal to merge canceling fixup into btrfs_folio*_set_dirty(), simplify the check for the fixup bit in EXTENT_DELALLOC, and use a helper function instead of btrfs_is_subpage() and related functions.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Sat, Jul 25, 2026 at 07:34:46PM +0930, Qu Wenruo wrote:
+&gt; 
+&gt; 
+&gt; \u5728 2026/7/25 15:54, Boris Burkov \u5199\u9053:
+&gt; [...]&gt;
+&gt; &gt; Link: https://lore.kernel.org/linux-btrfs/20260721191152.101118-1-borntraeger@linux.ibm.com/
+&gt; &gt; Signed-off-by: Boris Burkov &lt;boris@bur.io&gt;
+&gt; &gt; Assisted-by: LLM
+&gt; 
+&gt; Without LLM it&#x27;s very hard to come up with such huge change in such a short
+&gt; time, especially considering this fix is a little urgent due to both large
+&gt; folio and removal of cow fixup are in the same release.
+&gt; 
+&gt; So I&#x27;m totally fine with the involvement of LLM, just we will spend quite
+&gt; some time reworking/removing a lot of comments/commit message.
+&gt; 
+&gt; Not because they are not not grammarly sound (unlike my replies), but a lot
+&gt; of time they are too lengthy but brings not too much value compared to the
+&gt; number of lines.
+&gt; 
+&gt; But still, very impressed to see a working RFC this soon.
+&gt; 
+&gt; &gt; ---
+&gt; &gt;   fs/btrfs/btrfs_inode.h       |   1 +
+&gt; &gt;   fs/btrfs/defrag.c            |   1 +
+&gt; &gt;   fs/btrfs/disk-io.c           |   6 +-
+&gt; &gt;   fs/btrfs/extent_io.c         | 127 +++++++++++++++++
+&gt; &gt;   fs/btrfs/file.c              |   2 +
+&gt; &gt;   fs/btrfs/fs.h                |  20 +++
+&gt; &gt;   fs/btrfs/inode.c             | 262 ++++++++++++++++++++++++++++++++++-
+&gt; &gt;   fs/btrfs/reflink.c           |   1 +
+&gt; &gt;   fs/btrfs/relocation.c        |   1 +
+&gt; &gt;   fs/btrfs/subpage.c           |  93 +++++++++++++
+&gt; &gt;   fs/btrfs/subpage.h           |  43 +++++-
+&gt; &gt;   include/trace/events/btrfs.h |  35 +++++
+&gt; &gt;   12 files changed, 585 insertions(+), 7 deletions(-)
+&gt; &gt; 
+&gt; &gt; diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+&gt; &gt; index 7fdc6c3fd066..037445586b31 100644
+&gt; &gt; --- a/fs/btrfs/btrfs_inode.h
+&gt; &gt; +++ b/fs/btrfs/btrfs_inode.h
+&gt; &gt; @@ -600,6 +600,7 @@ int btrfs_prealloc_file_range_trans(struct inode *inode,
+&gt; &gt;   				    loff_t actual_len, u64 *alloc_hint);
+&gt; &gt;   int btrfs_run_delalloc_range(struct btrfs_inode *inode, struct folio *locked_folio,
+&gt; &gt;   			     u64 start, u64 end, struct writeback_control *wbc);
+&gt; &gt; +int btrfs_queue_writepage_fixup(struct btrfs_inode *inode, struct folio *folio);
+&gt; &gt;   int btrfs_encoded_io_compression_from_extent(struct btrfs_fs_info *fs_info,
+&gt; &gt;   					     int compress_type);
+&gt; &gt;   int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+&gt; &gt; diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+&gt; &gt; index 6ec5dd760d42..7de5febee9d1 100644
+&gt; &gt; --- a/fs/btrfs/defrag.c
+&gt; &gt; +++ b/fs/btrfs/defrag.c
+&gt; &gt; @@ -1158,6 +1158,7 @@ static void defrag_one_locked_target(struct btrfs_inode *inode,
+&gt; &gt;   		    start + len &lt;= folio_pos(folio))
+&gt; &gt;   			continue;
+&gt; &gt;   		btrfs_folio_clamp_set_dirty(fs_info, folio, start, len);
+&gt; &gt; +		btrfs_folio_cancel_fixup(fs_info, folio, start, len);
+&gt; 
+&gt; This call is very frequent, and to be honest, it&#x27;s redundant.
+&gt; 
+&gt; We can merge the cancel into btrfs_folio*_set_dirty(), as the
+&gt; btrfs_folio_*set_dirty() is the &quot;proper dirty&quot; entrance, so we know if we&#x27;re
+&gt; going through that interface, we are ensured to cancel the fixup.
+&gt; 
+&gt; &gt; +
+&gt; &gt; +	if (!folio_test_fixup_pending(folio))
+&gt; 
+&gt; if (likely())
+&gt; 
+&gt; &gt; +		return 0;
+&gt; &gt; +
+&gt; &gt; +	for_each_set_bit(bit, bio_ctrl-&gt;submit_bitmap, blocks_per_folio) {
+&gt; &gt; +		const u64 start = page_start + (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +
+&gt; &gt; +		if (btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree, start,
+&gt; &gt; +						start + sectorsize - 1,
+&gt; &gt; +						EXTENT_DELALLOC))
+&gt; 
+&gt; Can we simplify the check to just check if the fixup bit is not set?
+&gt; 
+&gt; To me, without fixup bit it means it went through the regular write
+&gt; preparation, thus should have EXTENT_DELALLOC.
+&gt; And checking a bit is way faster than check an extent range.
+&gt; 
+&gt; &gt; +			continue;
+&gt; &gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt; &gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize)) {
+&gt; 
+&gt; Again, we prefer not to use btrfs_is_subpage() and btrfs_subpage_*() out of
+&gt; subpage.c when possible.
+&gt; 
+&gt; So just some helper, like btrfs_folio_test_fixup() would make it more
+&gt; readable.
+&gt; 
+&gt; &gt; +			struct btrfs_ordered_extent *ordered;
+&gt; &gt; +
+&gt; &gt; +			/*
+&gt; &gt; +			 * Not a suspect: the only legal explanation for a
+&gt; &gt; +			 * dirty, unfunded block is that it is pending its own
+&gt; &gt; +			 * submission into a covering ordered extent - punting
+&gt; &gt; +			 * it would starve that ordered extent forever, and
+&gt; &gt; +			 * the worker could not see it anyway (its work list
+&gt; &gt; +			 * is the fixup bits). Verify the ordered extent
+&gt; &gt; +			 * exists; if not, the invariant is broken - leave the
+&gt; &gt; +			 * block in the bitmap so submission fails loudly
+&gt; &gt; +			 * (EUCLEAN) instead of silently repairing.
+&gt; &gt; +			 */
+&gt; 
+&gt; The block can be dirtied properly before, then -&gt;dirty_folio() callback is
+&gt; triggered.
+&gt; 
+&gt; In that case, we may have not run delalloc for the folio, thus there may be
+&gt; no OE created yet.
+&gt; 
+&gt; It looks like the assumption is not correct to me, and may cause false
+&gt; alerts.
+&gt; 
+&gt; But on the other hand, it&#x27;s already very hard to hit a case where we have
+&gt; some proper dirty blocks, and -&gt;dirty_folio() is called.
+&gt; E.g. for the direct IO case, -&gt;dirty_folio() is only called when the folio
+&gt; is clean.
+&gt; 
+&gt; Thus this false alerts case is not easy to test.
+&gt; 
+&gt; &gt; +			ordered = btrfs_lookup_ordered_range(inode, start,
+&gt; &gt; +							     sectorsize);
+&gt; 
+&gt; Doing this is a little overkilled.
+&gt; 
+&gt; As the recent patch &quot;btrfs: use ordered extent to grab the logical address
+&gt; for submission&quot; will do it at submission time, with better cached OE usage.
+&gt; 
+&gt; I&#x27;d prefer skip the OE lookup completely, and let the final submission path
+&gt; to grab the OE (which can reuse bbio-&gt;ordered when possible).
+&gt; &gt; +			if (unlikely(!ordered))
+&gt; &gt; +				DEBUG_WARN();
+&gt; &gt; +			else
+&gt; &gt; +				btrfs_put_ordered_extent(ordered);
+&gt; &gt; +			continue;
+&gt; &gt; +		}
+&gt; &gt; +		/*
+&gt; &gt; +		 * Block re-dirtied via dirty_folio(), requires async fixup.
+&gt; &gt; +		 * All other blocks in the folio should proceed as normal so
+&gt; &gt; +		 * that their OEs can make progress and complete.
+&gt; &gt; +		 */
+&gt; &gt; +		bitmap_clear(bio_ctrl-&gt;submit_bitmap, bit, 1);
+&gt; &gt; +		punt = true;
+&gt; 
+&gt; The variable naming choice is definitely very LLM.
+&gt; 
+&gt; Non-native speaker like me may need to google the word first...
+&gt; 
+&gt; &gt; +	}
+&gt; &gt; +	if (punt) {
+&gt; &gt; +		btrfs_queue_writepage_fixup(inode, folio);
+&gt; &gt; +		/*
+&gt; &gt; +		 * Keep the folio dirty for the punted blocks.  If nothing
+&gt; &gt; +		 * is left to submit this pass, the folio is done and we own
+&gt; &gt; +		 * the unlock, matching the async-submission contract.
+&gt; &gt; +		 */
+&gt; &gt; +		folio_redirty_for_writepage(bio_ctrl-&gt;wbc, folio);
+&gt; 
+&gt; We haven&#x27;t yet cleared any bit nor folio dirty in the first place.
+&gt; So not sure if this is really needed, nor the comment.
+&gt; 
+
+This was just inherited from the original fixup which had similar
+conditions of dirtiness. I think it is probably vestigial. I am leaving
+it in v2 for now since that is what I have tested the most, but I think
+it is likely very possible to remove.
+
+&gt; &gt; +		if (bitmap_empty(bio_ctrl-&gt;submit_bitmap, blocks_per_folio)) {
+&gt; &gt; +			folio_unlock(folio);
+&gt; &gt; +			return 1;
+&gt; &gt; +		}
+&gt; &gt; +		return 0;
+&gt; &gt; +	}
+&gt; &gt; +	/* Every dirty block is now covered; the folio is ordinary again. */
+&gt; &gt; +	if (btrfs_is_subpage(fs_info, folio))
+&gt; &gt; +		btrfs_subpage_clear_fixup(fs_info, folio, page_start,
+&gt; &gt; +					  folio_size(folio));
+&gt; 
+&gt; Again, a btrfs_folio_clear_fixup() is more helpful.
+&gt; 
+&gt; [...]
+&gt; &gt; +/*
+&gt; &gt; + * The folio has (or, for single-block folios, is) dirty blocks that were
+&gt; &gt; + * dirtied without notifying the filesystem (e.g. set_page_dirty_lock() on a
+&gt; &gt; + * GUP pin) and carry no reservation.  Set by btrfs_data_dirty_folio(), which
+&gt; &gt; + * records the affected blocks in the subpage fixup bitmap; cleared when the
+&gt; &gt; + * writepage fixup has covered every dirty block, or by a reserving write
+&gt; &gt; + * that covers the whole folio.  Reuses the PG_owner_2 bit that the folio
+&gt; &gt; + * ordered flag occupied before it was removed.
+&gt; 
+&gt; Again, very LLM comments. That&#x27;s why always delete all comments from LLM by
+&gt; default.
+&gt; 
+&gt; The older, removed comment is very simple for folio_ordered:
+&gt; 
+&gt;  * We use folio flag owner_2 to indicate there is an ordered extent with
+&gt;  * unfinished IO.
+&gt; 
+&gt; 
+&gt; [...]
+&gt; &gt; +static void btrfs_writepage_fixup_worker(struct btrfs_work *work)
+&gt; &gt; +{
+&gt; &gt; +	struct btrfs_writepage_fixup *fixup =
+&gt; &gt; +		container_of(work, struct btrfs_writepage_fixup, work);
+&gt; &gt; +	struct extent_state *cached_state = NULL;
+&gt; &gt; +	struct extent_changeset *data_reserved = NULL;
+&gt; &gt; +	unsigned long funded[BITS_TO_LONGS(BTRFS_MAX_BLOCKS_PER_FOLIO)] = { 0 };
+&gt; &gt; +	struct folio *folio = fixup-&gt;folio;
+&gt; &gt; +	struct btrfs_inode *inode = fixup-&gt;inode;
+&gt; &gt; +	struct btrfs_fs_info *fs_info = inode-&gt;root-&gt;fs_info;
+&gt; &gt; +	const unsigned int blocks_per_folio = btrfs_blocks_per_folio(fs_info, folio);
+&gt; &gt; +	const u32 sectorsize = fs_info-&gt;sectorsize;
+&gt; &gt; +	const u64 page_start = folio_pos(folio);
+&gt; &gt; +	const u64 page_end = folio_next_pos(folio) - 1;
+&gt; &gt; +	unsigned int start_bit;
+&gt; &gt; +	unsigned int end_bit;
+&gt; &gt; +	unsigned int bit;
+&gt; &gt; +	bool reserved;
+&gt; &gt; +	int ret;
+&gt; &gt; +
+&gt; &gt; +	/*
+&gt; &gt; +	 * Reserve for the whole folio before taking the folio lock, like
+&gt; &gt; +	 * page_mkwrite: the reservation may flush, and flushing writeback
+&gt; &gt; +	 * takes folio locks.  Which blocks actually need funding is only
+&gt; &gt; +	 * knowable under the lock, so reserve the worst case and release
+&gt; &gt; +	 * the unused ranges once the funded set is known.
+&gt; &gt; +	 */
+&gt; &gt; +	ret = btrfs_delalloc_reserve_space(inode, &amp;data_reserved, page_start,
+&gt; &gt; +					   folio_size(folio));
+&gt; 
+&gt; You fall into the same pitfall I&#x27;m worried about, but unfortunately or
+&gt; fortunately, it&#x27;s very hard to hit.
+&gt; 
+&gt; The problem here is, we can over-reserve, e.g. some range is already
+&gt; properly dirtied, thus they have already space reserved.
+&gt; 
+&gt; And you can not release the reserved space for them, because release will
+&gt; also clear the qgroup reserved extent flag.
+&gt; 
+&gt; This is the biggest problem that I have no way to fix.
+&gt; As there is no way to ensure the space we reserved is really needed before
+&gt; holding the folio lock.
+&gt; 
+&gt; 
+&gt; But since it&#x27;s really hard to get a dirty folio to be called with
+&gt; -&gt;dirty_folio(), thus it may not be exposed through tests.
+&gt; 
+&gt; &gt; +	reserved = (ret == 0);
+&gt; &gt; +again:
+&gt; &gt; +	folio_lock(folio);
+&gt; &gt; +
+&gt; &gt; +	/*
+&gt; &gt; +	 * The queueing writeback pass took references on the folio and the
+&gt; &gt; +	 * inode, but nothing else is stable: an in-band write may have funded
+&gt; &gt; +	 * the blocks and cancelled the fixup state, or the folio may have
+&gt; &gt; +	 * been invalidated.  Then there is nothing left to do - and a failed
+&gt; &gt; +	 * reservation against a folio that no longer needs one is no error.
+&gt; &gt; +	 */
+&gt; &gt; +	if (!folio-&gt;mapping || !folio_test_dirty(folio) ||
+&gt; &gt; +	    !folio_test_fixup_pending(folio)) {
+&gt; &gt; +		ret = 0;
+&gt; &gt; +		goto out;
+&gt; &gt; +	}
+&gt; &gt; +
+&gt; &gt; +	/* The folio still needs funding we could not get. */
+&gt; &gt; +	if (ret)
+&gt; &gt; +		goto out_error;
+&gt; &gt; +
+&gt; &gt; +	btrfs_lock_extent(&amp;inode-&gt;io_tree, page_start, page_end, &amp;cached_state);
+&gt; &gt; +
+&gt; &gt; +	for (bit = 0; bit &lt; blocks_per_folio; bit++) {
+&gt; &gt; +		struct btrfs_ordered_extent *ordered;
+&gt; &gt; +		const u64 start = page_start + (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +
+&gt; &gt; +		if (test_bit(bit, funded))
+&gt; &gt; +			continue;
+&gt; &gt; +		if (btrfs_is_subpage(fs_info, folio) &amp;&amp;
+&gt; &gt; +		    !btrfs_subpage_test_fixup(fs_info, folio, start, sectorsize))
+&gt; &gt; +			continue;
+&gt; &gt; +		/* An in-band write may have funded the block while we waited. */
+&gt; &gt; +		if (btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree, start,
+&gt; &gt; +						start + sectorsize - 1,
+&gt; &gt; +						EXTENT_DELALLOC))
+&gt; &gt; +			continue;
+&gt; &gt; +		ordered = btrfs_lookup_ordered_range(inode, start, sectorsize);
+&gt; &gt; +		if (ordered) {
+&gt; &gt; +			trace_btrfs_writepage_fixup_defer(inode, ordered);
+&gt; &gt; +			btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start,
+&gt; &gt; +					    page_end, &amp;cached_state);
+&gt; &gt; +			folio_unlock(folio);
+&gt; &gt; +			btrfs_start_ordered_extent(ordered);
+&gt; &gt; +			btrfs_put_ordered_extent(ordered);
+&gt; &gt; +			goto again;
+&gt; &gt; +		}
+&gt; &gt; +		ret = btrfs_set_extent_delalloc(inode, start,
+&gt; &gt; +						start + sectorsize - 1, 0,
+&gt; &gt; +						&amp;cached_state);
+&gt; &gt; +		if (ret) {
+&gt; &gt; +			btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start,
+&gt; &gt; +					    page_end, &amp;cached_state);
+&gt; &gt; +			goto out_error;
+&gt; &gt; +		}
+&gt; &gt; +		trace_btrfs_writepage_fixup_reserve(inode, start, sectorsize);
+&gt; &gt; +		if (btrfs_is_subpage(fs_info, folio))
+&gt; &gt; +			btrfs_subpage_clear_fixup(fs_info, folio, start,
+&gt; &gt; +						  sectorsize);
+&gt; &gt; +		__set_bit(bit, funded);
+&gt; 
+&gt; Why __set_bit() not set_bit()?
+&gt; 
+
+I think just being cute cause it&#x27;s a local variable. I&#x27;ll use set_bit to
+not make it stick out as if it&#x27;s an important choice.
+
+&gt; &gt; +	}
+&gt; &gt; +
+&gt; &gt; +	/* Every fixup block is funded; the folio is ordinary again. */
+&gt; &gt; +	folio_clear_fixup_pending(folio);
+&gt; &gt; +	btrfs_unlock_extent(&amp;inode-&gt;io_tree, page_start, page_end, &amp;cached_state);
+&gt; &gt; +	goto out;
+&gt; &gt; +
+&gt; &gt; +out_error:
+&gt; &gt; +	/*
+&gt; &gt; +	 * The remaining unnotified blocks cannot be funded.  There is no
+&gt; &gt; +	 * syscall to return this through, so surface it the way a failed
+&gt; &gt; +	 * writeback would - record the error on the mapping - and drop the
+&gt; &gt; +	 * blocks, or writeback would find and requeue them forever.
+&gt; &gt; +	 */
+&gt; &gt; +	mapping_set_error(folio-&gt;mapping, ret);
+&gt; &gt; +	if (btrfs_is_subpage(fs_info, folio)) {
+&gt; &gt; +		bool last = false;
+&gt; &gt; +
+&gt; &gt; +		for (bit = 0; bit &lt; blocks_per_folio; bit++) {
+&gt; 
+&gt; Again, a proper btrfs_folio_clear_fixup() and pass the folio range into it
+&gt; should handle the loop.
+&gt; 
+&gt; &gt; +			const u64 start = page_start +
+&gt; &gt; +					  (bit &lt;&lt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +
+&gt; &gt; +			if (!btrfs_subpage_test_fixup(fs_info, folio, start,
+&gt; &gt; +						      sectorsize))
+&gt; &gt; +				continue;
+&gt; &gt; +			last = btrfs_subpage_clear_and_test_dirty(fs_info,
+&gt; &gt; +							folio, start,
+&gt; &gt; +							sectorsize);
+&gt; &gt; +		}
+&gt; &gt; +		btrfs_folio_cancel_fixup(fs_info, folio, page_start,
+&gt; &gt; +					 folio_size(folio));
+&gt; &gt; +		if (last)
+&gt; &gt; +			folio_clear_dirty_for_io(folio);
+&gt; 
+&gt; Again, the regular btrfs_folio_clear_dirty() is going to handle all these,
+&gt; and no need for a special subpage branch.
+&gt; 
+&gt; &gt; +	} else {
+&gt; &gt; +		folio_clear_dirty_for_io(folio);
+&gt; &gt; +	}
+&gt; &gt; +	folio_clear_fixup_pending(folio);
+&gt; &gt; +out:
+&gt; &gt; +	if (reserved) {
+&gt; &gt; +		btrfs_delalloc_release_extents(inode, folio_size(folio));
+&gt; &gt; +		for_each_clear_bitrange(start_bit, end_bit, funded,
+&gt; &gt; +					blocks_per_folio)
+&gt; &gt; +			btrfs_delalloc_release_space(inode, data_reserved,
+&gt; &gt; +				page_start + (start_bit &lt;&lt; fs_info-&gt;sectorsize_bits),
+&gt; &gt; +				(end_bit - start_bit) &lt;&lt; fs_info-&gt;sectorsize_bits,
+&gt; &gt; +				true);
+&gt; &gt; +	}
+&gt; &gt; +	folio_unlock(folio);
+&gt; &gt; +	folio_put(folio);
+&gt; &gt; +	kfree(fixup);
+&gt; &gt; +	extent_changeset_free(data_reserved);
+&gt; &gt; +	/*
+&gt; &gt; +	 * As a precaution, do a delayed iput in case it would be the last
+&gt; &gt; +	 * iput that could need flushing space. Recursing back to the fixup
+&gt; &gt; +	 * worker would deadlock.
+&gt; &gt; +	 */
+&gt; &gt; +	btrfs_add_delayed_iput(inode);
+&gt; &gt; +}
+&gt; [...]
+&gt; &gt; +static bool btrfs_data_dirty_folio(struct address_space *mapping,
+&gt; &gt; +				   struct folio *folio)
+&gt; &gt; +{
+&gt; &gt; +	struct btrfs_inode *inode = BTRFS_I(mapping-&gt;host);
+&gt; &gt; +	struct btrfs_fs_info *fs_info = inode-&gt;root-&gt;fs_info;
+&gt; &gt; +	bool marked = false;
+&gt; &gt; +
+&gt; &gt; +	if (btrfs_is_subpage(fs_info, folio)) {
+&gt; &gt; +		const struct btrfs_folio_state *bfs = folio_get_private(folio);
+&gt; &gt; +		const u64 page_start = folio_pos(folio);
+&gt; &gt; +		const u64 range_end = min_t(u64, page_start + folio_size(folio),
+&gt; &gt; +					    round_up(i_size_read(&amp;inode-&gt;vfs_inode),
+&gt; &gt; +						     fs_info-&gt;sectorsize));
+&gt; &gt; +
+&gt; &gt; +		if (!READ_ONCE(bfs-&gt;reserving_dirty) &amp;&amp;
+&gt; &gt; +		    folio_test_uptodate(folio) &amp;&amp; range_end &gt; page_start)
+&gt; &gt; +			marked = btrfs_subpage_set_fixup_dirty(fs_info, folio,
+&gt; &gt; +							       page_start,
+&gt; &gt; +							       range_end - page_start);
+&gt; &gt; +	} else if (!folio_test_dirty(folio) &amp;&amp;
+&gt; &gt; +		   !btrfs_test_range_bit_exists(&amp;inode-&gt;io_tree,
+&gt; &gt; +						folio_pos(folio),
+&gt; &gt; +						folio_next_pos(folio) - 1,
+&gt; &gt; +						EXTENT_DELALLOC)) {
+&gt; 
+&gt; Again, the same question why the folio_test_dirty() check is not enough.
+&gt; 
+&gt; The subpage part has no such check.
+&gt; 
+&gt; &gt; +		marked = true;
+&gt; &gt; +	}
+&gt; &gt; +	if (marked)
+&gt; &gt; +		folio_set_fixup_pending(folio);
+&gt; &gt; +	return filemap_dirty_folio(mapping, folio);
+&gt; &gt; +}
+&gt; &gt; +
+&gt; [..]
+&gt; &gt; --- a/fs/btrfs/subpage.c
+&gt; &gt; +++ b/fs/btrfs/subpage.c
+&gt; &gt; @@ -356,7 +356,17 @@ void btrfs_subpage_set_dirty(const struct btrfs_fs_info *fs_info,
+&gt; &gt;   	spin_lock_irqsave(&amp;bfs-&gt;lock, flags);
+&gt; &gt;   	bitmap_set(bfs-&gt;bitmaps, start_bit, len &gt;&gt; fs_info-&gt;sectorsize_bits);
+&gt; &gt;   	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; &gt; +	/*
+&gt; &gt; +	 * Every caller of this helper is a reserving write path dirtying
+&gt; &gt; +	 * exactly the range it reserved; the dirty_folio callback must not
+&gt; &gt; +	 * treat it as potentially unnotified and drag the folio&#x27;s clean
+&gt; &gt; +	 * sibling blocks into COW (that breaks reflink sharing of the
+&gt; &gt; +	 * untouched blocks, among other things).  Unnotified dirtiers call
+&gt; &gt; +	 * folio_mark_dirty() directly and never pass through here.
+&gt; &gt; +	 */
+&gt; &gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, true);
+&gt; &gt;   	folio_mark_dirty(folio);
+&gt; 
+&gt; My solution in my initial patchset is to not call folio_mark_dirty() as it
+&gt; will call back to the -&gt;dirty_folio() call back.
+&gt; 
+&gt; So I implemented an local version which call back to filemap_mark_dirty(),
+&gt; other than -&gt;dirty_folio() which sets the fixup bits.
+&gt; 
+&gt; &gt; +	WRITE_ONCE(bfs-&gt;reserving_dirty, false);
+&gt; &gt;   }
+&gt; &gt;   static void folio_clear_tags(struct folio *folio)
+&gt; &gt; @@ -457,6 +467,88 @@ void btrfs_subpage_clear_writeback(const struct btrfs_fs_info *fs_info,
+&gt; &gt;   	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; &gt;   }
+&gt; &gt; +void btrfs_subpage_clear_fixup(const struct btrfs_fs_info *fs_info,
+&gt; &gt; +			       struct folio *folio, u64 start, u32 len)
+&gt; &gt; +{
+&gt; &gt; +	struct btrfs_folio_state *bfs = folio_get_private(folio);
+&gt; &gt; +	unsigned int start_bit = subpage_calc_start_bit(fs_info, folio,
+&gt; &gt; +							fixup, start, len);
+&gt; &gt; +	unsigned long flags;
+&gt; &gt; +
+&gt; &gt; +	spin_lock_irqsave(&amp;bfs-&gt;lock, flags);
+&gt; &gt; +	bitmap_clear(bfs-&gt;bitmaps, start_bit, len &gt;&gt; fs_info-&gt;sectorsize_bits);
+&gt; &gt; +	spin_unlock_irqrestore(&amp;bfs-&gt;lock, flags);
+&gt; 
+&gt; Shouldn&#x27;t we also check if we have cleared the last fixup bit and clear the
+&gt; folio fixup flag?
+&gt; [...]
+&gt; &gt; +void btrfs_folio_cancel_fixup(const struct btrfs_fs_info *fs_info,
+&gt; &gt; +			      struct folio *folio, u64 start, u32 len)
+&gt; 
+&gt; Why not let IMPLEMNT_BTRFS_PAGE_OPS() to implement all the fixup helpers?
+&gt; 
+
+I think the level 0 answer is it doesn&#x27;t apply to metadata and the llm
+also went nuts messing with the macros when it tried to use them.
+
+&gt; [...]
+&gt; &gt; @@ -50,6 +65,14 @@ enum {
+&gt; &gt;   struct btrfs_folio_state {
+&gt; &gt;   	/* Common members for both data and metadata pages */
+&gt; &gt;   	spinlock_t lock;
+&gt; &gt; +	/*
+&gt; &gt; +	 * Set across the folio_mark_dirty() that a reserving write path
+&gt; &gt; +	 * issues from btrfs_subpage_set_dirty(), so that the dirty_folio
+&gt; &gt; +	 * callback does not treat the dirtying as potentially unnotified
+&gt; &gt; +	 * and mark the folio&#x27;s still-clean sibling blocks.  Written under
+&gt; &gt; +	 * the folio lock, which every reserving path holds.
+&gt; &gt; +	 */
+&gt; &gt; +	bool reserving_dirty;
+&gt; 
+&gt; As I mentioned, this is only for dirty_folio() to skip setting fixup bit.
+&gt; 
+&gt; We can get rid of it, if the btrfs_folio_set_dirty() helper doesn&#x27;t go
+&gt; through folio_mark_dirty().
+&gt; 
+&gt; Thanks,
+&gt; Qu</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260727035702.GA302657@zen.localdomain" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged suggestions, agreed to rework</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-07-27">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Qu Wenruo</span>
-<a class="date-chip" href="../2026-07-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-25">2026-07-25</a>
-<span class="inline-review-badge">Inline Review</span>
+<a class="date-chip" href="../2026-07-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-27">2026-07-27</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Qu Wenruo noted that the patch does not properly handle the case where a dio read is in progress and btrfs finishes writing back the folio, causing the dio to re-dirty the folio unnecessarily. They requested that the dirty_folio() call be moved after the folio is unlocked.
-
-The reviewer is concerned that the patch&#x27;s complexity and size are overwhelming due to its rapid development by an LLM, which may lead to issues in review and maintenance.
-
-Reviewer Qu Wenruo noted that the call to trigger cow fixup via dirty_folio() is very frequent and redundant, suggesting that it can be merged into btrfs_folio*_set_dirty(), which ensures proper dirtying and cancellation of the fixup.
-
-Reviewer Qu Wenruo suggested simplifying the dirty_folio() check by only verifying if the fixup bit is not set, as this indicates that the folio has gone through regular write preparation and should have EXTENT_DELALLOC.
-
-Reviewer Qu Wenruo suggested replacing the use of btrfs_is_subpage() and related functions from subpage.c with a custom helper function, btrfs_folio_test_fixup(), to improve code readability.
-
-The reviewer noted that if a folio has already been dirtied properly, calling -&gt;dirty_folio() may trigger a false alert because there might be no ordered extent (OE) created yet for the folio, violating one of the critical invariants.
-
-Reviewer Qu Wenruo suggested simplifying the code by skipping ordered extent (OE) lookup and letting the final submission path handle it, citing a recent patch that achieves similar functionality at submission time.
-
-Reviewer Qu Wenruo expressed concern about the variable naming in the patch, stating that it appears to be generated by a Large Language Model (LLM) and may require additional explanation for non-native speakers.
-
-Reviewer Qu Wenruo questioned whether triggering cow fixup via dirty_folio() is necessary because the folio has not yet been dirtied, and expressed uncertainty about the need for this patch.
-
-Reviewer Qu Wenruo suggested using btrfs_folio_clear_fixup() instead of the proposed fix to trigger cow fixup via dirty_folio(), indicating that their preferred approach is more helpful.
-
-Reviewer Qu Wenruo expressed frustration with the LLM&#x27;s comments and suggested deleting them by default, implying that they are unnecessary or unhelpful.
-
-The reviewer, Qu Wenruo, pointed out that the patch can lead to over-reservation of space for already properly dirtied ranges, making it impossible to release reserved space without clearing qgroup flags. This issue is difficult to expose through tests because dirty folios are hard to trigger.
-
-Reviewer Qu Wenruo suggested using a proper btrfs_folio_clear_fixup() function to handle the loop, passing in the folio range instead of relying on dirty_folio().
-
-Reviewer Qu Wenruo pointed out that the patch&#x27;s approach to handling dirty folios via dirty_folio() is unnecessary, as regular btrfs_folio_clear_dirty() can handle all these cases and there&#x27;s no need for a special subpage branch.
-
-Reviewer Qu Wenruo questioned the necessity of using dirty_folio() when folio_test_dirty() would be sufficient, specifically pointing out that the subpage part does not have this check.
-
-Reviewer Qu Wenruo noted that calling folio_mark_dirty() would lead to a recursive call to -&gt;dirty_folio(), and instead implemented a local version of filemap_mark_dirty() to set the fixup bits.
-
-The reviewer noted that the patch may not fully address the COW fixup issue, suggesting that additional checks are needed to ensure that the last fixup bit is cleared and the folio fixup flag is reset.
-
-Reviewer Qu Wenruo suggested that the btrfs_page_ops implementation should handle all fixup helpers, rather than relying on a separate dirty_folio() function.
-
-Reviewer Qu Wenruo noted that since btrfs_folio_set_dirty() does not call folio_mark_dirty(), the fixup bit is not actually being set, and suggested removing the dirty_folio() call to skip setting the fixup bit.</div>
+<div class="review-comment-text">Reviewer Qu Wenruo suggested splitting the set/clear of the folio fixup flag into data and metadata specific functions to avoid exposing btrfs_is_subpage() checks, and proposed implementing btrfs_folio_set_fixup() and btrfs_folio_clear_fixup() helpers. They also recommended integrating fixup cancelling into the btrfs_folio_set_dirty() helper in a future cleanup/refactor series.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">在 2026/7/25 15:54, Boris Burkov 写道:
-[...]&gt;
-
----
-
-Without LLM it&#x27;s very hard to come up with such huge change in such a 
-short time, especially considering this fix is a little urgent due to 
-both large folio and removal of cow fixup are in the same release.
-
-So I&#x27;m totally fine with the involvement of LLM, just we will spend 
-quite some time reworking/removing a lot of comments/commit message.
-
-Not because they are not not grammarly sound (unlike my replies), but a 
-lot of time they are too lengthy but brings not too much value compared 
-to the number of lines.
-
-But still, very impressed to see a working RFC this soon.
-
----
-
-This call is very frequent, and to be honest, it&#x27;s redundant.
-
-We can merge the cancel into btrfs_folio*_set_dirty(), as the 
-btrfs_folio_*set_dirty() is the &quot;proper dirty&quot; entrance, so we know if 
-we&#x27;re going through that interface, we are ensured to cancel the fixup.
-
----
-
-Can we simplify the check to just check if the fixup bit is not set?
-
-To me, without fixup bit it means it went through the regular write 
-preparation, thus should have EXTENT_DELALLOC.
-And checking a bit is way faster than check an extent range.
-
----
-
-Again, we prefer not to use btrfs_is_subpage() and btrfs_subpage_*() out 
-of subpage.c when possible.
-
-So just some helper, like btrfs_folio_test_fixup() would make it more 
-readable.
-
----
-
-The block can be dirtied properly before, then -&gt;dirty_folio() callback 
-is triggered.
-
-In that case, we may have not run delalloc for the folio, thus there may 
-be no OE created yet.
-
-It looks like the assumption is not correct to me, and may cause false 
-alerts.
-
-But on the other hand, it&#x27;s already very hard to hit a case where we 
-have some proper dirty blocks, and -&gt;dirty_folio() is called.
-E.g. for the direct IO case, -&gt;dirty_folio() is only called when the 
-folio is clean.
-
-Thus this false alerts case is not easy to test.
-
----
-
-Doing this is a little overkilled.
-
-As the recent patch &quot;btrfs: use ordered extent to grab the logical 
-address for submission&quot; will do it at submission time, with better 
-cached OE usage.
-
-I&#x27;d prefer skip the OE lookup completely, and let the final submission 
-path to grab the OE (which can reuse bbio-&gt;ordered when possible).
-
----
-
-The variable naming choice is definitely very LLM.
-
-Non-native speaker like me may need to google the word first...
-
----
-
-We haven&#x27;t yet cleared any bit nor folio dirty in the first place.
-So not sure if this is really needed, nor the comment.
-
----
-
-Again, a btrfs_folio_clear_fixup() is more helpful.
-
+<pre class="raw-body-text">\u5728 2026/7/27 13:27, Boris Burkov \u5199\u9053:
 [...]
+&gt;&gt; Shouldn&#x27;t we also check if we have cleared the last fixup bit and clear the
+&gt;&gt; folio fixup flag?
+&gt;&gt; [...]
+&gt;&gt;&gt; +void btrfs_folio_cancel_fixup(const struct btrfs_fs_info *fs_info,
+&gt;&gt;&gt; +			      struct folio *folio, u64 start, u32 len)
+&gt;&gt;
+&gt;&gt; Why not let IMPLEMNT_BTRFS_PAGE_OPS() to implement all the fixup helpers?
+&gt;&gt;
+&gt; 
+&gt; I think the level 0 answer is it doesn&#x27;t apply to metadata and the llm
+&gt; also went nuts messing with the macros when it tried to use them.
 
----
+Right, metadata doesn&#x27;t need such fixup handling at all, thus we will 
+need to split the set/clear into (data|meta)_(set|clear)_func(), which 
+is a little overkilled for a hot fix.
 
-Again, very LLM comments. That&#x27;s why always delete all comments from LLM 
-by default.
+Although it would still be good to implement something like 
+btrfs_folio_set_fixup() and btrfs_folio_clear_fixup(), so that we do not 
+need to expose btrfs_is_subpage() checks.
 
-The older, removed comment is very simple for folio_ordered:
-
-  * We use folio flag owner_2 to indicate there is an ordered extent with
-  * unfinished IO.
-
-
-[...]
-
----
-
-You fall into the same pitfall I&#x27;m worried about, but unfortunately or 
-fortunately, it&#x27;s very hard to hit.
-
-The problem here is, we can over-reserve, e.g. some range is already 
-properly dirtied, thus they have already space reserved.
-
-And you can not release the reserved space for them, because release 
-will also clear the qgroup reserved extent flag.
-
-This is the biggest problem that I have no way to fix.
-As there is no way to ensure the space we reserved is really needed 
-before holding the folio lock.
-
-
-But since it&#x27;s really hard to get a dirty folio to be called with 
--&gt;dirty_folio(), thus it may not be exposed through tests.
-
----
-
-Again, a proper btrfs_folio_clear_fixup() and pass the folio range into 
-it should handle the loop.
-
----
-
-Again, the regular btrfs_folio_clear_dirty() is going to handle all 
-these, and no need for a special subpage branch.
-
----
-
-Again, the same question why the folio_test_dirty() check is not enough.
-
-The subpage part has no such check.
-
----
-
-My solution in my initial patchset is to not call folio_mark_dirty() as 
-it will call back to the -&gt;dirty_folio() call back.
-
-So I implemented an local version which call back to 
-filemap_mark_dirty(), other than -&gt;dirty_folio() which sets the fixup bits.
-
----
-
-Shouldn&#x27;t we also check if we have cleared the last fixup bit and clear 
-the folio fixup flag?
-[...]
-
----
-
-Why not let IMPLEMNT_BTRFS_PAGE_OPS() to implement all the fixup helpers?
-
-[...]
-
----
-
-As I mentioned, this is only for dirty_folio() to skip setting fixup bit.
-
-We can get rid of it, if the btrfs_folio_set_dirty() helper doesn&#x27;t go 
-through folio_mark_dirty().
+And we can integrate the fixup cancelling into btrfs_folio_set_dirty() 
+helper later, in a dedicated cleanup/refactor series.
 
 Thanks,
 Qu</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Boris Burkov</div>
-<a href="https://lore.kernel.org/r/dbb0e4ec-cdce-4852-9c1c-21634cc6fa4e@gmx.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, urgency of fix, complexity of change</div>
-</div>
-</div>
-<div class="thread-node depth-1" id="2026-07-26">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Qu Wenruo</span>
-<a class="date-chip" href="../2026-07-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-26">2026-07-26</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Qu Wenruo suggested using folio-&gt;private to add an extra bit indicating whether a folio is properly dirtied, similar to the subpage dirty bit for bs == folio size case.
-
-Reviewer Qu Wenruo pointed out the need for a local function, btrfs_folio_mark_dirty_prepared(), which would copy folio_mark_dirty() but call filemap_dirty_folio() instead of aops-&gt;dirty_folio(). They expressed uncertainty about whether MM will be happy with this change.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">In that case, I&#x27;d prefer to use folio-&gt;private to have one extra bit, to 
-indicate the folio is properly dirtied.
-
-E.g. this commit in my unfinished branch:
-https://github.com/adam900710/linux/commit/9a02921d348574573f1a6dbc50e54f993011e311
-
-Which acts like the subpage dirty bit for bs == folio size case.
-
----
-
-Yep. However the ugly part is, we will need a local 
-&quot;btrfs_folio_mark_dirty_prepared()&quot;, which copies &quot;folio_mark_dirty()&quot;, 
-except call filemap_dirty_folio() instead of using aops-&gt;dirty_folio.
-
-Not sure if MM will be happy about that.
-
-Thanks,
-Qu</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Boris Burkov</div>
-<a href="https://lore.kernel.org/r/3f37b7a7-64bd-46e4-a9d6-21d890e0f638@gmx.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, uncertainty</div>
-</div>
-</div>
+<a href="https://lore.kernel.org/r/eb9c30ad-8c19-4788-83ee-d282ddbdfd97@suse.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>
