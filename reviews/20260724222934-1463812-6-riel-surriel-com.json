@@ -9,6 +9,55 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch adds a new function, get_user_page_vma(), which allows faulting in a single page under a held lock. The function is designed to be used by __access_remote_vm() when it needs to access a page that is not already present in the page tables. It takes advantage of the existing VMA locking mechanism and simplifies the process of accessing remote memory. If the fault cannot complete under the per-VMA lock, the function releases the lock and returns -EAGAIN for both the mmap lock and the per-VMA lock. The patch also updates the handling of VM_FAULT_ERROR to return -EFAULT instead of BUG()."
+    },
+    "2026-07-27": {
+      "report_file": "2026-07-27_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "Suren Baghdasaryan",
+          "summary": "The reviewer pointed out a mistake in the patch description, specifically that there is no lock to drop under the per-VMA lock, and suggested renaming the @locked parameter to @mmap_locked for clarity.\n\nReviewer Suren Baghdasaryan expressed concern that the patch removes a comment explaining why -EAGAIN is returned after fault handling, and requested its reinstatement for clarity when using mmap_lock.\n\nReviewer Suren Baghdasaryan questioned the logic of returning -EAGAIN when handle_mm_fault() under per-VMA locks returns an unexpected value, suggesting that instead, -EAGAIN should be returned to retry under mmap_lock for a definitive result.\n\nReviewer Suren Baghdasaryan questioned why the patch changes the return value of -EAGAIN to -EFAULT even when operating under mmap_lock, requesting clarification on the reason behind this change.\n\nReviewer Suren Baghdasaryan questioned whether get_user_page_vma() should validate the VMA only once at the caller level, rather than for each page, and asked if relying on the caller to do this is acceptable.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvement",
+            "requested reinstatement of explanatory comment",
+            "requested clarification",
+            "questioning implementation detail",
+            "request for clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "\"There is no such lock to drop under the per-VMA lock\" is a bit\nconfusing. Maybe change it to \"Under per-VMA lock we are not holding\nmmap_lock, therefore @locked is not modified.\"\nTo avoid more confusion I would rename @locked parameter in this\nfunction to @mmap_locked. I think that would make things more clear.\n\n---\n\nThis comment explains why after completing the fault handling we still\nreturn -EAGAIN. I think it's still relevant for when we use mmap_lock.\nWhy are you removing it?\n\n---\n\nI don't follow this logic. If handle_mm_fault() under per-VMA locks\nreturns something unexpected, shouldn't we return -EAGAIN to retry\nunder mmap_lock and get the definitive result?\n\n---\n\nThis changes the returned error code even when we operate under\nmmpa_lock. What's the reason for it?\n\n---\n\nI assume get_user_page_vma() will be called multiple times for the\nsame VMA. Would it make sense to validate the VMA only once (at the\nlevel of the caller) instead of doing that for each page? Of you don't\nwant to rely on the caller to do that?",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-07-27",
+          "message_id": "CAJuCfpE5svMkGMRi6sxxsuYC6MuKuRfw4rV=nKrDOrsQOB4Upw@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "John Hubbard",
+          "summary": "Reviewer John Hubbard noted that the get_user_page_vma() function does not handle the case where a page is already mapped in the VMA's page tables, and requested that the function check for this condition before attempting to fault in the page.\n\nThe reviewer pointed out a difference in behavior between VM_IO and VM_PFNMAP VMA types, noting that VM_IO only indicates that MM callers should not inspect the mapped pages due to side effects, whereas VM_PFNMAP identifies mappings whose COWed pages should be returned. The reviewer suggested testing for VM_PFNMAP specifically instead of treating both as exceptions.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested change",
+            "specific technical concern",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On 7/24/26 3:29 PM, Rik van Riel wrote:\n...\n\n---\n\nThis treats VM_IO and VM_PFNMAP as the same exception, but they have\ndifferent meanings. VM_IO tells MM callers not to inspect the mapped\npages because accesses can have side effects. It does not imply that\nthe VMA contains raw PFNs!\n\nFor example, sg_mmap() creates a VM_IO-only VMA whose fault handler\ninstalls ordinary pages from the SCSI reserve buffer. If such a page is\nalready present, follow_page_mask() returns it before the pfnmap test\nbelow is reached. Patch 6 then lets /proc/PID/mem and ptrace copy that\npage directly, even though sg provides no ->access callback and the\noperation fails today. Writes can also modify the buffer when the\nmapping is writable. Existing ptrace authorization still applies, so\nthis is not a privilege bypass, but it removes the VM_IO exclusion for\na driver that did not opt in through ->access.\n\nAn untouched page in the same VMA still fails because pfnmap is also\ntrue for VM_IO and this function refuses to fault it. The result\ntherefore depends on whether the target previously touched the page.\nThe required exception is narrower. A remap_pfn_range() VMA has both\nVM_IO and VM_PFNMAP, but VM_PFNMAP is what identifies the mapping whose\nCOWed page should be returned. \n\nSo if you use the FOLL_PFNMAP_COW flag suggested on patch 4, and test\nonly VM_PFNMAP here:\n\n\tret = check_vma_flags(vma, gup_flags);\n\tif (ret)\n\t\tgoto fail;\n\tpfnmap = vma->vm_flags & VM_PFNMAP;\n\nPatch 6 can set FOLL_PFNMAP_COW for __access_remote_vm().\ncheck_vma_flags() then permits VM_IO | VM_PFNMAP for that caller while\ncontinuing to reject VM_IO-only mappings. vm_normal_page() supplies the\nremaining distinction: it returns the COWed normal page and rejects the\nraw PFN.\n\nSomething like that.\n\nthanks,\n-- \nJohn Hubbard",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-07-27",
+          "message_id": "e02b3b9f-85af-4df8-923a-cddf13afb6c7@nvidia.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds a new function called get_user_page_vma() to the Linux kernel's mm/gup.c file. It is designed to fault in a single page under a held lock, either the mmap lock or the per-VMA lock. The function simplifies __get_user_pages() by walking the page tables with follow_page_mask(), faults in missing pages with faultin_page(), and returns the page with a reference still held by the caller. It also includes checks for VM_IO/VM_PFNMAP VMA exceptions, userfaultfd VMA handling, and error cases where the lock is released and -EAGAIN is returned."
     }
   }
 }
