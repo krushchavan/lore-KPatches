@@ -2,7 +2,7 @@
   "date": "2026-07-27",
   "report_file": "2026-07-27_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-07-28 07:28 UTC",
+  "last_updated": "2026-07-28 07:32 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -3242,6 +3242,167 @@
       ],
       "patches_reviewed": [],
       "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Shakeel Butt",
+      "primary_email": "shakeel.butt@linux.dev",
+      "patches_submitted": [],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [RFC] Robust futex causing memcg OOM storm on exit",
+          "message_id": "ame7Q-0eVRrtt34j@linux.dev",
+          "url": "https://lore.kernel.org/all/ame7Q-0eVRrtt34j@linux.dev/",
+          "date": "2026-07-27T20:49:16Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "A patch to prevent memcg OOM storms on exit by detecting early if a cgroup is unreclaimable and allowing exiting threads to return with ENOMEM.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Michal Hocko",
+              "summary": "Provided a suggested patch that adds an early bail-out for OOM victims in try_charge_memcg, allowing exiting threads to return with ENOMEM and expedite their exit.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "APPROVED"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Mon 27-07-26 13:48:58, Shakeel Butt wrote:\n> On Mon, Jul 27, 2026 at 08:38:37AM -0700, Shakeel Butt wrote:\n> > On Mon, Jul 27, 2026 at 04:36:23PM +0200, Michal Hocko wrote:\n> > > On Wed 22-07-26 17:19:07, Shakeel Butt wrote:\n> \n> [...]\n> \n> > > \n> > > TBH I am not entirely happy about this approach. It effectivelly reverts\n> > > a75ffa26122b (\"memcg, oom: do not bypass oom killer for dying tasks\").\n> > > It just makes it lockless. Assumption that a dying task will do so\n> > > quickly and with bounded resources has turned wrong on several\n> > > occasions.\n> > \n> > That's why I kept it as RFC :)\n> > \n> > > \n> > > On the other hand I do undestand the contention issues and I can imagine\n> > > that the existing solution doesn't really work well for huge thread\n> > > groups that all end up lining up on the oom_lock just to learn there is\n> > > nothing really killable anymore because they are the oom victim...\n> > > \n> > > Would it be just safer to bail out only for oom victim threads. This\n> > > would narrow down potential runaways for oom victims which should be\n> > > more limited than any killed/exiting task. It would also give the oom\n> > > killer/reaper chance to work. WDYT?\n> > \n> > I will give the following patch a try with the reproducer I have. I am still\n> > improving the reproducer as I am still not able to recreate multi hour slowdown\n> > yet. I will report back once I have some results. \n> > \n> \n> I have some results with the reproducer I (AI) wrote.\n> \n> Setup: 20k threads, each with its robust_list head on its own page in a\n> large anon region pushed into a zswap pool (writeback off, so it's\n> unreclaimable and pins the memcg at the limit). On the OOM-group-kill\n> every thread faults that page in futex_cleanup() -> do_swap_page() ->\n> swapin charge -> memcg OOM. A separate thread holds mmap_lock for write\n> in a loop so the oom_reaper can't reap the pool -- matching the host,\n> where the reaper was blocked and the memcg never fell below the limit.\n> \n> I tested on next-20260726 as baseline and then tested your suggestion over it.\n> For baseline ~48k no-victim OOM invocations serialized on oom_lock; ~40s to\n> drain the 20k threads in a VM (hours on the host, where each invocation\n> was a dump_header over netconsole). With the patch the dying tasks stop\n> entering out_of_memory and the storm is gone.\n> \n> With the following suggestion, the threads of dying tasks stop entering\n> out_of_memory but the exit time doubled as each thread has to decompress the\n> page from zswap.\n> \n> \tif (tsk_is_oom_victim(current))\n> \t\tgoto force;\n> \n> I also tested by replacing goto force with goto nomem and the exit time halved\n> i.e. ~20 seconds. Looking deeper it seems like each thread is still going\n> through the reclaim loops.\n> \n> Just for testing purpose I moved this check along with goto nomem just before\n> the reclaim fuction i.e. try_to_free_mem_cgroup_pages() and the exit time falls\n> below 1 second. I think what we need is to detect early that the cgroup is\n> unreclaimable and the threads of exiting/reaped process should just return with\n> enomem.\n\nDo you mean, something like this?\n--- \ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 6dc4888a90f3..66f1eebf8c22 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -2648,6 +2648,18 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tif (!gfpflags_allow_blocking(gfp_mask))\n \t\tgoto nomem;\n \n+\t/*\n+\t * OOM victim still needs to charge memory to exit. OOM reaper should\n+\t * help but it might fail on mmap_lock contention. If the victim is a\n+\t * large thread group then all exiting threads might compete on oom_lock\n+\t * just to learn that there is nothing really killable anymore. Bail\n+\t * out early and fail the charge to expedite their exit. They are\n+\t * considered fully reclaimed by the oom reaper and they shouldn't contribute\n+\t * further charges.\n+\t */\n+\tif (tsk_is_oom_victim(current) && mm_flags_test(current->signal->oom_mm))\n+\t\tgoto nomem;\n+\n \t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n \traised_max_event = true;\n \n\n-- \nMichal Hocko\nSUSE Labs\n\n",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-07-28",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "mhocko@suse.com"
+            }
+          ],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v5 3/3] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost",
+          "message_id": "ameIpQtXv9pC2aaT@linux.dev",
+          "url": "https://lore.kernel.org/all/ameIpQtXv9pC2aaT@linux.dev/",
+          "date": "2026-07-27T16:35:25Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm",
+          "review_comments": [],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [RFC] Robust futex causing memcg OOM storm on exit",
+          "message_id": "amd6N4DVzZkl90cs@linux.dev",
+          "url": "https://lore.kernel.org/all/amd6N4DVzZkl90cs@linux.dev/",
+          "date": "2026-07-27T15:38:57Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "The patch addresses a memory congestion control group (memcg) Out-Of-Memory (OOM) issue caused by robust futexes on exit, which leads to a storm of OOM events. The problem occurs when the kernel fails to properly clean up resources allocated for futexes during process exit. This patch attempts to resolve the issue by improving the handling of futex cleanup and resource deallocation.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Shakeel Butt (author)",
+              "summary": "Author addressed a concern about the patch's performance impact, specifically the exit time of dying tasks. They tested two approaches: one that uses goto force and another that uses goto nomem, finding that the latter reduces exit time by half. The author suggests detecting early that the cgroup is unreclaimable to avoid unnecessary reclaim loops.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledges a fix is needed",
+                "requests further investigation"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I have some results with the reproducer I (AI) wrote.\n\nSetup: 20k threads, each with its robust_list head on its own page in a\nlarge anon region pushed into a zswap pool (writeback off, so it's\nunreclaimable and pins the memcg at the limit). On the OOM-group-kill\nevery thread faults that page in futex_cleanup() -> do_swap_page() ->\nswapin charge -> memcg OOM. A separate thread holds mmap_lock for write\nin a loop so the oom_reaper can't reap the pool -- matching the host,\nwhere the reaper was blocked and the memcg never fell below the limit.\n\nI tested on next-20260726 as baseline and then tested your suggestion over it.\nFor baseline ~48k no-victim OOM invocations serialized on oom_lock; ~40s to\ndrain the 20k threads in a VM (hours on the host, where each invocation\nwas a dump_header over netconsole). With the patch the dying tasks stop\nentering out_of_memory and the storm is gone.\n\nWith the following suggestion, the threads of dying tasks stop entering\nout_of_memory but the exit time doubled as each thread has to decompress the\npage from zswap.\n\n\tif (tsk_is_oom_victim(current))\n\t\tgoto force;\n\nI also tested by replacing goto force with goto nomem and the exit time halved\ni.e. ~20 seconds. Looking deeper it seems like each thread is still going\nthrough the reclaim loops.\n\nJust for testing purpose I moved this check along with goto nomem just before\nthe reclaim fuction i.e. try_to_free_mem_cgroup_pages() and the exit time falls\nbelow 1 second. I think what we need is to detect early that the cgroup is\nunreclaimable and the threads of exiting/reaped process should just return with\nenomem.",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "ame7Q-0eVRrtt34j@linux.dev",
+              "analysis_source": "llm",
+              "email": "shakeel.butt@linux.dev"
+            },
+            {
+              "author": "Michal Hocko",
+              "summary": "Reviewer noted that the OOM victim still needs to charge memory to exit, but this can lead to contention on oom_lock and mmap_lock, causing a deadlock; suggested adding an early bail out in try_charge_memcg() if the current task is an OOM victim with mm_flags_test(current->signal->oom_mm) set",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Do you mean, something like this?\n--- \ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 6dc4888a90f3..66f1eebf8c22 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -2648,6 +2648,18 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tif (!gfpflags_allow_blocking(gfp_mask))\n \t\tgoto nomem;\n \n+\t/*\n+\t * OOM victim still needs to charge memory to exit. OOM reaper should\n+\t * help but it might fail on mmap_lock contention. If the victim is a\n+\t * large thread group then all exiting threads might compete on oom_lock\n+\t * just to learn that there is nothing really killable anymore. Bail\n+\t * out early and fail the charge to expedite their exit. They are\n+\t * considered fully reclaimed by the oom reaper and they shouldn't contribute\n+\t * further charges.\n+\t */\n+\tif (tsk_is_oom_victim(current) && mm_flags_test(current->signal->oom_mm))\n+\t\tgoto nomem;\n+\n \t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n \traised_max_event = true;\n \n\n-- \nMichal Hocko\nSUSE Labs",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-07-28",
+              "message_id": "amhZ645Nhj856JfO@tiehlicka",
+              "analysis_source": "llm",
+              "email": "mhocko@suse.com"
+            }
+          ],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v4 2/2] mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost",
+          "message_id": "amdn2Kcfe9owkDWN@linux.dev",
+          "url": "https://lore.kernel.org/all/amdn2Kcfe9owkDWN@linux.dev/",
+          "date": "2026-07-27T14:28:53Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "cgroups@vger.kernel.org"
+        }
+      ],
+      "patches_acked": [
+        {
+          "activity_type": "patch_acked",
+          "subject": "Re: [PATCH v5 2/3] mm/vmscan: add pgrotate_anon and pgrotate_file vmstat counters",
+          "message_id": "ameIMBqJPeF-Wi8J@linux.dev",
+          "url": "https://lore.kernel.org/all/ameIMBqJPeF-Wi8J@linux.dev/",
+          "date": "2026-07-27T16:33:25Z",
+          "in_reply_to": null,
+          "ack_type": "Acked-by",
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm",
+          "review_comments": [],
+          "list_id": "cgroups@vger.kernel.org"
+        }
+      ],
       "discussions_posted": [],
       "errors": []
     }
