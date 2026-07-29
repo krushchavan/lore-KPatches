@@ -2,7 +2,7 @@
   "date": "2026-07-28",
   "report_file": "2026-07-28_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-07-29 06:16 UTC",
+  "last_updated": "2026-07-29 06:27 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -723,6 +723,1064 @@
       "primary_email": "jlayton@kernel.org",
       "patches_submitted": [],
       "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Joanne Koong",
+      "primary_email": "joannelkoong@gmail.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v4 00/21] iomap: convert to in-iter iomap_next() model",
+          "message_id": "20260727211758.1116539-1-joannelkoong@gmail.com",
+          "url": "https://lore.kernel.org/all/20260727211758.1116539-1-joannelkoong@gmail.com/",
+          "date": "2026-07-27T21:24:26Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-07-27",
+          "patch_version": 4,
+          "series_patch_count": 21,
+          "version_history": [
+            {
+              "version": 3,
+              "message_id": "20260720210202.1163861-1-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260720210202.1163861-1-joannelkoong@gmail.com/",
+              "subject": "[PATCH v3 00/20] iomap: convert to in-iter iomap_next() model",
+              "date": "2026-07-20T21:02:11Z"
+            },
+            {
+              "version": 4,
+              "message_id": "20260727211758.1116539-1-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-1-joannelkoong@gmail.com/",
+              "subject": "[PATCH v4 00/21] iomap: convert to in-iter iomap_next() model",
+              "date": "2026-07-27T21:24:26Z"
+            }
+          ],
+          "series_items": [
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 01/21] iomap: split iomap_iter() logic into iomap_iter_next()",
+              "message_id": "20260727211758.1116539-2-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-2-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:29Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch splits the iomap_iter() logic into a new helper function called iomap_iter_next(). This is done in preparation for changing iomap to use an in-iter model, where ->iomap_next() implementations can call iomap_iter_next() directly. The patch also introduces two macros, DEFINE_IOMAP_ITER_NEXT() and DEFINE_IOMAP_ITER_NEXT_END(), which generate boilerplate code for the new in-iter model. No functional changes are intended, but there is a minor difference on the error path of iomap_end().",
+              "analysis_source": "llm-per-reviewer",
+              "review_comments": [
+                {
+                  "author": "Brian Foster",
+                  "summary": "reviewer noted that iomap_end() may not necessarily transfer the iomap_flags on failure, potentially leading to a folio batch leak, and suggested accounting for failures from either callback by adding error handling in iomap_iter()",
+                  "sentiment": "NEEDS_WORK",
+                  "sentiment_signals": [
+                    "potential bug",
+                    "requested changes"
+                  ],
+                  "has_inline_review": true,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "So hch forwarded me a bit of Sashiko review feedback that called out a\npotential folio batch leak on error returns from iomap_begin() or\niomap_end(). Note that I think the ->iomap_end() variant is currently\nnot an issue because nothing returns error there, but it should be fixed\nregardless.\n\nAs such, I have the patch below as a fix based on current master. The\nidea here is to account for failures from either callback and also the\nfact that XFS may not necessarily transfer the iomap_flags on failure. I\nconsidered a couple other options here, like changing that behavior or\nusing an iter flag, but I think this is the cleanest option.\n\nHowever this obviously conflicts with this rework series. This isn't a\nmajor conflict IMO.. I'd probably just do the same thing and include the\nbatch cleanup in the error/exit path of iomap_iter() (or maybe start\npassing ret into iomap_iter_done()), but I would need to reintroduce the\nhelper above. Also after this series I think this could mean a duplicate\ncall in the termination case where iomap_iter_continue() would have\ncleaned things up, but that is relatively harmless. Maybe there is\nsomething incrementally cleaner, but I'm still wrapping my head around\nthe factoring here..\n\nBut anyways, the main thing I wanted to ask is how folks want to handle\nthis particular bug..? This rework is invasive and looks mostly reviewed\nso I don't want to unnecessarily hold it up. I can rebase on top of this\nand leave the patch below for -stable, or avoid the helper churn and\npost the patch below on its own and rework it into this, or maybe just\ntweak this to leave the helper around and avoid some churn that way..\nthoughts?\n\nBrian\n\n--- 8< ---\n\ndiff --git a/fs/iomap/iter.c b/fs/iomap/iter.c\nindex e4a29829591a..63617ec48250 100644\n--- a/fs/iomap/iter.c\n+++ b/fs/iomap/iter.c\n@@ -6,12 +6,18 @@\n #include <linux/iomap.h>\n #include \"trace.h\"\n \n+/*\n+ * Release the iter folio batch. Note that the iomap flag is meant to control\n+ * the I/O path for the mapping and may not be set in error situations.\n+ */\n static inline void iomap_iter_clean_fbatch(struct iomap_iter *iter)\n {\n-\tif (iter->iomap.flags & IOMAP_F_FOLIO_BATCH) {\n+\tif (!iter->fbatch)\n+\t\treturn;\n+\titer->iomap.flags &= ~IOMAP_F_FOLIO_BATCH;\n+\tif (folio_batch_count(iter->fbatch)) {\n \t\tfolio_batch_release(iter->fbatch);\n \t\tfolio_batch_reinit(iter->fbatch);\n-\t\titer->iomap.flags &= ~IOMAP_F_FOLIO_BATCH;\n \t}\n }\n \n@@ -79,7 +85,7 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n \t\t\t\t\t\t  olen),\n \t\t\t\tadvanced, iter->flags, &iter->iomap);\n \t\tif (ret < 0 && !advanced)\n-\t\t\treturn ret;\n+\t\t\tgoto error;\n \t}\n \n \t/* detect old return semantics where this would advance */\n@@ -110,7 +116,11 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n \tret = ops->iomap_begin(iter->inode, iter->pos, iter->len, iter->flags,\n \t\t\t       &iter->iomap, &iter->srcmap);\n \tif (ret < 0)\n-\t\treturn ret;\n+\t\tgoto error;\n \tiomap_iter_done(iter);\n \treturn 1;\n+\n+error:\n+\tiomap_iter_clean_fbatch(iter);\n+\treturn ret;\n }",
+                  "reply_to": "Joanne Koong",
+                  "message_date": "2026-07-28",
+                  "message_id": "amizdHj6ICgP2xFv@bfoster",
+                  "analysis_source": "llm",
+                  "email": "bfoster@redhat.com"
+                },
+                {
+                  "author": "Darrick Wong",
+                  "summary": "Reviewer Darrick Wong expressed uncertainty about the practical impact of the patch, questioning whether the issue being addressed is actually encountered in practice and requesting further investigation before merging into for-next.",
+                  "sentiment": "NEUTRAL",
+                  "sentiment_signals": [
+                    "uncertainty",
+                    "questioning"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "7.2 and work out the merge conflict resolution in for-next and send that\nto broonie/linus for 7.3.  But I'm not sure if people are actually\nhitting this and not realizing it; or if this is a fix for a theoretical\nproblem.\n\n--D",
+                  "reply_to": "Brian Foster",
+                  "message_date": "2026-07-28",
+                  "message_id": "20260728155508.GT2901224@frogsfrogsfrogs",
+                  "analysis_source": "llm",
+                  "email": "djwong@kernel.org"
+                },
+                {
+                  "author": "Brian Foster",
+                  "summary": "Reviewer Brian Foster noted that the patch is likely not hitting any error paths in reality and questioned the analysis of a potential issue with startblock check in xfs_bmbt_to_iomap(), suggesting it's mutually exclusive with a populated batch due to earlier validation.",
+                  "sentiment": "NEUTRAL",
+                  "sentiment_signals": [
+                    "questioning analysis",
+                    "unlikely error scenario"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "Sounds good to me, I'll post the current patch shortly.\n\nI don't think anybody is actually hitting this in reality; it just came\nfrom a Sashiko review. I had an LLM walk through and try and tell me\nwhat error paths could lead to this in practice and it basically\nnarrowed it down to the startblock check in xfs_bmbt_to_iomap(). When\npressed further from there, it says this is mutually exclusive with a\npopulated batch in practice due to earlier validation at the time the\nextents are read in from disk.\n\nI'm not sure I trust the analysis with 100% certainty, but all in all it\nseems like an unlikely or second order (i.e. memory corruption, etc.)\nerror scenario.\n\nBrian",
+                  "reply_to": "Darrick Wong",
+                  "message_date": "2026-07-28",
+                  "message_id": "amjztG-DisHYbV9W@bfoster",
+                  "analysis_source": "llm",
+                  "email": "bfoster@redhat.com"
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 02/21] iomap: decouple simple direct I/O reads from iomap_dio_rw",
+              "message_id": "20260727211758.1116539-3-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-3-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:31Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch decouples simple direct I/O reads from the iomap_dio_rw function to improve performance by allowing file systems to call into a new simple path explicitly, which can be inlined and optimized by the compiler. This change is necessary because the current implementation assumes that the iterator must be advanced at the end, but the direct I/O read fast path tries to avoid this. By splitting the simple path from iomap_dio_rw, file systems are required to only call the simple path for cases they can handle, and various checks for incompatible features can be dropped.",
+              "analysis_source": "llm-per-reviewer",
+              "review_comments": [
+                {
+                  "author": "Darrick Wong",
+                  "summary": "Reviewer Darrick Wong approved the patch, assuming it passes other tests and gave a Reviewed-by tag.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "approval",
+                    "tested"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "Looks fine to me, assuming it passes generic/521 and whatnot ;)\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+                  "reply_to": "Joanne Koong",
+                  "message_date": "2026-07-27",
+                  "message_id": "20260727222807.GG2901224@frogsfrogsfrogs",
+                  "analysis_source": "llm",
+                  "email": "djwong@kernel.org"
+                },
+                {
+                  "author": "changfengnan",
+                  "summary": "Gave Reviewed-by",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "",
+                  "reply_to": "Joanne Koong",
+                  "message_date": "2026-07-28",
+                  "message_id": "d9210bcdf73fbe1ac8b6ec132865609a3ed68688.18304f34.4a67.44d1.b331.9f18f1c35bb7@bytedance.com",
+                  "analysis_source": "heuristic",
+                  "email": "changfengnan@bytedance.com"
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 03/21] iomap: use GFP_NOWAIT when application for iomap_dio_simple allocations",
+              "message_id": "20260727211758.1116539-4-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-4-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:33Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "The patch series aims to optimize iomap_dio_simple allocations by using GFP_NOWAIT when possible, reducing the likelihood of blocking allocation for non-blocking iocbs.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "changfengnan",
+                  "summary": "Approved the patch with a Reviewed-by tag, indicating that it meets their standards for code quality and functionality.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "Looks good"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "\n> From: \"Joanne Koong\"<joannelkoong@gmail.com>\n> Date:  Tue, Jul 28, 2026, 05:24\n> Subject:  [PATCH v4 03/21] iomap: use GFP_NOWAIT when application for iomap_dio_simple allocations\n> To: \"Christian Brauner\"<brauner@kernel.org>, <hch@lst.de>, \"Darrick J . Wong\"<djwong@kernel.org>, <linux-fsdevel@vger.kernel.org>\n> Cc: <changfengnan@bytedance.com>, <kbusch@kernel.org>, \"Matthew Wilcox\"<willy@infradead.org>, \"Jan Kara\"<jack@suse.cz>, \"Jonathan Corbet\"<corbet@lwn.net>, \"David Sterba\"<dsterba@suse.com>, \"Gao Xiang\"<xiang@kernel.org>, \"Namjae Jeon\"<linkinjeon@kernel.org>, <tytso@mit.edu>, \"Jaegeuk Kim\"<jaegeuk@kernel.org>, \"Miklos Szeredi\"<miklos@szeredi.hu>, \"Andreas Gruenbacher\"<agruenba@redhat.com>, \"Mikulas Patocka\"<mikulas@artax.karlin.mff.cuni.cz>, \"Hyunchul Lee\"<hyc.lee@gmail.com>, \"Konstantin Komarov\"<almaz.alexandrovich@paragon-software.com>, \"Carlos Maiolino\"<cem@kernel.org>, \"Damien Le Moal\"<dlemoal@kernel.org>, <libaokun@linux.alibaba.com>, <linux-ext4@vger.kernel.org>, <linux-xfs@vger.kernel.org>\n> From: Christoph Hellwig <hch@lst.de>\n> \n> For non-blocking iocbs we should avoid blocking allocation where\n> possible, so switch to a GFP_NOWAIT allocation here.\n> \n> Reviewed-by: Darrick J. Wong <djwong@kernel.org>\n> Reviewed-by: Joanne Koong <joannelkoong@gmail.com>\n> Signed-off-by: Joanne Koong <joannelkoong@gmail.com>\n> Signed-off-by: Christoph Hellwig <hch@lst.de>\n\nLooks good.\nReviewed-by: Fengnan Chang <changfengnan@bytedance.com>\n\n> ---\n>  fs/iomap/direct-io.c | 7 ++++++-\n>  1 file changed, 6 insertions(+), 1 deletion(-)\n> \n> diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c\n> index 36c976cf0848..5c28124b9f02 100644\n> --- a/fs/iomap/direct-io.c\n> +++ b/fs/iomap/direct-io.c\n> @@ -986,6 +986,7 @@ static void iomap_dio_simple_end_io(struct bio *bio)\n>  ssize_t __iomap_dio_read_simple(struct kiocb *iocb, struct iov_iter *iter,\n>                  struct iomap_iter *iomi)\n>  {\n> +        gfp_t gfp = (iomi->flags & IOMAP_NOWAIT) ? GFP_NOWAIT : GFP_KERNEL;\n>          struct iomap_dio_simple *sr;\n>          unsigned int alignment;\n>          struct bio *bio;\n> @@ -1015,7 +1016,11 @@ ssize_t __iomap_dio_read_simple(struct kiocb *iocb, struct iov_iter *iter,\n>  \n>          bio = bio_alloc_bioset(iomi->iomap.bdev,\n>                                 bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n> -                               REQ_OP_READ, GFP_KERNEL, &iomap_dio_simple_pool);\n> +                               REQ_OP_READ, gfp, &iomap_dio_simple_pool);\n> +        if (!bio) {\n> +                ret = -EAGAIN;\n> +                goto out_dio_end;\n> +        }\n>          sr = container_of(bio, struct iomap_dio_simple, bio);\n>          sr->iocb = iocb;\n>          sr->dio_flags = 0;\n> -- \n> 2.52.0\n> \n",
+                  "reply_to": "",
+                  "message_date": "2026-07-28",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": "changfengnan@bytedance.com"
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 04/21] iomap: add ->iomap_next()",
+              "message_id": "20260727211758.1116539-5-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-5-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:35Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch introduces a new callback, ->iomap_next(), which replaces the existing ->iomap_begin() and ->iomap_end() callbacks in the iomap iteration mechanism. The goal is to improve performance by allowing callers to inline their iteration loop and pass the ->iomap_next() function as a compile-time constant.",
+              "analysis_source": "llm",
+              "review_comments": [
+                {
+                  "author": "Darrick J. Wong",
+                  "summary": "Identified the patch as a good improvement to the iomap iteration mechanism and provided a Reviewed-by tag.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "Looks great!"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "",
+                  "reply_to": "",
+                  "message_date": "",
+                  "message_id": "",
+                  "analysis_source": "llm",
+                  "email": ""
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 05/21] xfs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-6-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-6-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:37Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the XFS iomap operations to use the new ->iomap_next() callback, which is generated using macros that wrap the iomap_iter_next() helper. The conversion does not introduce any functional changes and is a step towards adopting the new callback interface. The patch updates several functions in xfs_iomap.c and xfs_file.c to use the new callback, including xfs_direct_write_iomap_ops, xfs_zoned_direct_write_iomap_ops, and xfs_atomic_write_cow_iomap_ops.",
+              "analysis_source": "llm-per-reviewer",
+              "review_comments": [
+                {
+                  "author": "Darrick Wong",
+                  "summary": "Reviewer noted that the patch is a 'straightforward conversion' and approved it, giving a Reviewed-by tag.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "conversion",
+                    "approved"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "Nice straightforward conversion! :)\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+                  "reply_to": "Joanne Koong",
+                  "message_date": "2026-07-27",
+                  "message_id": "20260727222858.GH2901224@frogsfrogsfrogs",
+                  "analysis_source": "llm",
+                  "email": "djwong@kernel.org"
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 06/21] btrfs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-7-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-7-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:39Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the Btrfs direct I/O operations to use the new ->iomap_next() callback, which is generated using a macro that wraps the iomap_iter_next helper. This change does not introduce any functional changes and only updates the internal implementation of the Btrfs direct I/O code. The conversion is done by replacing the existing iomap_begin and iomap_end callbacks with the new iomap_next callback.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 07/21] ntfs3: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-8-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-8-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:41Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the ntfs3 file system's iomap operations to use the new ->iomap_next() callback, which is generated using a macro that wraps the iomap_iter_next() helper to finish previous mappings and produce the next one. The conversion does not introduce any functional changes. Instead, it updates the existing code to conform to the latest API requirements.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 08/21] ntfs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-9-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-9-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:43Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for NTFS to use the new ->iomap_next() callback. The conversion is done using macros that wrap the iomap_iter_next() helper to finish previous mappings and produce the next one. No functional changes are intended, making this a refactoring patch. It affects several functions in fs/ntfs/iomap.c, including ntfs_read_iomap_begin, ntfs_zero_read_iomap_end, ntfs_seek_iomap_begin, and others. The conversion is done to align with the new iomap API and improve code consistency.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 09/21] ext4: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-10-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-10-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:46Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for ext4 to use the new ->iomap_next() callback, which is generated using the DEFINE_IOMAP_ITER_NEXT() macro. This change does not introduce any functional changes and only updates the code structure. The patch affects two files: fs/ext4/extents.c and fs/ext4/inode.c, making a total of 9 insertions and 3 deletions.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 10/21] erofs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-11-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-11-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:48Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations in the erofs file system to use the new ->iomap_next() callback, which is generated using macros that wrap the iomap_iter_next() helper. This change does not introduce any functional changes and is a step towards adopting the new iomap API. The conversion affects two files: data.c and zmap.c.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 11/21] zonefs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-12-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-12-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:50Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations in the zonefs filesystem to use the new ->iomap_next() callback. This is done by generating each callback using the DEFINE_IOMAP_ITER_NEXT() macro, which wraps the iomap_iter_next() helper to finish previous mappings and produce next ones. The change does not introduce any functional changes.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 12/21] ext2: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-13-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-13-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:52Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the ext2 file system's iomap operations to use the new ->iomap_next() callback, which is generated using a macro that wraps the iomap_iter_next helper. This change does not introduce any functional changes and is part of a larger series of patches. The conversion is done in the inode.c file, where the ext2_iomap_ops structure is updated to point to the new ->iomap_next() callback.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 13/21] block: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-14-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-14-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:54Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the block iomap operations to use a new callback function, ->iomap_next(), which is generated by the DEFINE_IOMAP_ITER_NEXT() macro. This change does not introduce any functional changes and is part of a larger series of patches. The new callback simplifies the process of generating the next mapping in an I/O operation.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 14/21] f2fs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-15-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-15-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:56Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for the f2fs file system to use the new ->iomap_next() callback, which is generated using the DEFINE_IOMAP_ITER_NEXT() macro. This change does not introduce any functional changes and only updates the internal implementation of iomap operations. The goal is to align f2fs with the latest iomap API requirements.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 15/21] gfs2: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-16-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-16-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:24:58Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for the GFS2 file system to use the new ->iomap_next() callback, which is generated using the DEFINE_IOMAP_ITER_NEXT_END() macro. This change does not introduce any functional changes and simply updates the existing code to conform to a newer API. The goal of this conversion is likely to prepare the GFS2 file system for future development and maintenance by aligning it with other Linux kernel components that use the ->iomap_next() callback.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 16/21] hpfs: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-17-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-17-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:25:01Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for the HPFS filesystem to use the new ->iomap_next() callback. This callback is generated using a macro that wraps an existing helper function, and it ensures that any previous mapping is finished before producing the next one. No functional changes are intended by this conversion.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 17/21] fuse: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-18-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-18-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:25:03Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for the FUSE file system to use the new ->iomap_next() callback, which is generated using macros that wrap the iomap_iter_next() helper. This change does not introduce any functional changes and only updates the implementation of the iomap operations. The conversion affects three files: fs/fuse/dax.c, fs/fuse/file.c, and fs/fuse/virtio_fs.c.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 18/21] exfat: convert iomap ops to ->iomap_next()",
+              "message_id": "20260727211758.1116539-19-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-19-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:25:06Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch converts the iomap operations for the exfat file system to use the new ->iomap_next() callback, which is generated using macros that wrap the iomap_iter_next helper. This change does not introduce any functional changes and only updates the code structure. The conversion is done for both read and write operations.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 19/21] iomap: remove ->iomap_begin()/->iomap_end() legacy path",
+              "message_id": "20260727211758.1116539-20-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-20-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:25:08Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch removes the legacy ->iomap_begin() and ->iomap_end() path from the iomap code, which is no longer needed since all in-tree filesystems have implemented the ->iomap_next() interface. The patch updates various functions to use the new interface instead of the old one, simplifying the code and reducing complexity.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 20/21] iomap: pass iomap_iter_next_fn directly instead of struct iomap_ops",
+              "message_id": "20260727211758.1116539-21-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-21-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:25:11Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch simplifies the iomap code by removing the struct iomap_ops, which only contained a single function pointer, and instead passes the iomap_iter_next_fn directly to various functions. This change is made possible because all filesystems now implement ->iomap_next() and have removed legacy fallbacks. The patch also renames the ops field in the iomap_iter tracepoint to next for consistency.",
+              "analysis_source": "llm-per-reviewer",
+              "review_comments": [
+                {
+                  "author": "Darrick Wong",
+                  "summary": "Reviewer Darrick Wong suggested using a macro to define the forward declaration of iomap_next functions, specifically proposing the DECLARE_IOMAP_NEXT(name) macro, but left open to alternative opinions.",
+                  "sentiment": "NEUTRAL",
+                  "sentiment_signals": [
+                    "suggestion",
+                    "open-ended"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "I wonder, would it make more sense to have a macro to define the forward\ndeclaration?  e.g.\n\n#define DECLARE_IOMAP_NEXT(name) \\\n\tint name(...)\n\nDECLARE_IOMAP_NEXT(xfs_buffered_write_iomap_next);\n\nHm?\n\nThough feel free to say \"declaration macros suck!\" because they do.\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+                  "reply_to": "Joanne Koong",
+                  "message_date": "2026-07-27",
+                  "message_id": "20260727223345.GI2901224@frogsfrogsfrogs",
+                  "analysis_source": "llm",
+                  "email": "djwong@kernel.org"
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v4 21/21] Documentation: iomap: update docs to reflect iomap_iter_next model",
+              "message_id": "20260727211758.1116539-22-joannelkoong@gmail.com",
+              "url": "https://lore.kernel.org/all/20260727211758.1116539-22-joannelkoong@gmail.com/",
+              "date": "2026-07-27T21:25:13Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": true,
+              "submitted_date": "2026-07-27",
+              "patch_version": 4,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch updates the iomap documentation to reflect a change in how filesystems interact with the iomap API. Specifically, it removes the need for separate iomap_begin and iomap_end callbacks, instead using a single iomap_iter_next callback that finishes the previous mapping and produces the next one. The patch also updates various sections of the documentation to match this new model, making it easier for filesystem developers to understand how to use the iomap API correctly.",
+              "analysis_source": "llm-per-reviewer",
+              "review_comments": [
+                {
+                  "author": "Darrick Wong",
+                  "summary": "Reviewer Darrick Wong noted that the documentation update is correct and matches the new iomap_iter_next() callback model, but did not provide any specific technical feedback or suggestions.",
+                  "sentiment": "POSITIVE",
+                  "sentiment_signals": [
+                    "LGTM"
+                  ],
+                  "has_inline_review": false,
+                  "tags_given": [
+                    "Reviewed-by"
+                  ],
+                  "raw_body": "Looks good to me,\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+                  "reply_to": "Joanne Koong",
+                  "message_date": "2026-07-27",
+                  "message_id": "20260727223937.GJ2901224@frogsfrogsfrogs",
+                  "analysis_source": "llm",
+                  "email": "djwong@kernel.org"
+                }
+              ],
+              "list_id": "linux-xfs@vger.kernel.org"
+            }
+          ],
+          "patch_summary": "This patch series converts the iomap code to use an iterator model, replacing the current begin/end pair of callbacks with a single next callback. This change allows for improved performance by enabling inlining and devirtualization of the iteration loop, as well as providing more flexibility for future callers to express custom logic in the IO path. The patches are broken down into 21 steps, including refactoring existing code, adding the new next callback, converting each filesystem, removing legacy paths, and updating documentation.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author addressed a concern about the iomap_iter() logic, moved it out into an inlined helper function called iomap_iter_next(), and provided macros to generate boilerplate ->iomap_next() wrapper functions. No functional change intended.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "no fix planned",
+                "clarification"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "In preparation for changing iomap to use an in-iter (->iomap_next())\nmodel, move the iomap_iter() logic out into the new iomap_iter_next()\nhelper function.\n\niomap_iter_next() is added as an inlined helper so it can be called\ndirectly by ->iomap_next() implementations where the begin()/end()\ncallbacks can be direct calls.\n\nThe DEFINE_IOMAP_ITER_NEXT() and DEFINE_IOMAP_ITER_NEXT_END() macros are\nalso provided to generate the boilerplate ->iomap_next() wrapper\nfunctions that simply forward to iomap_iter_next() with the appropriate\nbegin/end callbacks. DEFINE_IOMAP_ITER_NEXT() is for the common case\nwhere there is no end() callback. DEFINE_IOMAP_ITER_NEXT_END() is for\nthe case where there is an explicit end() callback.\n\nNo functional change intended. The only code-level difference is that on\nthe iomap_end() error path (ret < 0 && !advanced), the old code returned\nwith iter.status left as the caller's last value whereas the new code\nzeroes it, but this is not observable in practice as there are no in-tree\ncallers that read iter.status after the iteration loop.\n\nReviewed-by: Darrick J. Wong <djwong@kernel.org>\nReviewed-by: Fengnan Chang <changfengnan@bytedance.com>\nReviewed-by: Christoph Hellwig <hch@lst.de>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/iomap/iter.c       | 123 +++++++++++++++++++++---------------------\n include/linux/iomap.h | 102 +++++++++++++++++++++++++++++------\n 2 files changed, 147 insertions(+), 78 deletions(-)\n\ndiff --git a/fs/iomap/iter.c b/fs/iomap/iter.c\nindex e4a29829591a..66ccb87441ab 100644\n--- a/fs/iomap/iter.c\n+++ b/fs/iomap/iter.c\n@@ -6,15 +6,6 @@\n #include <linux/iomap.h>\n #include \"trace.h\"\n \n-static inline void iomap_iter_clean_fbatch(struct iomap_iter *iter)\n-{\n-\tif (iter->iomap.flags & IOMAP_F_FOLIO_BATCH) {\n-\t\tfolio_batch_release(iter->fbatch);\n-\t\tfolio_batch_reinit(iter->fbatch);\n-\t\titer->iomap.flags &= ~IOMAP_F_FOLIO_BATCH;\n-\t}\n-}\n-\n /* Advance the current iterator position and decrement the remaining length */\n int iomap_iter_advance(struct iomap_iter *iter, u64 count)\n {\n@@ -40,51 +31,28 @@ static inline void iomap_iter_done(struct iomap_iter *iter)\n }\n \n /**\n- * iomap_iter - iterate over a ranges in a file\n- * @iter: iteration structue\n- * @ops: iomap ops provided by the file system\n+ * iomap_iter_continue - decide whether iteration should continue\n+ * @iter: iteration structure\n+ * @iomap: the mapping that was just processed\n+ * @srcmap: the source mapping that was just processed\n  *\n- * Iterate over filesystem-provided space mappings for the provided file range.\n+ * Helper normally called via iomap_iter_next(). Called after the previous\n+ * mapping has been finished to determine whether there is more of the file\n+ * range left to process.\n  *\n- * This function handles cleanup of resources acquired for iteration when the\n- * filesystem indicates there are no more space mappings, which means that this\n- * function must be called in a loop that continues as long it returns a\n- * positive value.  If 0 or a negative value is returned, the caller must not\n- * return to the loop body.  Within a loop body, there are two ways to break out\n- * of the loop body:  leave @iter.status unchanged, or set it to a negative\n- * errno.\n+ * Returns 1 if there is more work to do, in which case @iomap and @srcmap are\n+ * cleared so the caller can produce the next mapping; zero if the range is\n+ * fully consumed; or a negative errno on error. Any folio batch attached to\n+ * the mapping is released before returning.\n  */\n-int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n+int iomap_iter_continue(const struct iomap_iter *iter, struct iomap *iomap,\n+\t\tstruct iomap *srcmap, int ret)\n {\n-\tbool stale = iter->iomap.flags & IOMAP_F_STALE;\n-\tssize_t advanced;\n-\tu64 olen;\n-\tint ret;\n-\n-\ttrace_iomap_iter(iter, ops, _RET_IP_);\n-\n-\tif (!iter->iomap.length)\n-\t\tgoto begin;\n-\n-\t/*\n-\t * Calculate how far the iter was advanced and the original length bytes\n-\t * for ->iomap_end().\n-\t */\n-\tadvanced = iter->pos - iter->iter_start_pos;\n-\tolen = iter->len + advanced;\n-\n-\tif (ops->iomap_end) {\n-\t\tret = ops->iomap_end(iter->inode, iter->iter_start_pos,\n-\t\t\t\tiomap_length_trim(iter, iter->iter_start_pos,\n-\t\t\t\t\t\t  olen),\n-\t\t\t\tadvanced, iter->flags, &iter->iomap);\n-\t\tif (ret < 0 && !advanced)\n-\t\t\treturn ret;\n-\t}\n+\tconst bool stale = iomap->flags & IOMAP_F_STALE;\n+\tconst ssize_t advanced = iter->pos - iter->iter_start_pos;\n \n-\t/* detect old return semantics where this would advance */\n-\tif (WARN_ON_ONCE(iter->status > 0))\n-\t\titer->status = -EIO;\n+\tif (ret < 0 && !advanced)\n+\t\treturn ret;\n \n \t/*\n \t * Use iter->len to determine whether to continue onto the next mapping.\n@@ -92,25 +60,58 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n \t * advanced at all (i.e. no work was done for some reason) unless the\n \t * mapping has been marked stale and needs to be reprocessed.\n \t */\n-\tif (iter->status < 0)\n+\tif (WARN_ON_ONCE(iter->status > 0))\n+\t\t/* detect old return semantics where this would advance */\n+\t\tret = -EIO;\n+\telse if (iter->status < 0)\n \t\tret = iter->status;\n \telse if (iter->len == 0 || (!advanced && !stale))\n \t\tret = 0;\n \telse\n \t\tret = 1;\n-\tiomap_iter_clean_fbatch(iter);\n-\titer->status = 0;\n+\n+\tif (iomap->flags & IOMAP_F_FOLIO_BATCH) {\n+\t\tfolio_batch_release(iter->fbatch);\n+\t\tfolio_batch_reinit(iter->fbatch);\n+\t\tiomap->flags &= ~IOMAP_F_FOLIO_BATCH;\n+\t}\n+\n \tif (ret <= 0)\n \t\treturn ret;\n \n-\tmemset(&iter->iomap, 0, sizeof(iter->iomap));\n-\tmemset(&iter->srcmap, 0, sizeof(iter->srcmap));\n+\tmemset(iomap, 0, sizeof(*iomap));\n+\tmemset(srcmap, 0, sizeof(*srcmap));\n \n-begin:\n-\tret = ops->iomap_begin(iter->inode, iter->pos, iter->len, iter->flags,\n-\t\t\t       &iter->iomap, &iter->srcmap);\n-\tif (ret < 0)\n-\t\treturn ret;\n-\tiomap_iter_done(iter);\n-\treturn 1;\n+\treturn ret;\n+}\n+EXPORT_SYMBOL_GPL(iomap_iter_continue);\n+\n+/**\n+ * iomap_iter - iterate over ranges in a file\n+ * @iter: iteration structure\n+ * @ops: iomap ops provided by the filesystem\n+ *\n+ * Iterate over filesystem-provided space mappings for the provided file range.\n+ *\n+ * This function handles cleanup of resources acquired for iteration when the\n+ * filesystem indicates there are no more space mappings, which means that this\n+ * function must be called in a loop that continues as long it returns a\n+ * positive value.  If 0 or a negative value is returned, the caller must not\n+ * return to the loop body.  Within a loop body, there are two ways to break out\n+ * of the loop body:  leave @iter.status unchanged, or set it to a negative\n+ * errno.\n+ */\n+int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n+{\n+\tint ret;\n+\n+\ttrace_iomap_iter(iter, ops, _RET_IP_);\n+\n+\tret = iomap_iter_next(iter, &iter->iomap, &iter->srcmap,\n+\t\t\tops->iomap_begin, ops->iomap_end);\n+\titer->status = 0;\n+\tif (ret > 0)\n+\t\tiomap_iter_done(iter);\n+\n+\treturn ret;\n }\ndiff --git a/include/linux/iomap.h b/include/linux/iomap.h\nindex 21e73cb9c51e..36490c08d6e9 100644\n--- a/include/linux/iomap.h\n+++ b/include/linux/iomap.h\n@@ -212,24 +212,27 @@ struct iomap_write_ops {\n #define IOMAP_ATOMIC\t\t(1 << 9) /* torn-write protection */\n #define IOMAP_DONTCACHE\t\t(1 << 10)\n \n-struct iomap_ops {\n-\t/*\n-\t * Return the existing mapping at pos, or reserve space starting at\n-\t * pos for up to length, as long as we can do it as a single mapping.\n-\t * The actual length is returned in iomap->length.\n-\t */\n-\tint (*iomap_begin)(struct inode *inode, loff_t pos, loff_t length,\n-\t\t\tunsigned flags, struct iomap *iomap,\n-\t\t\tstruct iomap *srcmap);\n+/*\n+ * Return the existing mapping at pos, or reserve space starting at pos for up\n+ * to length, as long as we can do it as a single mapping.\n+ * The actual length is returned in iomap->length.\n+ */\n+typedef int (*iomap_iter_begin_fn)(struct inode *inode, loff_t pos,\n+\t\tloff_t length, unsigned flags, struct iomap *iomap,\n+\t\tstruct iomap *srcmap);\n \n-\t/*\n-\t * Commit and/or unreserve space previous allocated using iomap_begin.\n-\t * Written indicates the length of the successful write operation which\n-\t * needs to be commited, while the rest needs to be unreserved.\n-\t * Written might be zero if no data was written.\n-\t */\n-\tint (*iomap_end)(struct inode *inode, loff_t pos, loff_t length,\n-\t\t\tssize_t written, unsigned flags, struct iomap *iomap);\n+/*\n+ * Commit and/or unreserve space previously allocated by iomap_iter_begin_fn.\n+ * Written indicates the length of the successful write operation which needs\n+ * to be committed, while the rest needs to be unreserved.\n+ * Written might be zero if no data was written.\n+ */\n+typedef int (*iomap_iter_end_fn)(struct inode *inode, loff_t pos, loff_t length,\n+\t\tssize_t written, unsigned flags, struct iomap *iomap);\n+\n+struct iomap_ops {\n+\tiomap_iter_begin_fn iomap_begin;\n+\tiomap_iter_end_fn iomap_end;\n };\n \n /**\n@@ -317,6 +320,71 @@ static inline const struct iomap *iomap_iter_srcmap(const struct iomap_iter *i)\n \treturn &i->iomap;\n }\n \n+int iomap_iter_continue(const struct iomap_iter *iter, struct iomap *iomap,\n+\t\tstruct iomap *srcmap, int ret);\n+\n+/**\n+ * iomap_iter_next - finish the previous mapping and produce the next one\n+ * @iter: iteration structure\n+ * @iomap: mapping to finish and then repopulate\n+ * @srcmap: source mapping to finish and then repopulate\n+ * @begin: callback that produces a mapping for the current position\n+ * @end: optional callback that finishes the previous mapping, or NULL\n+ *\n+ * Inline helper that implements the common body of an ->iomap_next()\n+ * callback: it finishes the previous mapping via @end (if present), decides\n+ * via iomap_iter_continue() whether to keep going, and obtains the next\n+ * mapping via @begin.\n+ *\n+ * This helper is marked __always_inline so that when a caller passes\n+ * compile-time-constant @begin and @end callbacks, the compiler can call them\n+ * directly, avoiding the indirect-call overhead.\n+ *\n+ * Returns 1 to continue iterating, 0 once the range is fully consumed, or a\n+ * negative errno on error.\n+ */\n+static __always_inline int iomap_iter_next(const struct iomap_iter *iter,\n+\t\tstruct iomap *iomap, struct iomap *srcmap,\n+\t\tiomap_iter_begin_fn begin, iomap_iter_end_fn end)\n+{\n+\tint ret = 0;\n+\n+\tif (iomap->length) {\n+\t\tif (end) {\n+\t\t\t/*\n+\t\t\t * Calculate how far the iter was advanced and the\n+\t\t\t * original length bytes for end().\n+\t\t\t */\n+\t\t\tssize_t advanced = iter->pos - iter->iter_start_pos;\n+\t\t\tloff_t len;\n+\n+\t\t\tlen = iomap_length_trim(iter, iter->iter_start_pos,\n+\t\t\t\t\titer->len + advanced);\n+\n+\t\t\tret = end(iter->inode, iter->iter_start_pos, len,\n+\t\t\t\t\tadvanced, iter->flags, iomap);\n+\t\t}\n+\t\tret = iomap_iter_continue(iter, iomap, srcmap, ret);\n+\t\tif (ret <= 0)\n+\t\t\treturn ret;\n+\t}\n+\n+\tret = begin(iter->inode, iter->pos, iter->len, iter->flags, iomap,\n+\t\t\tsrcmap);\n+\n+\treturn ret < 0 ? ret : 1;\n+}\n+\n+#define DEFINE_IOMAP_ITER_NEXT_END(name, begin_fn, end_fn)\t\t\\\n+int name(const struct iomap_iter *iter, struct iomap *iomap,\t\t\\\n+\t\tstruct iomap *srcmap)\t\t\t\t\t\\\n+{\t\t\t\t\t\t\t\t\t\\\n+\treturn iomap_iter_next(iter, iomap, srcmap, begin_fn, end_fn);\t\\\n+}\n+\n+#define DEFINE_IOMAP_ITER_NEXT(name, begin_fn)\t\t\t\t\\\n+\tDEFINE_IOMAP_ITER_NEXT_END(name, begin_fn, NULL)\n+\n /*\n  * Return the file offset for the first unchanged block after a short write.\n  *\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-2-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author acknowledged that the pending iomap_iter_next conversion creates performance issues for the new simple direct I/O read fast path, agreed to split the simple path from iomap_dio_rw and require file systems to call into it explicitly, and pass only a ->begin callback. This will allow dropping various checks for incompatible features while creating a requirement for the file system to only call the simple path for cases that it can handle.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledged performance issues",
+                "agreed to split simple path"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "From: Christoph Hellwig <hch@lst.de>\n\nThe pending iomap_iter_next conversion creates performance issues for the\nnew simple direct I/O read fast path, because it assumes a model where\nthe iterator must be advanced at the end, which the direct I/O read fast\npath tries to avoid.\n\nSide step this by splitting the simple path from iomap_dio_rw, and\nrequire the file systems to call into it explicitly, and pass only a\n->begin callback.  This allows to drop various checks for incompatible\nfeatures while creating a requirement for the file system to only call\nthe simple path for cases that it can handle.\n\nAs a side-benefit we can now inline the initial part of the simple\ndirect I/O read fast path and let the compiler convert the indirect call\nto ->begin into a direct call.\n\nReviewed-by: Joanne Koong <joannelkoong@gmail.com>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\nSigned-off-by: Christoph Hellwig <hch@lst.de>\n---\n fs/ext4/ext4.h        |   3 +\n fs/ext4/file.c        |   4 +-\n fs/ext4/inode.c       |   2 +-\n fs/iomap/direct-io.c  | 208 ++++++++++--------------------------------\n fs/xfs/xfs_file.c     |  14 +--\n fs/xfs/xfs_iomap.c    |   2 +-\n fs/xfs/xfs_iomap.h    |   4 +\n include/linux/iomap.h |  66 ++++++++++++++\n 8 files changed, 136 insertions(+), 167 deletions(-)\n\ndiff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h\nindex b37c136ea3ab..e134c0193e2b 100644\n--- a/fs/ext4/ext4.h\n+++ b/fs/ext4/ext4.h\n@@ -4007,6 +4007,9 @@ static inline void ext4_clear_io_unwritten_flag(ext4_io_end_t *io_end)\n extern const struct iomap_ops ext4_iomap_ops;\n extern const struct iomap_ops ext4_iomap_report_ops;\n \n+int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,\n+\t\tunsigned flags, struct iomap *iomap, struct iomap *srcmap);\n+\n static inline int ext4_buffer_uptodate(struct buffer_head *bh)\n {\n \t/*\ndiff --git a/fs/ext4/file.c b/fs/ext4/file.c\nindex eb1a323962b1..f20d92255546 100644\n--- a/fs/ext4/file.c\n+++ b/fs/ext4/file.c\n@@ -91,7 +91,9 @@ static ssize_t ext4_dio_read_iter(struct kiocb *iocb, struct iov_iter *to)\n \t\treturn generic_file_read_iter(iocb, to);\n \t}\n \n-\tret = iomap_dio_rw(iocb, to, &ext4_iomap_ops, NULL, 0, NULL, 0);\n+\tret = iomap_dio_read_simple(iocb, to, ext4_iomap_begin);\n+\tif (ret == -ENOTBLK)\n+\t\tret = iomap_dio_rw(iocb, to, &ext4_iomap_ops, NULL, 0, NULL, 0);\n \tinode_unlock_shared(inode);\n \n \tfile_accessed(iocb->ki_filp);\ndiff --git a/fs/ext4/inode.c b/fs/ext4/inode.c\nindex ce99807c5f5b..b48c54f3312b 100644\n--- a/fs/ext4/inode.c\n+++ b/fs/ext4/inode.c\n@@ -3771,7 +3771,7 @@ static int ext4_iomap_alloc(struct inode *inode, struct ext4_map_blocks *map,\n }\n \n \n-static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,\n+int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,\n \t\tunsigned flags, struct iomap *iomap, struct iomap *srcmap)\n {\n \tint ret;\ndiff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c\nindex ca790239e5eb..36c976cf0848 100644\n--- a/fs/iomap/direct-io.c\n+++ b/fs/iomap/direct-io.c\n@@ -894,6 +894,21 @@ __iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,\n }\n EXPORT_SYMBOL_GPL(__iomap_dio_rw);\n \n+ssize_t\n+iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,\n+\t\tconst struct iomap_ops *ops, const struct iomap_dio_ops *dops,\n+\t\tunsigned int dio_flags, void *private, size_t done_before)\n+{\n+\tstruct iomap_dio *dio;\n+\n+\tdio = __iomap_dio_rw(iocb, iter, ops, dops, dio_flags, private,\n+\t\t\t     done_before);\n+\tif (IS_ERR_OR_NULL(dio))\n+\t\treturn PTR_ERR_OR_ZERO(dio);\n+\treturn iomap_dio_complete(dio);\n+}\n+EXPORT_SYMBOL_GPL(iomap_dio_rw);\n+\n struct iomap_dio_simple {\n \tstruct kiocb\t\t*iocb;\n \tsize_t\t\t\tsize;\n@@ -968,211 +983,88 @@ static void iomap_dio_simple_end_io(struct bio *bio)\n \tiocb->ki_complete(iocb, iomap_dio_simple_complete(sr));\n }\n \n-static inline bool\n-iomap_dio_simple_supported(struct kiocb *iocb, struct iov_iter *iter,\n-\t\t\t   const struct iomap_dio_ops *dops,\n-\t\t\t   unsigned int dio_flags, size_t done_before)\n-{\n-\tstruct inode *inode = file_inode(iocb->ki_filp);\n-\tsize_t count = iov_iter_count(iter);\n-\n-\tif (dops || done_before)\n-\t\treturn false;\n-\tif (iov_iter_rw(iter) != READ)\n-\t\treturn false;\n-\tif (!count)\n-\t\treturn false;\n-\t/*\n-\t * Simple dio is an optimization for small IO. Filter out large IO\n-\t * early as it's the most common case to fail for typical direct IO\n-\t * workloads.\n-\t */\n-\tif (count > inode->i_sb->s_blocksize)\n-\t\treturn false;\n-\tif (dio_flags & (IOMAP_DIO_FORCE_WAIT | IOMAP_DIO_PARTIAL |\n-\t\t\t IOMAP_DIO_BOUNCE))\n-\t\treturn false;\n-\tif (iocb->ki_pos + count > i_size_read(inode))\n-\t\treturn false;\n-\tif (IS_ENCRYPTED(inode))\n-\t\treturn false;\n-\n-\treturn true;\n-}\n-\n-/*\n- * Fast path for small, block-aligned direct I/Os that map to a single\n- * contiguous on-disk extent.\n- *\n- * iomap_dio_simple_supported() enforces the cheap up-front constraints before\n- * entering this path.\n- *\n- * @dops must be NULL: a non-NULL @dops means the caller wants its\n- * ->end_io / ->submit_io hooks invoked, and in particular wants its bios to be\n- * allocated from the filesystem-private @dops->bio_set (whose front_pad sizes a\n- * filesystem-private wrapper around the bio).  The fast path instead allocates\n- * from the shared iomap_dio_simple_pool, whose front_pad matches struct\n- * iomap_dio_simple; the two wrappers are not interchangeable, so we must fall\n- * back to __iomap_dio_rw() in that case.\n- *\n- * @done_before must be zero: a non-zero caller-accumulated residual cannot be\n- * carried through a single-bio inline completion.\n- *\n- * @iter must describe a non-empty READ no larger than the inode block size:\n- * writes, zero-length I/O, and larger requests need the generic iomap direct\n- * I/O path.\n- *\n- * @dio_flags must not request IOMAP_DIO_FORCE_WAIT, IOMAP_DIO_PARTIAL, or\n- * IOMAP_DIO_BOUNCE: this path does not support forced waiting, partial direct\n- * I/O, or bouncing.  The range must also stay within i_size and encrypted\n- * inodes must use the generic iomap direct I/O path.\n- *\n- * -ENOTBLK is the private sentinel returned by iomap_dio_simple() when it\n- * decides the request does not fit the fast path.  In that case we proceed to\n- * the generic __iomap_dio_rw() slow path.  Any other errno is a real result and\n- * is propagated as-is, in particular -EAGAIN for IOCB_NOWAIT must reach the\n- * caller.\n- */\n-static ssize_t\n-iomap_dio_simple(struct kiocb *iocb, struct iov_iter *iter,\n-\t\t const struct iomap_ops *ops, void *private,\n-\t\t unsigned int dio_flags)\n+ssize_t __iomap_dio_read_simple(struct kiocb *iocb, struct iov_iter *iter,\n+\t\tstruct iomap_iter *iomi)\n {\n-\tstruct inode *inode = file_inode(iocb->ki_filp);\n-\tsize_t count = iov_iter_count(iter);\n-\tbool wait_for_completion = is_sync_kiocb(iocb);\n-\tstruct iomap_iter iomi = {\n-\t\t.inode\t\t= inode,\n-\t\t.pos\t\t= iocb->ki_pos,\n-\t\t.len\t\t= count,\n-\t\t.flags\t\t= IOMAP_DIRECT,\n-\t\t.private\t= private,\n-\t};\n \tstruct iomap_dio_simple *sr;\n \tunsigned int alignment;\n \tstruct bio *bio;\n \tssize_t ret;\n \n-\tif (iocb->ki_flags & IOCB_NOWAIT)\n-\t\tiomi.flags |= IOMAP_NOWAIT;\n-\n-\tret = kiocb_write_and_wait(iocb, count);\n-\tif (ret)\n-\t\treturn ret;\n-\n-\tinode_dio_begin(inode);\n-\n-\tret = ops->iomap_begin(inode, iomi.pos, count, iomi.flags,\n-\t\t\t       &iomi.iomap, &iomi.srcmap);\n-\tif (ret) {\n-\t\tinode_dio_end(inode);\n-\t\treturn ret;\n-\t}\n-\n-\tif (iomi.iomap.type != IOMAP_MAPPED ||\n-\t    iomi.iomap.offset + iomi.iomap.length < iomi.pos + count ||\n-\t    (iomi.iomap.flags & IOMAP_F_INTEGRITY)) {\n+\tif (iomi->iomap.type != IOMAP_MAPPED ||\n+\t    iomi->iomap.offset + iomi->iomap.length < iomi->pos + iomi->len ||\n+\t    (iomi->iomap.flags & IOMAP_F_INTEGRITY)) {\n \t\tret = -ENOTBLK;\n-\t\tgoto out_iomap_end;\n+\t\tgoto out_dio_end;\n \t}\n \n-\talignment = iomap_dio_alignment(inode, iomi.iomap.bdev, dio_flags);\n-\tif ((iomi.pos | count) & (alignment - 1)) {\n+\talignment = iomap_dio_alignment(iomi->inode, iomi->iomap.bdev, 0);\n+\tif ((iomi->pos | iomi->len) & (alignment - 1)) {\n \t\tret = -EINVAL;\n-\t\tgoto out_iomap_end;\n+\t\tgoto out_dio_end;\n \t}\n \n-\tif (!wait_for_completion && unlikely(!inode->i_sb->s_dio_done_wq)) {\n-\t\tret = sb_init_dio_done_wq(inode->i_sb);\n+\tif (unlikely(!iomi->inode->i_sb->s_dio_done_wq &&\n+\t\t\t!is_sync_kiocb(iocb))) {\n+\t\tret = sb_init_dio_done_wq(iomi->inode->i_sb);\n \t\tif (ret < 0)\n-\t\t\tgoto out_iomap_end;\n+\t\t\tgoto out_dio_end;\n \t}\n \n-\ttrace_iomap_dio_rw_begin(iocb, iter, dio_flags, 0);\n-\n-\tif (user_backed_iter(iter))\n-\t\tdio_flags |= IOMAP_DIO_USER_BACKED;\n+\ttrace_iomap_dio_rw_begin(iocb, iter, 0, 0);\n \n-\tbio = bio_alloc_bioset(iomi.iomap.bdev,\n+\tbio = bio_alloc_bioset(iomi->iomap.bdev,\n \t\t\t       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n \t\t\t       REQ_OP_READ, GFP_KERNEL, &iomap_dio_simple_pool);\n \tsr = container_of(bio, struct iomap_dio_simple, bio);\n \tsr->iocb = iocb;\n-\tsr->dio_flags = dio_flags;\n+\tsr->dio_flags = 0;\n \n-\tbio->bi_iter.bi_sector = iomap_sector(&iomi.iomap, iomi.pos);\n+\tbio->bi_iter.bi_sector = iomap_sector(&iomi->iomap, iomi->pos);\n \tbio->bi_ioprio = iocb->ki_ioprio;\n \n \tret = bio_iov_iter_get_pages(bio, iter, alignment - 1);\n \tif (unlikely(ret))\n \t\tgoto out_bio_put;\n \n-\tif (bio->bi_iter.bi_size != count) {\n+\tif (bio->bi_iter.bi_size != iomi->len) {\n \t\tiov_iter_revert(iter, bio->bi_iter.bi_size);\n \t\tret = -ENOTBLK;\n \t\tgoto out_bio_release_pages;\n \t}\n \n \tsr->size = bio->bi_iter.bi_size;\n-\n-\tif (dio_flags & IOMAP_DIO_USER_BACKED)\n+\tif (user_backed_iter(iter)) {\n \t\tbio_set_pages_dirty(bio);\n+\t\tsr->dio_flags |= IOMAP_DIO_USER_BACKED;\n+\t}\n \n \tif (iocb->ki_flags & IOCB_NOWAIT)\n \t\tbio->bi_opf |= REQ_NOWAIT;\n-\tif ((iocb->ki_flags & IOCB_HIPRI) && !wait_for_completion) {\n-\t\tbio->bi_opf |= REQ_POLLED;\n-\t\tWRITE_ONCE(iocb->private, bio);\n-\t}\n \n-\tif (ops->iomap_end)\n-\t\tops->iomap_end(inode, iomi.pos, count, count, iomi.flags,\n-\t\t\t       &iomi.iomap);\n-\n-\tif (!wait_for_completion) {\n-\t\tbio->bi_end_io = iomap_dio_simple_end_io;\n-\t\tsubmit_bio(bio);\n-\t\ttrace_iomap_dio_rw_queued(inode, iomi.pos, count);\n-\t\treturn -EIOCBQUEUED;\n+\tif (is_sync_kiocb(iocb)) {\n+\t\tsubmit_bio_wait(bio);\n+\t\treturn iomap_dio_simple_complete(sr);\n \t}\n \n-\tsubmit_bio_wait(bio);\n-\treturn iomap_dio_simple_complete(sr);\n+\tif ((iocb->ki_flags & IOCB_HIPRI)) {\n+\t\tbio->bi_opf |= REQ_POLLED;\n+\t\tWRITE_ONCE(iocb->private, bio);\n+\t}\n+\tbio->bi_end_io = iomap_dio_simple_end_io;\n+\tsubmit_bio(bio);\n+\ttrace_iomap_dio_rw_queued(iomi->inode, iocb->ki_pos, iomi->len);\n+\treturn -EIOCBQUEUED;\n \n out_bio_release_pages:\n \tbio_release_pages(bio, false);\n out_bio_put:\n \tbio_put(bio);\n-out_iomap_end:\n-\tif (ops->iomap_end)\n-\t\tops->iomap_end(inode, iomi.pos, count, 0, iomi.flags,\n-\t\t\t       &iomi.iomap);\n-\tinode_dio_end(inode);\n+out_dio_end:\n+\tinode_dio_end(iomi->inode);\n \treturn ret;\n }\n-\n-ssize_t\n-iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,\n-\t\tconst struct iomap_ops *ops, const struct iomap_dio_ops *dops,\n-\t\tunsigned int dio_flags, void *private, size_t done_before)\n-{\n-\tstruct iomap_dio *dio;\n-\tssize_t ret;\n-\n-\tif (iomap_dio_simple_supported(iocb, iter, dops, dio_flags,\n-\t\t\t\t       done_before)) {\n-\t\tret = iomap_dio_simple(iocb, iter, ops, private, dio_flags);\n-\t\tif (ret != -ENOTBLK)\n-\t\t\treturn ret;\n-\t}\n-\n-\tdio = __iomap_dio_rw(iocb, iter, ops, dops, dio_flags, private,\n-\t\t\t     done_before);\n-\tif (IS_ERR_OR_NULL(dio))\n-\t\treturn PTR_ERR_OR_ZERO(dio);\n-\treturn iomap_dio_complete(dio);\n-}\n-EXPORT_SYMBOL_GPL(iomap_dio_rw);\n+EXPORT_SYMBOL_GPL(__iomap_dio_read_simple);\n \n static int __init iomap_dio_init(void)\n {\ndiff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c\nindex 845a97c9b063..b733225d2864 100644\n--- a/fs/xfs/xfs_file.c\n+++ b/fs/xfs/xfs_file.c\n@@ -251,8 +251,6 @@ xfs_file_dio_read(\n \tstruct iov_iter\t\t*to)\n {\n \tstruct xfs_inode\t*ip = XFS_I(file_inode(iocb->ki_filp));\n-\tunsigned int\t\tdio_flags = 0;\n-\tconst struct iomap_dio_ops *dio_ops = NULL;\n \tssize_t\t\t\tret;\n \n \ttrace_xfs_file_direct_read(iocb, to);\n@@ -266,11 +264,15 @@ xfs_file_dio_read(\n \tif (ret)\n \t\treturn ret;\n \tif (mapping_stable_writes(iocb->ki_filp->f_mapping)) {\n-\t\tdio_ops = &xfs_dio_read_bounce_ops;\n-\t\tdio_flags |= IOMAP_DIO_BOUNCE;\n+\t\tret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops,\n+\t\t\t\t&xfs_dio_read_bounce_ops, IOMAP_DIO_BOUNCE,\n+\t\t\t\tNULL, 0);\n+\t} else {\n+\t\tret = iomap_dio_read_simple(iocb, to, xfs_read_iomap_begin);\n+\t\tif (ret == -ENOTBLK)\n+\t\t\tret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, NULL,\n+\t\t\t\t\t0, NULL, 0);\n \t}\n-\tret = iomap_dio_rw(iocb, to, &xfs_read_iomap_ops, dio_ops, dio_flags,\n-\t\t\tNULL, 0);\n \txfs_iunlock(ip, XFS_IOLOCK_SHARED);\n \n \treturn ret;\ndiff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c\nindex 225c3de88d03..0536e2aeddcc 100644\n--- a/fs/xfs/xfs_iomap.c\n+++ b/fs/xfs/xfs_iomap.c\n@@ -2173,7 +2173,7 @@ const struct iomap_ops xfs_buffered_write_iomap_ops = {\n \t.iomap_end\t\t= xfs_buffered_write_iomap_end,\n };\n \n-static int\n+int\n xfs_read_iomap_begin(\n \tstruct inode\t\t*inode,\n \tloff_t\t\t\toffset,\ndiff --git a/fs/xfs/xfs_iomap.h b/fs/xfs/xfs_iomap.h\nindex ebcce7d49446..cffcec532ea6 100644\n--- a/fs/xfs/xfs_iomap.h\n+++ b/fs/xfs/xfs_iomap.h\n@@ -49,6 +49,10 @@ xfs_aligned_fsb_count(\n \treturn count_fsb;\n }\n \n+int xfs_read_iomap_begin(struct inode *inode, loff_t offset,\n+\t\tloff_t length, unsigned flags, struct iomap *iomap,\n+\t\tstruct iomap *srcmap);\n+\n extern const struct iomap_ops xfs_buffered_write_iomap_ops;\n extern const struct iomap_ops xfs_direct_write_iomap_ops;\n extern const struct iomap_ops xfs_zoned_direct_write_iomap_ops;\ndiff --git a/include/linux/iomap.h b/include/linux/iomap.h\nindex 36490c08d6e9..80832edc7ec2 100644\n--- a/include/linux/iomap.h\n+++ b/include/linux/iomap.h\n@@ -10,6 +10,7 @@\n #include <linux/mm_types.h>\n #include <linux/blkdev.h>\n #include <linux/folio_batch.h>\n+#include <linux/pagemap.h>\n \n struct address_space;\n struct fiemap_extent_info;\n@@ -675,6 +676,71 @@ struct iomap_dio *__iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,\n ssize_t iomap_dio_complete(struct iomap_dio *dio);\n void iomap_dio_bio_end_io(struct bio *bio);\n \n+/*\n+ * Fast path for small, block-aligned direct I/Os that map to a single\n+ * contiguous on-disk extent.\n+ *\n+ * @iter must describe a non-empty READ no larger than the inode block size:\n+ * writes, zero-length I/O, and larger requests need the generic iomap direct\n+ * I/O path.\n+ *\n+ * Does not support iomap_dio_ops, dio_flags, done_before or private data.\n+ * The range must also stay within i_size and encrypted inodes must use the\n+ * generic iomap direct I/O path.\n+ *\n+ * -ENOTBLK indicates the generic path must be used by the caller instead.\n+ * Any other errno is a real result and is propagated as-is, in particular\n+ * -EAGAIN for IOCB_NOWAIT must reach the caller.\n+ *\n+ * The caller can only provide an iomap begin handler, and the iterator\n+ * is never advanced.\n+ */\n+ssize_t __iomap_dio_read_simple(struct kiocb *iocb, struct iov_iter *iter,\n+\t\tstruct iomap_iter *iomi);\n+static __always_inline ssize_t iomap_dio_read_simple(struct kiocb *iocb,\n+\t\tstruct iov_iter *iter, iomap_iter_begin_fn begin)\n+{\n+\tstruct iomap_iter iomi = {\n+\t\t.inode\t\t= file_inode(iocb->ki_filp),\n+\t\t.pos\t\t= iocb->ki_pos,\n+\t\t.len\t\t= iov_iter_count(iter),\n+\t\t.flags\t\t= IOMAP_DIRECT,\n+\t};\n+\tssize_t ret;\n+\n+\tif (!iomi.len)\n+\t\treturn 0;\n+\n+\t/*\n+\t * Simple dio is an optimization for small IO. Filter out large IO\n+\t * early as it's the most common case to fail for typical direct IO\n+\t * workloads.\n+\t */\n+\tif (iomi.len > iomi.inode->i_sb->s_blocksize)\n+\t\treturn -ENOTBLK;\n+\tif (iocb->ki_pos + iomi.len > i_size_read(iomi.inode))\n+\t\treturn -ENOTBLK;\n+\tif (IS_ENCRYPTED(iomi.inode))\n+\t\treturn -ENOTBLK;\n+\n+\tret = kiocb_write_and_wait(iocb, iomi.len);\n+\tif (ret)\n+\t\treturn ret;\n+\n+\tif (iocb->ki_flags & IOCB_NOWAIT)\n+\t\tiomi.flags |= IOMAP_NOWAIT;\n+\n+\tinode_dio_begin(iomi.inode);\n+\tret = begin(iomi.inode, iomi.pos, iomi.len, iomi.flags, &iomi.iomap,\n+\t\t\t&iomi.srcmap);\n+\tif (ret) {\n+\t\tinode_dio_end(iomi.inode);\n+\t\treturn ret;\n+\t}\n+\n+\treturn __iomap_dio_read_simple(iocb, iter, &iomi);\n+}\n+\n #ifdef CONFIG_SWAP\n struct file;\n struct swap_info_struct;\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-3-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author addressed a concern about GFP_KERNEL allocation in non-blocking iocbs, agreed to switch to GFP_NOWAIT allocation instead.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "agreed",
+                "switch"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "From: Christoph Hellwig <hch@lst.de>\n\nFor non-blocking iocbs we should avoid blocking allocation where\npossible, so switch to a GFP_NOWAIT allocation here.\n\nReviewed-by: Darrick J. Wong <djwong@kernel.org>\nReviewed-by: Joanne Koong <joannelkoong@gmail.com>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\nSigned-off-by: Christoph Hellwig <hch@lst.de>\n---\n fs/iomap/direct-io.c | 7 ++++++-\n 1 file changed, 6 insertions(+), 1 deletion(-)\n\ndiff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c\nindex 36c976cf0848..5c28124b9f02 100644\n--- a/fs/iomap/direct-io.c\n+++ b/fs/iomap/direct-io.c\n@@ -986,6 +986,7 @@ static void iomap_dio_simple_end_io(struct bio *bio)\n ssize_t __iomap_dio_read_simple(struct kiocb *iocb, struct iov_iter *iter,\n \t\tstruct iomap_iter *iomi)\n {\n+\tgfp_t gfp = (iomi->flags & IOMAP_NOWAIT) ? GFP_NOWAIT : GFP_KERNEL;\n \tstruct iomap_dio_simple *sr;\n \tunsigned int alignment;\n \tstruct bio *bio;\n@@ -1015,7 +1016,11 @@ ssize_t __iomap_dio_read_simple(struct kiocb *iocb, struct iov_iter *iter,\n \n \tbio = bio_alloc_bioset(iomi->iomap.bdev,\n \t\t\t       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n-\t\t\t       REQ_OP_READ, GFP_KERNEL, &iomap_dio_simple_pool);\n+\t\t\t       REQ_OP_READ, gfp, &iomap_dio_simple_pool);\n+\tif (!bio) {\n+\t\tret = -EAGAIN;\n+\t\tgoto out_dio_end;\n+\t}\n \tsr = container_of(bio, struct iomap_dio_simple, bio);\n \tsr->iocb = iocb;\n \tsr->dio_flags = 0;\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-4-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author is addressing a concern about the fallback path for filesystems that don't provide an ->iomap_next() callback, explaining that iomap_iter() will fall back to the ->iomap_begin()/->iomap_end() path. The author's response suggests no immediate fix or revision needed.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "no clear resolution signal",
+                "clarification"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Have one ->iomap_next() callback instead of ->iomap_begin() and\n->iomap_end(). ->iomap_next() finishes the previous mapping if needed,\nand produces the next mapping.\n\nCollapsing to a single callback lets a performance-critical caller\ninline its iteration loop and pass its ->iomap_next() function as a\ncompile-time constant, so the compiler can devirtualize that callback\ninto a direct call instead of an indirect call through a function\npointer.\n\niomap_iter() uses ->iomap_next() when the filesystem provides that\ncallback and otherwise falls back to the ->iomap_begin()/->iomap_end()\npath, so filesystems can be converted one at a time.\n\nSuggested-by: Christoph Hellwig <hch@lst.de>\nSuggested-by: Matthew Wilcox (Oracle) <willy@infradead.org>\nReviewed-by: Christoph Hellwig <hch@lst.de>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/iomap/iter.c       | 8 ++++++--\n include/linux/iomap.h | 9 +++++++++\n 2 files changed, 15 insertions(+), 2 deletions(-)\n\ndiff --git a/fs/iomap/iter.c b/fs/iomap/iter.c\nindex 66ccb87441ab..e05574602946 100644\n--- a/fs/iomap/iter.c\n+++ b/fs/iomap/iter.c\n@@ -107,8 +107,12 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n \n \ttrace_iomap_iter(iter, ops, _RET_IP_);\n \n-\tret = iomap_iter_next(iter, &iter->iomap, &iter->srcmap,\n-\t\t\tops->iomap_begin, ops->iomap_end);\n+\tif (ops->iomap_next)\n+\t\tret = ops->iomap_next(iter, &iter->iomap, &iter->srcmap);\n+\telse\n+\t\tret = iomap_iter_next(iter, &iter->iomap, &iter->srcmap,\n+\t\t\t\tops->iomap_begin, ops->iomap_end);\n+\n \titer->status = 0;\n \tif (ret > 0)\n \t\tiomap_iter_done(iter);\ndiff --git a/include/linux/iomap.h b/include/linux/iomap.h\nindex 80832edc7ec2..d203d9fe0f89 100644\n--- a/include/linux/iomap.h\n+++ b/include/linux/iomap.h\n@@ -231,9 +231,18 @@ typedef int (*iomap_iter_begin_fn)(struct inode *inode, loff_t pos,\n typedef int (*iomap_iter_end_fn)(struct inode *inode, loff_t pos, loff_t length,\n \t\tssize_t written, unsigned flags, struct iomap *iomap);\n \n+/*\n+ * Produce the next mapping (finishing the previous one if needed).\n+ * Return 1 to continue iterating, 0 if the range is fully consumed, or a\n+ * negative error on failure.\n+ */\n+typedef int (*iomap_iter_next_fn)(const struct iomap_iter *iter,\n+\t\tstruct iomap *iomap, struct iomap *srcmap);\n+\n struct iomap_ops {\n \tiomap_iter_begin_fn iomap_begin;\n \tiomap_iter_end_fn iomap_end;\n+\tiomap_iter_next_fn iomap_next;\n };\n \n /**\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-5-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author addressed a concern about the retry mechanism in xfs's iomap operations, specifically that it relies on the ->iomap_begin method returning -ENOPROTOOPT. The author explained that this is actually based on the ->iomap_next method returning -ENOPROTOOPT and provided updated code to reflect this change.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "clarification",
+                "explanation"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Convert xfs iomap_ops to the new ->iomap_next() callback. Each callback is\ngenerated with the DEFINE_IOMAP_ITER_NEXT()/DEFINE_IOMAP_ITER_NEXT_END()\nmacros, which wrap the iomap_iter_next() helper to finish the previous\nmapping if needed and produce the next one. No functional changes are\nintended.\n\nReviewed-by: Christoph Hellwig <hch@lst.de>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/xfs/xfs_file.c  |  4 ++--\n fs/xfs/xfs_iomap.c | 39 +++++++++++++++++++++++++++++----------\n 2 files changed, 31 insertions(+), 12 deletions(-)\n\ndiff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c\nindex b733225d2864..768cabf6250b 100644\n--- a/fs/xfs/xfs_file.c\n+++ b/fs/xfs/xfs_file.c\n@@ -859,9 +859,9 @@ xfs_file_dio_write_atomic(\n \t\t\tNULL, 0);\n \n \t/*\n-\t * The retry mechanism is based on the ->iomap_begin method returning\n+\t * The retry mechanism is based on the ->iomap_next method returning\n \t * -ENOPROTOOPT, which would be when the REQ_ATOMIC-based write is not\n-\t * possible. The REQ_ATOMIC-based method typically not be possible if\n+\t * possible. The REQ_ATOMIC-based method is typically not possible if\n \t * the write spans multiple extents or the disk blocks are misaligned.\n \t */\n \tif (ret == -ENOPROTOOPT && dops == &xfs_direct_write_iomap_ops) {\ndiff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c\nindex 0536e2aeddcc..71c45be8c652 100644\n--- a/fs/xfs/xfs_iomap.c\n+++ b/fs/xfs/xfs_iomap.c\n@@ -1037,8 +1037,11 @@ xfs_direct_write_iomap_begin(\n \treturn error;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(xfs_direct_write_iomap_next,\n+\t\txfs_direct_write_iomap_begin);\n+\n const struct iomap_ops xfs_direct_write_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_direct_write_iomap_begin,\n+\t.iomap_next\t\t= xfs_direct_write_iomap_next,\n };\n \n #ifdef CONFIG_XFS_RT\n@@ -1089,8 +1092,11 @@ xfs_zoned_direct_write_iomap_begin(\n \treturn 0;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(xfs_zoned_direct_write_iomap_next,\n+\t\txfs_zoned_direct_write_iomap_begin);\n+\n const struct iomap_ops xfs_zoned_direct_write_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_zoned_direct_write_iomap_begin,\n+\t.iomap_next\t\t= xfs_zoned_direct_write_iomap_next,\n };\n #endif /* CONFIG_XFS_RT */\n \n@@ -1274,8 +1280,11 @@ xfs_atomic_write_cow_iomap_begin(\n \treturn error;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(xfs_atomic_write_cow_iomap_next,\n+\t\txfs_atomic_write_cow_iomap_begin);\n+\n const struct iomap_ops xfs_atomic_write_cow_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_atomic_write_cow_iomap_begin,\n+\t.iomap_next\t\t= xfs_atomic_write_cow_iomap_next,\n };\n \n static int\n@@ -1298,9 +1307,11 @@ xfs_dax_write_iomap_end(\n \treturn xfs_reflink_end_cow(ip, pos, written);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(xfs_dax_write_iomap_next,\n+\t\txfs_direct_write_iomap_begin, xfs_dax_write_iomap_end);\n+\n const struct iomap_ops xfs_dax_write_iomap_ops = {\n-\t.iomap_begin\t= xfs_direct_write_iomap_begin,\n-\t.iomap_end\t= xfs_dax_write_iomap_end,\n+\t.iomap_next\t= xfs_dax_write_iomap_next,\n };\n \n /*\n@@ -2168,9 +2179,11 @@ xfs_buffered_write_iomap_end(\n \treturn 0;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(xfs_buffered_write_iomap_next,\n+\t\txfs_buffered_write_iomap_begin, xfs_buffered_write_iomap_end);\n+\n const struct iomap_ops xfs_buffered_write_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_buffered_write_iomap_begin,\n-\t.iomap_end\t\t= xfs_buffered_write_iomap_end,\n+\t.iomap_next\t\t= xfs_buffered_write_iomap_next,\n };\n \n int\n@@ -2214,8 +2227,10 @@ xfs_read_iomap_begin(\n \t\t\t\t shared ? IOMAP_F_SHARED : 0, seq);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(xfs_read_iomap_next, xfs_read_iomap_begin);\n+\n const struct iomap_ops xfs_read_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_read_iomap_begin,\n+\t.iomap_next\t\t= xfs_read_iomap_next,\n };\n \n static int\n@@ -2302,8 +2317,10 @@ xfs_seek_iomap_begin(\n \treturn error;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(xfs_seek_iomap_next, xfs_seek_iomap_begin);\n+\n const struct iomap_ops xfs_seek_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_seek_iomap_begin,\n+\t.iomap_next\t\t= xfs_seek_iomap_next,\n };\n \n static int\n@@ -2349,8 +2366,10 @@ xfs_xattr_iomap_begin(\n \treturn xfs_bmbt_to_iomap(ip, iomap, &imap, flags, IOMAP_F_XATTR, seq);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(xfs_xattr_iomap_next, xfs_xattr_iomap_begin);\n+\n const struct iomap_ops xfs_xattr_iomap_ops = {\n-\t.iomap_begin\t\t= xfs_xattr_iomap_begin,\n+\t.iomap_next\t\t= xfs_xattr_iomap_next,\n };\n \n int\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-6-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author addressed a concern about the implementation of the ->iomap_next() callback in the btrfs filesystem, explaining that it is generated by the DEFINE_IOMAP_ITER_NEXT_END() macro and does not introduce any functional changes.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "acknowledged",
+                "no functional changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Convert btrfs iomap_ops to the new ->iomap_next() callback. The callback is\ngenerated with the DEFINE_IOMAP_ITER_NEXT_END() macro, which wraps the\niomap_iter_next() helper to finish the previous mapping if needed and\nproduce the next one. No functional changes are intended.\n\nAcked-by: David Sterba <dsterba@suse.com>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/btrfs/direct-io.c | 6 ++++--\n 1 file changed, 4 insertions(+), 2 deletions(-)\n\ndiff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c\nindex 460326d34143..d5439b06cdc9 100644\n--- a/fs/btrfs/direct-io.c\n+++ b/fs/btrfs/direct-io.c\n@@ -798,9 +798,11 @@ static void btrfs_dio_submit_io(const struct iomap_iter *iter, struct bio *bio,\n \tbtrfs_submit_bbio(bbio, 0);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(btrfs_dio_iomap_next, btrfs_dio_iomap_begin,\n+\t\t\t\t  btrfs_dio_iomap_end);\n+\n static const struct iomap_ops btrfs_dio_iomap_ops = {\n-\t.iomap_begin            = btrfs_dio_iomap_begin,\n-\t.iomap_end              = btrfs_dio_iomap_end,\n+\t.iomap_next             = btrfs_dio_iomap_next,\n };\n \n static const struct iomap_dio_ops btrfs_dio_ops = {\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-7-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author addressed a concern about the conversion of the ntfs3 filesystem to use the new ->iomap_next() callback, explaining that it is generated using the DEFINE_IOMAP_ITER_NEXT_END macro and does not introduce any functional changes. The patch includes the necessary code modifications.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "acknowledged concern",
+                "explained approach"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Convert ntfs3 iomap_ops to the new ->iomap_next() callback. The callback is\ngenerated with the DEFINE_IOMAP_ITER_NEXT_END() macro, which wraps the\niomap_iter_next() helper to finish the previous mapping if needed and\nproduce the next one. No functional changes are intended.\n\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/ntfs3/inode.c | 6 ++++--\n 1 file changed, 4 insertions(+), 2 deletions(-)\n\ndiff --git a/fs/ntfs3/inode.c b/fs/ntfs3/inode.c\nindex c43101cc064d..53031e71c8fc 100644\n--- a/fs/ntfs3/inode.c\n+++ b/fs/ntfs3/inode.c\n@@ -2101,9 +2101,11 @@ const struct address_space_operations ntfs_aops_cmpr = {\n \t.invalidate_folio = iomap_invalidate_folio,\n };\n \n+static DEFINE_IOMAP_ITER_NEXT_END(ntfs_iomap_next, ntfs_iomap_begin,\n+\t\t\t\t  ntfs_iomap_end);\n+\n const struct iomap_ops ntfs_iomap_ops = {\n-\t.iomap_begin\t= ntfs_iomap_begin,\n-\t.iomap_end\t= ntfs_iomap_end,\n+\t.iomap_next\t= ntfs_iomap_next,\n };\n \n const struct iomap_write_ops ntfs_iomap_folio_ops = {\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-8-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author addressed a concern about converting the ntfs filesystem's iomap operations to use the new ->iomap_next() callback, explaining that each callback is generated with macros and no functional changes are intended.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "neutral explanation",
+                "acknowledgment of feedback"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Convert ntfs iomap_ops to the new ->iomap_next() callback. Each callback is\ngenerated with the DEFINE_IOMAP_ITER_NEXT()/DEFINE_IOMAP_ITER_NEXT_END()\nmacros, which wrap the iomap_iter_next() helper to finish the previous\nmapping if needed and produce the next one. No functional changes are\nintended.\n\nAcked-by: Namjae Jeon <linkinjeon@kernel.org>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/ntfs/iomap.c | 32 ++++++++++++++++++++++----------\n 1 file changed, 22 insertions(+), 10 deletions(-)\n\ndiff --git a/fs/ntfs/iomap.c b/fs/ntfs/iomap.c\nindex 52eecf5cb256..d0964ac840d9 100644\n--- a/fs/ntfs/iomap.c\n+++ b/fs/ntfs/iomap.c\n@@ -277,8 +277,10 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng\n \t\t\tsrcmap, true);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(ntfs_read_iomap_next, ntfs_read_iomap_begin);\n+\n const struct iomap_ops ntfs_read_iomap_ops = {\n-\t.iomap_begin = ntfs_read_iomap_begin,\n+\t.iomap_next = ntfs_read_iomap_next,\n };\n \n /*\n@@ -329,13 +331,17 @@ static int ntfs_zero_read_iomap_end(struct inode *inode, loff_t pos, loff_t leng\n \treturn written;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(ntfs_zero_read_iomap_next,\n+\t\tntfs_seek_iomap_begin, ntfs_zero_read_iomap_end);\n+\n static const struct iomap_ops ntfs_zero_read_iomap_ops = {\n-\t.iomap_begin = ntfs_seek_iomap_begin,\n-\t.iomap_end = ntfs_zero_read_iomap_end,\n+\t.iomap_next = ntfs_zero_read_iomap_next,\n };\n \n+static DEFINE_IOMAP_ITER_NEXT(ntfs_seek_iomap_next, ntfs_seek_iomap_begin);\n+\n const struct iomap_ops ntfs_seek_iomap_ops = {\n-\t.iomap_begin = ntfs_seek_iomap_begin,\n+\t.iomap_next = ntfs_seek_iomap_next,\n };\n \n int ntfs_dio_zero_range(struct inode *inode, loff_t offset, loff_t length)\n@@ -764,9 +770,11 @@ static int ntfs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,\n \treturn written;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(ntfs_write_iomap_next,\n+\t\tntfs_write_iomap_begin, ntfs_write_iomap_end);\n+\n const struct iomap_ops ntfs_write_iomap_ops = {\n-\t.iomap_begin\t\t= ntfs_write_iomap_begin,\n-\t.iomap_end\t\t= ntfs_write_iomap_end,\n+\t.iomap_next\t\t= ntfs_write_iomap_next,\n };\n \n static int ntfs_page_mkwrite_iomap_begin(struct inode *inode, loff_t offset,\n@@ -777,9 +785,11 @@ static int ntfs_page_mkwrite_iomap_begin(struct inode *inode, loff_t offset,\n \t\t\tNTFS_IOMAP_FLAGS_MKWRITE);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(ntfs_page_mkwrite_iomap_next,\n+\t\tntfs_page_mkwrite_iomap_begin, ntfs_write_iomap_end);\n+\n const struct iomap_ops ntfs_page_mkwrite_iomap_ops = {\n-\t.iomap_begin\t\t= ntfs_page_mkwrite_iomap_begin,\n-\t.iomap_end\t\t= ntfs_write_iomap_end,\n+\t.iomap_next\t\t= ntfs_page_mkwrite_iomap_next,\n };\n \n static int ntfs_dio_iomap_begin(struct inode *inode, loff_t offset,\n@@ -790,9 +800,11 @@ static int ntfs_dio_iomap_begin(struct inode *inode, loff_t offset,\n \t\t\tNTFS_IOMAP_FLAGS_DIO);\n }\n \n+static DEFINE_IOMAP_ITER_NEXT_END(ntfs_dio_iomap_next,\n+\t\tntfs_dio_iomap_begin, ntfs_write_iomap_end);\n+\n const struct iomap_ops ntfs_dio_iomap_ops = {\n-\t.iomap_begin\t\t= ntfs_dio_iomap_begin,\n-\t.iomap_end\t\t= ntfs_write_iomap_end,\n+\t.iomap_next\t\t= ntfs_dio_iomap_next,\n };\n \n static ssize_t ntfs_writeback_range(struct iomap_writepage_ctx *wpc,\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-9-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author is addressing a concern about the conversion of ext4 iomap_ops to the new ->iomap_next() callback, specifically that it was not clear how the existing code would be modified. The author responded by providing the modified code for ext4, using the DEFINE_IOMAP_ITER_NEXT macro to generate the new callbacks.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "clarification",
+                "explanation"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Convert ext4 iomap_ops to the new ->iomap_next() callback. Each callback is\ngenerated with the DEFINE_IOMAP_ITER_NEXT() macro, which wraps the\niomap_iter_next() helper to finish the previous mapping if needed and\nproduce the next one. No functional changes are intended.\n\nReviewed-by: Jan Kara <jack@suse.cz>\nReviewed-by: Baokun Li <libaokun@linux.alibaba.com>\nSigned-off-by: Joanne Koong <joannelkoong@gmail.com>\n---\n fs/ext4/extents.c | 4 +++-\n fs/ext4/inode.c   | 8 ++++++--\n 2 files changed, 9 insertions(+), 3 deletions(-)\n\ndiff --git a/fs/ext4/extents.c b/fs/ext4/extents.c\nindex 91c97af64b31..15972410d460 100644\n--- a/fs/ext4/extents.c\n+++ b/fs/ext4/extents.c\n@@ -5171,8 +5171,10 @@ static int ext4_iomap_xattr_begin(struct inode *inode, loff_t offset,\n \treturn error;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(ext4_iomap_xattr_next, ext4_iomap_xattr_begin);\n+\n static const struct iomap_ops ext4_iomap_xattr_ops = {\n-\t.iomap_begin\t\t= ext4_iomap_xattr_begin,\n+\t.iomap_next\t\t= ext4_iomap_xattr_next,\n };\n \n static int ext4_fiemap_check_ranges(struct inode *inode, u64 start, u64 *len)\ndiff --git a/fs/ext4/inode.c b/fs/ext4/inode.c\nindex b48c54f3312b..bf9755b541be 100644\n--- a/fs/ext4/inode.c\n+++ b/fs/ext4/inode.c\n@@ -3850,8 +3850,10 @@ int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,\n \treturn 0;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(ext4_iomap_next, ext4_iomap_begin);\n+\n const struct iomap_ops ext4_iomap_ops = {\n-\t.iomap_begin\t\t= ext4_iomap_begin,\n+\t.iomap_next\t\t= ext4_iomap_next,\n };\n \n static int ext4_iomap_begin_report(struct inode *inode, loff_t offset,\n@@ -3905,8 +3907,10 @@ static int ext4_iomap_begin_report(struct inode *inode, loff_t offset,\n \treturn 0;\n }\n \n+static DEFINE_IOMAP_ITER_NEXT(ext4_iomap_next_report, ext4_iomap_begin_report);\n+\n const struct iomap_ops ext4_iomap_report_ops = {\n-\t.iomap_begin = ext4_iomap_begin_report,\n+\t.iomap_next = ext4_iomap_next_report,\n };\n \n /*\n-- \n2.52.0",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727211758.1116539-10-joannelkoong@gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Darrick Wong",
+              "summary": "Reviewer Darrick Wong noted that the patch series looks good and is ready for review, providing a Reviewed-by tag.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "Looks great"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Looks great!\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-27",
+              "message_id": "20260727222743.GF2901224@frogsfrogsfrogs",
+              "analysis_source": "llm",
+              "email": "djwong@kernel.org"
+            },
+            {
+              "author": "Darrick Wong",
+              "summary": "Reviewer Darrick Wong found the patch acceptable, assuming it passes certain tests and gave a Reviewed-by tag.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "no specific technical issue raised"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Looks fine to me, assuming it passes generic/521 and whatnot ;)\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-27",
+              "message_id": "20260727222807.GG2901224@frogsfrogsfrogs",
+              "analysis_source": "llm",
+              "email": "djwong@kernel.org"
+            },
+            {
+              "author": "Darrick Wong",
+              "summary": "Reviewer Darrick Wong noted that the patch series is a 'nice straightforward conversion' and provided a Reviewed-by tag, indicating approval.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "approval",
+                "positive feedback"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Nice straightforward conversion! :)\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-27",
+              "message_id": "20260727222858.GH2901224@frogsfrogsfrogs",
+              "analysis_source": "llm",
+              "email": "djwong@kernel.org"
+            },
+            {
+              "author": "Darrick Wong",
+              "summary": "Reviewer Darrick Wong suggested using a macro to define the forward declaration of iomap_next() functions, specifically proposing DECLARE_IOMAP_NEXT(xfs_buffered_write_iomap_next) as an example.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "suggestion",
+                "question"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I wonder, would it make more sense to have a macro to define the forward\ndeclaration?  e.g.\n\n#define DECLARE_IOMAP_NEXT(name) \\\n\tint name(...)\n\nDECLARE_IOMAP_NEXT(xfs_buffered_write_iomap_next);\n\nHm?\n\nThough feel free to say \"declaration macros suck!\" because they do.\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727223345.GI2901224@frogsfrogsfrogs",
+              "analysis_source": "llm",
+              "email": "djwong@kernel.org"
+            },
+            {
+              "author": "Darrick Wong",
+              "summary": "Reviewer Darrick Wong noted that the patch series looks good and is ready for merge, providing a Reviewed-by tag.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "Looks good to me"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Looks good to me,\nReviewed-by: \"Darrick J. Wong\" <djwong@kernel.org>\n\n--D",
+              "reply_to": "",
+              "message_date": "2026-07-27",
+              "message_id": "20260727223937.GJ2901224@frogsfrogsfrogs",
+              "analysis_source": "llm",
+              "email": "djwong@kernel.org"
+            },
+            {
+              "author": "changfengnan",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-28",
+              "message_id": "d9210bcdf73fbe1ac8b6ec132865609a3ed68688.18304f34.4a67.44d1.b331.9f18f1c35bb7@bytedance.com",
+              "analysis_source": "heuristic",
+              "email": "changfengnan@bytedance.com"
+            },
+            {
+              "author": "changfengnan",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-28",
+              "message_id": "d9210bcdf73fbe1ac8b6ec132865609a3ed68688.3b277109.3b33.4175.9d57.4ea2181fb636@bytedance.com",
+              "analysis_source": "heuristic",
+              "email": "changfengnan@bytedance.com"
+            },
+            {
+              "author": "Christoph Hellwig",
+              "summary": "Reviewer noted that the patch series is mostly complete and ready for merge, expressing enthusiasm to see it included in the v7.3-rc1 cycle.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "enthusiasm",
+                "urgency"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I've already reviewed (or written :)) all relevant patches, but\nthe overall state here looks great.  Let's get this in ASAP.",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-28",
+              "message_id": "20260728035043.GA19120@lst.de",
+              "analysis_source": "llm",
+              "email": "hch@lst.de"
+            },
+            {
+              "author": "Brian Foster",
+              "summary": "Reviewer Brian Foster noted that the iomap_begin() and iomap_end() callbacks do not handle error returns properly, potentially leading to a folio batch leak, and suggested adding a cleanup path in the error/exit case of iomap_iter().",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "potential bug",
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "So hch forwarded me a bit of Sashiko review feedback that called out a\npotential folio batch leak on error returns from iomap_begin() or\niomap_end(). Note that I think the ->iomap_end() variant is currently\nnot an issue because nothing returns error there, but it should be fixed\nregardless.\n\nAs such, I have the patch below as a fix based on current master. The\nidea here is to account for failures from either callback and also the\nfact that XFS may not necessarily transfer the iomap_flags on failure. I\nconsidered a couple other options here, like changing that behavior or\nusing an iter flag, but I think this is the cleanest option.\n\nHowever this obviously conflicts with this rework series. This isn't a\nmajor conflict IMO.. I'd probably just do the same thing and include the\nbatch cleanup in the error/exit path of iomap_iter() (or maybe start\npassing ret into iomap_iter_done()), but I would need to reintroduce the\nhelper above. Also after this series I think this could mean a duplicate\ncall in the termination case where iomap_iter_continue() would have\ncleaned things up, but that is relatively harmless. Maybe there is\nsomething incrementally cleaner, but I'm still wrapping my head around\nthe factoring here..\n\nBut anyways, the main thing I wanted to ask is how folks want to handle\nthis particular bug..? This rework is invasive and looks mostly reviewed\nso I don't want to unnecessarily hold it up. I can rebase on top of this\nand leave the patch below for -stable, or avoid the helper churn and\npost the patch below on its own and rework it into this, or maybe just\ntweak this to leave the helper around and avoid some churn that way..\nthoughts?\n\nBrian\n\n--- 8< ---\n\ndiff --git a/fs/iomap/iter.c b/fs/iomap/iter.c\nindex e4a29829591a..63617ec48250 100644\n--- a/fs/iomap/iter.c\n+++ b/fs/iomap/iter.c\n@@ -6,12 +6,18 @@\n #include <linux/iomap.h>\n #include \"trace.h\"\n \n+/*\n+ * Release the iter folio batch. Note that the iomap flag is meant to control\n+ * the I/O path for the mapping and may not be set in error situations.\n+ */\n static inline void iomap_iter_clean_fbatch(struct iomap_iter *iter)\n {\n-\tif (iter->iomap.flags & IOMAP_F_FOLIO_BATCH) {\n+\tif (!iter->fbatch)\n+\t\treturn;\n+\titer->iomap.flags &= ~IOMAP_F_FOLIO_BATCH;\n+\tif (folio_batch_count(iter->fbatch)) {\n \t\tfolio_batch_release(iter->fbatch);\n \t\tfolio_batch_reinit(iter->fbatch);\n-\t\titer->iomap.flags &= ~IOMAP_F_FOLIO_BATCH;\n \t}\n }\n \n@@ -79,7 +85,7 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n \t\t\t\t\t\t  olen),\n \t\t\t\tadvanced, iter->flags, &iter->iomap);\n \t\tif (ret < 0 && !advanced)\n-\t\t\treturn ret;\n+\t\t\tgoto error;\n \t}\n \n \t/* detect old return semantics where this would advance */\n@@ -110,7 +116,11 @@ int iomap_iter(struct iomap_iter *iter, const struct iomap_ops *ops)\n \tret = ops->iomap_begin(iter->inode, iter->pos, iter->len, iter->flags,\n \t\t\t       &iter->iomap, &iter->srcmap);\n \tif (ret < 0)\n-\t\treturn ret;\n+\t\tgoto error;\n \tiomap_iter_done(iter);\n \treturn 1;\n+\n+error:\n+\tiomap_iter_clean_fbatch(iter);\n+\treturn ret;\n }",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-28",
+              "message_id": "amizdHj6ICgP2xFv@bfoster",
+              "analysis_source": "llm",
+              "email": "bfoster@redhat.com"
+            },
+            {
+              "author": "Darrick Wong",
+              "summary": "Reviewer Darrick Wong expressed uncertainty about the practical impact of the patch, questioning whether the issue it addresses is real and suggesting that the merge conflict resolution should be done in a separate step before sending to Linus.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "uncertainty",
+                "practical impact"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "7.2 and work out the merge conflict resolution in for-next and send that\nto broonie/linus for 7.3.  But I'm not sure if people are actually\nhitting this and not realizing it; or if this is a fix for a theoretical\nproblem.\n\n--D",
+              "reply_to": "Brian Foster",
+              "message_date": "2026-07-28",
+              "message_id": "20260728155508.GT2901224@frogsfrogsfrogs",
+              "analysis_source": "llm",
+              "email": "djwong@kernel.org"
+            },
+            {
+              "author": "Brian Foster",
+              "summary": "Reviewer Brian Foster expressed skepticism about the practical impact of a potential error path in xfs_bmbt_to_iomap(), suggesting that it's unlikely to occur due to earlier validation, and requested further review before posting the patch.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "skepticism",
+                "requested further review"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Sounds good to me, I'll post the current patch shortly.\n\nI don't think anybody is actually hitting this in reality; it just came\nfrom a Sashiko review. I had an LLM walk through and try and tell me\nwhat error paths could lead to this in practice and it basically\nnarrowed it down to the startblock check in xfs_bmbt_to_iomap(). When\npressed further from there, it says this is mutually exclusive with a\npopulated batch in practice due to earlier validation at the time the\nextents are read in from disk.\n\nI'm not sure I trust the analysis with 100% certainty, but all in all it\nseems like an unlikely or second order (i.e. memory corruption, etc.)\nerror scenario.\n\nBrian",
+              "reply_to": "Darrick Wong",
+              "message_date": "2026-07-28",
+              "message_id": "amjztG-DisHYbV9W@bfoster",
+              "analysis_source": "llm",
+              "email": "bfoster@redhat.com"
+            }
+          ],
+          "list_id": "linux-xfs@vger.kernel.org"
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH] iomap: release the folio batch on iomap callback failures",
+          "message_id": "CAJnrk1YME2vEunO=y6WhqVr0hEO+QXihyrFNa+sisKR4j7-=tw@mail.gmail.com",
+          "url": "https://lore.kernel.org/all/CAJnrk1YME2vEunO=y6WhqVr0hEO+QXihyrFNa+sisKR4j7-=tw@mail.gmail.com/",
+          "date": "2026-07-28T20:52:22Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-xfs@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH] iomap: release the folio batch on iomap callback failures",
+          "message_id": "CAJnrk1Z=qohEjesFFn-YbmU0mqSPkMH_Jy+E6qSCw4pM8niPhw@mail.gmail.com",
+          "url": "https://lore.kernel.org/all/CAJnrk1Z=qohEjesFFn-YbmU0mqSPkMH_Jy+E6qSCw4pM8niPhw@mail.gmail.com/",
+          "date": "2026-07-28T19:07:23Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch addresses a potential issue where iomap callback failures could lead to memory leaks by not releasing the folio batch. The patch aims to fix this problem by ensuring that the folio batch is released in such scenarios, thereby preventing memory leaks. To achieve this, the patch modifies the iomap code to properly handle callback failures and release the associated resources.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Brian Foster",
+              "summary": "Reviewer suggested merging the patch into an existing iomap iter rework series to avoid a nontrivial merge conflict, proposing either folding it in as a preparatory patch or submitting a v5 of the series separately.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "no clear signal"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "That's perfectly fine with me if you're Ok with doing that and nobody\notherwise objects.\n\nBrian",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-07-28",
+              "message_id": "amj_MJOEzLor4jMW@bfoster",
+              "analysis_source": "llm",
+              "email": "bfoster@redhat.com"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author agreed to fold the patch into an existing series as a preparatory patch and send it together with other changes, avoiding merge conflicts.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "agreed",
+                "planned"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I'll wait a day for anyone to object, and if no one does, I'll send v5\ntomorrow with your patch folded in.\n\nThanks,\nJoanne",
+              "reply_to": "Brian Foster",
+              "message_date": "2026-07-28",
+              "message_id": "CAJnrk1YME2vEunO=y6WhqVr0hEO+QXihyrFNa+sisKR4j7-=tw@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            }
+          ],
+          "list_id": "linux-xfs@vger.kernel.org"
+        }
+      ],
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
