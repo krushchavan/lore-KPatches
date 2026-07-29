@@ -9,24 +9,89 @@
       "reviews": [
         {
           "author": "Yosry Ahmed",
-          "summary": "Raised a question about why this needs to be handled in zswap, pointing out that writeback from sync devices still calls folio_end_writeaback() and does the dropbehind handling.",
-          "sentiment": "neutral",
+          "summary": "Reviewer Yosry Ahmed questioned why this patch is necessary for zswap, pointing out that writeback from sync devices already calls folio_end_writeaback() and handles dropbehind",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "requested clarification",
+            "questioned necessity"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Mon, Jul 27, 2026 at 7:39 AM Alexandre Ghiti <alex@ghiti.fr> wrote:\n>\n> zswap writeback decompresses an entry into a fresh swap cache folio and\n> writes it back. The folio is cold by construction, yet it is left on the\n> LRU for reclaim to find and free later, wasting a reclaim scan and keeping\n> cold memory resident longer than necessary.\n>\n> Allocate the folio off the LRU and drop it as soon as writeback completes:\n> mark it PG_dropbehind so the swap dropbehind path frees it once writeback\n> ends. Synchronous-IO devices complete writeback in this context, so there\n> the folio is dropped inline instead.\n\nWhy does this need to be handled in zswap? Doesn't writeback from sync\ndevices still call folio_end_writeaback() and do the dropbehind\nhandling?\n\n>\n> Suggested-by: Johannes Weiner <hannes@cmpxchg.org>\n> Suggested-by: Nhat Pham <nphamcs@gmail.com>\n> Signed-off-by: Alexandre Ghiti <alex@ghiti.fr>\n> ---\n>  mm/zswap.c | 13 ++++++++++---\n>  1 file changed, 10 insertions(+), 3 deletions(-)\n>\n> diff --git a/mm/zswap.c b/mm/zswap.c\n> index 8163e6c5f76c..e37828e02938 100644\n> --- a/mm/zswap.c\n> +++ b/mm/zswap.c\n> @@ -992,6 +992,7 @@ static int zswap_writeback_entry(struct zswap_entry *entry,\n>         struct folio *folio;\n>         struct mempolicy *mpol;\n>         struct swap_info_struct *si;\n> +       bool sync;\n>         int ret = 0;\n>\n>         /* try to allocate swap cache folio */\n> @@ -999,6 +1000,8 @@ static int zswap_writeback_entry(struct zswap_entry *entry,\n>         if (!si)\n>                 return -EEXIST;\n>\n> +       sync = data_race(si->flags & SWP_SYNCHRONOUS_IO);\n> +\n>         mpol = get_task_policy(current);\n>         folio = __swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,\n>                                          NO_INTERLEAVE_INDEX);\n> @@ -1013,7 +1016,6 @@ static int zswap_writeback_entry(struct zswap_entry *entry,\n>          */\n>         if (IS_ERR(folio))\n>                 return PTR_ERR(folio);\n> -       folio_add_lru(folio);\n>\n>         /*\n>          * folio is locked, and the swapcache is now secured against\n> @@ -1046,12 +1048,17 @@ static int zswap_writeback_entry(struct zswap_entry *entry,\n>         /* folio is up to date */\n>         folio_mark_uptodate(folio);\n>\n> -       /* move it to the tail of the inactive list after end_writeback */\n> -       folio_set_reclaim(folio);\n> +       if (!sync)\n> +               folio_set_dropbehind(folio);\n>\n>         /* start writeback */\n>         __swap_writepage(folio, NULL);\n>\n> +       if (sync) {\n> +               swap_dropbehind_free_one_folio(folio);\n> +               return 0;\n> +       }\n> +\n>  out:\n>         if (ret) {\n>                 swap_cache_del_folio(folio);\n> --\n> 2.53.0-Meta\n>\n\n",
-          "reply_to": "Alexandre Ghiti",
+          "raw_body": "Why does this need to be handled in zswap? Doesn't writeback from sync\ndevices still call folio_end_writeaback() and do the dropbehind\nhandling?",
+          "reply_to": "",
           "message_date": "2026-07-27",
-          "message_id": "",
+          "message_id": "CAO9r8zNJ1cfCVgxtpqx4Db380bjZ+Z0P842eAxPXw6Mh4XBrww@mail.gmail.com",
           "email": "yosry@kernel.org",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series extends the existing dropbehind mechanism to swap cache folios, allowing zswap to opt into it and free cold writeback folios promptly on completion. This approach replaces a previous implementation specific to zswap."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series improves the performance of zswap by allowing it to free cold writeback folios promptly on completion, rather than leaving them for page reclaim. The existing dropbehind mechanism is extended to swap cache folios and zswap is made to opt into this mechanism. This change reduces the number of pages scanned during reclaim and keeps cold memory resident for shorter periods. The patch series includes three patches that move LRU insertion out of the swap cache allocator, implement dropbehind for swap cache folios, and modify zswap to allocate its writeback folio off the LRU and mark it as dropbehind."
+    },
+    "2026-07-28": {
+      "report_file": "2026-07-28_ollama_llama3.1-8b.html",
+      "developer": "Alexandre Ghiti",
+      "reviews": [
+        {
+          "author": "Alexandre Ghiti",
+          "summary": "Reviewer noted that the patch does not handle the case where a swap cache folio is still under writeback when it is freed, and requested a defensive check to skip freeing such folios.\n\nReviewer Alexandre Ghiti questioned whether the optimization is necessary, pointing out that since we're already in a sleepable context, the folio can be safely dropped from the swap cache here, and sync folios are never handled by the dropbehind workqueue.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "optimization",
+            "lack of numbers"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Yosry,\n\nOn Mon, Jul 27, 2026 at 7:05 PM Yosry Ahmed <yosry@kernel.org> wrote:\n\n---\n\nThat's an optimization rather than a real need: since we know we are\nin a sleepable context, we can safely drop the folio from the swap\ncache here. And since we don't mark the sync folios as dropbehind,\nthey never enter the list handled by the dropbehind workqueue.\n\nBut maybe that's not worth it? I don't even have numbers to back the\noptimization claim, so I can drop this in v3.\n\nThanks,\n\nAlex",
+          "reply_to": "Yosry Ahmed",
+          "message_date": "2026-07-28",
+          "message_id": "CAEmasaXR5EmGCv3T5AzM_2908R-VjfMcObrACyVGokY2U=+i+Q@mail.gmail.com",
+          "email": "alexghiti@meta.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Nhat Pham",
+          "summary": "Reviewer suggested testing the patch on a different use case, specifically zswap writeback to zram, to see if it improves performance.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "suggested additional testing"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "It's a bit artificial, but you can try testing zswap writeback to\nzram? :) Likely you'll see some small tput win there?\n\n(TBH I have not seen sync IO swap backends other than zram though so\nidk what's more realistic. We don't have pmem device available for\ntesting etc.)",
+          "reply_to": "Alexandre Ghiti",
+          "message_date": "2026-07-28",
+          "message_id": "CAKEwX=P5G=Ckafy6fm9ws3njWP_Zm_AHRKOFERScB9Pkd_KvGw@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Nhat Pham",
+          "summary": "Reviewer Nhat Pham expressed uncertainty about the implications of the patch on synchronous swap backends, specifically mentioning zram, and admitted to only using zswap on zram for testing.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "uncertainty",
+            "lack of knowledge"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yeah that's what I'm thinking too, to be completely honest. But my\nmental model for sync backend is zram, so I'm not sure if there are\nother cases that are interesting that I'm not familiar with.\n\nNormally I just use zswap on zram for correctness stress testing :)\nThat set up fishes out a surprising amount of bugs.",
+          "reply_to": "Yosry Ahmed",
+          "message_date": "2026-07-28",
+          "message_id": "CAKEwX=MPPEBBepeaJtvZUZBJL0KmP6zGevD9HqTiUCKO4Pt_Cw@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series improves the performance of zswap by allowing it to free cold writeback folios promptly on completion, rather than leaving them for page reclaim. The existing dropbehind mechanism is extended to swap cache folios and zswap is made to opt into this mechanism. This change reduces the number of pages scanned during reclaim and keeps cold memory resident for shorter periods. The patch series includes three patches that move LRU insertion out of the swap cache allocator, implement dropbehind for swap cache folios, and modify zswap to allocate its writeback folio off the LRU and mark it as dropbehind."
     }
   }
 }
