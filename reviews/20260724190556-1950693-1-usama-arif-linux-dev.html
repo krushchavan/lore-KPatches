@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review Comments: [PATCH 02/16] selftests/mm: add folio-order check for VA ranges</title>
+    <title>Review Comments: [PATCH] squashfs: avoid thundering-herd cache wakeups</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -236,72 +236,144 @@
 </head>
 <body>
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
-    <h1>[PATCH 02/16] selftests/mm: add folio-order check for VA ranges</h1>
-    <div class="lore-link"><a href="https://lore.kernel.org/all/20260802195254.1937477-3-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-03</strong><div class="date-range-nav">Active on: <a href="#2026-08-03">2026-08-03</a> &bull; <a href="#2026-08-02">2026-08-02</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a new function, `is_range_backed_by_folio_orders`, to the selftests/mm module. It checks whether a given VA range is backed by folios of exactly a specified order, mapped head-to-tail. The function requires that each order-aligned window of the range maps one such folio, and that the VA range must be naturally aligned.</div></div>
+    <h1>[PATCH] squashfs: avoid thundering-herd cache wakeups</h1>
+    <div class="lore-link"><a href="https://lore.kernel.org/all/20260724190556.1950693-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
+    <div class="date-range">Submitted: <strong>2026-08-03</strong><div class="date-range-nav">Active on: <a href="#2026-08-03">2026-08-03</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a &#x27;thundering herd&#x27; problem in the SquashFS filesystem, where multiple cache wakeups occur simultaneously, leading to performance issues. The patch aims to mitigate this issue by implementing a solution that improves throughput for small file reads and stat operations.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-08-03">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Mike Rapoport</span>
+<span class="review-author">Usama Arif (author)</span>
 <a class="date-chip" href="../2026-08-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-03">2026-08-03</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Raised a few minor issues with the patch, including inconsistent naming conventions and unclear descriptions. Suggested rewording the description to be more explicit and using &#x27;address&#x27; instead of &#x27;VA range&#x27;.</div>
+<div class="review-comment-text">The author is addressing David Laight&#x27;s concern about the patch being a &#x27;thundering herd&#x27; problem, specifically whether it constitutes a priority inversion issue. The author explains that this is not a priority inversion because the woken task owns nothing and there is no handoff or resource contention. They also provide additional context about the squashfs_cache_put() function and its interaction with exclusive waits.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">&gt; is_backed_by_folio() answers &quot;what order folio backs this page&quot;, but
-&gt; mTHP collapse tests need the range-level question: is every
-&gt; order-aligned window of this VA range backed by one folio of exactly
+<pre class="raw-body-text">Hi,
 
-Nit:                          ^ address (even without Virtual) reads
-better to me here and in the subject.
+Thanks for looking at this.
 
-&gt; that order, mapped head-to-tail?
-&gt; 
-&gt; Add is_range_backed_by_folio_orders(): per window, require a present
-&gt; and naturally aligned head PFN, a contiguous PFN run across the
-&gt; window, and is_backed_by_folio() agreeing on the order. A window
-&gt; assembled from pieces of different folios, or mapping a folio outside
-&gt; its natural position, fails the check.
+I don&#x27;t think &quot;priority inversion&quot; fits: it needs a resource with an
+owner (Documentation/locking/rt-mutex-design.rst), and here the woken
+task owns nothing.  There is no handoff either - we re-test
+cache-&gt;unused with no queue-position or owner check, so the freed entry
+is not reserved for the wakee.  Any caller takes it immediately,
+including one that never slept.  If the wakee is slow to reach a CPU,
+only the wakee waits.  Nor is a wakeup to a busy CPU blocked:
+try_to_wake_up() enqueues and sets need_resched, with a resched IPI on
+SMP, and preempt-disabled sections are bounded.
 
-I&#x27;d need claude to understand this one ;-P
+And one squashfs_cache_put() frees exactly one entry, so at most one
+waiter can progress from it however many you wake.  The broadcast just
+makes the rest runnable so they can re-test cache-&gt;unused, find zero and
+sleep again.  Across several hosts in the Meta fleet this is the normal
+picture; one example was 19,511,556 wakeups for 1,045,132 releases in
+30s, i.e. 18.7 wakeups per release that freed a single entry.
 
-&gt; Assisted-by: Claude-Code:claude-opus-5
-&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
-&gt;
-&gt; diff --git a/tools/testing/selftests/mm/vm_util.c b/tools/testing/selftests/mm/vm_util.c
-&gt; index 343a15e25a9f..793342095420 100644
-&gt; --- a/tools/testing/selftests/mm/vm_util.c
-&gt; +++ b/tools/testing/selftests/mm/vm_util.c
-&gt; @@ -365,6 +365,52 @@ bool is_backed_by_folio(char *vaddr, int order, int pagemap_fd,
-&gt;  	return false;
-&gt;  }
-&gt;  
-&gt; +/*
-&gt; + * Check whether the range [start, start + len) is backed by folios of
-&gt; + * exactly @order, mapped at their natural alignment.
-&gt; + *
-&gt; + * is_backed_by_folio() classifies the folio backing one page; here we
-&gt; + * additionally require that each order-aligned window of the range maps
+This is the same shape as 0ddad21d3e99 (&quot;pipe: use exclusive waits when
+reading or writing&quot;): where the kernel sets wake_next_reader on the
+exclusive wakeup, clears it under the pipe mutex if the pipe turned out
+empty, and wakes the next reader after unlocking. That has been in since
+v5.6 on the pipe read path, with TASK_INTERRUPTIBLE waiters.
 
-I don&#x27;t think the description should be incremental on top of
-is_backed_by_folio() 
+Note this isn&#x27;t blanket wake-one: the publish wake passes
+nr_exclusive == 0, so all waiters for that block are released together,
+and wake_up_all() on entry-&gt;wait_queue is untouched.
+squashfs_cache_put() already passed nr_exclusive == 1 under a &quot;wake one
+up&quot; comment; the non-exclusive waiters just made it inert.
 
-&gt; + * one such folio head-to-tail: the VA range must be naturally aligned,
+Fair point though: the handoff is serial and FIFO ignores priority, so a
+waiter inherits the latency of the one ahead of it.  I&#x27;ll say so in v2.
+The filebench run is 128 threads on 32 CPUs - 4x oversubscribed, which
+is where that should hurt most - and mean latency went down from 11.30 to
+5.05 ms/op.
 
-Please spell out VA or just use &quot;address&quot;. selftests are userspace,
-&quot;virtual&quot; is kinda implied.
-
--- 
-Sincerely yours,
-Mike.
-
-</pre>
+Thanks,
+Usama</pre>
 </details>
-<div class="review-comment-signals">Signals: Nit: address (even without Virtual) reads better to me here and in the subject.</div>
+<div class="reply-to-label">&#8627; replying to David Laight</div>
+<a href="https://lore.kernel.org/r/c51f516f-d18b-4bd6-8c42-53e9b82ae5a4@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David Laight</span>
+<a class="date-chip" href="../2026-08-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-03">2026-08-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer questioned the effectiveness of the patch in solving the thundering herd problem, citing a lack of clear metrics or benchmarks to support its claims
+
+reviewer noted that the patch introduces a priority inversion problem, where if the task woken by the patch cannot be scheduled due to its priority or being pinned/real-time and the CPU having preemption disabled, it prevents other threads from running</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Mon, 3 Aug 2026 11:16:36 +0100
+Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
+
+---
+
+But it adds a priority inversion problem.
+It the task that is woken cannot be scheduled (either because if its priority
+or because it is pinned/real-time and the cpu it would be run on has preemption
+disabled, then none of the other threads can run either.
+
+I had terrible trouble trying to get a &#x27;thundering herd&#x27; from a
+pthread_broadcast() call....
+
+	David</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/20260803123958.414dd2ed@pumpkin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lack of clear metrics, questioned effectiveness, priority inversion problem</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Phillip Lougher</span>
+<a class="date-chip" href="../2026-08-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-03">2026-08-03</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer stated that they were unavailable to review the patch during its submission and promised to review it in the following week.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I have been on vacation.  I will review it this week.
+
+Phillip</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/20f40e87-02b8-4714-b417-2730f304d624@squashfs.org.uk" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif (author)</span>
+<a class="date-chip" href="../2026-08-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-03">2026-08-03</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author responded positively to Phillip Lougher&#x27;s feedback, stating &#x27;No worries&#x27; and expressing gratitude for the review.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">No worries! Thank you!
+
+Usama</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Phillip Lougher</div>
+<a href="https://lore.kernel.org/r/b4eb8a90-d11e-4992-87d2-99091d4aafd0@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged reviewer&#x27;s concern, expressed gratitude</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>
