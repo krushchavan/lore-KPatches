@@ -1,0 +1,160 @@
+{
+  "thread_id": "anE27CtvCFx7sAuO@cmpxchg.org",
+  "subject": "[PATCH v1 2/2] mm/memory: add anonymous mTHP folios to deferred split list",
+  "url": "https://lore.kernel.org/all/anE27CtvCFx7sAuO@cmpxchg.org/",
+  "dates": {
+    "2026-08-04": {
+      "report_file": "2026-08-04_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Barry Song",
+          "summary": "Barry Song expressed concern that reusing khugepaged_max_ptes_none for splitting would be disruptive, and suggested a specific alternative definition of LARGE_FOLIO_ZERO_SCAN_MIN_SIZE to improve efficiency\n\nReviewer Barry Song expressed concern that the proposed mechanism for finding waste in THP allocation would regress production systems by making the search less efficient, potentially leading to OOMs and thrashing.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "regression",
+            "performance impact"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Johannes,\n\nFor arm64, if the base page size is 64KB, a PMD would be 512MB,\nand PMD-1 would be 256MB. Usama mentioned 2MB, which is just\norder-5, not PMD-1 on arm64.\n\nBTW, I assume khugepaged_max_ptes_none is intended for collapse,\nnot splitting. I am a bit concerned that reusing it for this\npurpose would be quite disruptive.\n\nSo maybe just\n\n#define LARGE_FOLIO_ZERO_SCAN_MIN_SIZE SZ_2M\nif (folio_nr_pages(folio) < LARGE_FOLIO_ZERO_SCAN_MIN_SIZE)\n        return;\n\n---\n\nThanks\nBarry",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-08-04",
+          "message_id": "CAGsJ_4z7bsDzMtO5PzaSHV4CBYBFS=wmmG3H8xfj-mdUo4VyxA@mail.gmail.com",
+          "email": "baohua@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Johannes Weiner (author)",
+          "summary": "Author addressed Barry Song's confusion about the proposed patch by pointing out that the thp_underused() function already exists and is relied upon by ABI and setups, explaining that the proposed change is a transparent optimization that doesn't introduce new policy or sysctls.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "It already is:\n\nstatic bool thp_underused(struct folio *folio)\n{\n\tint num_zero_pages = 0, num_filled_pages = 0;\n\tint i;\n\n\tif (khugepaged_max_ptes_none == HPAGE_PMD_NR - 1)\n\t\treturn false;\n\n\tif (folio_contain_hwpoisoned_page(folio))\n\t\treturn false;\n\n\tfor (i = 0; i < folio_nr_pages(folio); i++) {\n\t\tif (pages_identical(folio_page(folio, i), ZERO_PAGE(0))) {\n\t\t\tif (++num_zero_pages > khugepaged_max_ptes_none)\n\t\t\t\treturn true;\n\t\t} else {\n\t\t\t/*\n\t\t\t * Another path for early exit once the number\n\t\t\t * of non-zero filled pages exceeds threshold.\n\t\t\t */\n\t\t\tif (++num_filled_pages >= HPAGE_PMD_NR - khugepaged_max_ptes_none)\n\t\t\t\treturn false;\n\t\t}\n\t}\n\treturn false;\n}\n\nThat's ABI and setups are relying on it.\n\nAll I'm proposing is to only queue pages that the shrinker would\nactually split under currently existing rules. That's a mostly\ntransparent optimization, not a new policy.\n\nNo new sysctls. No new policy hardcoded in kernel code. Default\nbehavior remains unchanged.",
+          "reply_to": "Barry Song",
+          "message_date": "2026-08-04",
+          "message_id": "anHxPU17Ui4MTcCb@cmpxchg.org",
+          "email": "hannes@cmpxchg.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) noted that the default split_underused_thp setting causes unnecessary page splits in khugepaged settings that don't result in any splits, and suggested changing the default to not add all pages in these setups.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I yet have to reply to some stuff here (sorry, it's a mess :( ), but one thing\nthat annoyed me right from the start is that we have:\n\nstatic bool split_underused_thp = true;\n\nBut the default khugepaged settings actually don't result in any splits.\n\nI think it would already be a big improvement to not default to adding all pages\nin default setups.\n\nWhen we last discussed changing that, one concern raised in the past was that\nchanging the khugepaged setting later would then not be able to reclaim pages\nallocated up to that point.\n\nWhen someone actually changes khugepaged settings such that the underused\nshrinker would get active, could we walk the LRU and add all eligible anon THPs\nto the underused shrinker? We could remember \"already scanned for underused\" per\nTHP, but maybe we could avoid that initially.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-08-04",
+          "message_id": "65b4baa3-77bd-4d2c-a128-9884f858e63d@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Reviewer noted that using different parameters for collapse and splitting can cause khugepaged and shrinker to constantly thrash each other, resulting in inefficient memory management.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "parameter consistency",
+            "potential performance issue"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "We have to use the same parameter for both collapse and splitting.\n\nFor example if you use a new parameter for splitting which is set\nhigher than the value for collapse, then khugepaged and shrinker\nwill constantly thrash each other. khugepaged will collapse\nand shrinker will break it down.",
+          "reply_to": "Barry Song",
+          "message_date": "2026-08-04",
+          "message_id": "7bb32d25-2c3e-40ab-904a-ba22fff60cca@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Johannes Weiner (author)",
+          "summary": "Author acknowledged that recovery from a rare setting change is not extremely performance-critical and suggested using khugepaged_scan.mm_head for targeted scanning when policy == madvise.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged",
+            "suggested"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Recovery like that makes sense to me. I don't think we have to be\nextremely performant either, that should be a rare setting change.\n\nWould it make sense to use khugepaged_scan.mm_head? That could be more\ntargeted when policy == madvise, easier to skip over shmem VMAs etc.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-08-04",
+          "message_id": "anI1U49rFrlhPx2x@cmpxchg.org",
+          "email": "hannes@cmpxchg.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joanne Koong",
+          "summary": "Reviewer Joanne Koong pointed out that the patch does not address her previous proposal for handling anonymous mTHP folios, and suggested an alternative implementation by modifying the deferred_split_folio function to return early when the number of pages in the folio is less than or equal to khugepaged_max_ptes_none.\n\nReviewer Joanne Koong noted that using the same threshold for splitting and collapsing PMDs could lead to thrashing, but since mTHP does not allow intermediary collapse values, this scenario is avoided; she suggested setting the split threshold internally as a function of the collapse threshold plus some scale of nr_pages instead of making it a tunable",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "requested_changes",
+            "suggested_improvement"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Barry,\n\nOn Tue, Aug 4, 2026 at 3:07 PM Barry Song <baohua@kernel.org> wrote:\n\n---\n\nI think PMD right now uses the same threshold for splitting and\ncollapse. It seems like if using the same splitting and collapse\nthreshold leads to thrashing, it would also manifest in the PMD case?\nJust curious, have there been reports of this? For mTHP today though,\nintermediary values for collapse can't be set, so I think that\nthrashing scenario is automatically avoided.\n\nIf we wanted to separate the split and collapse threshold though,\nmaybe it makes more sense to set it internally (eg split threshold =\ncollapse threshold + some scale of nr_pages) instead of adding it as a\ntunable. afaict, the only scenario where there's the thrashing\nfeedback loop on the same folio without any changes to the folio is if\nsomeone sets the split threshold below the collapse threshold.\n\nThanks,\nJoanne",
+          "reply_to": "Barry Song",
+          "message_date": "2026-08-04",
+          "message_id": "CAJnrk1ZriOyzOxbd3F+_dAgf-b80ViPaVe8x8_efpkvjGZ4C9A@mail.gmail.com",
+          "email": "joannelkoong@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds anonymous memory huge pages (mTHP folios) to the deferred split list in the mm/memory module, allowing for more efficient handling of THPs and reducing the likelihood of OOMs due to poor virtual packing. The change is motivated by issues with existing services that thrashed and ran out of memory when enabling 2M pages. By making it possible to run with THPs enabled, this patch aims to simplify the management of memory huge pages and improve system performance."
+    },
+    "2026-08-05": {
+      "report_file": "2026-08-04_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Barry Song",
+          "summary": "Reviewer Barry Song questioned whether khugepaged_max_ptes_none should be set to 16 (order-4) for a base page size of 64KB, suggesting that this would allow splitting when there are 17 or more zero PTEs and collapsing when there are 16 or fewer. He also proposed using different thresholds for splitting and collapse with the splitting threshold higher than the collapse threshold to avoid thrashing around the threshold.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "requested clarification",
+            "proposed alternative"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "thanks for the clarification, Usama, Johannes.\n\nFor your case, where the base page size is 64KB, you want to split\na 2MB mTHP, which is order-5. So would you have\nkhugepaged_max_ptes_none to 16 (i.e., order-4)?\n\nSo, for example, once you have 17 or more zero PTEs, you split the\nfolio. And if you have 16 or fewer zero PTEs, you collapse it?\n\nIf so, it seems Johannes's proposal might be the simplest way to\ngo.\n\nBTW, do you see any issue around 16? To me, it seems more\nsensible to use different thresholds for splitting and collapse,\nwith the splitting threshold higher than the collapse threshold.\nThat way, there is some hysteresis between the two, avoiding\nthrashing around the threshold.",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-08-05",
+          "message_id": "CAGsJ_4yn5w8b=YQYHEk==8cEc8psB8NHADyrmjBK+YbKtXbdOw@mail.gmail.com",
+          "email": "baohua@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds anonymous memory huge pages (mTHP folios) to the deferred split list in the mm/memory module, allowing for more efficient handling of THPs and reducing the likelihood of OOMs due to poor virtual packing. The change is motivated by issues with existing services that thrashed and ran out of memory when enabling 2M pages. By making it possible to run with THPs enabled, this patch aims to simplify the management of memory huge pages and improve system performance."
+    }
+  }
+}

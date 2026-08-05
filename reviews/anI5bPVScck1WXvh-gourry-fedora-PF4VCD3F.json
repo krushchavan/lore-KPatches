@@ -1,0 +1,51 @@
+{
+  "thread_id": "anI5bPVScck1WXvh@gourry-fedora-PF4VCD3F",
+  "subject": "[PATCH v8 10/15] mm: Check individual hugetlb pages for poison",
+  "url": "https://lore.kernel.org/all/anI5bPVScck1WXvh@gourry-fedora-PF4VCD3F/",
+  "dates": {
+    "2026-08-04": {
+      "report_file": "2026-08-04_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Gregory Price",
+          "summary": "Raised concerns about whether holding a reference on the page is necessary, but ultimately decided that it's not worth addressing.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Aug 04, 2026 at 10:21:29PM +0100, Matthew Wilcox wrote:\n> On Tue, Aug 04, 2026 at 03:15:37PM -0400, Gregory Price wrote:\n> \n> So the pointer we get back from page_folio() must have been a folio _at\n> some point_.  It may not be a folio now.  It may be a folio, but not one\n> that contains this page.  But it's not a wild pointer, and treating it\n> as if it's a folio won't cause any harm (as long as we're really careful).\n> \n> Specifically, we call:\n> \n> > +\tif (!folio_test_huge_poison(folio)) {\n> \n> and all that does is access folio->page.page_type aka mapcount.  So if\n> the pointer we have is not a current folio, it'll just return false and\n> we'll check PageHWPoison.\n> \n> So the only case this can return 'true' is if the folio was hugetlb\n> at that exact point.  And we've got the hugetlb lock, so it can't stop\n> being a hugetlb folio.  At this point it's safe to walk the list.\n>\n\nThis is basically the reasoning i came to, ergo \"not worth addressing\"\n\n> That's my reasoning, and I think Sashiko has explained enough of its\n> reasoning to be fairly sure Sashiko is wrong about this.  But hey,\n> you're not Sashiko.  Maybe you've found a gap in my logic.\n\nI think sashiko is essentially just saying:\n\n\"But if someone does a dumb thing with this interface in the future dumb\n things will happen\"\n\nTo which we say \"Don't do the blatantly dumb thing :]\"\n\n~Gregory\n",
+          "reply_to": "",
+          "message_date": "2026-08-04",
+          "message_id": "",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Matthew Wilcox",
+          "summary": "Provided a detailed explanation of why it's safe to proceed without holding a reference on the page, citing existing code and logic.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "POSITIVE"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Aug 04, 2026 at 03:15:37PM -0400, Gregory Price wrote:\n> On Fri, Jul 31, 2026 at 09:07:55PM +0100, Matthew Wilcox (Oracle) wrote:\n> > +/*\n> > + * We have no reference on the folio containing this page.\n> > + * The hugetlb_lock keeps hugetlb folios from being freed.\n> > + */\n> > +bool hugetlb_unref_page_hwpoison(const struct page *page)\n> > +{\n> > +\tconst struct folio *folio;\n> > +\tunsigned long flags;\n> > +\tbool ret;\n> > +\n> > +\tspin_lock_irqsave(&hugetlb_lock, flags);\n> > +\tfolio = page_folio(page);\n> > +\tif (!folio_test_huge_poison(folio)) {\n> > +\t\tret = PageHWPoison(page);\n> > +\t\tgoto unlock;\n> > +\t}\n> > +\n> > +\tret = precise_page_poisoned(folio, page);\n> > +unlock:\n> > +\tspin_unlock_irqrestore(&hugetlb_lock, flags);\n> > +\treturn ret;\n> > +}\n> > +\n> \n> I ended up with the same question as sashiko - i think this behavior\n> implies we must hold a reference on the page, otherwise the folio can\n> be invalid and all these accesses are unsafe.\n> \n> But that must be the existing behavior for poison checks like this, so\n> this is at least no worse. Not sure it's worth addressing.\n\nLet me just paste Sashiko's comment in here so we preserve it in the\nlore archives and so we're definitely talking about the same thing:\n\n> This is a pre-existing issue, but does calling page_folio()\n> here without holding a reference to the page risk a panic during\n> lockless PFN scanning?  If a monitoring tool reads /proc/kpageflags or\n> /proc/kcore, pfn_to_online_page() retrieves the page without acquiring\n> a reference. If the page is concurrently freed and reallocated for\n> driver use, compound_info (which aliases lru.next) could be modified.\n> Could this cause page_folio() to misidentify the page as a tail page\n> and return an invalid folio pointer, leading to an out-of-bounds memory\n> read when folio_test_huge_poison() accesses folio->page.page_type?\n> While the hugetlb_lock is held here, can it stabilize unreferenced\n> pages that might have already been repurposed into non-hugetlb pages?\n\nSashiko is mistaken (... and fair enough, I suspect you aren't the only\nhuman who's confused by this either)\n\nIt's quite right that we can observe a page in literally any state since\nwe do not hold a refcount.  But it is forbidden to use bit 0 of lru.next\nfor any purpose other than indicating \"this is a tail page\":\n\n       /*\n         * Five words (20/40 bytes) are available in this union.\n         * WARNING: bit 0 of the first word is used for PageTail(). That\n         * means the other users of this union MUST NOT use the bit to\n         * avoid collision and false-positive PageTail().\n         */\n\nThat's been the rule since 2015 with commit 1d798ca3f164\n\nSo the pointer we get back from page_folio() must have been a folio _at\nsome point_.  It may not be a folio now.  It may be a folio, but not one\nthat contains this page.  But it's not a wild pointer, and treating it\nas if it's a folio won't cause any harm (as long as we're really careful).\n\nSpecifically, we call:\n\n> +\tif (!folio_test_huge_poison(folio)) {\n\nand all that does is access folio->page.page_type aka mapcount.  So if\nthe pointer we have is not a current folio, it'll just return false and\nwe'll check PageHWPoison.\n\nSo the only case this can return 'true' is if the folio was hugetlb\nat that exact point.  And we've got the hugetlb lock, so it can't stop\nbeing a hugetlb folio.  At this point it's safe to walk the list.\n\nThat's my reasoning, and I think Sashiko has explained enough of its\nreasoning to be fairly sure Sashiko is wrong about this.  But hey,\nyou're not Sashiko.  Maybe you've found a gap in my logic.\n",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-08-04",
+          "message_id": "",
+          "email": "willy@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "The patch checks individual hugetlb pages for poison, but a reviewer questioned whether it's necessary to hold a reference on the page."
+    }
+  }
+}
