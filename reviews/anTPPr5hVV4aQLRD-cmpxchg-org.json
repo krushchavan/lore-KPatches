@@ -1,0 +1,50 @@
+{
+  "thread_id": "anTPPr5hVV4aQLRD@cmpxchg.org",
+  "subject": "[PATCH v2] memcg: keep folio's objcg same as its node",
+  "url": "https://lore.kernel.org/all/anTPPr5hVV4aQLRD@cmpxchg.org/",
+  "dates": {
+    "2026-08-06": {
+      "report_file": "2026-08-06_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Johannes Weiner (author)",
+          "summary": "Author acknowledged a concern about the behavior of get_migration_objcg() when there is a root mismatch, agreed that it must commit to the new objcg and explained how this affects the handling of page counters in mem_cgroup_replace_folio() and mem_cgroup_migrate(). The author provided a revised patch with the necessary changes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a concern",
+            "agreed to make changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Hm, it's still not quite right.\n\nWhen there is a root mismatch, we cannot fall back to committing the\nold objcg. That would reintroduce Karl's issue. Not as broadly as\nbefore, but can still happen if the memcg tree died up to the root.\n\nSo we have to commit to the new objcg, always.\n\nWhat obj_cgroup_is_root() then comes down to is whether uncharge will\nbalance the page counters or not.\n\nmem_cgroup_replace_folio() gets a new charge for the new page. We can\njust conditionalize that right away on whether the new objcg will\nactually uncharge.\n\nmem_cgroup_migrate() currently trades the charge, but that won't work\nif the new objcg is root and won't uncharge. So we have to settle it\nright then and there.\n\nThis?\n\n@@ -5319,6 +5319,46 @@ void __mem_cgroup_uncharge_folios(struct folio_batch *folios)\n \t\tuncharge_batch(&ug);\n }\n \n+/*\n+ * An LRU folio must hold the objcg belonging to its own node.\n+ *\n+ * memcg_reparent_objcgs() reparents a dying cgroup one node at a time:\n+ * the folios on that node's LRU lists move to the parent and that\n+ * node's objcg is redirected to the parent, atomically under the\n+ * node's lru_lock. folio_lruvec_lock() relies on this to provide a\n+ * stable folio<->lruvec binding. If a folio holds another node's\n+ * objcg, its list membership and its lruvec resolution change in\n+ * separate lock sections, and an LRU operation in between can re-add\n+ * the folio to, and strand it on, the LRU list of a dead memcg.\n+ *\n+ * So when migration transfers the memcg state to a folio on another\n+ * node, re-derive the objcg for the destination node. If the memcg is\n+ * dying and the destination node has already been reparented, the\n+ * lookup walks up to the nearest live ancestor - which is also where\n+ * that node's LRU lists went.\n+ *\n+ * Returns the objcg to commit to @new, with a reference for the caller.\n+ */\n+static struct obj_cgroup *get_migration_objcg(struct folio *old, struct folio *new)\n+{\n+\tstruct obj_cgroup *old_objcg, *new_objcg;\n+\tint new_nid = folio_nid(new);\n+\n+\told_objcg = get_obj_cgroup_from_folio(old);\n+\n+\tif (folio_nid(old) == new_nid)\n+\t\treturn old_objcg;\n+\n+\trcu_read_lock();\n+\tnew_objcg = __get_obj_cgroup_from_memcg(obj_cgroup_memcg(old_objcg),\n+\t\t\t\t\t\tnew_nid);\n+\trcu_read_unlock();\n+\n+\tobj_cgroup_put(old_objcg);\n+\n+\treturn new_objcg;\n+}\n+\n /**\n  * mem_cgroup_replace_folio - Charge a folio's replacement.\n  * @old: Currently circulating folio.\n@@ -5347,21 +5387,27 @@ void mem_cgroup_replace_folio(struct folio *old, struct folio *new)\n \tif (folio_memcg_charged(new))\n \t\treturn;\n \n-\tobjcg = folio_objcg(old);\n-\tVM_WARN_ON_ONCE_FOLIO(!objcg, old);\n-\tif (!objcg)\n+\tVM_WARN_ON_ONCE_FOLIO(!folio_objcg(old), old);\n+\tif (!folio_objcg(old))\n \t\treturn;\n \n+\tobjcg = get_migration_objcg(old, new);\n+\n \trcu_read_lock();\n \tmemcg = obj_cgroup_memcg(objcg);\n-\t/* Force-charge the new page. The old one will be freed soon */\n+\t/*\n+\t * Force-charge the new page. The old one will be freed soon.\n+\t *\n+\t * The rootness of the committed objcg decides whether the final\n+\t * uncharge of @new goes through the page counters (see\n+\t * uncharge_folio()); charge them only if the uncharge will.\n+\t */\n \tif (!obj_cgroup_is_root(objcg)) {\n \t\tpage_counter_charge(&memcg->memory, nr_pages);\n \t\tif (do_memsw_account())\n \t\t\tpage_counter_charge(&memcg->memsw, nr_pages);\n \t}\n \n-\tobj_cgroup_get(objcg);\n \tcommit_charge(new, objcg);\n \tmemcg1_commit_charge(new, memcg);\n \trcu_read_unlock();\n@@ -5373,14 +5419,15 @@ void mem_cgroup_replace_folio(struct folio *old, struct folio *new)\n  * @new: Replacement folio.\n  *\n  * Transfer the memcg data from the old folio to the new folio for migration.\n- * The old folio's data info will be cleared. Note that the memory counters\n- * will remain unchanged throughout the process.\n+ * The old folio's data info will be cleared. The memory counters remain\n+ * unchanged, unless the charge moves out of a fully reparented ancestry\n+ * and has to be settled (see below).\n  *\n  * Both folios must be locked, @new->mapping must be set up.\n  */\n void mem_cgroup_migrate(struct folio *old, struct folio *new)\n {\n-\tstruct obj_cgroup *objcg;\n+\tstruct obj_cgroup *objcg, *new_objcg;\n \n \tVM_BUG_ON_FOLIO(!folio_test_locked(old), old);\n \tVM_BUG_ON_FOLIO(!folio_test_locked(new), new);\n@@ -5401,12 +5448,30 @@ void mem_cgroup_migrate(struct folio *old, struct folio *new)\n \tif (!objcg)\n \t\treturn;\n \n-\t/* Transfer the charge and the objcg ref */\n-\tcommit_charge(new, objcg);\n+\tnew_objcg = get_migration_objcg(old, new);\n+\n+\t/*\n+\t * @old was charged through a non-root objcg, so its charge is in\n+\t * the page counters. If the re-derivation walked up to the root\n+\t * objcg - @old's entire ancestry is dying and already reparented\n+\t * - the final uncharge of @new will skip the page counters (see\n+\t * uncharge_folio()). Settle them now: this is @old's eventual\n+\t * uncharge, moved up to the point where its charge record ends.\n+\t */\n+\tif (obj_cgroup_is_root(new_objcg) && !obj_cgroup_is_root(objcg)) {\n+\t\trcu_read_lock();\n+\t\tmemcg_uncharge(obj_cgroup_memcg(objcg), folio_nr_pages(old));\n+\t\trcu_read_unlock();\n+\t}\n+\n+\tcommit_charge(new, new_objcg);\n \n \t/* Warning should never happen, so don't worry about refcount non-0 */\n \tWARN_ON_ONCE(folio_unqueue_deferred_split(old));\n \told->memcg_data = 0;\n+\n+\t/* @new holds its own reference now, drop @old's */\n+\tobj_cgroup_put(objcg);\n }\n \n DEFINE_STATIC_KEY_FALSE(memcg_sockets_enabled_key);",
+          "reply_to": "",
+          "message_date": "2026-08-06",
+          "message_id": "anTfChWlK998-7sY@cmpxchg.org",
+          "email": "hannes@cmpxchg.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Shakeel Butt",
+          "summary": "Reviewer noted that the get_migration_objcg() helper does not handle the case where new_nid is equal to folio_nid(old), and suggested using a helper that always returns a referenced objcg",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Thanks a lot Johannes, this looks much better. I will incorporate this and run\nthrough the reproducer before sending out the v3.",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-08-06",
+          "message_id": "anToOuVZ-xF6onE6@linux.dev",
+          "email": "shakeel.butt@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces a helper function get_migration_objcg() that returns the objcg (object cgroup) associated with a folio, ensuring it is referenced and consistent across node boundaries. The function is used in mem_cgroup_replace_folio() to update page counters and charges correctly when replacing a folio. This change simplifies the code and ensures accurate accounting of memory usage."
+    }
+  }
+}

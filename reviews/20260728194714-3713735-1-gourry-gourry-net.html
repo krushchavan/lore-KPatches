@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/4] mm: reject zone device folios in more folio walkers</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260728194714.3713735-1-gourry@gourry.net/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-29</strong><div class="date-range-nav">Active on: <a href="#2026-07-29">2026-07-29</a> &bull; <a href="#2026-07-28">2026-07-28</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-07-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-06</strong><div class="date-range-nav">Active on: <a href="#2026-08-06">2026-08-06</a> &bull; <a href="#2026-07-29">2026-07-29</a> &bull; <a href="#2026-07-28">2026-07-28</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds checks to prevent zone device memory from being accessed or modified by various Linux kernel functions, including madvise and mempolicy walkers. The changes are aimed at preventing potential issues that could arise when dealing with ZONE_DEVICE memory. The patches fall into two categories: genuine gaps in existing checks and defensive/consistency additions. No locking or refcount changes are involved, as the checks are placed after the folio is resolved and before it is acted upon. This series is a correctness/hardening cleanup found by inspection.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-07-28">
@@ -250,9 +250,7 @@
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer SJ Park noted that the patch does not handle the case where a zone device PMD is present, and requested an explicit check to be added in the !pmd_present branch of mm/huge_memory and mm/madvise.
-
-Reviewer SJ Park expressed concern that adding an explicit check in mm/damon/ops-common.c is not necessary for consistency, and suggested using CONFIG_DAMON_DEBUG_SANITY instead to achieve the same goal.</div>
+<div class="review-comment-text">Reviewer SJ Park expressed concerns that adding an explicit folio_is_zone_device() rejection in damon_get_folio() might confuse future readers and suggested using CONFIG_DAMON_DEBUG_SANITY instead, but Gregory Price explained the motivation behind the change, citing consistency across mm/ walkers and potential for abstraction later.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Hi Gregory,
@@ -260,7 +258,14 @@ Reviewer SJ Park expressed concern that adding an explicit check in mm/damon/ops
 
 On Tue, 28 Jul 2026 15:47:11 -0400 Gregory Price &lt;gourry@gourry.net&gt; wrote:
 
----
+&gt; All DAMON physical- and virtual-address operations obtain their folios
+&gt; through damon_get_folio(). That helper already excludes ZONE_DEVICE
+&gt; memory implicitly via pfn_to_online_page() and folio_test_lru(), but
+&gt; this is inconsistent with other callers in mm/ which test explicitly.
+&gt; 
+&gt; Add an explicit folio_is_zone_device() rejection in damon_get_folio()
+&gt; so the guarantee lives in one place and covers every caller uniformly,
+&gt; consistent with other mm walkers that reject zone device folios.
 
 Thank you for checking this and sharing this nice patch!
 
@@ -275,65 +280,131 @@ purpose.  What about using it with a good comment explaining why we doing that?
 Thanks,
 SJ
 
+[...]
+
+---
+
+On Tue, 28 Jul 2026 22:01:01 -0400 Gregory Price &lt;gourry@gourry.net&gt; wrote:
+
+&gt; On Tue, Jul 28, 2026 at 05:50:36PM -0700, SJ Park wrote:
+&gt; &gt; Hi Gregory,
+&gt; &gt; 
+&gt; &gt; 
+&gt; &gt; On Tue, 28 Jul 2026 15:47:11 -0400 Gregory Price &lt;gourry@gourry.net&gt; wrote:
+&gt; &gt; 
+&gt; &gt; &gt; All DAMON physical- and virtual-address operations obtain their folios
+&gt; &gt; &gt; through damon_get_folio(). That helper already excludes ZONE_DEVICE
+&gt; &gt; &gt; memory implicitly via pfn_to_online_page() and folio_test_lru(), but
+&gt; &gt; &gt; this is inconsistent with other callers in mm/ which test explicitly.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Add an explicit folio_is_zone_device() rejection in damon_get_folio()
+&gt; &gt; &gt; so the guarantee lives in one place and covers every caller uniformly,
+&gt; &gt; &gt; consistent with other mm walkers that reject zone device folios.
+&gt; &gt; 
+&gt; &gt; Thank you for checking this and sharing this nice patch!
+&gt; &gt; 
+&gt; &gt; However, I&#x27;m not very sure adding a call that not really required for only
+&gt; &gt; making it looks consistent with others is the right choice.  I&#x27;m especially
+&gt; &gt; concerned if this will confuse future readers including myself.
+&gt; &gt; 
+&gt; &gt; If this is a hardening purpose, we have CONFIG_DAMON_DEBUG_SANITY for the
+&gt; &gt; purpose.  What about using it with a good comment explaining why we doing that?
+&gt; &gt; 
+&gt; 
+&gt; It&#x27;s actually two fold:
+&gt; 
+&gt;   1) make zone_device more consistently handled across mm/
+&gt;   2) make these checks possible to abstract out later
+&gt; 
+&gt; In the private node work - every location that we&#x27;d need to filter
+&gt; folios based on private node membership is a zone_device check.
+&gt; 
+&gt; Where zone device checks are missing (like here) there&#x27;s some other
+&gt; implicit reason (specific to zone device) that allows it to be avoided.
+&gt; 
+&gt; I pointed out in the sashiko feedback that DAMON depends on a check
+&gt; for folio-&gt;pgmap in the hotplug code.  This is all quite fragile, and
+&gt; we can see that at least one patch in this series fixes an actual bug.
+&gt; 
+&gt; It seemed warranted to go audit every service and add the zone_device
+&gt; checks to make it clear there&#x27;s a zone device interaction - even if
+&gt; presently unreachable - should some silent, implicit filter change.
+&gt; 
+&gt; The goal is to come back around and replace these with something like:
+&gt; 
+&gt;     bool folio_allows_mm_op(struct folio *folio,
+&gt;                             enum node_states feature)
+&gt;     {
+&gt;         if (folio_is_zone_device(folio) ||
+&gt;             !node_state(folio_nid(folio), feature));
+&gt;     }
+&gt; 
+&gt;     - if (folio_is_zone_device(folio))
+&gt;     + if (folio_allows_mm_op(folio, N_MEMORY_DAMON))
+&gt; 
+&gt; If we ever get to folios having memdesc flags beyond page flags,
+&gt; this also gives us a single mm-wide location for these kinds of
+&gt; checks in the future.
+
+Thank you for kindly explaining the motivation.
+
+So, what do you think about adding the check under CONFIG_DAMON_DEBUG_SANITY
+with good comments at the moment, and later converting to folio_allows_mm_ops()
+together?
+
+
+Thanks,
+SJ
+
+[...]
+
+---
+
+On Thu, 6 Aug 2026 12:05:00 -0500 Gregory Price &lt;gourry@gourry.net&gt; wrote:
+
+&gt; On Thu, Aug 06, 2026 at 02:37:59PM +0100, Lorenzo Stoakes (ARM) wrote:
+&gt; &gt; On Tue, Jul 28, 2026 at 03:47:11PM -0400, Gregory Price wrote:
+&gt; &gt; &gt; All DAMON physical- and virtual-address operations obtain their folios
+&gt; &gt; &gt; through damon_get_folio(). That helper already excludes ZONE_DEVICE
+&gt; &gt; &gt; memory implicitly via pfn_to_online_page() and folio_test_lru(), but
+&gt; &gt; &gt; this is inconsistent with other callers in mm/ which test explicitly.
+&gt; &gt; &gt;
+&gt; &gt; &gt; Add an explicit folio_is_zone_device() rejection in damon_get_folio()
+&gt; &gt; &gt; so the guarantee lives in one place and covers every caller uniformly,
+&gt; &gt; &gt; consistent with other mm walkers that reject zone device folios.
+&gt; &gt; &gt;
+&gt; &gt; &gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+&gt; &gt; 
+&gt; &gt; Thanks, nice to make it explicit!
+&gt; &gt; 
+&gt; &gt; Acked-by: Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt;
+&gt; &gt;
+&gt; 
+&gt; SJ Asked me to drop it,
+
+I didn&#x27;t asked you to drop this.  I asked your thought about revisioning this
+for my concern.  And you replied [1] you can drop this.
+
+I interprete it as a withdrawal, rather than being asked to be dropped.  My
+dictionary is definitely not a good one, though.
+
+Anyway, if your intention was not withdrawing, please feel free to push back
+with the original change (explain me why my concern is wrong) or restart a
+discussion for making DAMON code better in a way that can resolve both of our
+concerns.
+
+[1] https://lore.kernel.org/amoXZr2vB_q5q5Wu@gourry-fedora-PF4VCD3F
+
+
+Thanks,
+SJ
+
 [...]</pre>
 </details>
 <a href="https://lore.kernel.org/r/20260729005036.98063-1-sj@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: missing-case, requested-change, requested changes</div>
+<div class="review-comment-signals">Signals: requested changes, concerns about clarity</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Gregory Price (author)</span>
-<a class="date-chip" href="../2026-07-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-28">2026-07-28</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing concerns about consistency and fragility in handling zone device memory across various mm walkers, explaining that they aimed to add explicit checks for zone device interactions even if currently unreachable, and plan to replace these checks with a more abstracted function in the future.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">It&#x27;s actually two fold:
-
-  1) make zone_device more consistently handled across mm/
-  2) make these checks possible to abstract out later
-
-In the private node work - every location that we&#x27;d need to filter
-folios based on private node membership is a zone_device check.
-
-Where zone device checks are missing (like here) there&#x27;s some other
-implicit reason (specific to zone device) that allows it to be avoided.
-
-I pointed out in the sashiko feedback that DAMON depends on a check
-for folio-&gt;pgmap in the hotplug code.  This is all quite fragile, and
-we can see that at least one patch in this series fixes an actual bug.
-
-It seemed warranted to go audit every service and add the zone_device
-checks to make it clear there&#x27;s a zone device interaction - even if
-presently unreachable - should some silent, implicit filter change.
-
-The goal is to come back around and replace these with something like:
-
-    bool folio_allows_mm_op(struct folio *folio,
-                            enum node_states feature)
-    {
-        if (folio_is_zone_device(folio) ||
-            !node_state(folio_nid(folio), feature));
-    }
-
-    - if (folio_is_zone_device(folio))
-    + if (folio_allows_mm_op(folio, N_MEMORY_DAMON))
-
-If we ever get to folios having memdesc flags beyond page flags,
-this also gives us a single mm-wide location for these kinds of
-checks in the future.
-
-~Gregory</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to SJ Park</div>
-<a href="https://lore.kernel.org/r/amlZ_6pnt2AC-Ppl@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged fragility, planned abstraction</div>
-</div>
-</div>
 <div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
@@ -387,6 +458,487 @@ SJ
 </div>
 </div>
 </div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price (author)</span>
+<a class="date-chip" href="../2026-07-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-28">2026-07-28</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern that adding an explicit folio_is_zone_device() rejection in damon_get_folio() might be unnecessary and confusing. He explained that the goal is to make zone device handling consistent across mm/ and prepare for future abstraction, and proposed using CONFIG_DAMON_DEBUG_SANITY with comments instead of adding the check now.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Jul 28, 2026 at 05:50:36PM -0700, SJ Park wrote:
+&gt; Hi Gregory,
+&gt; 
+&gt; 
+&gt; On Tue, 28 Jul 2026 15:47:11 -0400 Gregory Price &lt;gourry@gourry.net&gt; wrote:
+&gt; 
+&gt; &gt; All DAMON physical- and virtual-address operations obtain their folios
+&gt; &gt; through damon_get_folio(). That helper already excludes ZONE_DEVICE
+&gt; &gt; memory implicitly via pfn_to_online_page() and folio_test_lru(), but
+&gt; &gt; this is inconsistent with other callers in mm/ which test explicitly.
+&gt; &gt; 
+&gt; &gt; Add an explicit folio_is_zone_device() rejection in damon_get_folio()
+&gt; &gt; so the guarantee lives in one place and covers every caller uniformly,
+&gt; &gt; consistent with other mm walkers that reject zone device folios.
+&gt; 
+&gt; Thank you for checking this and sharing this nice patch!
+&gt; 
+&gt; However, I&#x27;m not very sure adding a call that not really required for only
+&gt; making it looks consistent with others is the right choice.  I&#x27;m especially
+&gt; concerned if this will confuse future readers including myself.
+&gt; 
+&gt; If this is a hardening purpose, we have CONFIG_DAMON_DEBUG_SANITY for the
+&gt; purpose.  What about using it with a good comment explaining why we doing that?
+&gt; 
+
+It&#x27;s actually two fold:
+
+  1) make zone_device more consistently handled across mm/
+  2) make these checks possible to abstract out later
+
+In the private node work - every location that we&#x27;d need to filter
+folios based on private node membership is a zone_device check.
+
+Where zone device checks are missing (like here) there&#x27;s some other
+implicit reason (specific to zone device) that allows it to be avoided.
+
+I pointed out in the sashiko feedback that DAMON depends on a check
+for folio-&gt;pgmap in the hotplug code.  This is all quite fragile, and
+we can see that at least one patch in this series fixes an actual bug.
+
+It seemed warranted to go audit every service and add the zone_device
+checks to make it clear there&#x27;s a zone device interaction - even if
+presently unreachable - should some silent, implicit filter change.
+
+The goal is to come back around and replace these with something like:
+
+    bool folio_allows_mm_op(struct folio *folio,
+                            enum node_states feature)
+    {
+        if (folio_is_zone_device(folio) ||
+            !node_state(folio_nid(folio), feature));
+    }
+
+    - if (folio_is_zone_device(folio))
+    + if (folio_allows_mm_op(folio, N_MEMORY_DAMON))
+
+If we ever get to folios having memdesc flags beyond page flags,
+this also gives us a single mm-wide location for these kinds of
+checks in the future.
+
+~Gregory
+
+---
+
+On Wed, Jul 29, 2026 at 07:22:28AM -0700, SJ Park wrote:
+&gt; On Tue, 28 Jul 2026 22:01:01 -0400 Gregory Price &lt;gourry@gourry.net&gt; wrote:
+&gt; 
+&gt; So, what do you think about adding the check under CONFIG_DAMON_DEBUG_SANITY
+&gt; with good comments at the moment, and later converting to folio_allows_mm_ops()
+&gt; together?
+&gt; 
+
+I think probably we can drop the commit since it&#x27;ll be a little odd to
+add ifdef&#x27;s and then take them out later (the latter check will be
+functional, not just a sanity check).
+
+~Gregory
+
+---
+
+On Thu, Aug 06, 2026 at 02:59:22PM +0100, Lorenzo Stoakes (ARM) wrote:
+&gt; I kinda wish he had some generalised folio handler like:
+&gt; 
+&gt; 	struct folio_ops {
+&gt; 		int (*handle_empty_entry)(void *priv);
+&gt; 		int (*handle_normal_folio)(void *priv, struct folio *folio);
+&gt; 		int (*handle_softleaf_pte_entry)(void *priv, const pte_t *ptep);
+&gt; 		int (*handle_zone_folio)(void *priv, struct folio *folio);
+&gt; 		...
+&gt; 	};
+&gt; 
+&gt; Or I don&#x27;t know an equivalent type of thing, as we keep having these same
+&gt; patterns emerge in mm that are duplicated in a million places with slight
+&gt; variations... :)
+&gt; 
+&gt; I wonder if C is expressive enough to get us to something sane though.
+&gt; 
+
+This is functionally folio-&gt;pgmap except it&#x27;s not generalized and it
+causes us pain :[
+
+I briefly took a forray into moving pgmap to be node-scope, and that
+works decently, but first i&#x27;m just trying to clena up what i can for
+zone device.
+
+Anyway, i get what you&#x27;re getting at here, and that would be nice.
+
+&gt; &gt; Fixes: 368076f52ebe (&quot;mm/huge_memory: add device-private THP support to PMD operations&quot;)
+&gt; &gt; Cc: &lt;stable@vger.kernel.org&gt;
+&gt; &gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+&gt; 
+&gt; Anyway LGTM so:
+&gt; 
+&gt; Reviewed-by: Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt;
+&gt;
+
+many thanks :]
+
+---
+
+On Thu, Aug 06, 2026 at 02:37:59PM +0100, Lorenzo Stoakes (ARM) wrote:
+&gt; On Tue, Jul 28, 2026 at 03:47:11PM -0400, Gregory Price wrote:
+&gt; &gt; All DAMON physical- and virtual-address operations obtain their folios
+&gt; &gt; through damon_get_folio(). That helper already excludes ZONE_DEVICE
+&gt; &gt; memory implicitly via pfn_to_online_page() and folio_test_lru(), but
+&gt; &gt; this is inconsistent with other callers in mm/ which test explicitly.
+&gt; &gt;
+&gt; &gt; Add an explicit folio_is_zone_device() rejection in damon_get_folio()
+&gt; &gt; so the guarantee lives in one place and covers every caller uniformly,
+&gt; &gt; consistent with other mm walkers that reject zone device folios.
+&gt; &gt;
+&gt; &gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+&gt; 
+&gt; Thanks, nice to make it explicit!
+&gt; 
+&gt; Acked-by: Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt;
+&gt;
+
+SJ Asked me to drop it, so I most likely will, but yeah - this exact
+patch is a good example of how many footguns zone device gives us.
+
+~Gregory
+
+---
+
+On Thu, Aug 06, 2026 at 03:23:25PM +0200, David Hildenbrand (Arm) wrote:
+&gt; On 7/28/26 21:47, Gregory Price wrote:
+&gt; &gt; madvise_cold_or_pageout_pte_range() resolves the folio backing a PMD
+&gt; &gt; via pmd_folio() and ages or reclaims it without checking for zone
+&gt; &gt; device memory.
+&gt; &gt; 
+&gt; &gt; The surrounding guards do not cover every zone device case:
+&gt; &gt; 
+&gt; &gt;   - can_madv_lru_vma() excludes VM_PFNMAP and VM_HUGETLB VMAs
+&gt; &gt;     (so device DAX is filtered)
+&gt; &gt; 
+&gt; &gt;   - !pmd_present() branch above rejects device-private and
+&gt; &gt;     migration entries, which are non-present.
+&gt; &gt; 
+&gt; &gt;   - A present zone device PMD - e.g. a device-coherent THP - is
+&gt; &gt;     not filtered by any of these, nor by pmd_folio() (unlike
+&gt; &gt;     vm_normal_page_pmd(), it performs no special/pfnmap check),
+&gt; &gt;     and would be aged or paged out here.
+&gt; &gt; 
+&gt; &gt; Skip ZONE_DEVICE folios explicitly during MADV_COLD/PAGEOUT.
+&gt; &gt; 
+&gt; 
+&gt; No fixes tag for this one required?
+&gt; 
+
+I think I convinced myself it was unreachable (PMD+Zone Device),
+but I will double check Fixes and send a v2 with 1/4 dropped.
+
+&gt; Acked-by: David Hildenbrand (Arm) &lt;david@kernel.org&gt;
+&gt;
+
+Thanks!
+
+---
+
+On Thu, Aug 06, 2026 at 03:16:03PM +0100, Lorenzo Stoakes (ARM) wrote:
+&gt; On Thu, Aug 06, 2026 at 04:11:21PM +0200, David Hildenbrand (Arm) wrote:
+&gt; &gt; On 8/6/26 15:36, Lorenzo Stoakes (ARM) wrote:
+&gt; &gt; &gt; On Thu, Aug 06, 2026 at 03:25:50PM +0200, David Hildenbrand (Arm) wrote:
+&gt; &gt; &gt;&gt; On 7/28/26 21:47, Gregory Price wrote:
+&gt; &gt; &gt;&gt;&gt;  mm/mempolicy.c | 4 ++++
+&gt; &gt; &gt;&gt;&gt; @@ -797,6 +799,8 @@ static int queue_folios_hugetlb(pte_t *pte, unsigned long hmask,
+&gt; &gt; &gt;&gt;&gt;  	folio = pfn_folio(pte_pfn(ptep));
+&gt; &gt; &gt;&gt;&gt;  	if (!queue_folio_required(folio, qp))
+&gt; &gt; &gt;&gt;&gt;  		goto unlock;
+&gt; &gt; &gt;&gt;&gt; +	if (folio_is_zone_device(folio))
+&gt; &gt; &gt;&gt;&gt; +		goto unlock;
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; Leave the hugetlb part alone. hugetlb folios will never be ZONE_DEVICE.
+&gt; &gt; &gt;
+&gt; &gt; &gt; &lt;Insert leave Britney alone meme here&gt; :P
+&gt; &gt; &gt;
+&gt; &gt; &gt; But dear God we have got to find ways to stop hugetlb being this big stupid
+&gt; &gt; &gt; nightmare that every single path of mm has to put an asterix next to itself
+&gt; &gt; &gt; about!
+&gt; &gt;
+&gt; &gt; Yeah, possibly unifying the code (possibly, because it&#x27;s a mess) but not
+&gt; &gt; replicating checks that don&#x27;t make any sense for hugetlb.
+&gt; 
+&gt; Yup agreed.
+&gt;
+
+No disagreement here.  I&#x27;ll drop this.
+
+~Geregory</pre>
+</details>
+<a href="https://lore.kernel.org/r/amlZ_6pnt2AC-Ppl@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-06">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-08-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-06">2026-08-06</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+<a href="https://lore.kernel.org/r/cb1c0af3-e0ba-45bd-b51b-b0b224e9a6eb@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lorenzo (ARM)</span>
+<a class="date-chip" href="../2026-08-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-06">2026-08-06</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Lorenzo expressed frustration about the proliferation of similar patterns in mm code, specifically mentioning hugetlb folios being a &#x27;big stupid nightmare&#x27; that every path has to handle uniquely. He suggested introducing a generalized folio handler type (struct folio_ops) with various handlers for different types of folios to reduce duplication and make the code more sane.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, Aug 06, 2026 at 03:25:50PM +0200, David Hildenbrand (Arm) wrote:
+&gt; On 7/28/26 21:47, Gregory Price wrote:
+&gt; &gt;  mm/mempolicy.c | 4 ++++
+&gt; &gt; @@ -797,6 +799,8 @@ static int queue_folios_hugetlb(pte_t *pte, unsigned long hmask,
+&gt; &gt;  	folio = pfn_folio(pte_pfn(ptep));
+&gt; &gt;  	if (!queue_folio_required(folio, qp))
+&gt; &gt;  		goto unlock;
+&gt; &gt; +	if (folio_is_zone_device(folio))
+&gt; &gt; +		goto unlock;
+&gt;
+&gt; Leave the hugetlb part alone. hugetlb folios will never be ZONE_DEVICE.
+
+&lt;Insert leave Britney alone meme here&gt; :P
+
+But dear God we have got to find ways to stop hugetlb being this big stupid
+nightmare that every single path of mm has to put an asterix next to itself
+about!
+
+&gt;
+&gt; --
+&gt; Cheers,
+&gt;
+&gt; David
+
+--
+Cheers, Lorenzo
+
+---
+
+On Tue, Jul 28, 2026 at 03:47:11PM -0400, Gregory Price wrote:
+&gt; All DAMON physical- and virtual-address operations obtain their folios
+&gt; through damon_get_folio(). That helper already excludes ZONE_DEVICE
+&gt; memory implicitly via pfn_to_online_page() and folio_test_lru(), but
+&gt; this is inconsistent with other callers in mm/ which test explicitly.
+&gt;
+&gt; Add an explicit folio_is_zone_device() rejection in damon_get_folio()
+&gt; so the guarantee lives in one place and covers every caller uniformly,
+&gt; consistent with other mm walkers that reject zone device folios.
+&gt;
+&gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+
+Thanks, nice to make it explicit!
+
+Acked-by: Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt;
+
+&gt; ---
+&gt;  mm/damon/ops-common.c | 3 ++-
+&gt;  1 file changed, 2 insertions(+), 1 deletion(-)
+&gt;
+&gt; diff --git a/mm/damon/ops-common.c b/mm/damon/ops-common.c
+&gt; index d7d7f100389b..d8bca7355b4f 100644
+&gt; --- a/mm/damon/ops-common.c
+&gt; +++ b/mm/damon/ops-common.c
+&gt; @@ -32,7 +32,8 @@ struct folio *damon_get_folio(unsigned long pfn)
+&gt;  	folio = page_folio(page);
+&gt;  	if (!folio_try_get(folio))
+&gt;  		return NULL;
+&gt; -	if (unlikely(page_folio(page) != folio) || !folio_test_lru(folio)) {
+&gt; +	if (unlikely(page_folio(page) != folio) || !folio_test_lru(folio) ||
+&gt; +	    folio_is_zone_device(folio)) {
+&gt;  		folio_put(folio);
+&gt;  		folio = NULL;
+&gt;  	}
+&gt; --
+&gt; 2.55.0
+&gt;
+
+--
+Cheers, Lorenzo
+
+---
+
+I kinda wish he had some generalised folio handler like:
+
+	struct folio_ops {
+		int (*handle_empty_entry)(void *priv);
+		int (*handle_normal_folio)(void *priv, struct folio *folio);
+		int (*handle_softleaf_pte_entry)(void *priv, const pte_t *ptep);
+		int (*handle_zone_folio)(void *priv, struct folio *folio);
+		...
+	};
+
+Or I don&#x27;t know an equivalent type of thing, as we keep having these same
+patterns emerge in mm that are duplicated in a million places with slight
+variations... :)
+
+I wonder if C is expressive enough to get us to something sane though.
+
+On Tue, Jul 28, 2026 at 03:47:12PM -0400, Gregory Price wrote:
+&gt; madvise_free_huge_pmd() resolves the folio backing a PMD via pmd_folio()
+&gt; and marks it lazyfree without checking for zone device memory.
+&gt;
+&gt; The surrounding guards do not cover every zone device case:
+&gt;  - MADV_FREE only operates on anonymous VMAs (DAX mappings are excluded)
+&gt;
+&gt;  - !pmd_present() branch rejects device-private and migration entries
+&gt;
+&gt;  - present zone device PMD (device coherent THP) is not filtered.
+&gt;    Unlike vm_normal_page_pmd(), it performs no special/pfnmap check,
+&gt;    and would be marked lazyfree here.
+&gt;
+&gt; Bail out when the folio is a zone device folio.
+&gt;
+&gt; Fixes: 368076f52ebe (&quot;mm/huge_memory: add device-private THP support to PMD operations&quot;)
+&gt; Cc: &lt;stable@vger.kernel.org&gt;
+&gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+
+Anyway LGTM so:
+
+Reviewed-by: Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt;
+
+&gt; ---
+&gt;  mm/huge_memory.c | 4 ++++
+&gt;  1 file changed, 4 insertions(+)
+&gt;
+&gt; diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+&gt; index 5bd8d4f59a7b..e0ffdeeb3077 100644
+&gt; --- a/mm/huge_memory.c
+&gt; +++ b/mm/huge_memory.c
+&gt; @@ -2338,6 +2338,10 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+&gt;  	}
+&gt;
+&gt;  	folio = pmd_folio(orig_pmd);
+&gt; +
+&gt; +	if (folio_is_zone_device(folio))
+&gt; +		goto out;
+&gt; +
+&gt;  	/*
+&gt;  	 * If other processes are mapping this folio, we couldn&#x27;t discard
+&gt;  	 * the folio unless they all do MADV_FREE so let&#x27;s skip the folio.
+&gt; --
+&gt; 2.55.0
+&gt;
+
+--
+Cheers, Lorenzo
+
+---
+
+On Tue, Jul 28, 2026 at 03:47:13PM -0400, Gregory Price wrote:
+&gt; madvise_cold_or_pageout_pte_range() resolves the folio backing a PMD
+&gt; via pmd_folio() and ages or reclaims it without checking for zone
+&gt; device memory.
+&gt;
+&gt; The surrounding guards do not cover every zone device case:
+&gt;
+&gt;   - can_madv_lru_vma() excludes VM_PFNMAP and VM_HUGETLB VMAs
+&gt;     (so device DAX is filtered)
+&gt;
+&gt;   - !pmd_present() branch above rejects device-private and
+&gt;     migration entries, which are non-present.
+&gt;
+&gt;   - A present zone device PMD - e.g. a device-coherent THP - is
+&gt;     not filtered by any of these, nor by pmd_folio() (unlike
+&gt;     vm_normal_page_pmd(), it performs no special/pfnmap check),
+&gt;     and would be aged or paged out here.
+&gt;
+&gt; Skip ZONE_DEVICE folios explicitly during MADV_COLD/PAGEOUT.
+&gt;
+&gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+
+LGTM so:
+
+Reviewed-by: Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt;
+
+&gt; ---
+&gt;  mm/madvise.c | 3 +++
+&gt;  1 file changed, 3 insertions(+)
+&gt;
+&gt; diff --git a/mm/madvise.c b/mm/madvise.c
+&gt; index 07a21ca31bad..ffd6a68320a8 100644
+&gt; --- a/mm/madvise.c
+&gt; +++ b/mm/madvise.c
+&gt; @@ -395,6 +395,9 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;
+&gt;  		folio = pmd_folio(orig_pmd);
+&gt;
+&gt; +		if (folio_is_zone_device(folio))
+&gt; +			goto huge_unlock;
+&gt; +
+&gt;  		/* Do not interfere with other mappings of this folio */
+&gt;  		if (folio_maybe_mapped_shared(folio))
+&gt;  			goto huge_unlock;
+&gt; --
+&gt; 2.55.0
+&gt;
+
+--
+Cheers, Lorenzo
+
+---
+
+On Thu, Aug 06, 2026 at 04:11:21PM +0200, David Hildenbrand (Arm) wrote:
+&gt; On 8/6/26 15:36, Lorenzo Stoakes (ARM) wrote:
+&gt; &gt; On Thu, Aug 06, 2026 at 03:25:50PM +0200, David Hildenbrand (Arm) wrote:
+&gt; &gt;&gt; On 7/28/26 21:47, Gregory Price wrote:
+&gt; &gt;&gt;&gt;  mm/mempolicy.c | 4 ++++
+&gt; &gt;&gt;&gt; @@ -797,6 +799,8 @@ static int queue_folios_hugetlb(pte_t *pte, unsigned long hmask,
+&gt; &gt;&gt;&gt;  	folio = pfn_folio(pte_pfn(ptep));
+&gt; &gt;&gt;&gt;  	if (!queue_folio_required(folio, qp))
+&gt; &gt;&gt;&gt;  		goto unlock;
+&gt; &gt;&gt;&gt; +	if (folio_is_zone_device(folio))
+&gt; &gt;&gt;&gt; +		goto unlock;
+&gt; &gt;&gt;
+&gt; &gt;&gt; Leave the hugetlb part alone. hugetlb folios will never be ZONE_DEVICE.
+&gt; &gt;
+&gt; &gt; &lt;Insert leave Britney alone meme here&gt; :P
+&gt; &gt;
+&gt; &gt; But dear God we have got to find ways to stop hugetlb being this big stupid
+&gt; &gt; nightmare that every single path of mm has to put an asterix next to itself
+&gt; &gt; about!
+&gt;
+&gt; Yeah, possibly unifying the code (possibly, because it&#x27;s a mess) but not
+&gt; replicating checks that don&#x27;t make any sense for hugetlb.
+
+Yup agreed.
+
+&gt;
+&gt; --
+&gt; Cheers,
+&gt;
+&gt; David
+
+--
+Cheers, Lorenzo</pre>
+</details>
+<a href="https://lore.kernel.org/r/anSNk7zgoGj62CWk@lucifer" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: suggested changes, expressed frustration</div>
 </div>
 </div>
 </div>
