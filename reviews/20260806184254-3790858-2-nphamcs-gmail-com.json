@@ -9,6 +9,40 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch introduces the virtual swap device infrastructure, creating a 16 TB virtual swap device at boot when CONFIG_VSWAP is enabled. It sets up dynamic cluster allocation and adds support for virtual swap devices to the kernel's memory management system. The patch also adds new flags and helpers to handle virtual swap devices efficiently. This is the first in a series of patches that will enable hot paths to skip per-device bookkeeping, implement vswap-aware swap-out and swap-in paths, and integrate with backends such as zswap and physical disks."
+    },
+    "2026-08-07": {
+      "report_file": "2026-08-07_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Johannes Weiner",
+          "summary": "Reviewer Johannes Weiner noted that the vswap_free() function acquires the per-vswap spinlock while holding the folio lock, creating a potential deadlock with reclaim paths, and requested the lock be dropped before calling try_to_unmap().\n\nReviewer suggested adding CONFIG_VSWAP_DEFAULT_ENABLED and a boot flag to enable virtual swap by default, allowing distributions to ship it without runtime overhead while still enabling user opt-in for early testing.\n\nReviewer noted that the patch's introduction of a virtual swap device as a config option is unclear and suggested revising the help text to explain its purpose and benefits.\n\nReviewer noted that the vswap feature is deeply integrated into the swap code and most core data structures are not conditional, limiting the usefulness of the CONFIG_VSWAP option.\n\nReviewer suggested moving list_del() from swap_cluster_free() to __free_cluster(), citing improved layering and pointing out that move_cluster() already handles list linkage\n\nReviewer noted that vswap_free() acquires the per-vswap spinlock while holding the folio lock, creating a potential deadlock with reclaim paths, and requested the lock be dropped before calling try_to_unmap().\n\nThe reviewer suggested refactoring the code to make it a pure allocation function, vswap_alloc_cluster(), that links to &si->free_clusters and reuses existing alloc_swap_scan_list() sites.\n\nreviewer noted that vswap space is only allocated through swap_cluster_info_static and requested it be also possible to allocate through swap_cluster_info_dynamic\n\nReviewer noted that the first slot of the virtual swap device has a bad page and questioned why the rest of the slots are not usable, suggesting that the integration could be made more organic by reusing existing functions and skipping unnecessary loops.\n\nreviewer suggested moving the code from vswap_free() to free_swap_cluster_info(), citing duplication and requesting a change\n\nreviewer noted that the patch does not handle allocation failures at boot, which would leave the system in a critical state",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "potential deadlock",
+            "requested changes",
+            "limited usefulness",
+            "runtime overhead",
+            "layering",
+            "improved",
+            "requested change",
+            "duplicated code",
+            "allocation failure",
+            "system in trouble"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hello Nhat,\n\nThis looks pretty clean to me overall. Nice. A few comments inline:\n\nOn Thu, Aug 06, 2026 at 11:42:44AM -0700, Nhat Pham wrote:\n\n---\n\nI think what could make sense is have\n\n- CONFIG_VSWAP\n- CONFIG_VSWAP_DEFAULT_ENABLED\n- a boot flag that's = CONFIG_VSWAP_DEFAULT_ENABLED\n\nThen you can use jump labels to cut runtime overhead to 0 if it isn't\nenabled at boot.\n\nThis way distributions can ship it with no overhead out of the box,\nwhile allowing users to opt in for early testing.\n\nIMO this is more valuable than a runtime toggle.\n\nIt should be part of this patch if you add it.\n\n---\n\nIMO this is difficult for a user to decide.\n\nIf we want to make this as a config, then IMO the help text should be\nabout not requiring a swapfile to use zswap, zerofill pages etc.\n\n---\n\nvswap.c feature like it used to be. It's pretty integrated into the\nswapcode, and it looks like a good chunk of the core datastructures\naren't conditional either.\n\nAt that point, the usefulness of the config option is limited. If you\ngo with the jump label and there is no runtime overhead, it might make\nsense to just keep the option on what the JL should default to.\n\n---\n\nShould this be part of __free_cluster() instead?\n\n- swap_cluster_assert_empty() seems useful.\n- move_cluster() handles the list linkage and could do the list_del().\n- swap_cluster_free_table() is the same.\n\nThe other caller is the discard path. That one isn't relevant, but it\nshouldn't hurt. The layering would still be a bit cleaner this way.\n\n---\n\nSince you replace the naked spin_lock() below with\nswap_cluster_lock(), change this to swap_cluster_unlock() as well?\n\n---\n\nThe name and the composability look off to me.\n\nCan you make this a pure allocation function - vswap_alloc_cluster()\nor something - that links it to &si->free_clusters, then jump back and\nuse the existing alloc_swap_scan_list() sites?\n\nThere is a new_cluster: label upstream you could use for the retry.\n\n---\n\nThis is describing what the code does, followed by a why not.\n\nDescribe the why: Vswap space is only allocated through [...], not [...]\n\n---\n\nBut it's one, not zero. And only the first slot is bad. Why is the\nrest not usable and the cluster on the nonfull_clusters list?\n\nI think you can make the integration a bit more organic in general:\n\nDon't do the DIV_ROUND_UP per default only to overwrite it here again\ne.g.\n\nIf you come out of this branch with cluster_info == &ci_dyn->ci, you\nshould be able to reuse the existing swap_cluster_setup_bad_slot(0).\n\nswap_header && i < swap_header->info.nr_badpages should skip that loop\nas well.\n\nYour maxpages is SWAPFILE_CLUSTER aligned, so that\n\n\tfor (i = maxpages; i < round_up(maxpages, SWAPFILE_CLUSTER); i++) {\n\nloop is skipped as well.\n\n---\n\nIMO it would be nicer to make this part of free_swap_cluster_info()\ninstead of duplicating it.\n\n---\n\nThat one probably doesn't matter. If these allocations fail at boot,\nthe system is in trouble.",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-08-07",
+          "message_id": "anX-ga41DMNWF6-2@cmpxchg.org",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces the infrastructure for a virtual swap device, allowing for dynamic allocation of swap space. It creates a 16 TB virtual swap device at boot and sets up the necessary data structures to manage it. The patch also adds support for the SWP_VSWAP flag, which allows hot paths to skip per-device bookkeeping that doesn't apply to virtual swap devices. This is the first in a series of patches that will enable the use of virtual swap devices, including backends and vswap-aware swap-out and swap-in paths."
     }
   }
 }
