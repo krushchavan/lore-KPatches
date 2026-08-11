@@ -1068,10 +1068,10 @@
 <body>
     <p class="back-to-index"><a href="index.html">&#8592; Back to Index</a></p>
     <h1>LKML Activity Report <span class="llm-badge">LLM: ollama/llama3.1:8b</span></h1>
-    <h2>2026-08-10 &mdash; Generated 2026-08-11 07:01:38</h2>
+    <h2>2026-08-10 &mdash; Generated 2026-08-11 07:01:43</h2>
     <p class="analysis-mode">Analysis: LLM-enriched (ollama/llama3.1:8b)</p>
+    <p class="log-link"><a href="logs/2026-08-10_ollama_llama3.1-8b.log">View generation log</a></p>
     
-    <div class="progress-banner"><span class="progress-spinner">&#x27F3;</span><span class="progress-count">16 / 16 developers complete</span><span class="refresh-controls">Auto-refresh:<button class="refresh-btn" data-secs="60">1 min</button><button class="refresh-btn" data-secs="300">5 min</button><button class="refresh-btn" data-secs="600">10 min</button><span class="refresh-countdown-wrap">in <span id="refresh-countdown">60s</span></span></span><span class="progress-updated">Updated: 2026-08-11 07:01 UTC</span></div>
 
     
     <div class="stats-grid">
@@ -1330,11 +1330,96 @@
 <p>This patch proposes an alternative solution to memcg stats flushing by updating the global per-memcg counter per batch and forgoing explicit flushing, which could potentially reduce performance overhead. The approach involves accumulating CPU counters in the flush path and unconditionally walking ancestors to update their counters on every update. This change is intended to mitigate potential performance issues associated with frequent flushing of memcg stats.</p>
 </div>
 <div class="progress-detail"><span class="progress-icon">&#9654;</span> Under review (1 reply from 1 reviewer)</div>
-<div class="review-comments-compact">
-<div class="review-tree">
-<div class="review-tree-row rtree-sent-needs_work" style="padding-left:4px"><a href="reviews/CAJnrk1YifN22mA5PFRVrh3m-ygxax6x4-8nraG2hPqCzyzBj7A-mail-gmail-com.html#2026-08-11" class="rtree-link" title="Go to Yosry Ahmed's comment"><span class="rtree-author">Yosry Ahmed</span><span class="rtree-date">Aug 11</span></a><span class="rtree-tag">Reviewed-by</span><span class="rtree-tag rtree-tag-inline">Inline</span></div>
+<div class="review-comments">
+<div class="review-comments-header">2 participants</div>
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Yosry Ahmed</span>
+<span class="reply-to-label">↳ replying to Joanne Koong</span>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-detail-link"><a href="reviews/CAJnrk1YifN22mA5PFRVrh3m-ygxax6x4-8nraG2hPqCzyzBj7A-mail-gmail-com.html#2026-08-10">View full discussion &rarr;</a></div>
+<div class="review-comment-text">Reviewer questioned whether a solution that updates the global per-memcg counter per batch and forgoes flushing would be viable, citing potential performance implications of unconditionally walking ancestors to update counters on every update.
+
+Reviewer Yosry Ahmed suggested experimenting with shifting workload between update and reader sides in memcg stats flushing, proposing two options: (a) updating per-CPU counters directly on stats updates or (b) using a global atomic to track exceeded thresholds. He also shared ideas for benchmarking the zswap stats, including running stress-ng with multiple workers in cgroups of different levels.</div>
+<div class="review-comment-footer">
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I was running stress-ng and measuring the latency of zswap_load() and
+zswap_store() with bpftrace. But I suspect whatever works for writeback
+should work for zswap :)
+
+---
+
+I think we need to experiment with how much work we can shift around
+between the update and reader sides.
+
+Right now, on the update side, we call __css_rstat_updated(), which
+iterates the parents and puts them on the per-CPU rstat tree, then we
+iterate the parents again in memcg_rstat_updated() and:
+- Check if flushing threshold is already met.
+- Update per-CPU counter for stats_updates.
+- If per-CPU update exceeds (another) threshold, we update an atomic for
+  stats_updates.
+
+The flush side checks the flushing threshold and does an rstat flush,
+which will walk the update trees on all CPUs and iterates all child
+cgroups on it. Pretty expensive when the threshold is met.
+
+I think we discussed two different options:
+
+(a) On stats updates, iterate the parents and update the per-CPU
+counters of the stat directly.
+
+In this case, we can&#x27;t keep using rstat, as we would still need to add
+the cgroup and all its ancestors to the update tree anyway and the flush
+cost will remain similar. So on the flush path we&#x27;ll need to iterate all
+CPUs and add the counters. We can explore if use a cpumask can help
+here, but perhaps not since we&#x27;ll need to update it atomically on all
+stat updates.
+
+I imagine that if we do this we&#x27;ll drop the stats_updates optimization
+to avoid adding more cost to the update side. We&#x27;ll be replacing parent
+stats_updates modification with parent stat counter modification. But
+maybe it&#x27;s feasible to keep both to limit the cost of flusing.
+
+This only works if the cost of iterate the CPUs on the flush side ends
+up being cheaper than the current flush. I imagine the average cost will
+be higher but the cost should be much more consistent vs the current
+flush, so the tail should be better.
+
+(b) On stats updates, iterate the parents and update the per-CPU
+counters of the stat directly AND update a global atomic if the per-CPU
+counter exceeds a threshold. I think updates may get too expensive as we
+may need to update multiple atomics, especially when updating the root
+counter as it will be contended by all cgroups.
+
+The flush side becomes an atomic read, so should be very cheap, and we
+can drop other heuristics and optimizations.
+
+---
+
+I think ultimately we need to experiment with these approachs (and
+perhaps others) to check what actually works in practice. You&#x27;ll
+probably want some benchmarks or synthetic tests with many cgroups to
+exercise the worst case scenarios.
+
+For the zswap stats, I used to run stress-ng with a bunch of workers
+(20, 50, 100, ..) in cgroups of different levels. Since all workers are
+in the same cgroups, all the parents are common and all threads end up
+competing on the same atomics, so worst case scenario. I was also
+testing in a VM that has more CPUs than stress-ng workers, to exercise
+the full extent of the concurrency and contention.
+
+This could be a lot of work, so I am not really asking you to do it, but
+just brainstorming and sharing ideas :)</pre>
+</details>
+<a href="https://lore.kernel.org/r/anpsLy_pCanocgS1@google.com" target="_blank" rel="noopener" class="lore-link">View on lore ↗</a>
+</div>
+<div class="review-comment-signals">Signals: potential performance hit, nontrivial performance hit, requested changes</div>
+</div>
 </div>
 </div>
 </details>
@@ -1455,7 +1540,7 @@
 <a href="https://lore.kernel.org/all/20260807113647.3744609-1-kirill@shutemov.name/" target="_blank" class="item-link">[PATCH v2 00/17] selftests/mm: improve khugepaged coverage</a>
 <span class="patch-count">17 patches</span>
 <span class="version-chain">
-<a href="https://lore.kernel.org/all/20260802195254.1937477-1-kirill@shutemov.name/" class="version-badge" target="_blank">v1</a>
+<a href="reviews/20260802195254-1937477-1-kirill-shutemov-name.html" class="version-badge" target="_blank">v1</a>
 <span class="version-arrow">→</span>
 <a href="reviews/20260807113647-3744609-1-kirill-shutemov-name.html" class="version-badge latest" target="_blank">v2</a>
 </span>
@@ -2047,56 +2132,12 @@
 </div>
 
     <footer>
-        Generated in 0.0s
+        Generated in 3701.7s
         &bull; 16 developers tracked
         &bull; Data from lore.kernel.org
         &bull; LLM: ollama/llama3.1:8b
-        
+        &bull; <a href="logs/2026-08-10_ollama_llama3.1-8b.log">Log</a>
     </footer>
 
-<script>
-(function () {
-    var DEFAULT_SECS = 60;
-    var remaining, timer;
-
-    function stored() {
-        try { return parseInt(localStorage.getItem('lkml_refresh_secs')) || DEFAULT_SECS; }
-        catch (e) { return DEFAULT_SECS; }
-    }
-    function store(s) {
-        try { localStorage.setItem('lkml_refresh_secs', s); } catch (e) {}
-    }
-    function tick() {
-        remaining--;
-        update();
-        if (remaining <= 0) { clearInterval(timer); location.reload(); }
-    }
-    function start(secs) {
-        clearInterval(timer);
-        remaining = secs;
-        update();
-        timer = setInterval(tick, 1000);
-    }
-    function update() {
-        var el = document.getElementById('refresh-countdown');
-        if (el) el.textContent = remaining + 's';
-    }
-    function choose(secs) {
-        store(secs);
-        document.querySelectorAll('.refresh-btn').forEach(function (b) {
-            b.classList.toggle('active', parseInt(b.dataset.secs) === secs);
-        });
-        start(secs);
-    }
-    document.addEventListener('DOMContentLoaded', function () {
-        var secs = stored();
-        document.querySelectorAll('.refresh-btn').forEach(function (b) {
-            b.addEventListener('click', function () { choose(parseInt(b.dataset.secs)); });
-            if (parseInt(b.dataset.secs) === secs) b.classList.add('active');
-        });
-        start(secs);
-    });
-})();
-</script>
 </body>
 </html>

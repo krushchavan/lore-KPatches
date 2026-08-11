@@ -9,6 +9,59 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch fixes a bug in the blk-iocost module by clearing the delay state when freeing policy data. The issue was that the delay state was not being cleared after the policy data was removed, causing the block-cgroup to remain congested even though no further bios could arrive. This led to incorrect throttling behavior for tasks in the affected cgroups and their descendants. The patch adds a call to blkcg_clear_delay() when freeing policy data to ensure that the delay state is properly cleared."
+    },
+    "2026-08-10": {
+      "report_file": "2026-08-10_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Tejun Heo",
+          "summary": "Confirmed that the two mechanisms (iocost and iolatency) aren't usually used together and even when they step on each other, clearing use_delay spuriously is transient and doesn't break anything.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "LGTM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "> Does this unconditional call to blkcg_clear_delay() overwrite state managed\n> by other policies?\n> \n> Since use_delay is shared among block cgroup policies, if iocost never\n> actually applied a delay, this might forcefully zero out the delay state\n> managed by other active policies like blk-iolatency. \n> \n> Would it be safer to check if iocost had actually set a delay before clearing\n> it here?\n\nYeah, this is fine. The two mechanisms aren't usually used together and even\nwhen they step on each other, use_delay being cleared spuriously is\ntransient and nothing really breaks.\n\nThanks.\n\n-- \ntejun\n",
+          "reply_to": "",
+          "message_date": "2026-08-10",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Addressed concerns about clearing delay state, explaining that the main problematic sequence is when both policies coexist on the same device/blkg and one policy's data is freed while the other remains active.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "clarified explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "\n\nOn 06/08/2026 19:37, Usama Arif wrote:\n> iocg_kick_delay() turns sufficiently large debt into an explicit\n> block-cgroup delay with blkcg_set_delay(), setting blkg->use_delay to\n> -1 and incrementing blkcg->congestion_count.  Clearing it again depends\n> on iocg_kick_delay() running from the period timer, the waitq timer or\n> the issue path.\n> \n> ioc_pd_free() removes the iocg from active_iocgs and cancels its waitq\n> timer, and no further bios can arrive, so once it has run nothing is\n> left which can reduce the debt and clear the delay.  The blkcg stays\n> marked congested for the rest of its life.\n> \n> blk_cgroup_congested() then returns true for every task in that cgroup\n> and its descendants: page_cache_sync_ra() cuts readahead to a single\n> page, page_cache_async_ra() skips it altogether, and\n> __folio_throttle_swaprate() takes swap_avail_lock and schedules a\n> throttle on anonymous folio allocation.\n> \n> Clear it explicitly, after the list removal and the synchronous\n> hrtimer_cancel() so that neither timer processing nor an I/O path can\n> re-arm it.  The free callback can also see policy data which was never\n> attached to a blkg, hence the pd->blkg check.\n> \n> Fixes: 7caa47151ab2 (\"blkcg: implement blk-iocost\")\n> Signed-off-by: Usama Arif <usama.arif@linux.dev>\n> ---\n>  block/blk-iocost.c | 7 +++++++\n>  1 file changed, 7 insertions(+)\n> \n> diff --git a/block/blk-iocost.c b/block/blk-iocost.c\n> index b60625613e095..64b92aa3e5d48 100644\n> --- a/block/blk-iocost.c\n> +++ b/block/blk-iocost.c\n> @@ -3063,6 +3063,7 @@ static void iocg_release(struct rcu_head *rcu)\n>  static void ioc_pd_free(struct blkg_policy_data *pd)\n>  {\n>  \tstruct ioc_gq *iocg = pd_to_iocg(pd);\n> +\tstruct blkcg_gq *blkg = pd_to_blkg(pd);\n>  \tstruct ioc *ioc = iocg->ioc;\n>  \tunsigned long flags;\n>  \n> @@ -3085,6 +3086,12 @@ static void ioc_pd_free(struct blkg_policy_data *pd)\n>  \t\thrtimer_cancel(&iocg->waitq_timer);\n>  \t}\n>  \n> +\t/* off ->active_iocgs and timer gone, so nothing can re-arm the delay */\n> +\tiocg->delay = 0;\n> +\tiocg->indelay_since = 0;\n> +\tif (blkg)\n> +\t\tblkcg_clear_delay(blkg);\n> +\n\n\nSashiko reported:\n\n---\n[Severity: High]\nDoes this unconditional call to blkcg_clear_delay() overwrite state managed\nby other policies?\n\nSince use_delay is shared among block cgroup policies, if iocost never\nactually applied a delay, this might forcefully zero out the delay state\nmanaged by other active policies like blk-iolatency. \n\nWould it be safer to check if iocost had actually set a delay before clearing\nit here?\n---\n\n\nMy understanding is that this requires both policies to coexist on the same\ndevice/blkg?\n\nI believe the main problematic sequence would be:\n\n  1. io.latency owns positive use_delay.\n  2. io.cost policy data exists but may never have delayed anything.\n  3. io.cost policy data is freed while the blkg survives.\n  4. Its unconditional clear removes io.latency\\u2019s state.\n\nWith only one policy, the terminal clear is correct and clearing zero is harmless.\n\nThe concern is narrower still: ordinary disk/cgroup destruction removes the whole\nblkg, so the main observable case is one-policy activation rollback or deactivation\nwhile the other remains active.\n\nI am not sure if this is something that is done by users? So might not need\nto be addressed?\n\nThanks,\nUsama\n\n\n>  \tcall_rcu(&pd->rcu_head, iocg_release);\n>  }\n>  \n\n",
+          "reply_to": "",
+          "message_date": "2026-08-10",
+          "message_id": "",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Acknowledged Tejun's response, but expressed uncertainty about whether this is something that needs to be addressed by users.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "acknowledgment and question"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "\n\nOn 06/08/2026 19:37, Usama Arif wrote:\n> iocg_kick_delay() turns sufficiently large debt into an explicit\n> block-cgroup delay with blkcg_set_delay(), setting blkg->use_delay to\n> -1 and incrementing blkcg->congestion_count.  Clearing it again depends\n> on iocg_kick_delay() running from the period timer, the waitq timer or\n> the issue path.\n> \n> ioc_pd_free() removes the iocg from active_iocgs and cancels its waitq\n> timer, and no further bios can arrive, so once it has run nothing is\n> left which can reduce the debt and clear the delay.  The blkcg stays\n> marked congested for the rest of its life.\n> \n> blk_cgroup_congested() then returns true for every task in that cgroup\n> and its descendants: page_cache_sync_ra() cuts readahead to a single\n> page, page_cache_async_ra() skips it altogether, and\n> __folio_throttle_swaprate() takes swap_avail_lock and schedules a\n> throttle on anonymous folio allocation.\n> \n> Clear it explicitly, after the list removal and the synchronous\n> hrtimer_cancel() so that neither timer processing nor an I/O path can\n> re-arm it.  The free callback can also see policy data which was never\n> attached to a blkg, hence the pd->blkg check.\n> \n> Fixes: 7caa47151ab2 (\"blkcg: implement blk-iocost\")\n> Signed-off-by: Usama Arif <usama.arif@linux.dev>\n> ---\n>  block/blk-iocost.c | 7 +++++++\n>  1 file changed, 7 insertions(+)\n> \n> diff --git a/block/blk-iocost.c b/block/blk-iocost.c\n> index b60625613e095..64b92aa3e5d48 100644\n> --- a/block/blk-iocost.c\n> +++ b/block/blk-iocost.c\n> @@ -3063,6 +3063,7 @@ static void iocg_release(struct rcu_head *rcu)\n>  static void ioc_pd_free(struct blkg_policy_data *pd)\n>  {\n>  \tstruct ioc_gq *iocg = pd_to_iocg(pd);\n> +\tstruct blkcg_gq *blkg = pd_to_blkg(pd);\n>  \tstruct ioc *ioc = iocg->ioc;\n>  \tunsigned long flags;\n>  \n> @@ -3085,6 +3086,12 @@ static void ioc_pd_free(struct blkg_policy_data *pd)\n>  \t\thrtimer_cancel(&iocg->waitq_timer);\n>  \t}\n>  \n> +\t/* off ->active_iocgs and timer gone, so nothing can re-arm the delay */\n> +\tiocg->delay = 0;\n> +\tiocg->indelay_since = 0;\n> +\tif (blkg)\n> +\t\tblkcg_clear_delay(blkg);\n> +\n\n\nSashiko reported:\n\n---\n[Severity: High]\nDoes this unconditional call to blkcg_clear_delay() overwrite state managed\nby other policies?\n\nSince use_delay is shared among block cgroup policies, if iocost never\nactually applied a delay, this might forcefully zero out the delay state\nmanaged by other active policies like blk-iolatency. \n\nWould it be safer to check if iocost had actually set a delay before clearing\nit here?\n---\n\n\nMy understanding is that this requires both policies to coexist on the same\ndevice/blkg?\n\nI believe the main problematic sequence would be:\n\n  1. io.latency owns positive use_delay.\n  2. io.cost policy data exists but may never have delayed anything.\n  3. io.cost policy data is freed while the blkg survives.\n  4. Its unconditional clear removes io.latency\\u2019s state.\n\nWith only one policy, the terminal clear is correct and clearing zero is harmless.\n\nThe concern is narrower still: ordinary disk/cgroup destruction removes the whole\nblkg, so the main observable case is one-policy activation rollback or deactivation\nwhile the other remains active.\n\nI am not sure if this is something that is done by users? So might not need\nto be addressed?\n\nThanks,\nUsama\n\n\n>  \tcall_rcu(&pd->rcu_head, iocg_release);\n>  }\n>  \n\n",
+          "reply_to": "Tejun Heo",
+          "message_date": "2026-08-10",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series addresses issues in the blk-iocost module, specifically related to clearing delay state when freeing policy data. The patch in question modifies the ioc_pd_free function to explicitly clear the delay state after removing the iocg from active_iocgs and canceling its waitq timer."
     }
   }
 }
