@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260817043047.1553572-1-joshua.hahnjy@gmail.com",
+  "subject": "[PATCH] mm: memcg: flush empty per-cpu stock slots on memcg offlining",
+  "url": "https://lore.kernel.org/all/20260817043047.1553572-1-joshua.hahnjy@gmail.com/",
+  "dates": {
+    "2026-08-17": {
+      "report_file": "2026-08-17_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "Joshua Hahn",
+          "summary": "Raised concerns about the patch's potential to cause cache misses due to unnecessary drain operations. Suggested an alternative solution using a conditional check for memcg descendants and dying objects.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "CONTENTIOUS"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Song Hu",
+          "summary": "Acknowledged Joshua's concerns and agreed to drop the disputed claim about objcg symmetry. Confirmed that the ordering of CSS_DYING and css_offline ensures correct behavior.",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi, \n\n\\u5728 2026/8/17 12:30, Joshua Hahn \\u5199\\u9053:\n> On Mon, 17 Aug 2026 10:59:17 +0800 Song Hu <husong@kylinos.cn> wrote:\n> \n>> refill_stock() takes a css reference for each cached memcg slot and\n>> mem_cgroup_css_offline() relies on drain_all_stock() to release those\n>> references before the cgroup can finish dying.\n>>\n>> consume_stock() can drive a slot's nr_pages to zero while its cached[]\n>> pointer stays set.  is_memcg_drain_needed() skips such empty slots, so\n>> the offlining drain is a no-op for them: the pinned css reference is\n>> released only if the slot happens to be evicted by later unrelated\n>> charges on the same CPU, or by CPU hotplug.  The memcg then lingers\n>> in the dying state indefinitely.  On a CPU with container churn, a\n>> per-cpu stock can pin up to NR_MEMCG_STOCK (7) zombie memcgs.\n>>\n>> The sibling obj_stock_flush_required() has no such gate: a cached\n>> objcgs slot is flushed regardless of its byte count.  Drop the\n>> nr_pages gate from is_memcg_drain_needed() accordingly.  Draining an\n>> empty slot is a single css_put() and a NULL store, and it happens at\n>> most once per slot per drain, so the extra work is negligible.\n> \n> Hi Song,\n> \n> I feel that this above statement is quite misleading.\n> Scheduling a drain on a memcg that doesn't have stock eventually\n> performs a drain operation on every memcg cached in that CPU.\n> \nRight, I missed that drain_local_memcg_stock() flushes the whole\nstock, so an unrelated charge below a dying memcg would throw away the\nother slots on that CPU.  Will drop that claim and the objcg\ncomparison from the changelog; the objcg side has no reference to\nrelease from the stock, so there is no symmetry to argue from.\n\n> drain_local_memcg_stock\n>   drain_stock_fully\n>   {\n>     for (i = 0; i < NR_MEMCG_STOCK; ++i)\n>       drain_stock(stock, i);\n>   {\n> \n> Sure, for any empty stock during this iteration drain_stock is trivial,\n> but for nonempty stock that happen to co-exist on the CPU, it's forcing\n> a cache miss on the next charge.\n> \n> The problem that you note does seem quite real though. I think a less\n> invasive solution could be something like\n> \n> if (mem_cgroup_is_descendant(memcg, root_memct) &&\n>     (READ_ONCE(stock->nr_pages[i]) || css_is_dying(&memcg->css))\n> \nWill do.  The ordering works out: kill_css_sync() sets CSS_DYING\nbefore css_offline is queued, so css_is_dying() is already true when\nmem_cgroup_css_offline() calls drain_all_stock().\n> By the way, I think the argument that \"obj_stock_flush_required has no\n> such gate so is_memcg_drain_needed doesn't need one too\" is also not\n> really correct since a dying objcg doesn't flush anyways. \n> \nThanks,\nSong> I hope you have a great day,\n> Joshua\n> \n>> This is easily reproduced with short-lived cgroups pinned to one CPU:\n>> 12 charge/exit/rmdir cycles leave nr_dying_subsys_memory at +2, stable\n>> across later slot displacement.\n>>\n>> Fixes: d1a05b6973c7 (\"memcg: do not try to drain per-cpu caches without pages\")\n>> Signed-off-by: Song Hu <husong@kylinos.cn>\n>> ---\n>>  mm/memcontrol.c | 8 ++++++--\n>>  1 file changed, 6 insertions(+), 2 deletions(-)\n>>\n>> diff --git a/mm/memcontrol.c b/mm/memcontrol.c\n>> index 17da1f43b7d3..b931ec16bb82 100644\n>> --- a/mm/memcontrol.c\n>> +++ b/mm/memcontrol.c\n>> @@ -2291,8 +2291,12 @@ static bool is_memcg_drain_needed(struct memcg_stock_pcp *stock,\n>>  \t\tif (!memcg)\n>>  \t\t\tcontinue;\n>>  \n>> -\t\tif (READ_ONCE(stock->nr_pages[i]) &&\n>> -\t\t    mem_cgroup_is_descendant(memcg, root_memcg)) {\n>> +\t\t/*\n>> +\t\t * An empty slot still pins a css reference which\n>> +\t\t * mem_cgroup_css_offline() relies on drain_all_stock()\n>> +\t\t * to release.\n>> +\t\t */\n>> +\t\tif (mem_cgroup_is_descendant(memcg, root_memcg)) {\n>>  \t\t\tflush = true;\n>>  \t\t\tbreak;\n>>  \t\t}\n>> -- \n>> 2.43.0\n\n",
+          "reply_to": "Joshua Hahn",
+          "message_date": "2026-08-17",
+          "message_id": "",
+          "email": "husong@kylinos.cn",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Patch aims to flush empty per-cpu stock slots on memcg offlining, addressing potential cache misses and improving performance."
+    }
+  }
+}

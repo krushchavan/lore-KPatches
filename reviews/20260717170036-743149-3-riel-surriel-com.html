@@ -238,146 +238,10 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH RFC v3 2/6] riscv/mm: add untagged_addr_remote_unlocked()</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260717170036.743149-3-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-07-17</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-07-20</strong><div class="date-range-nav">Active on: <a href="#2026-07-20">2026-07-20</a> &bull; <a href="#2026-07-17">2026-07-17</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-07-20</strong><div class="date-range-nav">Active on: <a href="#2026-07-20">2026-07-20</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a new function called untagged_addr_remote_unlocked() to the RISC-V architecture&#x27;s memory management code. The function is used to untage addresses in a remote process without holding the mmap lock, which was previously not possible due to incorrect handling of pointer masking. The patch also annotates accesses to mm-&gt;context.pmlen with READ_ONCE() and WRITE_ONCE() macros to make lockless reads explicit and KCSAN-clean. This change is necessary because current-&gt;mm is used instead of the target mm in the generic version, leading to incorrect untagging when using pointer masking for remote access.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-07-17">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Rik Riel (author)</span>
-<a class="date-chip" href="../2026-07-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-07-17">2026-07-17</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2, but did not provide a clear resolution or timeline for addressing this issue.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">__access_remote_vm() untags the remote address before looking up the VMA,
-now without holding the mmap lock. riscv defines untagged_addr_remote() but
-not untagged_addr_remote_unlocked(), so it falls back to the generic
-version, which untags with untagged_addr().
-
-That reads current-&gt;mm, not the target mm, so a remote access to a process
-using pointer masking would untag with the wrong mask.
-
-mm-&gt;context.pmlen is set only through PR_SET_TAGGED_ADDR_CTRL and is stable
-afterwards, so it can be read without the mmap lock, as it already is from
-untagged_addr() and mm_untag_mask().
-
-Add untagged_addr_remote_unlocked(), which untags against the target mm,
-and annotate context.pmlen accesses with READ_ONCE() and WRITE_ONCE() so
-the lockless reads are explicit and KCSAN-clean. untagged_addr_remote()
-keeps its mmap_assert_locked() and shares the code.
-
-Assisted-by: Claude:claude-opus-4.8
-Signed-off-by: Rik van Riel &lt;riel@surriel.com&gt;
----
- arch/riscv/include/asm/mmu_context.h |  4 ++--
- arch/riscv/include/asm/uaccess.h     | 10 +++++++---
- arch/riscv/kernel/process.c          | 12 +++++++-----
- 3 files changed, 16 insertions(+), 10 deletions(-)
-
-diff --git a/arch/riscv/include/asm/mmu_context.h b/arch/riscv/include/asm/mmu_context.h
-index dbf27a78df6c..3ce16796e5a2 100644
---- a/arch/riscv/include/asm/mmu_context.h
-+++ b/arch/riscv/include/asm/mmu_context.h
-@@ -21,7 +21,7 @@ static inline void activate_mm(struct mm_struct *prev,
- 			       struct mm_struct *next)
- {
- #ifdef CONFIG_RISCV_ISA_SUPM
--	next-&gt;context.pmlen = 0;
-+	WRITE_ONCE(next-&gt;context.pmlen, 0);
- #endif
- 	switch_mm(prev, next, NULL);
- }
-@@ -44,7 +44,7 @@ DECLARE_STATIC_KEY_FALSE(use_asid_allocator);
- #define mm_untag_mask mm_untag_mask
- static inline unsigned long mm_untag_mask(struct mm_struct *mm)
- {
--	return -1UL &gt;&gt; mm-&gt;context.pmlen;
-+	return -1UL &gt;&gt; READ_ONCE(mm-&gt;context.pmlen);
- }
- #endif
- 
-diff --git a/arch/riscv/include/asm/uaccess.h b/arch/riscv/include/asm/uaccess.h
-index 5d4ec15584cf..53806e0f7dcf 100644
---- a/arch/riscv/include/asm/uaccess.h
-+++ b/arch/riscv/include/asm/uaccess.h
-@@ -16,7 +16,7 @@
- static inline unsigned long __untagged_addr_remote(struct mm_struct *mm, unsigned long addr)
- {
- 	if (riscv_has_extension_unlikely(RISCV_ISA_EXT_SUPM)) {
--		u8 pmlen = mm-&gt;context.pmlen;
-+		u8 pmlen = READ_ONCE(mm-&gt;context.pmlen);
- 
- 		/* Virtual addresses are sign-extended; physical addresses are zero-extended. */
- 		if (IS_ENABLED(CONFIG_MMU))
-@@ -33,12 +33,16 @@ static inline unsigned long __untagged_addr_remote(struct mm_struct *mm, unsigne
- 	(__force __typeof__(addr))__untagged_addr_remote(current-&gt;mm, __addr);	\
- })
- 
--#define untagged_addr_remote(mm, addr) ({					\
-+#define untagged_addr_remote_unlocked(mm, addr) ({				\
- 	unsigned long __addr = (__force unsigned long)(addr);			\
--	mmap_assert_locked(mm);							\
- 	(__force __typeof__(addr))__untagged_addr_remote(mm, __addr);		\
- })
- 
-+#define untagged_addr_remote(mm, addr) ({					\
-+	mmap_assert_locked(mm);							\
-+	untagged_addr_remote_unlocked(mm, addr);				\
-+})
-+
- #define access_ok(addr, size) likely(__access_ok(untagged_addr(addr), size))
- #else
- #define untagged_addr(addr) (addr)
-diff --git a/arch/riscv/kernel/process.c b/arch/riscv/kernel/process.c
-index b2df7f72241a..6ae7552fed09 100644
---- a/arch/riscv/kernel/process.c
-+++ b/arch/riscv/kernel/process.c
-@@ -357,13 +357,15 @@ long set_tagged_addr_ctrl(struct task_struct *task, unsigned long arg)
- 	if (mmap_write_lock_killable(mm))
- 		return -EINTR;
- 
--	if (test_bit(MM_CONTEXT_LOCK_PMLEN, &amp;mm-&gt;context.flags) &amp;&amp; mm-&gt;context.pmlen != pmlen) {
--		mmap_write_unlock(mm);
--		return -EBUSY;
-+	if (test_bit(MM_CONTEXT_LOCK_PMLEN, &amp;mm-&gt;context.flags)) {
-+		if (READ_ONCE(mm-&gt;context.pmlen) != pmlen) {
-+			mmap_write_unlock(mm);
-+			return -EBUSY;
-+		}
- 	}
- 
- 	envcfg_update_bits(task, ENVCFG_PMM, pmm);
--	mm-&gt;context.pmlen = pmlen;
-+	WRITE_ONCE(mm-&gt;context.pmlen, pmlen);
- 
- 	mmap_write_unlock(mm);
- 
-@@ -394,7 +396,7 @@ long get_tagged_addr_ctrl(struct task_struct *task)
- 		break;
- 	}
- 
--	if (task-&gt;mm-&gt;context.pmlen)
-+	if (READ_ONCE(task-&gt;mm-&gt;context.pmlen))
- 		ret |= PR_TAGGED_ADDR_ENABLE;
- 
- 	return ret;
--- 
-2.53.0-Meta
-
-
-_______________________________________________
-linux-riscv mailing list
-linux-riscv@lists.infradead.org
-http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260717170036.743149-3-riel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged fix is needed, agreed to restructure</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Usama Arif</span>
@@ -417,7 +281,7 @@ http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
 <div class="review-comment-signals">Signals: requested_changes, uncertainty, concurrency issue</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-2">
+<div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Rik Riel (author)</span>
@@ -464,7 +328,7 @@ any locking changes?</pre>
 <div class="review-comment-signals">Signals: clarifying question, exploring edge cases</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-3">
+<div class="thread-node depth-2">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Usama Arif</span>
@@ -519,7 +383,7 @@ http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
 <div class="review-comment-signals">Signals: concurrent PMLEN change, incorrect address untagging</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-4">
+<div class="thread-node depth-3">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Rik Riel (author)</span>
@@ -649,8 +513,6 @@ http://lists.infradead.org/mailman/listinfo/linux-riscv</pre>
 <div class="reply-to-label">&#8627; replying to Rik Riel</div>
 <a href="https://lore.kernel.org/r/20260720115741.239657-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: clarification, patch-specific, stability concern</div>
-</div>
-</div>
 </div>
 </div>
 </div>
