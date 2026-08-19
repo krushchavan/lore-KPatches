@@ -238,31 +238,1801 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH v3 00/14] Introduce tiered memcg limits</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260807202059.2620949-1-joshua.hahnjy@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-07</strong><div class="date-range-nav">Active on: <a href="#2026-08-07">2026-08-07</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces tiered memory limits for the memory cgroup controller, allowing for proportional scaling and enforcement of memory limits across different tiers of memory. The patches modify various functions in the mm/memcontrol.c file to make them aware of the tiered limits, enabling fair distribution of memory among workloads on multi-host systems.</div></div>
+    <div class="date-range">Submitted: <strong>2026-08-07</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-18</strong><div class="date-range-nav">Active on: <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-07">2026-08-07</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new boot parameter &#x27;cgroup.memory=tiered_limits&#x27; that enables tier-proportional scaling and enforcement of memory cgroup controller limits. The feature is incompatible with cgroup v1 and raises a warning if a system booted with tiered limits mounts a legacy cgroup. A static key is used to minimize overhead for cgroups not using tier-aware memcg limits, which will become a hotpath in later commits.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-07">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author"><span class="maintainer-star" title="Subsystem maintainer">&#9733;</span> David Hildenbrand</span>
+<span class="review-author">Joshua Hahn (author)</span>
 <a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a potential issue with the tier-aware memory limits, suggesting that the current implementation may lead to incorrect reclaim decisions. Proposed an alternative approach using a separate page counter for each tier.</div>
-<div class="review-comment-signals">Signals: potential bug, alternative solution</div>
+<div class="review-comment-text">Author addressed a concern about the need for tier-aware memory placement on systems with multiple workloads and different memory tiers. They explained that their patch introduces tiered memcg limits, which establish memory limits per-tier that scale with memcg limits and the system&#x27;s per-tier capacity. The author described how these limits are enforced at allocation time, try_charge_memcg time, in the background, during migration, and through ratelimited promotions. They acknowledged that ensuring fairness in memory placement is not free and may involve underutilizing fast tiers or entering reclaim earlier to prevent overconsuming on fast tiers.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">INTRODUCTION
+============
+On machines serving multiple workloads whose memory is isolated with the
+memory cgroup controller, it is currently impossible to enforce a fair
+distribution of memory placement. memory.{max, high} bounds a cgroup&#x27;s
+total footprint but says nothing about where that memory resides, so a
+cgroup that starts first can occupy all of a fast tier, while latecomers
+are pushed out to slower tiers.
+
+On systems with tiered memory (e.g. HBM, DRAM, CXL, PMEM, etc.),
+memory placement directly maps to performance, meaning memory and
+performance isolation breaks down on tiered systems; well-behaved
+workloads using less memory than their memcg limits may still hurt other
+workloads&#x27; performance by hogging more than their &quot;fair share&quot; of memory
+on fast tiers. Performance then depends on workload-external factors,
+like which other workloads are present on the system and what order they
+were launched in.
+
+However, ensuring fairness in memory placement is not free; ensuring
+fair memory placement can mean underutilizing fast tiers, entering
+reclaim earlier to proactively prevent overconsuming on fast tiers,
+and host-level hotness inversion. On lightly-loaded systems, it means
+that reclaim happens on fast tiers, even if no other workloads compete
+for that memory. For some workloads, this tradeoff can be worth taking
+to ensure higher run-to-run consistency and isolation from
+noisy neighbors (see USECASES).
+
+Introduce tiered memcg limits, which establish memory limits per-tier
+that scale with memcg limits and the system&#x27;s per-tier capacity.
+
+MECHANISM
+=========
+memory.{min, low, high, max} are partitioned across the system&#x27;s memory
+tiers in proportion to the tiers&#x27; share of the total memory.
+For instance, on a two-tier system with 75% of its memory in tier 0:
+  - a cgroup with memory.max = 100G has a 75G tier 0 max limit
+  - a cgroup with memory.low = 40G has 30G of tier 0 protection
+
+Enforcement limits (high / max) are enforced in five ways:
+  - At allocation time, a cgroup&#x27;s allocation will try to serve a page
+    from a tier where it still has headroom.
+  - At try_charge_memcg time, a folio that lands on an exhausted tier
+    anyways (because of __GFP_THISNODE, mempolicy, or memory pressure)
+    triggers targeted reclaim restricted to that tier&#x27;s nodes.
+  - In the background, a tier pushed over its tiered memcg limit by page
+    migration or folio replacement gets reclaimed by the memory.high
+    worker.
+  - Migration (promotion / demotion) now performs a try_charge on
+    cross-tier migrations, and will attempt to reclaim the destination
+    tier if it breaches the limits.
+  - In addition, promotions are ratelimited when they are attempted on
+    exhausted memcg tiers.
+
+A few details about the enforcement:
+  - Allocation time steering is best-effort and yields to explicit
+    allocation requests, like mempolicy, cpusets, and allocations that
+    request a specific node (promotion / demotion). If that allocation
+    were to push the memcg tier over its limit, enforcement happens at
+    charge time.
+  - Tier max can be exceeded by demotions, which may force charge
+    since they can&#x27;t (and should not) trigger recursive reclaim.
+  - As of this time, the mechanism is completely transparent to the
+    user. Booting the system with the &quot;cgroup.memory=tiered_limits&quot;
+    boot parameter will enable the feature, with no other interfaces.
+  - There are no behavioral or performance effects on systems without
+    the boot parameter, since all of the hooks are gated behind a static
+    branch that compiles to a no-op. However, there are allocations and
+    static variables that we must define unconditionally
+    (even though they are not used).
+  - Tiered memcg limits are a v2-only feature. A warning is emitted if a
+    cgroup v1 user attempts to use tiered memcg limits.
+
+USECASES
+========
+As mentioned in the introduction, some users may prefer to trade off
+total throughput for reduced run-to-run variance:
+  - VM hosting services that must provide the maximal performance
+    guarantee for any workload present on a host.
+  - Database workloads that want to minimize the maximum latency for
+    queries hosted on the host.
+  - Hosts running memory-isolated sharded workloads that block progress
+    until the last shard terminates.
+  - Any workload that wants to minimize variance, as a means to gather
+    measurable gains in performance over time.
+
+RFC QUESTIONS
+=============
+  - Should we OOM when we fail to allocate on a given tier?
+  - What kinds of observability (if any) do we want?
+  - What kinds of user interfaces (if any) do we want?
+
+TESTING
+=======
+All the tests were run on a 1TB 2-tier 316 CPU machine, with
+750G DRAM and 250G CXL. The first benchmark runs 12 containers on the
+host, where each container runs an identical pointer-chasing task in a
+loop. Each container is 80GB, so DRAM is overcommitted:
+    (80GB * 12 = 960GB &gt; 750GB)
+I ran 8 trials and aggregated the data. When 50% of the pointers
+are kept hot, these are the results:
+
+Mean DRAM usage across the 12 workloads:
++---------+----------+--------+
+|         | Untiered | Tiered |
++---------+----------+--------+
+| min     | 43.09    | 51.25  |
+| max     | 68.54    | 53.03  |
+| max/min | 1.59x    | 1.03x  |
++---------+----------+--------+
+
+Mean CXL usage across the 12 workloads:
++---------+----------+--------+
+|         | Untiered | Tiered |
++---------+----------+--------+
+| min     | 3.05     | 13.98  |
+| max     | 21.65    | 14.87  |
+| max/min | 7.10x    | 1.06x  |
++---------+----------+--------+
+
+For the tiered system, the deviance from max to min DRAM and CXL usage
+is quite low across workloads. What is interesting is that for untiered
+systems, there is up to a 7x difference between the cgroup using the
+most CXL and the least CXL; there&#x27;s a clear inequality in how the
+resource gets allocated.
+
+This gets reflected in the distribution of the job completion times of
+the 12 workloads as well.
+
+Job completion time (s)
++-----------+----------+--------+-------+
+|           | Untiered | Tiered | Delta |
++-----------+----------+--------+-------+
+| min       |    260.1 |  276.5 | +6.3% |
+| mean      |    274.4 |  290.0 | +5.7% |
+| max       |    315.0 |  302.6 | -3.9% |
+| max - min |     54.9 |   26.1 | -52%  |
++-----------+----------+--------+-------+
+
+SERIES OVERVIEW
+===============
+Commits 1-3 are preparatory patches. We introduce the new boot
+parameter, refactor try_charge_memcg() to make the following charges
+easier to follow, and cache frequently-used values like the
+node &lt;-&gt; tier mapping.
+
+Commits 4-5 allocate the new per-memcg-tier page_counters for tracking
+and set their limits according to the standard memcg limits.
+
+Commits 6-10 track per-tier charges, and introduce the protection and
+enforcement mechanisms for min/low/high/max. 
+
+Commits 11-13 further enforce the migration (promotion / demotion) paths
+and ensure that we do not introduce unnecessary churn by reclaiming
+earlier. 
+
+Commit 14 steers allocations so that we do not accidentally introduce
+zone_reclaim_mode-like behavior and immediately reclaim after allocating
+on exhausted memcg tiers.
+
+FUTURE WORK
+===========
+I am currently working on another series [1], which pushes the memcg
+cached charges (stock) to the page_counter level, meaning each tier can
+manage its own independent stock. This should increase the performance
+and simplicity of the code much more.
+
+CHANGELOG
+=========
+v2 --&gt; v3
+- N tier support, instead of toptier vs. rest enforcement
+- Max enforcement
+- Migration enforcement
+- Page allocator steering for exhausted tiers
+- Promotion fastpath restriction &amp; throttling
+
+[1] https://lore.kernel.org/all/20260623180124.868655-1-joshua.hahnjy@gmail.com/
+
+Joshua Hahn (14):
+  mm/memcontrol: Introduce cgroup.memory=tiered_limits boot parameter
+  mm/memcontrol: Refactor page_counter charging in try_charge_memcg
+  mm/memory-tiers: Introduce a mapping from nid to tier_slot
+  mm/memcontrol: Allocate per-tier page_counters
+  mm/memcontrol: Set tier limits proportional to memory limits
+  mm/vmscan, memcontrol: Add nodemask to try_to_free_mem_cgroup_pages
+  mm/memcontrol: Charge/uncharge tiered memory to mem_cgroup
+  mm/memcontrol: Make memory.low and memory.min tier-aware
+  mm/memcontrol: Make memory.high tier-aware
+  mm/memcontrol: Make memory.max tier-aware
+  mm/memcontrol, migrate: Transfer tier charge on migration
+  mm/memcontrol: Kick async reclaim on migration and folio replacement
+  mm/memcontrol, sched/numa: Gate NUMA promotions into memcg tiers
+  mm/page_alloc: steer allocations away from exhausted memory tiers
+
+ include/linux/memcontrol.h   |  75 ++++-
+ include/linux/memory-tiers.h |  24 ++
+ kernel/sched/fair.c          |   3 +-
+ mm/internal.h                |   3 +-
+ mm/memcontrol-v1.c           |   5 +-
+ mm/memcontrol.c              | 528 ++++++++++++++++++++++++++++++++---
+ mm/memory-tiers.c            | 110 +++++++-
+ mm/migrate.c                 |  30 +-
+ mm/page_alloc.c              |  19 +-
+ mm/vmscan.c                  |  25 +-
+ 10 files changed, 753 insertions(+), 69 deletions(-)
+
+
+base-commit: 7b25c83e4711038989b5b08a8977fb68468c854e
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-1-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a concern, provided detailed explanation</div>
 </div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Zi Yan</span>
+<span class="review-author">Joshua Hahn (author)</span>
 <a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Expressed concerns about the complexity and overhead of implementing tier-aware memory limits, suggesting that a simpler approach may be more suitable. Asked for clarification on the benefits of this new feature.</div>
-<div class="review-comment-signals">Signals: complexity concern, benefit question</div>
+<div class="review-comment-text">Author addressed a concern about code organization and maintainability by refactoring the try_charge_memcg function to make it easier to distinguish between memcg v1 and v2 cases, with no functional changes intended.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">In preparation for adding charging and uncharging of a new page_counter
+toptier to try_charge_memcg, refactor the code so that it is easier to
+distinguish between the memcg v1/v2 cases.
+
+No functional changes intended.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/memcontrol.c | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index cefe33b5fd285..ec28512de6a23 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2668,18 +2668,22 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 		batch = nr_pages;
+ 
+ 	reclaim_options = MEMCG_RECLAIM_MAY_SWAP;
+-	if (!do_memsw_account() ||
+-	    page_counter_try_charge(&amp;memcg-&gt;memsw, batch, &amp;counter)) {
+-		if (page_counter_try_charge(&amp;memcg-&gt;memory, batch, &amp;counter))
+-			goto done_restock;
+-		if (do_memsw_account())
+-			page_counter_uncharge(&amp;memcg-&gt;memsw, batch);
+-		mem_over_limit = mem_cgroup_from_counter(counter, memory);
+-	} else {
++
++	if (do_memsw_account() &amp;&amp;
++	    !page_counter_try_charge(&amp;memcg-&gt;memsw, batch, &amp;counter)) {
+ 		mem_over_limit = mem_cgroup_from_counter(counter, memsw);
+ 		reclaim_options &amp;= ~MEMCG_RECLAIM_MAY_SWAP;
++		goto reclaim;
+ 	}
+ 
++	if (page_counter_try_charge(&amp;memcg-&gt;memory, batch, &amp;counter))
++		goto done_restock;
++
++	if (do_memsw_account())
++		page_counter_uncharge(&amp;memcg-&gt;memsw, batch);
++	mem_over_limit = mem_cgroup_from_counter(counter, memory);
++
++reclaim:
+ 	if (batch &gt; nr_pages) {
+ 		batch = nr_pages;
+ 		goto retry;
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-3-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: refactor, no functional changes</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about establishing tiered memcg limits at boot time and dealing with tiers coming online/offline at runtime due to DAX memory hotplugging/hot-unplugging. Author proposed introducing a new &#x27;tier_slot&#x27; which is a dense index that does not change once a tier comes online, along with a helper to retrieve the nodemask associated with a tier.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Establishing tiered memcg limits will require an ordering of tiers, as
+well as a way to account how much memory is present in each tier.
+This will need to be done starting at boot, so that all memory becomes
+properly accounted.
+
+However, tiers can come online and offline at runtime due to DAX memory
+whose nodes can be hotplugged / hot-unplugged, and these nodes&#x27; tiers
+are not available at boot.
+
+Therefore, to establish a fixed mapping from nid to tier that isn&#x27;t
+sparse like the tier_ids, introduce a new &quot;tier_slot&quot; which is a dense
+index that does not change once a tier comes online.
+
+Also introduce a helper to retrieve the nodemask associated with a tier.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memory-tiers.h | 18 ++++++++
+ mm/memory-tiers.c            | 86 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/memory-tiers.h b/include/linux/memory-tiers.h
+index 7999c58629eeb..0e49645cdd1a9 100644
+--- a/include/linux/memory-tiers.h
++++ b/include/linux/memory-tiers.h
+@@ -41,6 +41,8 @@ extern struct memory_dev_type *default_dram_type;
+ extern nodemask_t default_dram_nodes;
+ struct memory_dev_type *alloc_memory_type(int adistance);
+ void put_memory_type(struct memory_dev_type *memtype);
++int mt_nr_tier_slots(void);
++int nid_tier_slot(int nid);
+ void init_node_memory_type(int node, struct memory_dev_type *default_type);
+ void clear_node_memory_type(int node, struct memory_dev_type *memtype);
+ int register_mt_adistance_algorithm(struct notifier_block *nb);
+@@ -52,6 +54,7 @@ int mt_perf_to_adistance(struct access_coordinate *perf, int *adist);
+ struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+ 						  struct list_head *memory_types);
+ void mt_put_memory_types(struct list_head *memory_types);
++const nodemask_t *mt_tier_nodes(int slot);
+ #ifdef CONFIG_NUMA_MIGRATION
+ int next_demotion_node(int node, const nodemask_t *allowed_mask);
+ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
+@@ -151,5 +154,20 @@ static inline struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+ static inline void mt_put_memory_types(struct list_head *memory_types)
+ {
+ }
++
++static inline int mt_nr_tier_slots(void)
++{
++	return 0;
++}
++
++static inline int nid_tier_slot(int nid)
++{
++	return -1;
++}
++
++static inline const nodemask_t *mt_tier_nodes(int slot)
++{
++	return NULL;
++}
+ #endif	/* CONFIG_NUMA */
+ #endif  /* _LINUX_MEMORY_TIERS_H */
+diff --git a/mm/memory-tiers.c b/mm/memory-tiers.c
+index 54851d8a195b0..36187c0ea9ded 100644
+--- a/mm/memory-tiers.c
++++ b/mm/memory-tiers.c
+@@ -43,6 +43,16 @@ static LIST_HEAD(memory_tiers);
+  */
+ static LIST_HEAD(default_memory_types);
+ static struct node_memory_type_map node_memory_types[MAX_NUMNODES];
++
++/*
++ * nr_tier_slots and tier_slot_ids are written with memory_tier_lock and
++ * read locklessly. nr_tier_slots is monotonically increasing.
++ */
++static int nr_tier_slots;
++static int tier_slot_ids[MAX_NUMNODES]   = {[0 ... MAX_NUMNODES - 1] = -1,};
++static int node_tier_slots[MAX_NUMNODES] = {[0 ... MAX_NUMNODES - 1] = -1,};
++static nodemask_t tier_nodemasks[MAX_NUMNODES];
++
+ struct memory_dev_type *default_dram_type;
+ nodemask_t default_dram_nodes __initdata = NODE_MASK_NONE;
+ 
+@@ -273,6 +283,65 @@ static struct memory_tier *__node_get_memory_tier(int node)
+ 				     lockdep_is_held(&amp;memory_tier_lock));
+ }
+ 
++/* Caller must hold memory_tier_lock */
++static int tier_id_slot(int tier_id)
++{
++	int slot, free_slot = -1;
++
++	for (slot = 0; slot &lt; nr_node_ids; slot++) {
++		if (tier_slot_ids[slot] == tier_id)
++			return slot;
++		if (tier_slot_ids[slot] == -1 &amp;&amp; free_slot == -1) {
++			free_slot = slot;
++			tier_slot_ids[slot] = tier_id;
++		}
++	}
++
++	return free_slot;
++}
++
++static void establish_tier_slots(void)
++{
++	int old_nr_tier_slots = mt_nr_tier_slots();
++	int highest_slot = old_nr_tier_slots;
++
++	lockdep_assert_held_once(&amp;memory_tier_lock);
++
++	for (int slot = 0; slot &lt; old_nr_tier_slots; slot++)
++		nodes_clear(tier_nodemasks[slot]);
++
++	for (int nid = 0; nid &lt; nr_node_ids; nid++) {
++		struct memory_tier *memtier = NULL;
++		int slot = -1;
++
++		if (node_state(nid, N_MEMORY))
++			memtier = __node_get_memory_tier(nid);
++		if (memtier) {
++			slot = tier_id_slot(memtier-&gt;dev.id);
++			highest_slot = max(highest_slot, slot + 1);
++		}
++
++		WRITE_ONCE(node_tier_slots[nid], slot);
++
++		if (slot != -1)
++			node_set(nid, tier_nodemasks[slot]);
++	}
++	WRITE_ONCE(nr_tier_slots, highest_slot);
++}
++
++int mt_nr_tier_slots(void)
++{
++	return READ_ONCE(nr_tier_slots);
++}
++
++int nid_tier_slot(int nid)
++{
++	if (nid &lt; 0 || nid &gt;= MAX_NUMNODES)
++		return -1;
++
++	return READ_ONCE(node_tier_slots[nid]);
++}
++
+ #ifdef CONFIG_NUMA_MIGRATION
+ bool node_is_toptier(int node)
+ {
+@@ -729,6 +798,7 @@ static int __init memory_tier_late_init(void)
+ 	}
+ 
+ 	establish_demotion_targets();
++	establish_tier_slots();
+ 	put_online_mems();
+ 
+ 	return 0;
+@@ -878,6 +948,14 @@ int mt_calc_adistance(int node, int *adist)
+ }
+ EXPORT_SYMBOL_GPL(mt_calc_adistance);
+ 
++const nodemask_t *mt_tier_nodes(int slot)
++{
++	if (slot &lt; 0)
++		return NULL;
++
++	return &amp;tier_nodemasks[slot];
++}
++
+ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 					      unsigned long action, void *_arg)
+ {
+@@ -887,15 +965,19 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 	switch (action) {
+ 	case NODE_REMOVED_LAST_MEMORY:
+ 		mutex_lock(&amp;memory_tier_lock);
+-		if (clear_node_memory_tier(nn-&gt;nid))
++		if (clear_node_memory_tier(nn-&gt;nid)) {
+ 			establish_demotion_targets();
++			establish_tier_slots();
++		}
+ 		mutex_unlock(&amp;memory_tier_lock);
+ 		break;
+ 	case NODE_ADDED_FIRST_MEMORY:
+ 		mutex_lock(&amp;memory_tier_lock);
+ 		memtier = set_node_memory_tier(nn-&gt;nid);
+-		if (!IS_ERR(memtier))
++		if (!IS_ERR(memtier)) {
+ 			establish_demotion_targets();
++			establish_tier_slots();
++		}
+ 		mutex_unlock(&amp;memory_tier_lock);
+ 		break;
+ 	}
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-4-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the memory tiering implementation needing one page_counter per memory tier. They added a page_counter array (memcg-&gt;tier) to struct mem_cgroup, sized to nr_node_ids and allocated only when tiered limits are enabled. The array is initialized and parent-linked in mem_cgroup_css_alloc(), and freed in __mem_cgroup_free().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Tier-aware limits need one page_counter per memory tier.  Add a
+page_counter array (memcg-&gt;tier) to struct mem_cgroup, sized to
+nr_node_ids (an upper bound on the number of tiers) and allocated only
+when tiered limits are enabled, so memcgs pay nothing when the feature is
+off.  Initialise and parent-link every slot in mem_cgroup_css_alloc(),
+and free the array in __mem_cgroup_free().
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h |  1 +
+ mm/memcontrol.c            | 23 +++++++++++++++++++++++
+ mm/memory-tiers.c          | 17 ++++++++++++++---
+ 3 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index dce03df7eae05..bb5bde87ac85a 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -207,6 +207,7 @@ struct mem_cgroup {
+ 
+ 	/* Accounted resources */
+ 	struct page_counter memory;		/* Both v1 &amp; v2 */
++	struct page_counter *tier;		/* v2 only */
+ 
+ 	union {
+ 		struct page_counter swap;	/* v2 only */
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index ec28512de6a23..d096010366515 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -53,6 +53,7 @@
+ #include &lt;linux/seq_file.h&gt;
+ #include &lt;linux/vmpressure.h&gt;
+ #include &lt;linux/memremap.h&gt;
++#include &lt;linux/memory-tiers.h&gt;
+ #include &lt;linux/mm_inline.h&gt;
+ #include &lt;linux/cpu.h&gt;
+ #include &lt;linux/oom.h&gt;
+@@ -4126,6 +4127,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
+ 	memcg1_free_events(memcg);
+ 	kfree(memcg-&gt;vmstats);
+ 	free_percpu(memcg-&gt;vmstats_percpu);
++	kfree(memcg-&gt;tier);
+ 	kfree(memcg);
+ }
+ 
+@@ -4178,6 +4180,13 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
+ 		if (!alloc_mem_cgroup_per_node_info(memcg, node))
+ 			goto fail;
+ 
++	if (mem_cgroup_tiered_limits()) {
++		memcg-&gt;tier = kcalloc(nr_node_ids, sizeof(*memcg-&gt;tier),
++				      GFP_KERNEL);
++		if (!memcg-&gt;tier)
++			goto fail;
++	}
++
+ 	if (memcg_wb_domain_init(memcg, GFP_KERNEL))
+ 		goto fail;
+ 
+@@ -4206,6 +4215,16 @@ static struct mem_cgroup *mem_cgroup_alloc(struct mem_cgroup *parent)
+ 	return ERR_PTR(error);
+ }
+ 
++static void memcg_init_tier_counters(struct mem_cgroup *memcg,
++				     struct mem_cgroup *parent, bool protection)
++{
++	for (int i = 0; i &lt; nr_node_ids; i++) {
++		page_counter_init(&amp;memcg-&gt;tier[i],
++				  parent ? &amp;parent-&gt;tier[i] : NULL, protection);
++		page_counter_set_high(&amp;memcg-&gt;tier[i], PAGE_COUNTER_MAX);
++	}
++}
++
+ static struct cgroup_subsys_state * __ref
+ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ {
+@@ -4231,6 +4250,8 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 	page_counter_set_high(&amp;memcg-&gt;swap, PAGE_COUNTER_MAX);
+ 	if (parent) {
+ 		page_counter_init(&amp;memcg-&gt;memory, &amp;parent-&gt;memory, memcg_on_dfl);
++		if (mem_cgroup_tiered_limits())
++			memcg_init_tier_counters(memcg, parent, memcg_on_dfl);
+ 		page_counter_init(&amp;memcg-&gt;swap, &amp;parent-&gt;swap, false);
+ #ifdef CONFIG_MEMCG_V1
+ 		WRITE_ONCE(memcg-&gt;swappiness, mem_cgroup_swappiness(parent));
+@@ -4243,6 +4264,8 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 		init_memcg_stats();
+ 		init_memcg_events();
+ 		page_counter_init(&amp;memcg-&gt;memory, NULL, true);
++		if (mem_cgroup_tiered_limits())
++			memcg_init_tier_counters(memcg, NULL, true);
+ 		page_counter_init(&amp;memcg-&gt;swap, NULL, false);
+ #ifdef CONFIG_MEMCG_V1
+ 		page_counter_init(&amp;memcg-&gt;kmem, NULL, false);
+diff --git a/mm/memory-tiers.c b/mm/memory-tiers.c
+index 36187c0ea9ded..bd5c78cd26ec4 100644
+--- a/mm/memory-tiers.c
++++ b/mm/memory-tiers.c
+@@ -52,6 +52,7 @@ static int nr_tier_slots;
+ static int tier_slot_ids[MAX_NUMNODES]   = {[0 ... MAX_NUMNODES - 1] = -1,};
+ static int node_tier_slots[MAX_NUMNODES] = {[0 ... MAX_NUMNODES - 1] = -1,};
+ static nodemask_t tier_nodemasks[MAX_NUMNODES];
++static unsigned long tier_capacity[MAX_NUMNODES];
+ 
+ struct memory_dev_type *default_dram_type;
+ nodemask_t default_dram_nodes __initdata = NODE_MASK_NONE;
+@@ -307,8 +308,10 @@ static void establish_tier_slots(void)
+ 
+ 	lockdep_assert_held_once(&amp;memory_tier_lock);
+ 
+-	for (int slot = 0; slot &lt; old_nr_tier_slots; slot++)
++	for (int slot = 0; slot &lt; old_nr_tier_slots; slot++) {
+ 		nodes_clear(tier_nodemasks[slot]);
++		WRITE_ONCE(tier_capacity[slot], 0);
++	}
+ 
+ 	for (int nid = 0; nid &lt; nr_node_ids; nid++) {
+ 		struct memory_tier *memtier = NULL;
+@@ -323,8 +326,16 @@ static void establish_tier_slots(void)
+ 
+ 		WRITE_ONCE(node_tier_slots[nid], slot);
+ 
+-		if (slot != -1)
+-			node_set(nid, tier_nodemasks[slot]);
++		if (slot &lt; 0)
++			continue;
++
++		node_set(nid, tier_nodemasks[slot]);
++		for (int i = 0; i &lt; MAX_NR_ZONES; i++) {
++			struct zone *zone = &amp;NODE_DATA(nid)-&gt;node_zones[i];
++
++			WRITE_ONCE(tier_capacity[slot],
++				tier_capacity[slot] + zone_managed_pages(zone));
++		}
+ 	}
+ 	WRITE_ONCE(nr_tier_slots, highest_slot);
+ }
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-5-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about selective reclaim on certain nodes by adding a new nodemask parameter to try_to_free_mem_cgroup_pages, allowing for future patches to selectively perform reclaim on toptier and place downward pressure when toptier limits are breached but memcg-wide limits are not yet breached. The author&#x27;s response suggests that the patch will need further revision as they added new functionality.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Add a new nodemask parameter to try_to_free_mem_cgroup_pages to allow
+selective reclaim on certain nodes. This new function signature can be
+used in future patches to selectively perform reclaim on toptier and
+place downward pressure when toptier limits are breached but memcg-wide
+limits are not yet breached.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/internal.h      |  3 ++-
+ mm/memcontrol-v1.c |  5 +++--
+ mm/memcontrol.c    | 11 +++++++----
+ mm/vmscan.c        | 10 +++++++---
+ 4 files changed, 19 insertions(+), 10 deletions(-)
+
+diff --git a/mm/internal.h b/mm/internal.h
+index f47f06c555481..5f2f6a1757bd9 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -84,7 +84,8 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 					   unsigned long nr_pages,
+ 					   gfp_t gfp_mask,
+ 					   unsigned int reclaim_options,
+-					   int *swappiness);
++					   int *swappiness,
++					   const nodemask_t *allowed);
+ unsigned long mem_cgroup_shrink_node(struct mem_cgroup *memcg,
+ 				     gfp_t gfp_mask, bool noswap,
+ 				     pg_data_t *pgdat,
+diff --git a/mm/memcontrol-v1.c b/mm/memcontrol-v1.c
+index 835fc8e511844..688896b59efe4 100644
+--- a/mm/memcontrol-v1.c
++++ b/mm/memcontrol-v1.c
+@@ -1815,7 +1815,8 @@ static int mem_cgroup_resize_max(struct mem_cgroup *memcg,
+ 		}
+ 
+ 		if (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,
+-				memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP, NULL)) {
++				memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP,
++				NULL, NULL)) {
+ 			ret = -EBUSY;
+ 			break;
+ 		}
+@@ -1851,7 +1852,7 @@ static int mem_cgroup_force_empty(struct mem_cgroup *memcg)
+ 			break;
+ 
+ 		if (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,
+-						  MEMCG_RECLAIM_MAY_SWAP, NULL))
++					MEMCG_RECLAIM_MAY_SWAP, NULL, NULL))
+ 			nr_retries--;
+ 	}
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index defd04acfb3fd..6c67d9d2c9ac7 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2397,7 +2397,7 @@ static unsigned long reclaim_high(struct mem_cgroup *memcg,
+ 		nr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,
+ 							gfp_mask,
+ 							MEMCG_RECLAIM_MAY_SWAP,
+-							NULL);
++							NULL, NULL);
+ 		psi_memstall_leave(&amp;pflags);
+ 	} while ((memcg = parent_mem_cgroup(memcg)) &amp;&amp;
+ 		 !mem_cgroup_is_root(memcg));
+@@ -2710,7 +2710,8 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 
+ 	psi_memstall_enter(&amp;pflags);
+ 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+-						    gfp_mask, reclaim_options, NULL);
++						    gfp_mask, reclaim_options,
++						    NULL, NULL);
+ 	psi_memstall_leave(&amp;pflags);
+ 
+ 	if (mem_cgroup_margin(mem_over_limit) &gt;= nr_pages)
+@@ -4946,7 +4947,8 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 		}
+ 
+ 		reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,
+-					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL);
++					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,
++					NULL, NULL);
+ 
+ 		if (!reclaimed &amp;&amp; !nr_retries--)
+ 			break;
+@@ -5007,7 +5009,8 @@ static ssize_t memory_max_write(struct kernfs_open_file *of,
+ 
+ 		if (nr_reclaims) {
+ 			if (!try_to_free_mem_cgroup_pages(memcg, nr_pages - max,
+-					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL))
++					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,
++					NULL, NULL))
+ 				nr_reclaims--;
+ 			continue;
+ 		}
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 17d2b793cbfc4..ffe7ea3c5aff6 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -6859,7 +6859,8 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 					   unsigned long nr_pages,
+ 					   gfp_t gfp_mask,
+ 					   unsigned int reclaim_options,
+-					   int *swappiness)
++					   int *swappiness,
++					   const nodemask_t *allowed)
+ {
+ 	unsigned long nr_reclaimed;
+ 	unsigned int noreclaim_flag;
+@@ -6875,6 +6876,7 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 		.may_unmap = 1,
+ 		.may_swap = !!(reclaim_options &amp; MEMCG_RECLAIM_MAY_SWAP),
+ 		.proactive = !!(reclaim_options &amp; MEMCG_RECLAIM_PROACTIVE),
++		.nodemask = allowed,
+ 	};
+ 	/*
+ 	 * Traverse the ZONELIST_FALLBACK zonelist of the current node to put
+@@ -6900,7 +6902,8 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+ 					   unsigned long nr_pages,
+ 					   gfp_t gfp_mask,
+ 					   unsigned int reclaim_options,
+-					   int *swappiness)
++					   int *swappiness,
++					   const nodemask_t *allowed)
+ {
+ 	return 0;
+ }
+@@ -8033,7 +8036,8 @@ int user_proactive_reclaim(char *buf,
+ 			reclaimed = try_to_free_mem_cgroup_pages(memcg,
+ 						 batch_size, gfp_mask,
+ 						 reclaim_options,
+-						 swappiness == -1 ? NULL : &amp;swappiness);
++						 swappiness == -1 ? NULL : &amp;swappiness,
++						 NULL);
+ 		} else {
+ 			struct scan_control sc = {
+ 				.gfp_mask = current_gfp_context(gfp_mask),
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-7-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: added new nodemask parameter, new function signature for future patches</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about updating tiered limits when users write to memory limit sysfs files or during memory hotplug events by adding code to compute proportional per-tier limits and update them accordingly, but only if the system has tiered memcg limits enabled.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Compute proportional per-tier limits based on memory limits when
+users write to memory limit sysfs files, or when memory hotplug causes
+tier proportions to be shifted.
+
+No-op unless the system has tiered memcg limits enabled.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h   | 10 +++++++
+ include/linux/memory-tiers.h |  6 ++++
+ mm/memcontrol.c              | 54 ++++++++++++++++++++++++++++++++++++
+ mm/memory-tiers.c            | 13 +++++++++
+ 4 files changed, 83 insertions(+)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index bb5bde87ac85a..f7a92b66330ec 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -537,11 +537,17 @@ static inline bool mem_cgroup_tiered_limits(void)
+ {
+ 	return static_branch_unlikely(&amp;memcg_tiered_limits_key);
+ }
++
++void establish_memcg_tier_limits(void);
+ #else
+ static inline bool mem_cgroup_tiered_limits(void)
+ {
+ 	return false;
+ }
++
++static inline void establish_memcg_tier_limits(void)
++{
++}
+ #endif
+ 
+ static inline void mem_cgroup_protection(struct mem_cgroup *root,
+@@ -1102,6 +1108,10 @@ static inline bool mem_cgroup_tiered_limits(void)
+ 	return false;
+ }
+ 
++static inline void establish_memcg_tier_limits(void)
++{
++}
++
+ static inline void memcg_memory_event(struct mem_cgroup *memcg,
+ 				      enum memcg_memory_event event)
+ {
+diff --git a/include/linux/memory-tiers.h b/include/linux/memory-tiers.h
+index 0e49645cdd1a9..04b396f60b457 100644
+--- a/include/linux/memory-tiers.h
++++ b/include/linux/memory-tiers.h
+@@ -55,6 +55,7 @@ struct memory_dev_type *mt_find_alloc_memory_type(int adist,
+ 						  struct list_head *memory_types);
+ void mt_put_memory_types(struct list_head *memory_types);
+ const nodemask_t *mt_tier_nodes(int slot);
++unsigned long mt_scale_by_tier(unsigned long val, int slot);
+ #ifdef CONFIG_NUMA_MIGRATION
+ int next_demotion_node(int node, const nodemask_t *allowed_mask);
+ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
+@@ -169,5 +170,10 @@ static inline const nodemask_t *mt_tier_nodes(int slot)
+ {
+ 	return NULL;
+ }
++
++static inline unsigned long mt_scale_by_tier(unsigned long val, int slot)
++{
++	return val;
++}
+ #endif	/* CONFIG_NUMA */
+ #endif  /* _LINUX_MEMORY_TIERS_H */
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index d096010366515..defd04acfb3fd 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4421,6 +4421,35 @@ static void mem_cgroup_css_free(struct cgroup_subsys_state *css)
+ 	mem_cgroup_free(memcg);
+ }
+ 
++static inline unsigned long page_counter_max_or_scale(unsigned long val,
++						      int slot)
++{
++	return val == PAGE_COUNTER_MAX ? PAGE_COUNTER_MAX :
++					 mt_scale_by_tier(val, slot);
++}
++
++static void memcg_scale_tier_limits(struct mem_cgroup *memcg)
++{
++	unsigned long min = READ_ONCE(memcg-&gt;memory.min);
++	unsigned long low = READ_ONCE(memcg-&gt;memory.low);
++	unsigned long high = READ_ONCE(memcg-&gt;memory.high);
++	unsigned long max = READ_ONCE(memcg-&gt;memory.max);
++	int nr_tier_slots = mt_nr_tier_slots();
++
++	for (int slot = 0; slot &lt; nr_tier_slots; slot++) {
++		unsigned long new_min = page_counter_max_or_scale(min, slot);
++		unsigned long new_low = page_counter_max_or_scale(low, slot);
++		unsigned long new_high = page_counter_max_or_scale(high, slot);
++		unsigned long new_max = page_counter_max_or_scale(max, slot);
++		struct page_counter *tier = &amp;memcg-&gt;tier[slot];
++
++		page_counter_set_min(tier, new_min);
++		page_counter_set_low(tier, new_low);
++		page_counter_set_high(tier, new_high);
++		xchg(&amp;tier-&gt;max, new_max);
++	}
++}
++
+ /**
+  * mem_cgroup_css_reset - reset the states of a mem_cgroup
+  * @css: the target css
+@@ -4454,6 +4483,8 @@ static void mem_cgroup_css_reset(struct cgroup_subsys_state *css)
+ 	page_counter_set_high(&amp;memcg-&gt;memory, PAGE_COUNTER_MAX);
+ 	memcg1_soft_limit_reset(memcg);
+ 	page_counter_set_high(&amp;memcg-&gt;swap, PAGE_COUNTER_MAX);
++	if (mem_cgroup_tiered_limits())
++		memcg_scale_tier_limits(memcg);
+ 	memcg_wb_domain_size_changed(memcg);
+ }
+ 
+@@ -4797,6 +4828,21 @@ static ssize_t memory_peak_write(struct kernfs_open_file *of, char *buf,
+ 			  &amp;memcg-&gt;memory_peaks);
+ }
+ 
++#ifdef CONFIG_NUMA
++void establish_memcg_tier_limits(void)
++{
++	struct mem_cgroup *memcg;
++
++	if (!mem_cgroup_tiered_limits())
++		return;
++
++	for_each_mem_cgroup_tree(memcg, NULL) {
++		if (memcg != root_mem_cgroup)
++			memcg_scale_tier_limits(memcg);
++	}
++}
++#endif
++
+ #undef OFP_PEAK_UNSET
+ 
+ static int memory_min_show(struct seq_file *m, void *v)
+@@ -4818,6 +4864,8 @@ static ssize_t memory_min_write(struct kernfs_open_file *of,
+ 		return err;
+ 
+ 	page_counter_set_min(&amp;memcg-&gt;memory, min);
++	if (mem_cgroup_tiered_limits())
++		memcg_scale_tier_limits(memcg);
+ 
+ 	return nbytes;
+ }
+@@ -4841,6 +4889,8 @@ static ssize_t memory_low_write(struct kernfs_open_file *of,
+ 		return err;
+ 
+ 	page_counter_set_low(&amp;memcg-&gt;memory, low);
++	if (mem_cgroup_tiered_limits())
++		memcg_scale_tier_limits(memcg);
+ 
+ 	return nbytes;
+ }
+@@ -4866,6 +4916,8 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 		return err;
+ 
+ 	page_counter_set_high(&amp;memcg-&gt;memory, high);
++	if (mem_cgroup_tiered_limits())
++		memcg_scale_tier_limits(memcg);
+ 
+ 	if (of-&gt;file-&gt;f_flags &amp; O_NONBLOCK)
+ 		goto out;
+@@ -4925,6 +4977,8 @@ static ssize_t memory_max_write(struct kernfs_open_file *of,
+ 		return err;
+ 
+ 	xchg(&amp;memcg-&gt;memory.max, max);
++	if (mem_cgroup_tiered_limits())
++		memcg_scale_tier_limits(memcg);
+ 
+ 	if (of-&gt;file-&gt;f_flags &amp; O_NONBLOCK)
+ 		goto out;
+diff --git a/mm/memory-tiers.c b/mm/memory-tiers.c
+index bd5c78cd26ec4..e2c99f51c36d1 100644
+--- a/mm/memory-tiers.c
++++ b/mm/memory-tiers.c
+@@ -810,6 +810,7 @@ static int __init memory_tier_late_init(void)
+ 
+ 	establish_demotion_targets();
+ 	establish_tier_slots();
++	establish_memcg_tier_limits();
+ 	put_online_mems();
+ 
+ 	return 0;
+@@ -967,6 +968,16 @@ const nodemask_t *mt_tier_nodes(int slot)
+ 	return &amp;tier_nodemasks[slot];
+ }
+ 
++unsigned long mt_scale_by_tier(unsigned long val, int slot)
++{
++	unsigned long total_capacity = totalram_pages();
++
++	if (slot &lt; 0 || !total_capacity)
++		return 0;
++
++	return mult_frac(val, READ_ONCE(tier_capacity[slot]), total_capacity);
++}
++
+ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 					      unsigned long action, void *_arg)
+ {
+@@ -979,6 +990,7 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 		if (clear_node_memory_tier(nn-&gt;nid)) {
+ 			establish_demotion_targets();
+ 			establish_tier_slots();
++			establish_memcg_tier_limits();
+ 		}
+ 		mutex_unlock(&amp;memory_tier_lock);
+ 		break;
+@@ -988,6 +1000,7 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
+ 		if (!IS_ERR(memtier)) {
+ 			establish_demotion_targets();
+ 			establish_tier_slots();
++			establish_memcg_tier_limits();
+ 		}
+ 		mutex_unlock(&amp;memory_tier_lock);
+ 		break;
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-6-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed, agreed to restructure in v2</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about existing memory accounting not considering tiered memory usage by adding an nid parameter to try_charge_memcg() and tracking tier charges alongside the existing memory charge. The author explained that enforcement of per-tier limits will come in future patches.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Memory cgroup limits isolate memory as a resource, but treat all
+memory as equally valuable regardless of which memory tier it
+resides in.
+
+Account tiered memory usage in parallel with existing memory
+accounting. Add an nid parameter to try_charge_memcg(); callers
+resolve it to a tier slot with nid_tier_slot() and charge
+memcg-&gt;tier[slot] alongside memcg-&gt;memory.
+
+Uncharging reuses uncharge_gather to batch. Because the high-volume
+free path reclaims per-node, a batch is normally single-tier; if a
+folio in a different tier appears mid-batch, flush the accumulated
+uncharge and start accumulating for the new tier. Folios on
+different nodes within the same tier do not force a flush.
+
+Also, mem_cgroup_migrate() and mem_cgroup_replace_folio() now move the
+tier charge when the folio changes tier.
+
+Currently this only tracks LRU folios (try_charge_memcg() callers
+from charge_memcg()). The other two sites, obj_cgroup_charge_pages()
+and mem_cgroup_sk_charge(), will be handled by a future series that
+transitions enum memcg_stat_item to a per-lruvec counter
+(enum node_stat_item).
+
+The per-tier limits computed in the previous patch are not consulted
+yet, this patch only acounts the memory. Enforcement will come in the
+following patches.
+
+No-op unless the system has tiered memcg limits enabled.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/memcontrol.c | 116 ++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 108 insertions(+), 8 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 6c67d9d2c9ac7..f3714dfd85aa0 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1561,6 +1561,15 @@ void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
+ 		*lru_size += nr_pages;
+ }
+ 
++static struct page_counter *mem_cgroup_tier_counter(struct mem_cgroup *memcg,
++						    int slot)
++{
++	if (slot &lt; 0)
++		return NULL;
++
++	return &amp;memcg-&gt;tier[slot];
++}
++
+ /**
+  * mem_cgroup_margin - calculate chargeable space of a memory cgroup
+  * @memcg: the memory cgroup
+@@ -2645,13 +2654,32 @@ void __mem_cgroup_handle_over_high(gfp_t gfp_mask)
+ 	css_put(&amp;memcg-&gt;css);
+ }
+ 
++static void mem_cgroup_uncharge_tier(struct mem_cgroup *memcg,
++				     int slot, unsigned int nr_pages)
++{
++	struct page_counter *tier_counter = mem_cgroup_tier_counter(memcg, slot);
++
++	if (tier_counter)
++		page_counter_uncharge(tier_counter, nr_pages);
++}
++
++static void mem_cgroup_charge_tier(struct mem_cgroup *memcg,
++				   int slot, unsigned int nr_pages)
++{
++	struct page_counter *tier_counter = mem_cgroup_tier_counter(memcg, slot);
++
++	if (tier_counter)
++		page_counter_charge(tier_counter, nr_pages);
++}
++
+ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+-			    unsigned int nr_pages)
++			    unsigned int nr_pages, int nid)
+ {
+ 	unsigned int batch = max(MEMCG_CHARGE_BATCH, nr_pages);
+ 	int nr_retries = MAX_RECLAIM_RETRIES;
+ 	struct mem_cgroup *mem_over_limit;
+ 	struct page_counter *counter;
++	struct page_counter *tier_counter = NULL;
+ 	unsigned long nr_reclaimed;
+ 	bool passed_oom = false;
+ 	unsigned int reclaim_options;
+@@ -2659,10 +2687,19 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	bool raised_max_event = false;
+ 	unsigned long pflags;
+ 	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
++	int slot = -1;
++
++	if (mem_cgroup_tiered_limits()) {
++		slot = nid_tier_slot(nid);
++		tier_counter = mem_cgroup_tier_counter(memcg, slot);
++	}
+ 
+ retry:
+-	if (consume_stock(memcg, nr_pages))
++	if (consume_stock(memcg, nr_pages)) {
++		if (tier_counter)
++			page_counter_charge(tier_counter, nr_pages);
+ 		return 0;
++	}
+ 
+ 	if (!allow_spinning)
+ 		/* Avoid the refill and flush of the older stock */
+@@ -2677,8 +2714,11 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 		goto reclaim;
+ 	}
+ 
+-	if (page_counter_try_charge(&amp;memcg-&gt;memory, batch, &amp;counter))
++	if (page_counter_try_charge(&amp;memcg-&gt;memory, batch, &amp;counter)) {
++		if (tier_counter)
++			page_counter_charge(tier_counter, nr_pages);
+ 		goto done_restock;
++	}
+ 
+ 	if (do_memsw_account())
+ 		page_counter_uncharge(&amp;memcg-&gt;memsw, batch);
+@@ -2781,6 +2821,8 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	 * temporarily by force charging it.
+ 	 */
+ 	page_counter_charge(&amp;memcg-&gt;memory, nr_pages);
++	if (tier_counter)
++		page_counter_charge(tier_counter, nr_pages);
+ 	if (do_memsw_account())
+ 		page_counter_charge(&amp;memcg-&gt;memsw, nr_pages);
+ 
+@@ -2852,7 +2894,7 @@ static inline int try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (mem_cgroup_is_root(memcg))
+ 		return 0;
+ 
+-	return try_charge_memcg(memcg, gfp_mask, nr_pages);
++	return try_charge_memcg(memcg, gfp_mask, nr_pages, NUMA_NO_NODE);
+ }
+ 
+ static void commit_charge(struct folio *folio, struct obj_cgroup *objcg)
+@@ -3152,7 +3194,7 @@ static int obj_cgroup_charge_pages(struct obj_cgroup *objcg, gfp_t gfp,
+ 
+ 	memcg = get_mem_cgroup_from_objcg(objcg);
+ 
+-	ret = try_charge_memcg(memcg, gfp, nr_pages);
++	ret = try_charge_memcg(memcg, gfp, nr_pages, NUMA_NO_NODE);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -5280,7 +5322,8 @@ static int charge_memcg(struct folio *folio, struct mem_cgroup *memcg,
+ 	objcg = get_obj_cgroup_from_memcg(memcg);
+ 	/* Do not account at the root objcg level. */
+ 	if (!obj_cgroup_is_root(objcg))
+-		ret = try_charge_memcg(memcg, gfp, folio_nr_pages(folio));
++		ret = try_charge_memcg(memcg, gfp, folio_nr_pages(folio),
++				       folio_nid(folio));
+ 	if (ret) {
+ 		obj_cgroup_put(objcg);
+ 		return ret;
+@@ -5376,6 +5419,8 @@ struct uncharge_gather {
+ 	unsigned long pgpgout;
+ 	unsigned long nr_kmem;
+ 	int nid;
++	int tier_slot;
++	unsigned long tier_nr;
+ };
+ 
+ static inline void uncharge_gather_clear(struct uncharge_gather *ug)
+@@ -5383,6 +5428,34 @@ static inline void uncharge_gather_clear(struct uncharge_gather *ug)
+ 	memset(ug, 0, sizeof(*ug));
+ }
+ 
++static void flush_tier_charge(struct mem_cgroup *memcg,
++			      const struct uncharge_gather *ug)
++{
++	struct page_counter *tier_counter;
++
++	tier_counter = &amp;memcg-&gt;tier[ug-&gt;tier_slot];
++	page_counter_uncharge(tier_counter, ug-&gt;tier_nr);
++}
++
++static void gather_tier_charge(struct uncharge_gather *ug, struct folio *folio,
++			       unsigned long nr_pages)
++{
++	int slot = nid_tier_slot(folio_nid(folio));
++
++	if (slot &lt; 0)
++		return;
++
++	if (ug-&gt;tier_nr &amp;&amp; slot != ug-&gt;tier_slot) {
++		rcu_read_lock();
++		flush_tier_charge(obj_cgroup_memcg(ug-&gt;objcg), ug);
++		rcu_read_unlock();
++		ug-&gt;tier_nr = 0;
++	}
++
++	ug-&gt;tier_slot = slot;
++	ug-&gt;tier_nr += nr_pages;
++}
++
+ static void uncharge_batch(const struct uncharge_gather *ug)
+ {
+ 	struct mem_cgroup *memcg;
+@@ -5395,6 +5468,8 @@ static void uncharge_batch(const struct uncharge_gather *ug)
+ 			mod_memcg_state(memcg, MEMCG_KMEM, -ug-&gt;nr_kmem);
+ 			memcg1_account_kmem(memcg, -ug-&gt;nr_kmem);
+ 		}
++		if (ug-&gt;tier_nr)
++			flush_tier_charge(memcg, ug);
+ 		memcg1_oom_recover(memcg);
+ 	}
+ 
+@@ -5440,8 +5515,11 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
+ 		ug-&gt;nr_kmem += nr_pages;
+ 	} else {
+ 		/* LRU pages aren&#x27;t accounted at the root level */
+-		if (!obj_cgroup_is_root(objcg))
++		if (!obj_cgroup_is_root(objcg)) {
+ 			ug-&gt;nr_memory += nr_pages;
++			if (mem_cgroup_tiered_limits())
++				gather_tier_charge(ug, folio, nr_pages);
++		}
+ 		ug-&gt;pgpgout++;
+ 
+ 		WARN_ON_ONCE(folio_unqueue_deferred_split(folio));
+@@ -5514,6 +5592,11 @@ void mem_cgroup_replace_folio(struct folio *old, struct folio *new)
+ 	/* Force-charge the new page. The old one will be freed soon */
+ 	if (!obj_cgroup_is_root(objcg)) {
+ 		page_counter_charge(&amp;memcg-&gt;memory, nr_pages);
++		if (mem_cgroup_tiered_limits()) {
++			int slot = nid_tier_slot(folio_nid(new));
++
++			mem_cgroup_charge_tier(memcg, slot, nr_pages);
++		}
+ 		if (do_memsw_account())
+ 			page_counter_charge(&amp;memcg-&gt;memsw, nr_pages);
+ 	}
+@@ -5558,6 +5641,23 @@ void mem_cgroup_migrate(struct folio *old, struct folio *new)
+ 	if (!objcg)
+ 		return;
+ 
++	if (!obj_cgroup_is_root(objcg) &amp;&amp; mem_cgroup_tiered_limits()) {
++		struct mem_cgroup *memcg;
++		unsigned long nr_pages = folio_nr_pages(old);
++		int old_slot, new_slot;
++
++		rcu_read_lock();
++		memcg = obj_cgroup_memcg(objcg);
++		old_slot = nid_tier_slot(folio_nid(old));
++		new_slot = nid_tier_slot(folio_nid(new));
++
++		if (old_slot != new_slot) {
++			mem_cgroup_uncharge_tier(memcg, old_slot, nr_pages);
++			mem_cgroup_charge_tier(memcg, new_slot, nr_pages);
++		}
++		rcu_read_unlock();
++	}
++
+ 	/* Transfer the charge and the objcg ref */
+ 	commit_charge(new, objcg);
+ 
+@@ -5633,7 +5733,7 @@ bool mem_cgroup_sk_charge(const struct sock *sk, unsigned int nr_pages,
+ 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
+ 		return memcg1_charge_skmem(memcg, nr_pages, gfp_mask);
+ 
+-	if (try_charge_memcg(memcg, gfp_mask, nr_pages) == 0) {
++	if (try_charge_memcg(memcg, gfp_mask, nr_pages, NUMA_NO_NODE) == 0) {
+ 		mod_memcg_state(memcg, MEMCG_SOCK, nr_pages);
+ 		return true;
+ 	}
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-8-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: no clear resolution signal, clarification or explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the current memory cgroup controller limits do not account for tiered memory distribution and explained that extending existing protection mechanisms to be tier-aware will allow for proportional best-effort and guaranteed memory protection of higher-tier memory.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On machines serving multiple workloads whose memory is isolated via
+the memory cgroup controller, it is currently impossible to enforce a
+fair distribution of tiered memory among the workloads, as the only
+enforceable limits have to do with total memory footprint, but not where
+that memory resides.
+
+This makes ensuring a consistent and baseline performance difficult, as
+each workload&#x27;s performance is heavily impacted by workload-external
+factors such as which other workloads are co-located in the same host,
+and the order at which different workloads are started.
+
+Extend the existing memory.{low, min} protection to be tier-aware in
+order to enforce proportional best-effort and guaranteed memory
+protection of higher-tier memory.
+
+No-op unless the system has tiered memcg limits enabled.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ include/linux/memcontrol.h | 25 +++++++++++++++++++++----
+ mm/memcontrol.c            | 11 ++++++++++-
+ mm/vmscan.c                | 15 +++++++++------
+ 3 files changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index f7a92b66330ec..ceba0fd6de184 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -18,6 +18,7 @@
+ #include &lt;linux/page_counter.h&gt;
+ #include &lt;linux/vmpressure.h&gt;
+ #include &lt;linux/eventfd.h&gt;
++#include &lt;linux/memory-tiers.h&gt;
+ #include &lt;linux/mm.h&gt;
+ #include &lt;linux/vmstat.h&gt;
+ #include &lt;linux/writeback.h&gt;
+@@ -618,21 +619,37 @@ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
+ }
+ 
+ static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
+-					struct mem_cgroup *memcg)
++					struct mem_cgroup *memcg, int nid)
+ {
+ 	if (mem_cgroup_unprotected(target, memcg))
+ 		return false;
+ 
++	if (mem_cgroup_tiered_limits()) {
++		int slot = nid_tier_slot(nid);
++
++		if (slot &gt;= 0)
++			return READ_ONCE(memcg-&gt;tier[slot].elow) &gt;=
++				page_counter_read(&amp;memcg-&gt;tier[slot]);
++	}
++
+ 	return READ_ONCE(memcg-&gt;memory.elow) &gt;=
+ 		page_counter_read(&amp;memcg-&gt;memory);
+ }
+ 
+ static inline bool mem_cgroup_below_min(struct mem_cgroup *target,
+-					struct mem_cgroup *memcg)
++					struct mem_cgroup *memcg, int nid)
+ {
+ 	if (mem_cgroup_unprotected(target, memcg))
+ 		return false;
+ 
++	if (mem_cgroup_tiered_limits()) {
++		int slot = nid_tier_slot(nid);
++
++		if (slot &gt;= 0)
++			return READ_ONCE(memcg-&gt;tier[slot].emin) &gt;=
++				page_counter_read(&amp;memcg-&gt;tier[slot]);
++	}
++
+ 	return READ_ONCE(memcg-&gt;memory.emin) &gt;=
+ 		page_counter_read(&amp;memcg-&gt;memory);
+ }
+@@ -1142,13 +1159,13 @@ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
+ 	return true;
+ }
+ static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
+-					struct mem_cgroup *memcg)
++					struct mem_cgroup *memcg, int nid)
+ {
+ 	return false;
+ }
+ 
+ static inline bool mem_cgroup_below_min(struct mem_cgroup *target,
+-					struct mem_cgroup *memcg)
++					struct mem_cgroup *memcg, int nid)
+ {
+ 	return false;
+ }
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index f3714dfd85aa0..025496794cb91 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5310,7 +5310,16 @@ void mem_cgroup_calculate_protection(struct mem_cgroup *root,
+ 	if (!root)
+ 		root = root_mem_cgroup;
+ 
+-	page_counter_calculate_protection(&amp;root-&gt;memory, &amp;memcg-&gt;memory, recursive_protection);
++	page_counter_calculate_protection(&amp;root-&gt;memory, &amp;memcg-&gt;memory,
++					  recursive_protection);
++
++	if (mem_cgroup_tiered_limits()) {
++		int nr_tier_slots = mt_nr_tier_slots();
++
++		for (int slot = 0; slot &lt; nr_tier_slots; slot++)
++			page_counter_calculate_protection(&amp;root-&gt;tier[slot],
++				&amp;memcg-&gt;tier[slot], recursive_protection);
++	}
+ }
+ 
+ static int charge_memcg(struct folio *folio, struct mem_cgroup *memcg,
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index ffe7ea3c5aff6..29f3f12042650 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -4190,7 +4190,7 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	DEFINE_MIN_SEQ(lruvec);
+ 
+-	if (mem_cgroup_below_min(NULL, memcg))
++	if (mem_cgroup_below_min(NULL, memcg, lruvec_pgdat(lruvec)-&gt;node_id))
+ 		return false;
+ 
+ 	if (!lruvec_is_sizable(lruvec, sc))
+@@ -5057,6 +5057,7 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	bool need_rotate = false, should_age = false;
+ 	long nr_batch, nr_to_scan;
+ 	int swappiness = get_swappiness(lruvec, sc);
++	int nid = lruvec_pgdat(lruvec)-&gt;node_id;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 
+ 	nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);
+@@ -5064,7 +5065,7 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 		int delta;
+ 		DEFINE_MAX_SEQ(lruvec);
+ 
+-		if (mem_cgroup_below_min(sc-&gt;target_mem_cgroup, memcg)) {
++		if (mem_cgroup_below_min(sc-&gt;target_mem_cgroup, memcg, nid)) {
+ 			need_rotate = true;
+ 			break;
+ 		}
+@@ -5104,12 +5105,13 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+ 	unsigned long reclaimed = sc-&gt;nr_reclaimed;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
++	int nid = pgdat-&gt;node_id;
+ 
+ 	/* lru_gen_age_node() called mem_cgroup_calculate_protection() */
+-	if (mem_cgroup_below_min(NULL, memcg))
++	if (mem_cgroup_below_min(NULL, memcg, nid))
+ 		return MEMCG_LRU_YOUNG;
+ 
+-	if (mem_cgroup_below_low(NULL, memcg)) {
++	if (mem_cgroup_below_low(NULL, memcg, nid)) {
+ 		/* see the comment on MEMCG_NR_GENS */
+ 		if (READ_ONCE(lruvec-&gt;lrugen.seg) != MEMCG_LRU_TAIL)
+ 			return MEMCG_LRU_TAIL;
+@@ -6168,6 +6170,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 	};
+ 	struct mem_cgroup_reclaim_cookie *partial = &amp;reclaim;
+ 	struct mem_cgroup *memcg;
++	int nid = pgdat-&gt;node_id;
+ 
+ 	/*
+ 	 * In most cases, direct reclaimers can do partial walks
+@@ -6197,13 +6200,13 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ 
+ 		mem_cgroup_calculate_protection(target_memcg, memcg);
+ 
+-		if (mem_cgroup_below_min(target_memcg, memcg)) {
++		if (mem_cgroup_below_min(target_memcg, memcg, nid)) {
+ 			/*
+ 			 * Hard protection.
+ 			 * If there is no reclaimable memory, OOM.
+ 			 */
+ 			continue;
+-		} else if (mem_cgroup_below_low(target_memcg, memcg)) {
++		} else if (mem_cgroup_below_low(target_memcg, memcg, nid)) {
+ 			/*
+ 			 * Soft protection.
+ 			 * Respect the protection only as long as
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-9-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a technical issue, provided explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-07">2026-08-07</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing a concern about the inability to enforce fair distribution of tiered memory among workloads, which makes ensuring consistent baseline performance difficult due to workload-external factors such as co-location and start order. The author proposes extending the existing memory.high protection to be tier-aware, allowing selective reclaim on tiers based on limit breaches. They also provide a new function memcg_tier_over_limit() to check if a cgroup is over its tier limits.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On machines serving multiple workloads whose memory is isolated via
+the memory cgroup controller, it is currently impossible to enforce a
+fair distribution of tiered memory among the workloads, as the only
+enforceable limits have to do with total memory footprint, but not where
+that memory resides.
+
+This makes ensuring consistent baseline performance difficult, as each
+workload&#x27;s performance is heavily impacted by workload-external factors
+such as which other workloads are co-located in the same host, and the
+order in which the workloads are started.
+
+Extend the existing memory.high protection to be tier-aware.
+
+Depending on the combination of limit breaches, selectively reclaim on
+tiers: when memory.high is breached, perform reclaim on all tiers.
+When memory.high is safe but individual tier limits are breached,
+perform targeted reclaim on those tiers only.
+
+No-op unless the system has tiered memcg limits enabled.
+
+Signed-off-by: Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt;
+---
+ mm/memcontrol.c | 66 ++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 025496794cb91..44ea465b2005d 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2387,6 +2387,28 @@ static int memcg_hotplug_cpu_dead(unsigned int cpu)
+ 	return 0;
+ }
+ 
++static bool memcg_tier_over_limit(struct mem_cgroup *memcg,
++				  unsigned long *overage, int *breached_slot)
++{
++	int nr_tier_slots = mt_nr_tier_slots();
++
++	for (int slot = 0; slot &lt; nr_tier_slots; slot++) {
++		unsigned long usage = page_counter_read(&amp;memcg-&gt;tier[slot]);
++		unsigned long limit = READ_ONCE(memcg-&gt;tier[slot].high);
++
++		if (usage &lt;= limit)
++			continue;
++
++		if (overage)
++			*overage = usage - limit;
++		if (breached_slot)
++			*breached_slot = slot;
++		return true;
++	}
++
++	return false;
++}
++
+ static unsigned long reclaim_high(struct mem_cgroup *memcg,
+ 				  unsigned int nr_pages,
+ 				  gfp_t gfp_mask)
+@@ -2395,10 +2417,19 @@ static unsigned long reclaim_high(struct mem_cgroup *memcg,
+ 
+ 	do {
+ 		unsigned long pflags;
++		const nodemask_t *reclaim_nodes = NULL;
+ 
+ 		if (page_counter_read(&amp;memcg-&gt;memory) &lt;=
+-		    READ_ONCE(memcg-&gt;memory.high))
+-			continue;
++		    READ_ONCE(memcg-&gt;memory.high)) {
++			int slot;
++
++			if (!mem_cgroup_tiered_limits())
++				continue;
++			if (!memcg_tier_over_limit(memcg, NULL, &amp;slot))
++				continue;
++
++			reclaim_nodes = mt_tier_nodes(slot);
++		}
+ 
+ 		memcg_memory_event(memcg, MEMCG_HIGH);
+ 
+@@ -2406,7 +2437,7 @@ static unsigned long reclaim_high(struct mem_cgroup *memcg,
+ 		nr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,
+ 							gfp_mask,
+ 							MEMCG_RECLAIM_MAY_SWAP,
+-							NULL, NULL);
++							NULL, reclaim_nodes);
+ 		psi_memstall_leave(&amp;pflags);
+ 	} while ((memcg = parent_mem_cgroup(memcg)) &amp;&amp;
+ 		 !mem_cgroup_is_root(memcg));
+@@ -2842,23 +2873,25 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	 * reclaim, the cost of mismatch is negligible.
+ 	 */
+ 	do {
+-		bool mem_high, swap_high;
++		bool mem_high, swap_high, tier_high;
+ 
+ 		mem_high = page_counter_read(&amp;memcg-&gt;memory) &gt;
+ 			READ_ONCE(memcg-&gt;memory.high);
+ 		swap_high = page_counter_read(&amp;memcg-&gt;swap) &gt;
+ 			READ_ONCE(memcg-&gt;swap.high);
++		tier_high = mem_cgroup_tiered_limits() &amp;&amp;
++			memcg_tier_over_limit(memcg, NULL, NULL);
+ 
+ 		/* Don&#x27;t bother a random interrupted task */
+ 		if (!in_task()) {
+-			if (mem_high) {
++			if (mem_high || tier_high) {
+ 				schedule_work(&amp;memcg-&gt;high_work);
+ 				break;
+ 			}
+ 			continue;
+ 		}
+ 
+-		if (mem_high || swap_high) {
++		if (mem_high || swap_high || tier_high) {
+ 			/*
+ 			 * The allocating tasks in this cgroup will need to do
+ 			 * reclaim or be throttled to prevent further growth
+@@ -4967,13 +5000,24 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 
+ 	for (;;) {
+ 		unsigned long nr_pages = page_counter_read(&amp;memcg-&gt;memory);
+-		unsigned long reclaimed;
++		unsigned long reclaimed, charge;
++		const nodemask_t *reclaim_nodes = NULL;
+ 
+ 		if (high != READ_ONCE(memcg-&gt;memory.high))
+ 			break;
+ 
+-		if (nr_pages &lt;= high)
+-			break;
++		if (nr_pages &lt;= high) {
++			int slot;
++
++			if (!mem_cgroup_tiered_limits())
++				break;
++			if (!memcg_tier_over_limit(memcg, &amp;charge, &amp;slot))
++				break;
++
++			reclaim_nodes = mt_tier_nodes(slot);
++		} else {
++			charge = nr_pages - high;
++		}
+ 
+ 		if (signal_pending(current))
+ 			break;
+@@ -4988,9 +5032,9 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 			continue;
+ 		}
+ 
+-		reclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,
++		reclaimed = try_to_free_mem_cgroup_pages(memcg, charge,
+ 					GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,
+-					NULL, NULL);
++					NULL, reclaim_nodes);
+ 
+ 		if (!reclaimed &amp;&amp; !nr_retries--)
+ 			break;
+-- 
+2.53.0-Meta</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260807202059.2620949-10-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-08-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-18">2026-08-18</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in a future version.
+
+Author acknowledges that Song Hu raised a valid concern about penalty_jiffies/throttling, but suggests that the issue is outside the scope of his patch series and proposes a standalone fix.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, 18 Aug 2026 09:21:15 +0800 Song Hu &lt;husong@kylinos.cn&gt; wrote:
+
+Hi Song, thank you for your reply.
+
+---
+
+I think this could be a real concern, but I&#x27;m not sure that my series
+is the right place to fold this change in. Namely because I don&#x27;t
+touch the penalty_jiffies / throttling part at all.
+
+Maybe a standalone fix could be worth it? : -) I have no plans at the
+moment so please feel free to take a crack at it if you think it&#x27;s
+a good idea!
+Joshua</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Song Hu</div>
+<a href="https://lore.kernel.org/r/20260819034650.708665-1-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, acknowledges concern, suggests separate fix</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-18">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Song Hu</span>
+<a class="date-chip" href="../2026-08-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-18">2026-08-18</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that the calculation of `penalty_jiffies` in `calculate_high_delay()` can overflow due to the multiplication of `max_overage * max_overage`, which can exceed the maximum value representable by a fixed-point number. This issue is caused by the fact that `max_overage` is calculated as `(usage - high) &lt;&lt; 20 / high`, leading to a potential overflow when `high` is tightened far below the current usage of a large working set.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">(pre-existing, not from this series - mentioning it here because
+it reworks memory.high behaviour)
+
+The penalty computation in calculate_high_delay() can overflow:
+
+	penalty_jiffies = max_overage * max_overage * HZ;
+
+max_overage is a fixed-point relative overage:
+calculate_overage() returns (usage - high) &lt;&lt; 20 / high, so the
+square times HZ wraps once (usage - high) / high reaches
+4096 / sqrt(HZ).  That is roughly 130x at HZ=1000 and 259x at
+HZ=250 - reachable when memory.high is tightened far below the
+current usage of a large working set.
+
+Most wrapped values are still caught by the 2s clamp in
+mem_cgroup_handle_over_high(), but residues below the clamp pass
+through, and some of them produce far less throttling than
+intended - down to no sleep at all.
+
+check_mul_overflow() with a clamp would saturate the penalty
+instead of wrapping it.  Could be folded in while memory.high is
+being reworked, or a standalone fix.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
+<a href="https://lore.kernel.org/r/20260818012115.65838-1-husong@kylinos.cn" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: overflow, potential issue</div>
+</div>
+</div>
 </div>
 </div>
 </div>

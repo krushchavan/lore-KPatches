@@ -1,0 +1,32 @@
+{
+  "thread_id": "20260818131202.494754-6-usama.arif@linux.dev",
+  "subject": "[PATCH v6 05/12] mm: zswap: add range lookup for large-folio swapin",
+  "url": "https://lore.kernel.org/all/20260818131202.494754-6-usama.arif@linux.dev/",
+  "dates": {
+    "2026-08-18": {
+      "report_file": "2026-08-18_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer Yosry Ahmed noted that the cluster lock is not relevant for checking if a large folio is in zswap and suggested moving the check to __swap_cache_alloc() after allocating the folio, where it can be combined with an existing failure path.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Sorry I didn't catch it in the discussion in v5, but I think it's\nactually clearer to do have this check in __swap_cache_alloc() as you\ninitially suggested, but not necessarily under the lock.\n\nI don't think the cluster lock is relevant per se, but rather the actual\nswap cache allocation. Once you allocate the folio in the swapcache,\nyou cannot race with zswap store or writeback. I think the comment here\nis a bit misleading in that regard. Especially that it mentions\nwriteback, but I think the real risk is racing with zswap store?\n\nThe check here is performed twice, once before allocating the folio and\nonce after. I think the one before allocating the folio is not really\nuseful, as we don't actually allocate the swapcache entry so nothing\nactually prevents a zswap store/writeback from happening right after\nreleasing the lock.\n\nWe already have a failure path in __swap_cache_alloc() after allocating\nthe folio and dropping the lock. Can we use the same path to check if\nzswap is present?\n\nMaybe something along these lines (completely untested):\n\ndiff --git a/mm/swap_state.c b/mm/swap_state.c\nindex 8ccd03c39a407..ce00a2311c5fd 100644\n--- a/mm/swap_state.c\n+++ b/mm/swap_state.c\n@@ -415,6 +415,7 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n        swp_entry_t entry;\n        struct folio *folio;\n        void *shadow = NULL;\n+       bool large_in_zswap;\n        unsigned short memcg_id;\n        unsigned long address, nr_pages = 1UL << order;\n        struct vm_area_struct *vma = vmf ? vmf->vma : NULL;\n@@ -459,7 +460,16 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,\n        __swap_cache_do_add_folio(ci, folio, entry);\n        spin_unlock(&ci->lock);\n\n-       if (mem_cgroup_swapin_charge_folio(folio, memcg_id,\n+       /*\n+        * Check if any part of the folio is in zswap after stabilizing the swap\n+        * cache entry to avoid races with zswap store/writeback. Reject\n+        * high-order entries that are partially or fully in zswap, as it is not\n+        * supported.\n+        */\n+       large_in_zswap = order && zswap_is_present(entry, nr_pages);\n+\n+       if (large_in_zswap ||\n+           mem_cgroup_swapin_charge_folio(folio, memcg_id,\n                                           vmf ? vmf->vma->vm_mm : NULL, gfp)) {\n                spin_lock(&ci->lock);\n                __swap_cache_do_del_folio(ci, folio, entry, shadow);",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-08-18",
+          "message_id": "aoSd8iovG5QKc6mT@google.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds range lookup support to the zswap compression algorithm, allowing it to handle large folio swapins by scanning the covered range and returning an error if any slot is still in zswap. It also introduces a new function `zswap_is_present` to check if a PMD swap-entry is present in zswap before attempting PMD-order swapin. The patch addresses issues with partial initialization of data when reconstructing large folios from compressed entries, and clarifies the error handling for conflicts between zswap and disk-backed swap."
+    }
+  }
+}
