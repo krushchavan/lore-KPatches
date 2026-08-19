@@ -461,6 +461,156 @@
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
+    },
+    {
+      "name": "Joanne Koong",
+      "primary_email": "joannelkoong@gmail.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "memcg stats flushing (WAS \"Re: [PATCH] fuse: disable default bdi strictlimiting\")",
+          "message_id": "CAJnrk1bk66ZhRAS7mojSnD5RBfFS+0ChAPymE3ObRWr0C_udWg@mail.gmail.com",
+          "url": "https://lore.kernel.org/all/CAJnrk1bk66ZhRAS7mojSnD5RBfFS+0ChAPymE3ObRWr0C_udWg@mail.gmail.com/",
+          "date": "2026-08-06T21:04:21Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-08-06",
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "CAJnrk1bk66ZhRAS7mojSnD5RBfFS+0ChAPymE3ObRWr0C_udWg@mail.gmail.com",
+              "url": "https://lore.kernel.org/all/CAJnrk1bk66ZhRAS7mojSnD5RBfFS+0ChAPymE3ObRWr0C_udWg@mail.gmail.com/",
+              "subject": "memcg stats flushing (WAS \"Re: [PATCH] fuse: disable default bdi strictlimiting\")",
+              "date": "2026-08-06T21:04:21Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch addresses the issue of stale memory cgroup (memcg) stats causing premature OOM kills by proposing a solution to reduce the overhead of updating and flushing these statistics. The idea is for memcg to accumulate updates on a per-CPU basis, then propagate them up to a global atomic counter when it reaches a certain threshold, eliminating the need for frequent flushing. This approach aims to scale better for large machines with many cores and focuses on reducing the number of stats that require flushing, specifically NR_FILE_DIRTY and NR_WRITEBACK in the writeback case.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author acknowledges that the flush operation would need to touch multiple cachelines per CPU on a large machine, but does not provide a clear resolution or plan for addressing this issue.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledges a potential scalability issue"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Sorry, I think I messed up how things got linked when trying to update\nthe thread title in gmail. This is a continuation of the previous\ndiscussion thread (\"PATCH] fuse: disable default bdi strictlimiting\")\nwhich is at https://lore.kernel.org/linux-fsdevel/s4kv7qep3jlncs67q72xfhserpd66hpbwzkoppiddc5raufyjd@ksuvlfqcrbk2/T/#t.\n\nThanks,\nJoanne",
+              "reply_to": "",
+              "message_date": "2026-08-06",
+              "message_id": "CAJnrk1YNZ-mW7VDXtbNYDUbim7g20gSsec1Gxpy8kWKrDEN5_Q@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Yosry Ahmed",
+              "summary": "Reviewer Yosry Ahmed noted that the patch may not address premature OOM kills due to stale stats in the vmscan path, citing a test where VMs experienced OOM kills after the ratelimited flush, and suggested further investigation is needed.\n\nReviewer Yosry Ahmed questioned the trade-off between update and read performance in memcg stats, suggesting that increasing the cost of updates could improve the manageability of the read path, which is becoming slow in some cases.\n\nThe reviewer pointed out that memcg stats perform similar per-CPU counting and thresholding as vmstat, but with a cgroup hierarchy, which requires reading hierarchical stats including children. They suggested replacing the current flushing logic with updating the stat on each parent or forgoing the rstat flushing logic altogether.\n\nReviewer suggested side-stepping the flushing issue by either keeping track of CPUs with updates via rstat or propagating per-CPU stat updates when reaching a threshold, similar to how vmstat handles batching",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes",
+                "further investigation"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I don't think we had time to look into this closely. We have a test\nthat runs VMs with some memory pressure / reclaim, and we observed OOM\nkills in that test after the ratelimited flush in the vmscan path.\nWhether or not this translates to additional OOM kills in our prod is\ncurrently unknown, but it's a signal that reclaim effectiveness may be\nnegatively affected in some cases.\n\n---\n\nYeah I think we generally want to keep updates faster than reads,\nbecause some of them are also in latency-sensitive paths like\nnetworking. However, since reads are becoming too slow in some cases,\nthe question here is whether we can afford some extra cost on the\nupdate side (to iterate parent per-CPU counters) to make the read path\nmore manageable.\n\n---\n\nThe memcg stats perform similar per-CPU counting and thresholding. The\nmain difference from vmstat AFAICT is the cgroup hierarchy. In vmstat\nwe have per-CPU counters and a global atomic counter for each stat.\nFor memcg, we have the same for each cgroup, then we also have a\ncgroup tree. When we read the stats of a cgroup, we usually want the\nhierarchical stats including all of its children, so we can't just\nread the global counter.\n\nWe use rstat, a cgroup framework that keeps track of which cgroups\nhave updates on which CPUs, and then memcg has thresholding logic on\ntop to only flush if the number of pending updates exceeds a\nthreshold. Essentially, if the magnitude updates on a CPU exceeds\nMEMCG_CHARGE_BATCH, we add it to a global per-memcg counter. We only\nflush if that global per-memcg counter has > NR_CPUS *\nMEMCG_CHARGE_BATCH updates. So in theory I think we tolerate up to 2 *\nNR_CPUS * MEMCG_CHARGE_BATCH of stale stats (combined for all the\nstats).\n\nSee memcg_rstat_updated() and memcg_vmstats_needs_flush() for this logic.\n\nLooking at this code again, it made me realize that we already iterate\nthe per-CPU stats_updates on every update to increment the number of\npending stats on this CPU. I wonder if we can replace this with\nactually updating the stat on each parent, then the flush path only\nneeds to accumulate CPU counters. Or maybe as you mention, we update\nthe global per-memcg counter when updates on a CPU exceed a threshold,\nand forgo the rstat flushing logic completely.\n\n---\n\nProbably not (hence I called it radical), but I think this can be\nside-stepped by either keeping the tracking of CPUs that have updates\nvia rstat (or similar), or just propagating the per-CPU stat updates\nwhen they reach a threshold like vmstat.",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-08-06",
+              "message_id": "CAO9r8zPpe6fWOSXtRUjFB8WNMroeBqvLT+2QtAU4E27AtLUXMQ@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "yosry@kernel.org"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "The author is addressing concerns about the performance impact of flushing memcg stats and exploring an alternative approach to batching updates. She proposes running experiments to test updating global per-memcg counters in batches, but notes that this may incur a nontrivial performance hit due to unconditional walking of ancestors on every update.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledges need for further investigation",
+                "expresses uncertainty about performance impact"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I can run some experiments and see if updating the global per-memcg\ncounter per batch and forgoing flushing could be a viable solution. I\ncan use my setup to test it for writeback, but for the zswap use case,\nwhat's the best way to test if the changes are too expensive? Is there\na benchmark program you're running?\n\nFor updating the stat on each parent and having the flush path only\naccumulate CPU counters, I think this means we would have to\nunconditionally walk the ancestors + update its counters on every\nupdate, as we wouldn't be able to early break if the flushable\nthreshold was already exceeded. I don't think we could replace the\nstats_update update, as it seems like readers still need some way of\nknowing when to flush. It seems like this could be a nontrivial\nperformance hit, but maybe it's a non-factor in reality. If you think\nthis would be useful to get benchmark numbers on, I can run some\nexperiments on this too.\n\nThanks,\nJoanne",
+              "reply_to": "Yosry Ahmed",
+              "message_date": "2026-08-10",
+              "message_id": "CAJnrk1YifN22mA5PFRVrh3m_ygxax6x4_8nraG2hPqCzyzBj7A@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Yosry Ahmed",
+              "summary": "Reviewer suggested that memcg could use a batching approach similar to vmstat, where the per-CPU counter is accumulated and propagated up to a global atomic counter only when it reaches a threshold, potentially eliminating the need for flushing.\n\nReviewer Yosry Ahmed suggested experimenting with shifting workload between update and reader sides for memcg stats flushing, proposing two options: (a) updating per-CPU counters directly on stats updates or (b) using a global atomic counter that's updated when the per-CPU threshold is exceeded. He also proposed running benchmarks to test worst-case scenarios.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes",
+                "suggested alternative solution",
+                "NEEDS_EXPERIMENTATION",
+                "PROPOSED_SOLUTION"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I was running stress-ng and measuring the latency of zswap_load() and\nzswap_store() with bpftrace. But I suspect whatever works for writeback\nshould work for zswap :)\n\n---\n\nI think we need to experiment with how much work we can shift around\nbetween the update and reader sides.\n\nRight now, on the update side, we call __css_rstat_updated(), which\niterates the parents and puts them on the per-CPU rstat tree, then we\niterate the parents again in memcg_rstat_updated() and:\n- Check if flushing threshold is already met.\n- Update per-CPU counter for stats_updates.\n- If per-CPU update exceeds (another) threshold, we update an atomic for\n  stats_updates.\n\nThe flush side checks the flushing threshold and does an rstat flush,\nwhich will walk the update trees on all CPUs and iterates all child\ncgroups on it. Pretty expensive when the threshold is met.\n\nI think we discussed two different options:\n\n(a) On stats updates, iterate the parents and update the per-CPU\ncounters of the stat directly.\n\nIn this case, we can't keep using rstat, as we would still need to add\nthe cgroup and all its ancestors to the update tree anyway and the flush\ncost will remain similar. So on the flush path we'll need to iterate all\nCPUs and add the counters. We can explore if use a cpumask can help\nhere, but perhaps not since we'll need to update it atomically on all\nstat updates.\n\nI imagine that if we do this we'll drop the stats_updates optimization\nto avoid adding more cost to the update side. We'll be replacing parent\nstats_updates modification with parent stat counter modification. But\nmaybe it's feasible to keep both to limit the cost of flusing.\n\nThis only works if the cost of iterate the CPUs on the flush side ends\nup being cheaper than the current flush. I imagine the average cost will\nbe higher but the cost should be much more consistent vs the current\nflush, so the tail should be better.\n\n(b) On stats updates, iterate the parents and update the per-CPU\ncounters of the stat directly AND update a global atomic if the per-CPU\ncounter exceeds a threshold. I think updates may get too expensive as we\nmay need to update multiple atomics, especially when updating the root\ncounter as it will be contended by all cgroups.\n\nThe flush side becomes an atomic read, so should be very cheap, and we\ncan drop other heuristics and optimizations.\n\n---\n\nI think ultimately we need to experiment with these approachs (and\nperhaps others) to check what actually works in practice. You'll\nprobably want some benchmarks or synthetic tests with many cgroups to\nexercise the worst case scenarios.\n\nFor the zswap stats, I used to run stress-ng with a bunch of workers\n(20, 50, 100, ..) in cgroups of different levels. Since all workers are\nin the same cgroups, all the parents are common and all threads end up\ncompeting on the same atomics, so worst case scenario. I was also\ntesting in a VM that has more CPUs than stress-ng workers, to exercise\nthe full extent of the concurrency and contention.\n\nThis could be a lot of work, so I am not really asking you to do it, but\njust brainstorming and sharing ideas :)",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-08-11",
+              "message_id": "anpsLy_pCanocgS1@google.com",
+              "analysis_source": "llm",
+              "email": "yosry@kernel.org"
+            },
+            {
+              "author": "Joanne Koong (author)",
+              "summary": "Author Joanne Koong addressed Yosry Ahmed's concern about the impact of stale stats on various kernel components, specifically zswap, cachestat(), working set, and vmscan. She performed armchair analysis for each component, concluding that only vmscan is troublesome due to its reliance on accurate stats to determine whether reclaim can deactivate. Joanne acknowledged the potential issue in vmscan but did not propose a fix, instead suggesting that frequent flushing might not solve the problem and proposing alternative solutions such as keeping deactivation state for a period of time if refaults were observed.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "no clear resolution signal",
+                "acknowledged potential issue but no proposed fix"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Thanks for your guidance and insights on this, Yosry! Your responses\nhave been very helpful.\n\nI'll do some experimentation with this and try to get a sense of what\nthe update costs are.\n\nOne thing I was unclear about and have been looking at is how\npervasive/important this issue is outside of the writeback case. It\nlooks like there are roughly 4 other categories of users that rely on\nstats that can be 2s stale: zswap, cachestat(), working set, and\nvmscan.\n\nOf these, vmscan is the only one that looks troublesome. Some armchair\nanalysis below:\n\na) zswap (zswap_shrinker_count()): 2s of staleness looks fine. the\nstats are only used to calculate the compression ratio and the ratio\nscales a count that comes from a list_lru and *isn't* stale. The ratio\nis an average over the whole pool, so it seems like that should be\nfairly steady across 2s. A stale result doesn't seem too bad - afaict,\nit is a heuristic of how zswap should get weighed against the other\nshrinkers.\n\nb) cachestat() syscall (filemap_cachestat()): seems preferable to just\nrely on the 2s flusher worker. The results are returned back to\nuserspace and not used for any internal kernel decision-making, seems\nok to have one field in it (nr_recently_evicted) potentially be stale.\nSeems better to err on the side of less frequent flushing anyways, as\nthe call path is invoked from unprivileged userspace and flushes the\nroot memcg.\n\nc) workingset: looking at the original commits, the calculations are\nestimates that don't require exact stats -\n\nrefaulting (workingset_test_recent()): commit 9b3016154c91 (\"memcg:\nsync flush only if periodic flush is delayed\")\n    Now the question: what are the side-effects of this change? The worst\n    that can happen is the refault codepath will see 4sec old lruvec stats\n    and may cause false (or missed) activations of the refaulted page which\n    may under-or-overestimate the workingset size.  Though that is not very\n    concerning as the kernel can already miss or do false activations.\n\nshadow-node shrinker (count_shadow_nodes()): commit d4a5b369ad6d (\"mm:\nratelimit stat flush from workingset shrinker\")\n    On further inspection it seems like we don't really need\n    accurate stats in this function as it was already approximating the amount\n    of appropriate shadow entries to keep for maintaining the refault\n    information.\n\nd) vmscan (prepare_scan_control()): for determining whether reclaim\ncan deactivate, there's this logic\n\n                /*\n                 * When refaults are being observed, it means a new\n                 * workingset is being established. Deactivate to get\n                 * rid of any stale active pages quickly.\n                 */\n                refaults = lruvec_page_state(target_lruvec,\n                                WORKINGSET_ACTIVATE_ANON);\n                if (refaults != target_lruvec->refaults[WORKINGSET_ANON] ||\n                        inactive_is_low(target_lruvec, LRU_INACTIVE_ANON))\n                        sc->may_deactivate |= DEACTIVATE_ANON;\n                else\n                        sc->may_deactivate &= ~DEACTIVATE_ANON;\n\n(and same for DEACTIVATE_FILE for file-backed folios)\n\ntarget_lruvec->refaults[] gets set at the end of the reclaim pass. It\nstores the same lruvec_page_state() value that prepare_scan_control()\nwill read at the start of the next reclaim pass, which means if\nreclaim passes happen more frequently than the 2s flushes (eg under\nsustained/heavy memory pressure), this logic will incorrectly assume\nno refaults occurred and deactivation is disabled, which afaict means\nfolios won't be moved from the active -> inactive list, and reclaim\nwill start evicting pages from the inactive list that are hot (eg more\nrefaults).\n\nThis is from reading the code rather than a reproducer though, so I\ndon't know how much this matters in practice. Unlike for the writeback\ncase, I don't think flushign more frequently solves the problem. It\nwould shrink the staleness window but not eliminate it. Maybe one\nsolution is to keep the deactivation state for a period of time if\nrefaults were observed.\n\nIf it turns out iterating the parents and updating the per-CPU\ncounters of the stat on updates is too expensive, perhaps it makes\nsense to keep the existing rstat logic as is and have caller-side\nworkarounds, as only writeback and vmscan would require them.\n\nThanks,\nJoanne",
+              "reply_to": "Yosry Ahmed",
+              "message_date": "2026-08-12",
+              "message_id": "CAJnrk1Yoj7fqbzurmHkbA-vegpQu3cf-_dfvKor_VxuNhPR-AA@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "joannelkoong@gmail.com"
+            },
+            {
+              "author": "Yosry Ahmed",
+              "summary": "Reviewer Yosry Ahmed noted that the patch may cause OOM kills due to stale stats in the zswap limits calculation, which uses ratelimited flushing, and suggested adding Song's patch to address this issue.\n\nReviewer suggested treating cachestat() syscall similarly to memory.stat by performing a full flush on user-space read, unless the syscall is invoked frequently.\n\nReviewer Yosry Ahmed questioned the practicality of a specific concern about incorrect activations leading to thrashing, without providing further details or suggestions.\n\nReviewer Yosry Ahmed noted that the ratelimited flush in vmscan is causing OOM kills during memory pressure tests and suggested investigating this further.\n\nReviewer suggested that memcg could use batching to update its per-memcg atomic global counter, eliminating the need for flushing and reducing overhead.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes",
+                "NEUTRAL",
+                "requested investigation",
+                "indicated potential problem",
+                "suggested alternative approach"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "There is also the zswap limits calculation, which Song sent a patch to\nchange to using ratelimited flushing. I think that case is more\nproblematic as it can cause OOM kills if we use stale stats (e.g.\nafter a burst of writeback frees up space in zswap). Adding Song here.\n\nThe shrinker case is more benign.\n\n---\n\nI am not sure how the cachestat() syscall is used, but my preference\nwould be to treat it like memory.stat and do a full flush on userspace\nread, unless it's a syscall that is invoked frequently for some\nreason.\n\n---\n\nIncorrect activations can lead to thrashing in some cases, but I am\nnot sure how practical the concern is.\n\n---\n\nWe do have an internal test that runs a VM under memory pressure and\nwe started observing OOM kills after the ratelimited flush was added\nin vmscan, so I think it's more problematic than just reclaiming hot\nmemory, but I didn't look too closely.\n\n---\n\nAlso zswap limits calculation. I am not sure how benign the workingset\ncase is, but it has been ratelimited for a while now AFAICT, so maybe\nit's fine.",
+              "reply_to": "Joanne Koong",
+              "message_date": "2026-08-18",
+              "message_id": "CAO9r8zPLipVW6bvyDK1ypSawbo=LHKvmLqWH0xA6WMR9GYNJpg@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "yosry@kernel.org"
+            }
+          ],
+          "list_id": "fuse-devel@lists.linux.dev"
+        }
+      ],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
     }
   ]
 }
