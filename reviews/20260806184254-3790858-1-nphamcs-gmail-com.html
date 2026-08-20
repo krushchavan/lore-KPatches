@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 00/11] Virtual Swap Space (Swap Table Edition)</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260806184254.3790858-1-nphamcs@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-06</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-18</strong><div class="date-range-nav">Active on: <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-15">2026-08-15</a> &bull; <a href="#2026-08-12">2026-08-12</a> &bull; <a href="#2026-08-10">2026-08-10</a> &bull; <a href="#2026-08-07">2026-08-07</a> &bull; <a href="#2026-08-06">2026-08-06</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-06</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a> &bull; <a href="#2026-08-19">2026-08-19</a> &bull; <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-15">2026-08-15</a> &bull; <a href="#2026-08-12">2026-08-12</a> &bull; <a href="#2026-08-10">2026-08-10</a> &bull; <a href="#2026-08-07">2026-08-07</a> &bull; <a href="#2026-08-06">2026-08-06</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces the virtual swap device infrastructure, creating a 16 TB virtual swap device at boot. It adds dynamic cluster allocation and sets up the necessary data structures for the vswap layer. The patch is pure scaffolding and does not yet enable swapon or swapoff operations on the virtual device. It lays the groundwork for subsequent patches to implement the vswap-aware swap-out, swap-in, and writeback paths.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-06">
@@ -6449,6 +6449,99 @@ checked in a couple of places to allow allocation.</pre>
 </details>
 <a href="https://lore.kernel.org/r/CAKEwX=MmqyWdqfrp8kxeuucNFhU2e6Hk2TdANUGhNFHhvtSPwg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: agreed to address concerns, acknowledged reviewer suggestions</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-20">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kunwu Chan</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-20">2026-08-20</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kunwu Chan noted that vswap_free() acquires the per-vswap spinlock while holding the folio lock, creating a lock ordering violation with reclaim paths, and requested the lock be dropped before calling try_to_unmap().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu,  6 Aug 2026 11:42:45 -0700 Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+
+Hi Nhat,
+[...]
+syzbot reported a NULL dereference in the v3 series:
+
+  __vtable_get()
+    vswap_to_phys()
+      swap_entry_backend_has_flag()
+
+Seems like the underlying issue is introduced by this patch&#x27;s
+`virtual_table` lifetime management.
+
+This patch adds:
+
+&gt; @@ -70,6 +70,7 @@ struct swap_cluster_info_dynamic {
+&gt;       struct swap_cluster_info ci;
+&gt;       unsigned int index;             /* for cluster_index() */
+&gt;       struct rcu_head rcu;
+&gt; +     atomic_long_t *virtual_table;   /* Backing pointers for vswap slots */
+&gt;  };
+
+[...]
+
+while the read side does:
+
+&gt; +static inline unsigned long __vtable_get(struct swap_cluster_info_dynamic *ci_dyn,
+&gt; +                                      unsigned int off)
+&gt; +{
+&gt; +     VM_WARN_ON_ONCE(off &gt;= SWAPFILE_CLUSTER);
+&gt; +     return atomic_long_read(&amp;ci_dyn-&gt;virtual_table[off]);
+&gt; +}
+&gt; +
+
+`atomic_long_read()` only makes the access atomic; it does not protect
+the lifetime of the allocation being accessed.
+
+[...]
+
+&gt; +static inline void vswap_cluster_free_vtable(struct swap_cluster_info *ci)
+&gt; +{
+&gt; +     struct swap_cluster_info_dynamic *ci_dyn;
+&gt; +
+
+and frees it synchronously:
+
+&gt; +     ci_dyn = container_of(ci, struct swap_cluster_info_dynamic, ci);
+&gt; +     kfree(ci_dyn-&gt;virtual_table);
+&gt; +     ci_dyn-&gt;virtual_table = NULL;
+&gt; +}
+&gt; +
+
+The existing `ci-&gt;table` already has an RCU-aware lifetime: readers use
+the corresponding RCU access rules, and the storage is not freed until
+after the appropriate grace period. `virtual_table` introduced here does
+not have an equivalent lifetime rule.
+
+The syzbot crash shows that the current teardown/read-side synchronization
+is insufficient: `__vtable_get()` can observe a torn-down
+`virtual_table` and dereference NULL.
+
+I don&#x27;t think a NULL check in `__vtable_get()` alone would be the right
+fix. The NULL dereference is a symptom of the missing lifetime guarantee.
+`virtual_table` needs to remain valid for as long as a reader can reach
+and access the corresponding dynamic cluster.
+
+It probably makes sense to make `virtual_table` follow the same lifetime
+scheme as the existing cluster table, or otherwise tie its freeing to the
+lifetime of `swap_cluster_info_dynamic`.
+
+[...]
+
+
+Thanks,
+KunWu</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260820041940.443214-1-kunwu.chan@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NULL dereference, missing lifetime guarantee</div>
 </div>
 </div>
 </div>

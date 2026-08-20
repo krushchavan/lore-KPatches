@@ -1,0 +1,124 @@
+{
+  "thread_id": "aoWw_iKEDLjKL2jr@thinkstation",
+  "subject": "[PATCH] mm/huge_memory: transfer the pmd dirty bit to the folio on zap",
+  "url": "https://lore.kernel.org/all/aoWw_iKEDLjKL2jr@thinkstation/",
+  "dates": {
+    "2026-08-20": {
+      "report_file": "2026-08-19_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "Reviewer noted that pageout() cannot pass its refcount check due to PMD mapping holding an extra folio reference, which is dropped by mmu_gather only after TLB flush\n\nReviewer noted that writeback can run folio_mkclean() concurrently with another CPU holding a stale TLB entry reference, causing a silent lost write and missing PG_dirty\n\nReviewer noted that zap_huge_pmd() only handles one PMD under PTL and suggested flushing the TLB before calling folio_remove_rmap_pmd() to avoid stale TLB entries.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "concern about concurrent execution",
+            "request for fix"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Right. pageout() cannot pass its refcount check while PMD mapping still\nholds an extra folio ref, and mmu_gather drops that ref only after TLB\nflush.\n\n---\n\nYep. Writeback can run folio_mkclean() while that ref is still held,\nthough, and with rmap already gone it misses the PMD ...\n\n---\n\nzap_huge_pmd() only handles one PMD under PTL anyway ... how about just\nflushing before folio_remove_rmap_pmd()?\n\n---8<---\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex afbb5974bd22..6fb34924ef66 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -2531,6 +2531,14 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,\n \tis_present = pmd_present(orig_pmd);\n \tfolio = normal_or_softleaf_folio_pmd(vma, addr, orig_pmd, is_present);\n \thas_deposit = has_deposited_pgtable(vma, orig_pmd, folio);\n+\t/*\n+\t * folio_mkclean() relies on the rmap to find writable mappings.\n+\t * Flush stale TLB entries before removing it below.\n+\t */\n+\tif (folio && is_present && !folio_test_anon(folio) &&\n+\t    pmd_dirty(orig_pmd))\n+\t\ttlb_flush_mmu_tlbonly(tlb);\n+\n \tif (folio)\n \t\tzap_huge_pmd_folio(mm, vma, orig_pmd, folio, is_present);\n \tif (has_deposit)\n---\n\nCheers, Lance",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-20",
+          "message_id": "20260819161728.70270-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Lance Yang noted that in the case of an initial shared write fault on non-DAX XFS, __handle_mm_fault() first tries to create a huge PMD, which fails and sends the fault to handle_pte_fault(). This path leaves an empty PMD without a PTE, calls do_pte_missing(), and eventually leads to finish_fault(), which sees FAULT_FLAG_WRITE and attempts to set a dirty+writable PMD with do_set_pmd(). Lance Yang pointed out that this can lead to silently lost writes if another CPU stores through a stale TLB entry while the folio is being cleaned, and suggested fixing this issue.\n\nThe reviewer pointed out that __handle_mm_fault() calls wp_huge_pmd() only when a write/unshare fault hits an existing read-only PMD THP, and that the initial shared write fault above runs page_mkwrite before do_set_pmd() installs the writable file PMD.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "clarification",
+            "correction"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hmm.. that happens on an initial shared write fault. For non-DAX XFS, the\npath starts with an empty PMD.\n\nTL;DR\n\nWith an empty PMD and PMD-order THP allowed, __handle_mm_fault() first\ntries create_huge_pmd(). VM_FAULT_FALLBACK sends the fault to\nhandle_pte_fault():\n\nstatic vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,\n\t\tunsigned long address, unsigned int flags)\n{\n\t...\n\tif (pmd_none(*vmf.pmd) &&\n\t    thp_vma_allowable_order(vma, vm_flags, TVA_PAGEFAULT, PMD_ORDER)) {\n\t\tret = create_huge_pmd(&vmf);\n\t\tif (ret & VM_FAULT_FALLBACK)\n\t\t\tgoto fallback;\n\t\telse\n\t\t\treturn ret;\n\t}\n\t...\nfallback:\n\treturn handle_pte_fault(&vmf);\n}\n\ncreate_huge_pmd() dispatches to the filesystem's huge_fault callback:\n\nstatic inline vm_fault_t create_huge_pmd(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\t...\n\tif (vma->vm_ops->huge_fault)\n\t\treturn vma->vm_ops->huge_fault(vmf, PMD_ORDER);\n\treturn VM_FAULT_FALLBACK;\n}\n\nFor non-DAX XFS, that callback returns VM_FAULT_FALLBACK:\n\nstatic vm_fault_t\nxfs_filemap_huge_fault(\n\tstruct vm_fault\t\t*vmf,\n\tunsigned int\t\torder)\n{\n\tif (!IS_DAX(file_inode(vmf->vma->vm_file)))\n\t\treturn VM_FAULT_FALLBACK;\n\t...\n}\n\nXFS installs the huge-fault, regular-fault, and page_mkwrite callbacks\nin the same vm_ops:\n\nstatic const struct vm_operations_struct xfs_file_vm_ops = {\n\t.fault\t\t= xfs_filemap_fault,\n\t.huge_fault\t= xfs_filemap_huge_fault,\n\t...\n\t.page_mkwrite\t= xfs_filemap_page_mkwrite,\n\t...\n};\n\nOn the fallback path, handle_pte_fault() leaves an empty PMD without a\nPTE and calls do_pte_missing():\n\nstatic vm_fault_t handle_pte_fault(struct vm_fault *vmf)\n{\n\t...\n\tif (unlikely(pmd_none(*vmf->pmd))) {\n\t\t/*\n\t\t * Leave __pte_alloc() until later: because vm_ops->fault may\n\t\t * want to allocate huge page, and if we expose page table\n\t\t * for an instant, it will be difficult to retract from\n\t\t * concurrent faults and from rmap lookups.\n\t\t */\n\t\tvmf->pte = NULL;\n\t\tvmf->flags &= ~FAULT_FLAG_ORIG_PTE_VALID;\n\t...\n\t}\n\n\tif (!vmf->pte)\n\t\treturn do_pte_missing(vmf);\n\t...\n}\n\nFor a file VMA, do_pte_missing() calls do_fault():\n\nstatic vm_fault_t do_pte_missing(struct vm_fault *vmf)\n{\n\tif (vma_is_anonymous(vmf->vma))\n\t\treturn do_anonymous_page(vmf);\n\telse\n\t\treturn do_fault(vmf);\n}\n\ndo_fault() sends FAULT_FLAG_WRITE + VM_SHARED to do_shared_fault():\n\nstatic vm_fault_t do_fault(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\t...\n\tif (!vma->vm_ops->fault) {\n\t\t...\n\t} else if (!(vmf->flags & FAULT_FLAG_WRITE))\n\t\tret = do_read_fault(vmf);\n\telse if (!(vma->vm_flags & VM_SHARED))\n\t\tret = do_cow_fault(vmf);\n\telse\n\t\tret = do_shared_fault(vmf);\n\t...\n}\n\ndo_shared_fault() first calls __do_fault():\n\nstatic vm_fault_t do_shared_fault(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tvm_fault_t ret, tmp;\n\tstruct folio *folio;\n\t...\n\tret = __do_fault(vmf);\n\t...\n}\n\n__do_fault() invokes the regular fault callback:\n\nstatic vm_fault_t __do_fault(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tstruct folio *folio;\n\tvm_fault_t ret;\n\t...\n\tret = vma->vm_ops->fault(vmf);\n\t...\n\treturn ret;\n}\n\nFor non-DAX XFS, xfs_filemap_fault() reaches filemap_fault():\n\nstatic vm_fault_t\nxfs_filemap_fault(\n\tstruct vm_fault\t\t*vmf)\n{\n\tstruct inode\t\t*inode = file_inode(vmf->vma->vm_file);\n\t...\n\treturn filemap_fault(vmf);\n}\n\nOnce that returns the folio, do_shared_fault() calls do_page_mkwrite()\nand then finish_fault():\n\nstatic vm_fault_t do_shared_fault(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tvm_fault_t ret, tmp;\n\tstruct folio *folio;\n\t...\n\tfolio = page_folio(vmf->page);\n\t...\n\tif (vma->vm_ops->page_mkwrite) {\n\t\tfolio_unlock(folio);\n\t\ttmp = do_page_mkwrite(vmf, folio);\n\t\t...\n\t}\n\n\tret |= finish_fault(vmf);\n\t...\n}\n\ndo_page_mkwrite() calls the XFS callback installed above and restores\nthe original fault flags:\n\nstatic vm_fault_t do_page_mkwrite(struct vm_fault *vmf, struct folio *folio)\n{\n\tvm_fault_t ret;\n\tunsigned int old_flags = vmf->flags;\n\n\tvmf->flags = FAULT_FLAG_WRITE|FAULT_FLAG_MKWRITE;\n\t...\n\tret = vmf->vma->vm_ops->page_mkwrite(vmf);\n\t/* Restore original flags so that caller is not surprised */\n\tvmf->flags = old_flags;\n\t...\n}\n\nSo finish_fault() still sees FAULT_FLAG_WRITE. With an empty PMD, no\nfallback requirement, and a PMD-mappable folio, it tries do_set_pmd():\n\nvm_fault_t finish_fault(struct vm_fault *vmf)\n{\n\t...\n\tif (pmd_none(*vmf->pmd)) {\n\t\tif (!needs_fallback && folio_test_pmd_mappable(folio)) {\n\t\t\tret = do_set_pmd(vmf, folio, page);\n\t\t\tif (ret != VM_FAULT_FALLBACK)\n\t\t\t\treturn ret;\n\t\t}\n\t\t...\n\t}\n\t...\n}\n\nAfter its checks pass, do_set_pmd() takes FAULT_FLAG_WRITE from vmf and\ninstalls a dirty+writable PMD:\n\nvm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tbool write = vmf->flags & FAULT_FLAG_WRITE;\n\tunsigned long haddr = vmf->address & HPAGE_PMD_MASK;\n\tpmd_t entry;\n\t...\n\tentry = folio_mk_pmd(folio, vma->vm_page_prot);\n\tif (write)\n\t\tentry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);\n\t...\n\tset_pmd_at(vma->vm_mm, haddr, vmf->pmd, entry);\n\t...\n}\n\nmaybe_pmd_mkwrite() sets write permission for VM_WRITE:\n\npmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)\n{\n\tif (likely(vma->vm_flags & VM_WRITE))\n\t\tpmd = pmd_mkwrite(pmd, vma);\n\treturn pmd;\n}\n\n---\n\nThat comment is about a different path. __handle_mm_fault() calls\nwp_huge_pmd() only when a write/unshare fault hits an existing PMD THP\nwhich is not writable:\n\nstatic vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,\n\t\tunsigned long address, unsigned int flags)\n{\n\t...\n\tif (pmd_trans_huge(vmf.orig_pmd)) {\n\t\t...\n\t\tif ((flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) &&\n\t\t    !pmd_write(vmf.orig_pmd)) {\n\t\t\tret = wp_huge_pmd(&vmf);\n\t\t\tif (!(ret & VM_FAULT_FALLBACK))\n\t\t\t\treturn ret;\n\t\t...\n\t}\n\t...\n}\n\nIf the filesystem huge_fault callback falls back there, wp_huge_pmd()\nsplits that existing read-only PMD:\n\nstatic inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tconst bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;\n\tvm_fault_t ret;\n\t...\n\tif (vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) {\n\t\tif (vma->vm_ops->huge_fault) {\n\t\t\tret = vma->vm_ops->huge_fault(vmf, PMD_ORDER);\n\t\t\tif (!(ret & VM_FAULT_FALLBACK))\n\t\t\t\treturn ret;\n\t\t}\n\t}\n\nsplit:\n\t/* COW or write-notify handled on pte level: split pmd. */\n\t__split_huge_pmd(vma, vmf->pmd, vmf->address, false);\n\n\treturn VM_FAULT_FALLBACK;\n}\n\nSo I don't think that comment says file PMDs must never be writable. It\ncovers a later write fault against an existing read-only PMD. On the\ninitial shared write fault above, page_mkwrite runs before do_set_pmd()\ninstalls the writable file PMD.\n\nCheers, Lance",
+          "reply_to": "Pedro Falcato",
+          "message_date": "2026-08-20",
+          "message_id": "20260820061337.24669-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses an issue where the pmd dirty bit is not being transferred to the folio when a huge page is zapped, leading to potential silent data loss in certain file systems like xfs. The problem arises because the TLB flush is deferred and can occur after the rmap has been dropped under the pmd lock, causing stale TLB entries to remain. To fix this, the patch aims to transfer the pmd dirty bit to the folio on zap, ensuring that data integrity is maintained even in the presence of concurrent writes."
+    },
+    "2026-08-19": {
+      "report_file": "2026-08-19_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Usama Arif",
+          "summary": "Reviewer noted that the current implementation of tlb_flush_mmu_tlbonly() and tlb_remove_page_size() can lead to a stale TLB entry being accessed after its rmap entry is removed, resulting in a silently lost write. They suggested adding a new function pmd_zap_needs_tlb_flush() to check if a TLB flush is needed before dropping the rmap entry.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I am currently at below to reduce tlb flushes, but still WIP\n\n\ndiff --git a/include/asm-generic/tlb.h b/include/asm-generic/tlb.h\nindex bdcc2778ac64f..60bdd6287b5a9 100644\n--- a/include/asm-generic/tlb.h\n+++ b/include/asm-generic/tlb.h\n@@ -301,6 +301,12 @@ bool __tlb_remove_folio_pages(struct mmu_gather *tlb, struct page *page,\n  * function, except we define it before the 'struct mmu_gather'.\n  */\n #define tlb_delay_rmap(tlb) (((tlb)->delayed_rmap = 1), true)\n+/*\n+ * Like tlb_delay_rmap() but without the side effect, for callers that must\n+ * flush rather than delay: can another CPU still reach this mapping through a\n+ * stale TLB entry once its rmap entry is gone? Not during fullmm teardown.\n+ */\n+#define tlb_rmap_needs_flush(tlb) (!(tlb)->fullmm)\n extern void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma);\n #endif\n\n@@ -315,6 +321,7 @@ extern void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma);\n  */\n #ifndef tlb_delay_rmap\n #define tlb_delay_rmap(tlb) (false)\n+#define tlb_rmap_needs_flush(tlb) (false)\n static inline void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma) { }\n #endif\n\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex afbb5974bd225..76d8d5cf92ee0 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -2493,6 +2493,33 @@ static bool has_deposited_pgtable(struct vm_area_struct *vma, pmd_t pmdval,\n        return folio && folio_test_anon(folio);\n }\n\n\n+static bool pmd_zap_needs_tlb_flush(struct mmu_gather *tlb, pmd_t pmdval,\n+                                   struct folio *folio, bool is_present)\n+{\n+       struct address_space *mapping;\n+\n+       if (!is_present || !pmd_dirty(pmdval) || folio_test_anon(folio))\n+               return false;\n+       if (!tlb_rmap_needs_flush(tlb))\n+               return false;\n+\n+       mapping = folio_mapping(folio);\n+       return mapping && mapping_can_writeback(mapping);\n+}\n+\n /**\n  * zap_huge_pmd - Zap a huge THP which is of PMD size.\n  * @tlb: The MMU gather TLB state associated with the operation.\n@@ -2531,8 +2558,15 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,\n        is_present = pmd_present(orig_pmd);\n        folio = normal_or_softleaf_folio_pmd(vma, addr, orig_pmd, is_present);\n        has_deposit = has_deposited_pgtable(vma, orig_pmd, folio);\n-       if (folio)\n+       if (folio) {\n+               /* Flush before zap_huge_pmd_folio() drops the rmap entry. */\n+               if (pmd_zap_needs_tlb_flush(tlb, orig_pmd, folio, is_present)) {\n+                       tlb_flush_mmu_tlbonly(tlb);\n+                       /* Re-arm: tlb_remove_page_size() needs tlb->end set. */\n+                       tlb_remove_pmd_tlb_entry(tlb, pmd, addr);\n+               }\n                zap_huge_pmd_folio(mm, vma, orig_pmd, folio, is_present);\n+       }\n        if (has_deposit)\n                zap_deposited_table(mm, pmd);",
+          "reply_to": "Lance Yang",
+          "message_date": "2026-08-19",
+          "message_id": "1d0271fc-9f60-4b7f-8b89-e82a4f7034d5@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Pedro Falcato",
+          "summary": "Reviewer Pedro Falcato questioned the assumption that page_mkwrite is called in the same path as do_set_pmd(), citing write amplification concerns and pointing to a comment in wp_huge_pmd() indicating that COW or write-notify should be handled on the pte level.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "technical disagreement"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Where do you see page_mkwrite being called in the same path as do_set_pmd()?\nPer my understanding of the code, this Should Not Happen, and it really Should\nNot Happen for many, many reasons (write amplification being the main one).\n\nNamely, see the comment in wp_huge_pmd():\n\t/* COW or write-notify handled on pte level: split pmd. */\n\nif file huge pages get mapped writable, that's a bug.\n \n\n-- \nPedro",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-19",
+          "message_id": "aoXYh9EPF6QnlvIK@pedro-suse.lan",
+          "email": "pfalcato@suse.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Hugh Dickins",
+          "summary": "Reviewer noted that modifying a 2MiB+ hole in a shmem file through an mmap can result in silent data loss due to the pmd dirty bit not being updated, and suggested fixing this by adding a pmd equivalent of tlb_delay_rmap()\n\nGave Acked-by",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by",
+            "Acked-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "It isn't entirely clear from the report, but this is all about modifying\na 2MiB+ *hole* in a shmem file through an mmap thereof, with first fault\na read fault not a write fault.  I suppose only a few proceed in that way\n(though truncating an empty file to some size and then mmap'ing that size\nis very normal).\n\nOr everybody who tried to report this bug, wrote their report into a\n2MiB hole in a shmem file through an mmap thereof.\n\nOther than holes, all shmem folios are dirty throughout (and re-marked\ndirty as soon as brought back from swap): so for most, it doesn't matter\nwhat the pmd says.\n\nThis raised a dim memory, took a while to locate what I was remembering:\ne1f1b1572e8d (\"mm/huge_memory.c: fix data loss when splitting a file pmd\")\nfrom 2018.\n\nNot quite the same; but what a pity that one didn't prompt any of us\nto look further and find what Usama now has.",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-19",
+          "message_id": "5bd5c5fe-0d55-9fec-aadf-477891428887@google.com",
+          "email": "hughd@google.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses an issue where the pmd dirty bit is not being transferred to the folio when a huge page is zapped, leading to potential silent data loss in certain file systems like xfs. The problem arises because the TLB flush is deferred and can occur after the rmap has been dropped under the pmd lock, causing stale TLB entries to remain. To fix this, the patch aims to transfer the pmd dirty bit to the folio on zap, ensuring that data integrity is maintained even in the presence of concurrent writes."
+    }
+  }
+}

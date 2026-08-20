@@ -238,9 +238,400 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v7 1/6] fuse: decouple fuse_ring creation from ent registration</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260814185946.3679478-2-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-14</strong><div class="date-range-nav">Active on: <a href="#2026-08-14">2026-08-14</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch decouples the creation of fuse_ring from entry registration in FUSE (Filesystem in Userspace) connections. The ring is now created during initialization, after a server has negotiated and set FUSE_OVER_IO_URING, rather than lazily on the first FUSE_IO_URING_CMD_REGISTER command. This change eliminates concurrent creations of the single per-connection fuse_ring, which previously required open-coded handling to detect and protect against. The patch also updates various functions to use the pre-initialized ring instead of creating it themselves.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-08-14</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-19</strong><div class="date-range-nav">Active on: <a href="#2026-08-19">2026-08-19</a> &bull; <a href="#2026-08-14">2026-08-14</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch decouples the creation of fuse_ring from entry registration in the FUSE (Filesystem in Userspace) driver. Currently, the ring is created lazily on the first FUSE_IO_URING_CMD_REGISTER command, which can lead to concurrent creations and requires open-coded handling. The patch moves the ring creation to the FUSE_INIT reply processing after a server has negotiated and set FUSE_OVER_IO_URING, ensuring that the ring is published before the connection is marked initialized. This change simplifies the code and reduces the risk of concurrent creations.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a concern about optional FUSE_OVER_IO_URING init reply flag, explained the issue is due to libfuse setting it but loraw.c server not doing so, and proposed creating the fuse_ring on the first io-uring command instead of at FUSE_INIT or FUSE_IO_URING_CMD_REGISTER ent creation time. The author agreed to send a new patch with this change.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks for attaching the repro.
+
+This is happening because this patch uses the FUSE_OVER_IO_URING init
+reply as a signal that the ring should be created, but I missed that
+the FUSE_OVER_IO_URING reply is *optional*.
+
+Prior to this patch, there&#x27;s two scenarios:
+a) server sets FUSE_OVER_IO_URING reply at init time - requests will
+automatically block until fuse-io-uring is completely set up
+b) server does not set FUSE_OVER_IO_URING but later sends uring
+register request - requests will continue along /dev/fuse path until
+fuse-io-uring is completely set up
+
+Libfuse sets FUSE_OVER_IO_URING in the reply, but the loraw.c server does not.
+
+I think the best way to fix this is to have the ring creation happen
+when the kernel receives the first io-uring command instead of at
+FUSE_INIT or at FUSE_IO_URING_CMD_REGISTER ent creation time, given
+that FUSE_IO_URING_ADD_QUEUE needs the ring to exist:
+
+Subject: [PATCH] fuse: create fuse_ring on the first io-uring command
+
+Commit 6330b1f61ed1 (&quot;fuse: decouple fuse_ring creation from ent
+registration&quot;) moved fuse_ring creation to FUSE_INIT reply processing,
+gated on the server setting FUSE_OVER_IO_URING in its reply flags.
+
+However, that flag is optional. Libfuse sets it but servers not going
+through libfuse may not.
+
+Create the ring on the first io-uring command instead, independent of
+what the server negotiated. Ring creation stays decoupled from ent
+registration, which FUSE_IO_URING_CMD_ADD_QUEUE depends on since it
+needs the ring to exist before any entry is registered.
+
+Fixes: 6330b1f61ed1 (&quot;fuse: decouple fuse_ring creation from ent registration&quot;)
+Reported-by: Miklos Szeredi &lt;mszeredi@redhat.com&gt;
+Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
+---
+ fs/fuse/dev.c         |  2 +-
+ fs/fuse/dev_uring.c   | 18 +++++++++++-------
+ fs/fuse/dev_uring_i.h |  5 -----
+ 3 files changed, 12 insertions(+), 13 deletions(-)
+
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index 4fec31fc0b84..a665d76292c9 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -77,7 +77,7 @@ void fuse_chan_set_initialized(struct fuse_chan
+*fch, struct fuse_chan_param *pa
+                fch-&gt;max_pages = param-&gt;max_pages;
+
+                if (param-&gt;io_uring_enabled)
+-                       fuse_uring_conn_init(fch);
++                       fch-&gt;io_uring = 1;
+        }
+
+        /* Pairs with smp_load_acquire() readers of fch-&gt;initialized */
+diff --git a/fs/fuse/dev_uring.c b/fs/fuse/dev_uring.c
+index e22a48c9a678..23c26099d159 100644
+--- a/fs/fuse/dev_uring.c
++++ b/fs/fuse/dev_uring.c
+@@ -303,6 +303,7 @@ static struct fuse_ring *fuse_uring_create(struct
+fuse_chan *fch)
+ {
+        struct fuse_ring *ring;
+        size_t nr_queues = num_possible_cpus();
++       struct fuse_ring *res = NULL;
+        size_t max_payload_size;
+
+        ring = kzalloc_obj(*ring, GFP_KERNEL_ACCOUNT);
+@@ -322,6 +323,12 @@ static struct fuse_ring *fuse_uring_create(struct
+fuse_chan *fch)
+                spin_unlock(&amp;fch-&gt;lock);
+                goto out_err;
+        }
++       if (fch-&gt;ring) {
++               /* race, another thread created the ring in the meantime */
++               spin_unlock(&amp;fch-&gt;lock);
++               res = fch-&gt;ring;
++               goto out_err;
++       }
+
+        init_waitqueue_head(&amp;ring-&gt;stop_waitq);
+
+@@ -336,13 +343,7 @@ static struct fuse_ring *fuse_uring_create(struct
+fuse_chan *fch)
+ out_err:
+        kfree(ring-&gt;queues);
+        kfree(ring);
+-       return NULL;
+-}
+-
+-void fuse_uring_conn_init(struct fuse_chan *fch)
+-{
+-       if (fuse_uring_create(fch))
+-               fch-&gt;io_uring = 1;
++       return res;
+ }
+
+ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
+@@ -1685,6 +1686,9 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd,
+unsigned int issue_flags)
+        if (!smp_load_acquire(&amp;fch-&gt;initialized))
+                return -EAGAIN;
+
++       if (!smp_load_acquire(&amp;fch-&gt;ring) &amp;&amp; !fuse_uring_create(fch))
++               return -ENOMEM;
++
+        switch (cmd_op) {
+        case FUSE_IO_URING_CMD_REGISTER:
+                err = fuse_uring_register(cmd, issue_flags, fch);
+diff --git a/fs/fuse/dev_uring_i.h b/fs/fuse/dev_uring_i.h
+index 263d0f8b9714..3233b07430d2 100644
+--- a/fs/fuse/dev_uring_i.h
++++ b/fs/fuse/dev_uring_i.h
+@@ -184,7 +184,6 @@ struct fuse_ring {
+        bool ready;
+ };
+
+-void fuse_uring_conn_init(struct fuse_chan *fch);
+ void fuse_uring_stop_queues(struct fuse_ring *ring);
+ void fuse_uring_abort_end_requests(struct fuse_ring *ring);
+ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags);
+@@ -224,10 +223,6 @@ static inline bool fuse_uring_ready(struct fuse_chan *fch)
+
+ #else /* CONFIG_FUSE_IO_URING */
+
+-static inline void fuse_uring_conn_init(struct fuse_chan *fch)
+-{
+-}
+-
+ static inline void fuse_uring_abort(struct fuse_chan *fch)
+ {
+ }
+--
+2.52.0
+
+
+If you&#x27;d prefer an inline replacement for the original commit instead
+of a fixup patch on top of the tree, please let me know and I&#x27;d be
+happy to send that over. Whatever would be easiest for you.
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Miklos Szeredi</div>
+<a href="https://lore.kernel.org/r/CAJnrk1bocn3zSUe23E4F6oTNyosmF8kdVdFB-2hX2qbSqx-LDA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged concern, proposed fix</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-19">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Miklos Szeredi</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Miklos Szeredi reported a failure in the loraw test, which resulted in an assertion error due to cqe-&gt;res being -22 (EINVAL), and requested that the reproducer be attached for further investigation.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I tested this with loraw (a &quot;raw&quot; loopback tester that doesn&#x27;t use
+libfuse) and it fails with
+
+root@kvm:~# ./loraw -u  /mnt/fuse
+loraw: loraw.c:1010: lo_start_uring: Assertion `!cqe-&gt;res&#x27; failed.
+
+cqe-&gt;res is -22 (EINVAL).
+
+Attaching the reproducer.  To compile:
+
+cp $(KERNEL_TREE)/include/uapi/linux/fuse.h fuse_kernel.h
+gcc loraw.c -oloraw -luring
+
+Thanks,
+Miklos</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/CAJfpegt2NTn27A_QoMnfb8gDLZpRc9WHzWW6wGBjWc+nvJxg=A@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: test_failure, request_for_reproducer</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Bernd Schubert</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer expressed no specific technical concerns or suggestions regarding the patch, but instead mentioned that they would review it later.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Unless Joannes replies earlier, I will take a look in about 5 to 7 hours
+- reply expected in the night.
+
+
+Thanks,
+Bernd</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Miklos Szeredi</div>
+<a href="https://lore.kernel.org/r/4e085cc8-0a78-4ea5-89ec-ad425f6a38c6@bsbernd.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: no clear signal</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author Joanne Koong addressed a concern about breaking backwards compatibility by pointing out that the pre-existing behavior has been in the kernel since version 6.14 and changing it would break Miklos&#x27;s loraw program.
+
+Author acknowledged that the condition check in fuse_uring_cmd() is an &amp;&amp;, not an ||, and explained that this allows the fuse io-uring logic to proceed regardless of whether the server replied with FUSE_OVER_IO_URING or not.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This is pre-existing behavior that&#x27;s been there since the beginning
+(kernel version 6.14) [1]. I don&#x27;t think we can change this now, or
+it&#x27;ll break backwards compatibility, like Miklos&#x27;s loraw program.
+
+---
+
+The condition check in fuse_uring_cmd() is an &amp;&amp; and not an ||. It
+doesn&#x27;t enforce that the server must have sent over FUSE_OVER_IO_URING
+in the init reply to use fuse io-uring. With enable_uring=1 (which is
+needed for the kernel to advertise FUSE_OVER_IO_URING in the init
+request in the first place), the fuse io-uring logic proceeds
+regardless of whether the server replied with the FUSE_OVER_IO_URING
+flag or not.
+
+Thanks,
+Joanne
+
+[1] https://elixir.bootlin.com/linux/v6.14-rc1/source/fs/fuse/inode.c#L1455</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Bernd Schubert</div>
+<a href="https://lore.kernel.org/r/CAJnrk1Z_ioW02xbrUekpzSJNerHL=XH-VYqHmUXFzyUD4HDNdQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: backwards compatibility, breaking existing code, acknowledged a technical issue</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Bernd Schubert</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Bernd Schubert noted that enabling io-uring on a connection should be blocked if the FUSE_OVER_IO_URING flag is not set, and also required to prevent lock order issues between queue-&gt;lock and fch-&gt;bg_lock. He suggested checking for this condition in fuse_uring_cmd() and blocking requests in fuse_block_alloc().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I don&#x27;t think we should allow io-uring without FUSE_OVER_IO_URING and 
+I really thought that was disabled. 
+
+&lt;... checking the code ...&gt;
+
+I&#x27;m on a ublk branch without your commits a applied, i.e. plain upstream 7.2 fuse
+
+fuse_uring_cmd()
+	/* Once a connection has io-uring enabled on it, it can&#x27;t be disabled */
+	if (!enable_uring &amp;&amp; !fch-&gt;io_uring) {
+		pr_info_ratelimited(&quot;fuse-io-uring is disabled\n&quot;);
+		return -EOPNOTSUPP;
+	}
+
+
+
+In process_init_reply()
+
+if (flags &amp; FUSE_OVER_IO_URING &amp;&amp; fuse_uring_enabled())
+    fuse_chan_io_uring_enable(fc-&gt;chan);
+
+
+And this is also absolutely needed to block requests in fuse_block_alloc(),
+which is a requirement to avoid lock order issues between queue-&gt;lock and
+fch-&gt;bg_lock (at least I believe that has not been solved yet).
+
+
+I&#x27;m going to try Miklos&#x27; reproducer in a bit, but one way or the other
+let&#x27;s please not allow io-uring without FUSE_OVER_IO_URING reply.
+
+
+Thanks,
+Bernd</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/f0cc2fd8-bf0a-4722-b81c-d54fbafd00a7@bsbernd.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, blocking requests</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Bernd Schubert</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that there is a lock order inversion issue due to fuse_uring_queue_bq_req() holding two locks, and also pointed out that the condition in fuse_block_alloc() doesn&#x27;t make sense without FUSE_OVER_IO_URING reply.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The comment there is definitely outdated, at least it was *supposed* to.
+
+Well, then we have a problem because we have a lock order inversion
+issue. After adding in the reduce-queue series I had planned to work on
+distributing fch-&gt;num_background among queues, so that each queue gets
+its own num_background, so that holding two locks like in
+fuse_uring_queue_bq_req() wouldn&#x27;t be needed anymore.
+
+Also again, without FUSE_OVER_IO_URING reply the condition in
+fuse_block_alloc() doesn&#x27;t make any sense.
+
+
+Thanks,
+Bernd</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/ce65de6a-2c80-492e-b256-7e6e1ead9aa8@bsbernd.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lock ordering violation, condition doesn&#x27;t make sense</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Bernd Schubert</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Bernd Schubert noted a potential lock order inversion issue in the code, where the queue-&gt;lock is taken while holding fch-&gt;bg_lock, and requested that the lock be dropped before calling try_to_unmap(). Additionally, he pointed out an incorrect &#x27;&amp;&amp;&#x27; operator in fuse_uring_cmd() that could bypass the module option to enable io-uring.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Lock order inversion is this
+
+ CPU 0 - io-uring completion              | CPU 1 - legacy background completion
+                                           | fuse_request_end()
+                                           |   takes fch-&gt;bg_lock
+                                           |   fuse_request_bg_finish()
+  fuse_uring_cmd()                         |
+    fuse_uring_commit_fetch()              |
+      fuse_uring_commit()                  |   
+        fuse_uring_req_end()               |
+          takes queue-&gt;lock                |
+          wants fch-&gt;bg_lock               |
+                                           |   flush_bg_queue()
+                                           |     fuse_send_one()
+                                           |       fiq-&gt;ops-&gt;send_req()
+                                           |         fuse_uring_queue_fuse_req()
+                                           |           wants queue-&gt;lock
+
+
+(I queried AI about it to quickly generate that graph, but that is
+exactly what I had seen back in development and which is why fuse
+requests are supposed to be blocked until queue initialization is
+complete, i.e. to avoid switching from /dev/fuse to io-uring at
+run time.
+
+The wrong &quot;&amp;&amp;&quot; in fuse_uring_cmd() also makes it possible that people
+bypass the module option to enable io-uring, by just setting the flag
+in their userspace implementation. Yikes :/</pre>
+</details>
+<a href="https://lore.kernel.org/r/bcfe659d-f638-4d53-a733-3f815495813e@bsbernd.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lock order inversion, incorrect &amp;&amp; operator</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

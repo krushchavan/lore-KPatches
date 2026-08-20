@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 00/57] mm/collapse: rebuild collapse on migration primitives</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260816224609.308019-1-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-18</strong><div class="date-range-nav">Active on: <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-17">2026-08-17</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-19</strong><div class="date-range-nav">Active on: <a href="#2026-08-19">2026-08-19</a> &bull; <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-17">2026-08-17</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patchset replaces khugepaged&#x27;s anonymous collapse mechanism with a new engine that can collapse sub-PMD ranges, built around migration entries and frozen folios to improve scalability and reduce disruption to the workload being collapsed. The old mechanism held the address space still by locking it, while the new engine makes the sources themselves inert between two barriers, allowing the copy to run without holding any lock. This change aims to fix limitations in the original implementation, particularly with PMD-granular operations and VMA alignment.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-16">
@@ -4136,6 +4136,215 @@ All Rights Reversed.</pre>
 </details>
 <a href="https://lore.kernel.org/r/905d08d102e56a026a5ad69573c507d2d9becc37.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: frustration, complexity</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-19">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed concerns about the patch series&#x27; complexity and maintainability, explaining that it&#x27;s not a cleanup but a replacement of an existing mechanism. He acknowledged that the current locking is &#x27;nasty&#x27;, but argued that the new engine changes the serialization model in a way that improves scalability. The author proposed to incrementally improve the code by adding the new engine alongside the old one and then removing the old mechanism, rather than trying to refactor everything at once.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Aug 18, 2026 at 04:12:17PM +0200, David Hildenbrand (Arm) wrote:
+&gt; I think we all agree that there is a lot of room for improvement, but the big
+&gt; question is:
+&gt; 
+&gt; (a) When does it stop being a cleanup and is a new feature in disguise that
+&gt;     makes the code more complicated and even harder to maintain.
+&gt; 
+&gt; (b) Can it just naturally be made looking like a cleanup.
+&gt; 
+&gt; Ideally, we&#x27;d get b), in small, nice-to-review chunks that incrementally improve
+&gt; the code without inflating it heavily or moving everything around.
+
+It is not a cleanup and I would rather not sell it as one.  It replaces a
+mechanism, so judged as (b) it fails by construction.
+
+I believe the end result is much cleaner. But I might be biased. :)
+
+&gt; The current locking is nasty, so anything that moves us one step closer into
+&gt; something that is not only simpler but also more scalable is nice. I am a bit
+&gt; concerned with the churn in the series as is.
+&gt; 
+&gt; After this series, mm/collapse.c itself is way larger than just mm/khugepaged.c
+&gt; originally, which raises some eyebrows.
+
+Line count is a poor proxy for simplicity or scalability.  What the
+engine changes is the serialization model, and that is the part collapse
+needs changed: the PMD granularity and the exclusion both come out of
+the locking.
+
+Incremental does not reach it, though.  The old mechanism is correct
+because it holds mmap_write_lock, the anon_vma write lock and a reference
+from the LRU; the engine is correct because the sources are frozen behind
+migration entries.  There is no halfway state that is correct under both,
+so the switch lands as one patch.
+
+What can be incremental is everything around it: the engine goes in beside
+the old mechanism, patch 25 points the anon path at it, and 28 removes what
+it replaces.  Until 28 both are in the tree with only one of them
+reachable, so the switch can be reverted on its own.
+
+&gt; We should also be aware that people are proposing file/shmem mTHP collapse, so
+&gt; ideally what we refactor would naturally unify some of these code paths.
+&gt; 
+&gt; I am wondering whether shmem mTHP collapse should come first. (I&#x27;m hoping that
+&gt; shmem mTHP collapse can unify some of the anon+file collapse code in a nice way,
+&gt; to similarly just look like a cleanup while enabling a new scenario.
+
+mTHP collapse as it stands has limited usability: PMD-aligned windows only,
+and one VMA has to own the PMD.  Bolting file collapse onto the same
+structure adds to the debt instead of paying it down.
+
+It would fit the new design.  The frame -- scan, candidate selection, the
+round and its passes -- has nothing anon-specific in it; what is
+anon-specific sits in the freeze (folio_test_anon(), PageAnonExclusive())
+and the unshare in the fault-in pass.  A file source would bring its own
+check, freeze, copy and install.
+
+I am not sure it should, though.
+
+Do we want to find file collapse candidates by walking the virtual
+address space at all?
+
+collapse_file() already works on the mapping -- it builds the folio in
+the page cache and then repairs every mapping through
+retract_page_tables() -- so the VMA walk only picks which inode range to
+try, and it reaches only what a registered mm maps right now.  Large
+folios buy more than TLB reach: fewer page cache entries, cheaper
+writeback, natural locking batch, etc.  Those apply whether the file is
+mapped or not, and going at the inode directly would reach them.
+
+&gt; Agreed, I think we really should unify+cleanup the existing code first before
+&gt; doing more drastic changes.
+&gt; 
+&gt; Having a series that throws all of khugepaged.c into a mixer and pours something
+&gt; new into collapse.c is ... concerning :)
+
+The moving around is patches 29-35 and the tracing after them.  None of it
+is needed for the engine: 1-28 add it, switch the anon path over and delete
+the old mechanism, without moving anything else out of khugepaged.c.  If
+the churn is the problem, v2 can stop there and the moves can come later as
+their own series.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Tue, Aug 18, 2026 at 04:15:27PM +0200, David Hildenbrand (Arm) wrote:
+&gt; &gt; David and I talked about this at LSF/MM. 
+&gt; 
+&gt; Ah, I missed the context in my other reply. Lorenzo already had some patches at
+&gt; some point to split up mm/memory.c into better chunks that will also better help
+&gt; our subcomponent maintenance model.
+
+Lorenzo, if you can dig those out, I would rather build on them than start
+over.  Happy to do the legwork.
+
+&gt; I think the challenge is how to handle huge_memory.c, because ideally, we&#x27;d not
+&gt; have these stupid callbacks into huge_memory.c once we make PMDs just a
+&gt; first-class citizen.
+
+Agreed on settling the target shape before moving anything.
+
+Splitting by operation answers most of huge_memory.c on its own, though.
+
+Its entry points are named after the operation they implement, and each has
+one destination: do_huge_pmd_anonymous_page(), do_huge_pmd_wp_page() and
+do_huge_pmd_numa_page() belong next to do_anonymous_page() in
+mm/fault.c.
+
+zap_huge_pmd() next to zap_pte_range(), copy_huge_pmd() next to
+copy_pte_range().  change_huge_pmd(), move_huge_pmd() and follow_huge_pmd()
+have their callers in the right file already -- mprotect.c, mremap.c, gup.c
+-- so they move to the caller.  The callback goes away because the PMD case
+becomes a branch beside the PTE case instead of a call into another file.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Tue, Aug 18, 2026 at 03:41:40PM +0100, Lorenzo Stoakes (ARM) wrote:
+&gt; &gt; Ah, I missed the context in my other reply. Lorenzo already had some patches at
+&gt; &gt; some point to split up mm/memory.c into better chunks that will also better help
+&gt; &gt; our subcomponent maintenance model.
+&gt; 
+&gt; Ah yeah I kinda lost those but indeed doing this is a good idea.
+
+Oh, well, I can give it a try from scratch.
+
+&gt; I should try to dig those out again or look again when I have a chance...
+&gt; 
+&gt; &gt;
+&gt; &gt; I think the challenge is how to handle huge_memory.c, because ideally, we&#x27;d not
+&gt; &gt; have these stupid callbacks into huge_memory.c once we make PMDs just a
+&gt; &gt; first-class citizen.
+&gt; 
+&gt; Yes and another point and I think it&#x27;s one that Kiryl also gets at is - can we
+&gt; _please_ stop pretending huge folios == THP == what the page cache does == page
+&gt; special cases like DAX? :)
+
+Yes.  That is also why I want the split by operation rather than by
+THP-ness: a PMD case belongs next to the PTE case for the same operation,
+not in a file that collects everything huge.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<a href="https://lore.kernel.org/r/aoXn1B7cPnPq7uxd@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged complexity, explained design changes</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David suggested renaming khugepaged.c to collapse.c and moving related header files to avoid unnecessary churn when the new engine is implemented.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 8/17/26 00:45, Kiryl Shutsemau wrote:
+&gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; 
+&gt; Preparation for building the new collapse engine in its own file.  The
+&gt; engine and khugepaged.c need to agree on what a collapse result is and
+&gt; what state a scan carries.
+&gt; 
+&gt; Move enum scan_result and struct collapse_control into a new
+&gt; mm/collapse.h.
+&gt; 
+&gt; No functional change intended.
+&gt; 
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt; ---
+
+BTW, I&#x27;m wondering whether it would result in less churn (independent of the
+other changes) to
+
+a) Rename mm/khugeapged.c to mm/collapse.c
+
+b) Move stuff into mm/collapse.h that a new ...
+
+c) mm/khugapegd.c will need.
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<a href="https://lore.kernel.org/r/3113ac8b-c1ce-4577-9e93-449b70818918@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: suggested changes, less churn</div>
 </div>
 </div>
 </div>
