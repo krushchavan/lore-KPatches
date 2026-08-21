@@ -11,7 +11,7 @@
       "patch_summary": "This patch decouples the creation of fuse_ring from entry registration in FUSE (Filesystem in Userspace) connections. The ring is now created during initialization, after a server has negotiated and set FUSE_OVER_IO_URING, rather than lazily on the first FUSE_IO_URING_CMD_REGISTER command. This change eliminates concurrent creations of the single per-connection fuse_ring, which previously required open-coded handling to detect and protect against. The patch also updates various functions to use the pre-initialized ring instead of creating it themselves."
     },
     "2026-08-19": {
-      "report_file": "2026-08-19_ollama_llama3.1-8b.html",
+      "report_file": "2026-08-20_ollama_llama3.1-8b.html",
       "developer": "Joanne Koong",
       "reviews": [
         {
@@ -133,6 +133,171 @@
           "reply_to": "",
           "message_date": "2026-08-19",
           "message_id": "bcfe659d-f638-4d53-a733-3f815495813e@bsbernd.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch decouples the creation of fuse_ring from entry registration in the FUSE (Filesystem in Userspace) driver. Currently, the ring is created lazily on the first FUSE_IO_URING_CMD_REGISTER command, which can lead to concurrent creations and requires open-coded handling. The patch moves the ring creation to the FUSE_INIT reply processing after a server has negotiated and set FUSE_OVER_IO_URING, ensuring that the ring is published before the connection is marked initialized. This change simplifies the code and reduces the risk of concurrent creations."
+    },
+    "2026-08-20": {
+      "report_file": "2026-08-20_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [
+        {
+          "author": "Baokun Li",
+          "summary": "reviewer noted that the patch does not handle the case where FUSE_INIT reply processing fails and requested a check to be added to ensure the ring is properly cleaned up in this scenario\n\nReviewer Baokun Li expressed concern that enabling io-uring without FUSE_OVER_IO_URING allows a capability beyond what was negotiated, and suggested printing the negotiated flags to dmesg at INIT time for easier issue detection.\n\nReviewer noted that clearing fch->io_uring on REGISTER failure may reject subsequent io_uring commands with -EOPNOTSUPP while the data path is still running on uring ops, and suggested that fch->io_uring should remain set even after a single REGISTER failure.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "failure handling",
+            "cleanup",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi all,\n\nOn 2026/8/20 04:05, Bernd Schubert wrote:\n\n---\n\nI share Bernd's concern here. Allowing io-uring without\nFUSE_OVER_IO_URING means enabling a capability beyond what was\nnegotiated. We should honor the negotiated feature set, and print\nthe negotiated flags to dmesg at INIT time so issues like this are\neasy to spot.\n\n---\n\nBTW, the current code clears fch->io_uring on REGISTER failure:\n\n        if (err) {\n            fch->io_uring = 0;\n            wake_up_all(&fch->blocked_waitq);\n            return err;\n        }\n\nBut by then other entries may have already registered successfully,\nfiq->ops is switched to fuse_io_uring_ops, and requests are flowing\nthrough the uring path. Clearing fch->io_uring here may reject all\nsubsequent io_uring commands with -EOPNOTSUPP while the data path\nis still running on uring ops.\n\nfch->io_uring is a protocol fact \\u2014 the daemon negotiated\nFUSE_OVER_IO_URING at INIT time. A single REGISTER failure should\nnot regress it, at least not once the ring is ready. The daemon\ncan retry; the negotiated capability should be permanent.\n\n\nThanks,\nBaokun",
+          "reply_to": "Bernd Schubert",
+          "message_date": "2026-08-20",
+          "message_id": "69545a14-e3ca-487c-a98d-b9f16b745c39@linux.alibaba.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Joanne Koong (author)",
+          "summary": "Author acknowledged that changing the existing behavior would break backwards compatibility and cited a specific kernel version (6.14) as evidence.\n\nAuthor addressed a concern that the check in fuse_uring_cmd() would allow enabling IO_URING even if admin disabled it, explaining that the check is an && not an || and will only return -EOPNOTSUPP if admin disables enable_uring.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged a potential issue",
+            "cited pre-existing behavior",
+            "acknowledged",
+            "explained"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Not sure if you missed this reply [1], but will copy and paste it here:\n\nThis is pre-existing behavior that's been there since the beginning\n(kernel version 6.14). I don't think we can change this now, or\nit'll break backwards compatibility, like Miklos's loraw program.\n\n---\n\nThis is also pre-existing behavior. The check in fuse_uring_cmd() is a\n&& not an ||. It'll only return -EOPNOTSUPP if admin disables\nenable_uring.\n\nThanks,\nJoanne\n\n[1] https://lore.kernel.org/fuse-devel/CAJnrk1Z_ioW02xbrUekpzSJNerHL=XH-VYqHmUXFzyUD4HDNdQ@mail.gmail.com/",
+          "reply_to": "Baokun Li",
+          "message_date": "2026-08-20",
+          "message_id": "CAJnrk1a0ztS6iSZvCFgFf6tH5W4rJM_BdgkJHLjjftJF8qeyNQ@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Bernd Schubert",
+          "summary": "Reviewer noted that the current implementation may lead to a deadlock due to incorrect lock ordering, and also allows for module option bypass and flag bypass between fuse-server and kernel, suggesting switching to FUSE_OVER_IO_URING2 flag instead.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "lock ordering issue",
+            "module option bypass"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "I think we need to discuss this. I had replied that the current\naccidental scheme we\n\n- deadlock (lock order), with bg_lock being one issue, but I bet there\nis more\n- module option bypass\n- bypass of what fuse-client/kernel announces\n\nI.e. if a fuse-server did implement the accidental scheme, it was broken\nanyway.\n\nIf wanted to be paranoid, we would switch to FUSE_OVER_IO_URING2 flag\nand ignore FUSE_OVER_IO_URING. I hope you don't insist on allowing\nfuse-server to set flags that fuse-server doesn't even announce...\n\nThanks,\nBernd",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-08-20",
+          "message_id": "fa10e184-8390-4e79-abfa-e0dcb6888da8@bsbernd.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Joanne Koong (author)",
+          "summary": "Author pushed back on the suggestion to introduce a new flag (FUSE_OVER_IO_URING2) to handle servers using older versions of libfuse, arguing that it would be behaviorally identical to just enforcing FUSE_OVER_IO_URING and could break compatibility\n\nAuthor pushed back on feedback about potential backwards compatibility issues, suggesting that the decision should be left up to Miklos. She also proposed a potential fix for a lockdep issue by restructuring the flush_bg_queue() function.",
+          "sentiment": "CONTENTIOUS",
+          "sentiment_signals": [
+            "pushed back on feedback",
+            "disagreed with suggestion",
+            "pushed_back",
+            "proposed_fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I don't think a new FUSE_OVER_IO_URING2 flag helps. If the kernel\nignores FUSE_OVER_IO_URING as you describe, servers using older\nversions of libfuse will break. If it accepts both flags, it's\nbehaviorally identical to just enforcing FUSE_OVER_IO_URING.\n\n---\n\nI think this is a call better left up to Miklos. I don't know how\nrigorously it is enforced in linux that nothing should break backwards\ncompatibility. The code was released in March 2025 as part of kernel\nversion 6.14, so it's been roughly a year and a half, which I guess\nisn't that long in the grand scheme of things, but if Miklos has his\nloraw server program that relies on this, it's probably likely there's\nother users out there who have servers that would similarly just break\nif we switch the policy now.\n\nI haven't had time to look deeply at the lockdep thing you wrote\nabout, but from a first glance, couldn't we fix it at the source?\nflush_bg_queue() calls ->send_req() while holding the fch->bg_lock\nwhich is what creates the bg_lock -> queue->lock deadlock. If it\ninstead only does the background accounting under the lock and moves\nthe requests to a caller-provided list where the caller only sends\n*after* dropping the bg_lock, doesn't that solve the deadlock? This\nwould fix it for every server regardless of whether it sent\nFUSE_OVER_IO_URING or not. I'll try to get some time to look at this\nnext week.\n\nThanks,\nJoanne",
+          "reply_to": "Bernd Schubert",
+          "message_date": "2026-08-20",
+          "message_id": "CAJnrk1YfHOqcoNhCS=ukMiOH436_NzSVtNiPLpSw6fqWDhKGjA@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Bernd Schubert",
+          "summary": "The reviewer objects to the introduction of an unannounced flag for io_uring_enabled, considering it a behavioral change that should be debated.\n\nReviewer Bernd Schubert expressed concern that the patch may introduce new issues due to runtime switching, and suggested discussing further before proceeding.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "behavioral change",
+            "unannounced flag",
+            "requested discussion",
+            "fear of introducing new issues"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Well, setting a flag that is not announced by kernel is not ok\neither. Yes, it is change in behavior, but it is debatable.\n\n---\n\nI have a basic patch for that, but I fear testing will bring up ore\nissues when we switch at run time.\n\nLet's discuss in a few min.\n\n\nThanks,\nBernd",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-08-20",
+          "message_id": "85651260-19d4-4f15-9d87-4f47cd996cfa@bsbernd.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch decouples the creation of fuse_ring from entry registration in the FUSE (Filesystem in Userspace) driver. Currently, the ring is created lazily on the first FUSE_IO_URING_CMD_REGISTER command, which can lead to concurrent creations and requires open-coded handling. The patch moves the ring creation to the FUSE_INIT reply processing after a server has negotiated and set FUSE_OVER_IO_URING, ensuring that the ring is published before the connection is marked initialized. This change simplifies the code and reduces the risk of concurrent creations."
+    },
+    "2026-08-21": {
+      "report_file": "2026-08-20_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [
+        {
+          "author": "Baokun Li",
+          "summary": "Reviewer Baokun Li expressed concern that enabling capabilities beyond what was negotiated can introduce inconsistencies, referencing issues found in their downstream tree related to the fch->io_uring switch.\n\nReviewer Baokun Li noted that the current implementation of io_uring flags has unclear boundaries and inconsistent states, specifically mentioning enable_uring, fch->io_uring, and ring->ready. He suggested a clean design where fch->io_uring is set at INIT time based on negotiated flags and user-controlled enable_uring, and then write-once, with the io_uring path taken when ring->ready and falling back to classic /dev/fuse otherwise.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "inconsistencies",
+            "fch->io_uring",
+            "requested changes",
+            "suggested improvements"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Yes, I saw it, but pre-existing doesn't necessarily mean correct.\nEnabling capabilities beyond what was negotiated easily introduces\ninconsistencies.\n\nIn our recent hardening work we found that the fch->io_uring switch\ncauses anomalies in several mechanisms (mostly in our downstream tree),\nwhich is why I replied in Bernd's thread \\u2014 he raised the\nenable_uring / fch->io_uring bypass there.\n\n---\n\nYes, that's exactly the problem. Right now we have several flags\nwith unclear boundaries:\n\n enable_uring: user-controlled, can be toggled at any time\n fch->io_uring: set to 1 at INIT negotiation, but cleared to 0\n   on any entry registration failure \\u2014 even if other entries\n   have already registered successfully and fiq->ops has been\n   switched to uring ops. The two states are inconsistent.\n ring->ready: set when at least one entry has registered\n\nI think the clean design would be: at INIT time, decide based on\nenable_uring and the negotiated flags whether to initialize uring\nand set fch->io_uring. After that, enable_uring is no longer\nconsulted \\u2014 fch->io_uring is write-once. When ring->ready (at\nleast one entry registered), take the io_uring path; otherwise\nfall back to the classic /dev/fuse path. This way each\nvariable has a single, clear semantic.\n\n\nThanks,\nBaokun",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-08-21",
+          "message_id": "bfdf3493-b208-4df0-89f0-0f14032814f0@linux.alibaba.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Baokun Li",
+          "summary": "Reviewer noted that a server skipping FUSE_OVER_IO_URING was never in a well-defined state due to lack of blocking guarantee and lock ordering protection, and agreed with the patch's decoupling approach.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "agreed",
+            "no blocking guarantee"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Agreed. A server that skips FUSE_OVER_IO_URING was never in a\nwell-defined state \\u2014 no blocking guarantee, no lock ordering\nprotection, nothing. There is nothing to preserve compatibility\nwith.\n\n\nThanks,\nBaokun",
+          "reply_to": "Bernd Schubert",
+          "message_date": "2026-08-21",
+          "message_id": "00b36c50-5ab6-40a2-bd64-3c8d93fa83cb@linux.alibaba.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Baokun Li",
+          "summary": "The reviewer agrees that decoupling fuse_ring creation from ent registration is a good approach, as it simplifies the code structure by eliminating nested operations.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "agreement",
+            "simplification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Makes sense \\u2014 separating dequeue from send eliminates the nesting\nstructurally.\n\n\nCheers,\nBaokun",
+          "reply_to": "Joanne Koong",
+          "message_date": "2026-08-21",
+          "message_id": "f41796b8-161c-4380-9073-615ed45c995c@linux.alibaba.com",
           "analysis_source": "llm"
         }
       ],

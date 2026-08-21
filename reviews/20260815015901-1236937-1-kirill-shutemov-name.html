@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 00/19] selftests/mm: improve khugepaged coverage</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260815015901.1236937-1-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-15</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-18</strong><div class="date-range-nav">Active on: <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-15">2026-08-15</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-15</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a> &bull; <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-15">2026-08-15</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series improves the coverage of selftests/mm by adding new cases to test the khugepaged mechanism, which collapses huge pages into smaller ones. The existing tests were limited and did not cover all possible scenarios. The new additions include folio-order helpers, anon collapse cases with mixed sources, a shared-source write race, and tests for various edge cases such as faults, MADV_DONTNEED, pins, fork, mremap, reclaim, compaction, and KASAN/lockdep checks. The changes also address existing issues in the test suite, including scaling the collapse wait time with PMD size, skipping certain cases where they are not applicable, and retrying swap cases to ensure accurate results.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-15">
@@ -2198,6 +2198,843 @@ Cheers, Lorenzo</pre>
 </details>
 <a href="https://lore.kernel.org/r/aoQ11Zo40gJw7qI8@lucifer" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, criticism of comment style</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-20">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Mike Rapoport</span>
+<a class="date-chip" href="../2026-08-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-20">2026-08-20</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Mike Rapoport noted that khugepaged&#x27;s collapse mechanism has a race condition on arm64 with 64K pages, where the page cache caps folio order at MAX_PAGECACHE_ORDER, which is below the PMD order. This causes four shmem cases to fail and the run to bail out in the middle. He also pointed out that MADV_COLLAPSE answers -EINVAL and khugepaged passes over the range. Additionally, he noted that collapse_swapin_single_pte() and collapse_max_ptes_swap() have a race condition where MADV_PAGEOUT is best effort and wait_for_scan() leaves MADV_HUGEPAGE behind, causing the daemon to still be working on the range. He requested retrying several times for up to two seconds while holding the range out of khugepaged&#x27;s reach.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Kiryl,
+
+&gt; 
+&gt;  - The changelogs are rewritten throughout (Mike Rapoport).
+ 
+Sorry for being PITA, but I can&#x27;t say I&#x27;m happy with the result.
+
+I commented of several commit messages and some of the comments, but I
+despaired at some point.
+
+My ask for the next revision, please, please, read the text as if you
+were a reviewer or presuming it&#x27;s a future you that reads it.
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; The page cache caps folio order at MAX_PAGECACHE_ORDER, which is smaller
+&gt; than the PMD order on arm64 with 64K pages, where a PMD is 512M.  A
+&gt; PMD-sized page cache folio is impossible there, so MADV_COLLAPSE answers
+
+Nit: the code comment phrases it better: &quot;so kernel refuses these
+collapses&quot;.
+
+&gt; -EINVAL and khugepaged passes over the range.  The shmem cases ask for a
+&gt; PMD-sized folio anyway, so four of them fail and the run bails out in the
+&gt; middle.
+&gt; 
+&gt; MAX_PAGECACHE_ORDER is not shmem-specific: it caps every file folio.  Skip
+&gt; both mem types where the cap is below the PMD order.
+&gt; 
+&gt; Anonymous collapse is unaffected: its orders are not capped this way.
+&gt; 
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/khugepaged.c b/tools/testing/selftests/mm/khugepaged.c
+&gt; index a5ada78d90ee..b436b401e2ea 100644
+&gt; --- a/tools/testing/selftests/mm/khugepaged.c
+&gt; +++ b/tools/testing/selftests/mm/khugepaged.c
+&gt; @@ -1391,6 +1391,30 @@ int main(int argc, char **argv)
+&gt;  
+&gt;  	setbuf(stdout, NULL);
+&gt;  
+&gt; +	/*
+&gt; +	 * The page cache caps folio order at MAX_PAGECACHE_ORDER, which is
+&gt; +	 * below the PMD order on arm64 with 64K pages.  A PMD-sized page cache
+&gt; +	 * folio is impossible there, so the kernel refuses these collapses by
+&gt; +	 * design and there is nothing to test.  The cap is not shmem-specific:
+&gt; +	 * it rules out regular files too, and the per-order shmem_enabled
+&gt; +	 * controls exist for exactly the orders it allows, which is what makes
+&gt; +	 * them readable here.
+&gt; +	 */
+&gt; +	if (!(thp_shmem_supported_orders() &amp; (1UL &lt;&lt; hpage_pmd_order))) {
+&gt; +		if (shmem_ops) {
+&gt; +			ksft_print_msg(&quot;no PMD-order page cache folio: skipping shmem\n&quot;);
+&gt; +			shmem_ops = NULL;
+&gt; +		}
+&gt; +		if (read_only_file_ops) {
+&gt; +			ksft_print_msg(&quot;no PMD-order page cache folio: skipping file\n&quot;);
+&gt; +			read_only_file_ops = NULL;
+&gt; +			read_write_file_read_ops = NULL;
+&gt; +			read_write_file_write_ops = NULL;
+&gt; +		}
+&gt; +		if (!anon_ops &amp;&amp; !shmem_ops &amp;&amp; !read_only_file_ops)
+&gt; +			ksft_exit_skip(&quot;Nothing left to collapse into\n&quot;);
+&gt; +	}
+&gt; +
+&gt;  	default_settings.khugepaged.max_ptes_none = hpage_pmd_nr - 1;
+&gt;  	default_settings.khugepaged.max_ptes_swap = hpage_pmd_nr / 8;
+&gt;  	default_settings.khugepaged.max_ptes_shared = hpage_pmd_nr / 2;
+
+Reviewed-by: Mike Rapoport (Microsoft) &lt;rppt@kernel.org&gt;
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; collapse_swapin_single_pte() and collapse_max_ptes_swap() swap a range out
+&gt; and then require smaps to report exactly the count they asked for.  Two
+&gt; things keep that count from arriving.
+&gt; 
+&gt; MADV_PAGEOUT is best effort, so the count often turns up a moment late.
+&gt; 
+&gt; And wait_for_scan() leaves MADV_HUGEPAGE behind, so khugepaged is still
+
+&quot;... leaves range as eligible for collapsing, so khugepaged is still
+working on it.&quot;
+
+&gt; working on the range.  Collapsing a range with up to max_ptes_swap pages
+&gt; swapped out means reading them back in, so the daemon empties the swap as
+&gt; fast as the case fills it.  On arm64 with 64K pages max_ptes_swap is 1024
+&gt; pages, which is 64M a step, and the case loses:
+
+&quot;.. the case looses the race:&quot;
+
+&gt; 
+&gt;     # Swapout 1024 of 8192 pages... Fail
+&gt;     not ok 10 collapse_max_ptes_swap
+&gt; 
+&gt; Ask again for up to two seconds, with the range held out of the daemon&#x27;s
+&gt; reach while asking.  The collapse each case runs next puts MADV_HUGEPAGE
+&gt; back, so only the setup is affected.
+
+&quot;Retry several times for up to two seconds meanwhile holding the range
+out of the khugepaged reach. The collapse each case runs next restores
+MADV_NOHUGEPAGE, so only setup is affected&quot;
+
+&gt; 
+&gt; If the pages still will not go, skip.  A machine with no swap, or swap too
+
+&quot;If the pages still won&#x27;t swap out, skip&quot;.
+
+&gt; small, full, capped by a memcg or busy with writeback, is not the kernel
+&gt; under test refusing.  An error from madvise() itself still ends the run.
+&gt; 
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Reviewed-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/khugepaged.c b/tools/testing/selftests/mm/khugepaged.c
+&gt; index b436b401e2ea..a3d14cc1a2bf 100644
+&gt; --- a/tools/testing/selftests/mm/khugepaged.c
+&gt; +++ b/tools/testing/selftests/mm/khugepaged.c
+&gt; @@ -241,6 +241,41 @@ static bool check_swap(void *addr, unsigned long size)
+&gt;  	return swap;
+&gt;  }
+&gt;  
+&gt; +/*
+&gt; + * Page the range out and wait for the swap count to say so.
+&gt; + *
+&gt; + * Two things get in the way.  MADV_PAGEOUT is best effort:
+&gt; + * shrink_folio_list() leaves a folio alone when it cannot reclaim it right
+&gt; + * away, and one still under writeback from an earlier pageout is the common
+&gt; + * case, so the count the caller asks for arrives a moment later.  And a range
+&gt; + * an earlier collapse left MADV_HUGEPAGE is one khugepaged is still working
+&gt; + * on: collapsing a range with up to max_ptes_swap pages swapped out means
+&gt; + * reading those pages back in, so the daemon undoes the pageout as fast as it
+&gt; + * is asked for.  Keep the range out of its reach; the collapse the caller runs
+&gt; + * next puts MADV_HUGEPAGE back.
+&gt; + *
+&gt; + * Failing to get the pages out is the machine&#x27;s answer, not the kernel&#x27;s --
+&gt; + * swap too small, swap full, a memcg cap, a folio still under writeback -- so
+&gt; + * callers skip rather than fail.  An error from madvise() is different, and
+&gt; + * ends the run here.
+
+I&#x27;d replace this cumbersome comment with
+
+&gt; + */
+&gt; +static bool swapout_range(void *p, unsigned long size)
+&gt; +{
+&gt; +	int i;
+&gt; +
+
+	/* prevent khugepaged from swapping into this range */
+
+&gt; +	if (madvise(p, size, MADV_NOHUGEPAGE))
+&gt; +		ksft_exit_fail_perror(&quot;madvise(MADV_NOHUGEPAGE)&quot;);
+&gt; +
+
+	/*
+	 * retry several times because MADV_PAGEOUT is best effort.
+	 * sleep between the retries to give a chance for outstanding
+	 * writebacks for pages being swapped out to finish.
+	 */
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; __madvise_collapse() turns THP off before each MADV_COLLAPSE, both to keep
+&gt; khugepaged out of the range and to prove MADV_COLLAPSE ignores the setting.
+&gt; It clears the global controls only, which is no longer enough.  A per-order
+&gt; control overrides them, and -s leaves the source order at &quot;always&quot;, so
+
+Nit: description of &#x27;-s&#x27; would be nice :)
+
+&gt; khugepaged collapses the very range the case is working on.  The case then
+&gt; fails on a collapse that was interfered with rather than refused.
+&gt; 
+&gt; Clear the per-order controls too.  Set them to &quot;inherit&quot;, not &quot;never&quot;.
+&gt; khugepaged honours the global never and stays out.  A forced shmem collapse
+&gt; takes the order it builds from these very controls, and still finds one.
+&gt; 
+&gt; Fixes: 9f0704eae8a4 (&quot;selftests/mm/khugepaged: enlighten for multi-size THP&quot;)
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/khugepaged.c b/tools/testing/selftests/mm/khugepaged.c
+&gt; index a3d14cc1a2bf..5aa92de93ec1 100644
+&gt; --- a/tools/testing/selftests/mm/khugepaged.c
+&gt; +++ b/tools/testing/selftests/mm/khugepaged.c
+&gt; @@ -572,8 +572,8 @@ static bool is_anon(struct mem_ops *ops)
+&gt;  static void __madvise_collapse(const char *msg, char *p, int nr_hpages,
+&gt;  			       struct mem_ops *ops, bool expect)
+&gt;  {
+&gt; -	int ret;
+&gt;  	struct thp_settings settings = *thp_current_settings();
+&gt; +	int ret, i;
+&gt;  
+&gt;  	ksft_print_msg(&quot;%s...&quot;, msg);
+&gt;  
+&gt; @@ -586,9 +586,20 @@ static void __madvise_collapse(const char *msg, char *p, int nr_hpages,
+&gt;  	/*
+&gt;  	 * Prevent khugepaged interference and tests that MADV_COLLAPSE
+&gt;  	 * ignores /sys/kernel/mm/transparent_hugepage/enabled
+&gt; +	 *
+&gt; +	 * The per-order controls have to go too, not just the global one: a
+&gt; +	 * source order left at &quot;always&quot; -- which -s does -- lets khugepaged
+&gt; +	 * collapse the very range the case is working on.  Set them to
+&gt; +	 * &quot;inherit&quot;, not &quot;never&quot;.  khugepaged honours the global never and
+&gt; +	 * stays out.  A forced shmem collapse takes the order it builds from
+&gt; +	 * these very controls, and still finds one.
+
+&gt;From my experience LLMs tend to add lengthy comments that describe their
+actions in the moment. Adding to the prompt an instruction to make
+comments more concise and in the global context usually helps :)
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+On Sat, 15 Aug 2026 02:58:50 +0100, Kiryl Shutsemau &lt;kirill@shutemov.name&gt; wrote:
+&gt; An mTHP collapse test needs to know that a range is backed by folios of the
+&gt; target order, and that they sit where a collapse would put them.  Nothing
+&gt; answers that today: is_backed_by_folio() classifies the folio behind a
+&gt; single page, and check_huge_anon() reads smaps AnonHugePages, which only
+&gt; accounts PMD mappings.
+&gt; 
+&gt; Add is_range_backed_by_folio_orders().  For every order-aligned window of
+&gt; the range it requires a present head PFN at its natural alignment and a
+&gt; contiguous PFN run across the window.
+&gt; 
+&gt; [...]
+
+Reviewed-by: Mike Rapoport (Microsoft) &lt;rppt@kernel.org&gt;
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; The khugepaged mTHP tests detect collapse results with the vm_util
+&gt; folio-order helpers rather than smaps AnonHugePages, which only sees PMD
+&gt; mappings.  If those helpers are wrong, every case built on them is wrong
+&gt; the same way, and nothing says so.
+&gt; 
+&gt; Check them directly.  For every anon THP order the kernel supports, fault
+&gt; memory in with only that order enabled.  Require the helpers to classify
+&gt; the backing as exactly that order: not a neighbouring order, and 4K-backed
+&gt; memory as order 0.
+&gt; 
+&gt; Run it in the thp category, ahead of ./khugepaged, so a broken helper is
+&gt; reported as itself rather than as a collapse failure.  Verified on x86-64
+&gt; 4K (orders 0, 2-9) and arm64 64K (orders 0, 2-13).
+&gt; 
+&gt; The test needs ALIGN(), which hmm-tests.c and migration.c each defined
+&gt; privately.  Move it to vm_util.h and drop both copies.
+&gt; 
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/Makefile b/tools/testing/selftests/mm/Makefile
+&gt; index 2d5366196e30..2093fcf6e915 100644
+&gt; --- a/tools/testing/selftests/mm/Makefile
+&gt; +++ b/tools/testing/selftests/mm/Makefile
+&gt; @@ -104,6 +104,7 @@ TEST_GEN_FILES += guard-regions
+&gt;  TEST_GEN_FILES += merge
+&gt;  TEST_GEN_FILES += rmap
+&gt;  TEST_GEN_FILES += folio_split_race_test
+&gt; +TEST_GEN_FILES += folio_order_check
+&gt;  
+&gt;  ifneq ($(ARCH),arm64)
+&gt;  TEST_GEN_FILES += soft-dirty
+&gt; diff --git a/tools/testing/selftests/mm/folio_order_check.c b/tools/testing/selftests/mm/folio_order_check.c
+&gt; new file mode 100644
+&gt; index 000000000000..93030a42c3cc
+&gt; --- /dev/null
+&gt; +++ b/tools/testing/selftests/mm/folio_order_check.c
+&gt; @@ -0,0 +1,137 @@
+&gt; +// SPDX-License-Identifier: GPL-2.0
+&gt; +/*
+&gt; + * Self-check for the vm_util folio-order detection helpers,
+&gt; + * is_backed_by_folio() and is_range_backed_by_folio_orders().
+&gt; + *
+&gt; + * For every anon THP order the kernel supports, fault memory in with only
+&gt; + * that order enabled and verify the helpers report exactly that order:
+&gt; + * not a neighbouring order, and plain 4K memory as order 0. The helpers
+&gt; + * are what the khugepaged mTHP tests use to detect collapse results, so
+&gt; + * they must agree with the kernel&#x27;s own idea of the backing before any
+&gt; + * collapse test relies on them.
+&gt; + */
+&gt; +#define _GNU_SOURCE
+&gt; +#include &lt;fcntl.h&gt;
+&gt; +#include &lt;stdio.h&gt;
+&gt; +#include &lt;stdlib.h&gt;
+&gt; +#include &lt;sys/mman.h&gt;
+&gt; +#include &lt;unistd.h&gt;
+&gt; +
+&gt; +#include &quot;kselftest.h&quot;
+&gt; +#include &quot;vm_util.h&quot;
+&gt; +#include &quot;hugepage_settings.h&quot;
+&gt; +
+&gt; +static int pagemap_fd;
+&gt; +static int kpageflags_fd;
+&gt; +
+&gt; +/* mmap an anon VMA of exactly @size bytes at a @size-aligned address. */
+&gt; +static char *alloc_aligned(size_t size)
+&gt; +{
+&gt; +	size_t len = size * 2;
+&gt; +	uintptr_t aligned;
+
+wouldn&#x27;t void * result in fewer castings?
+
+&gt; +	char *p;
+&gt; +
+&gt; +	p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+&gt; +		 MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+&gt; +	if (p == MAP_FAILED)
+&gt; +		ksft_exit_fail_perror(&quot;mmap()&quot;);
+&gt; +
+&gt; +	aligned = ALIGN((uintptr_t)p, size);
+&gt; +	if (aligned != (uintptr_t)p)
+&gt; +		munmap(p, aligned - (uintptr_t)p);
+&gt; +	if (aligned + size != (uintptr_t)p + len)
+&gt; +		munmap((char *)aligned + size,
+&gt; +		       (uintptr_t)p + len - aligned - size);
+&gt; +
+&gt; +	return (char *)aligned;
+&gt; +}
+&gt; +
+&gt; +/*
+&gt; + * Enable only @order (order 0: nothing), fault one aligned window in and
+&gt; + * check the helpers see exactly @order.
+
+... check that is_range_backed_by_folio_orders() sees ...
+
+&gt; + */
+&gt; +static void check_order(int order)
+&gt; +{
+&gt; +	struct thp_settings settings = *thp_current_settings();
+&gt; +	size_t size = psize() &lt;&lt; order;
+&gt; +	bool ok = true;
+&gt; +	char *p;
+&gt; +	int i;
+&gt; +
+&gt; +	for (i = 0; i &lt; NR_ORDERS; i++)
+&gt; +		settings.hugepages[i].enabled = THP_NEVER;
+&gt; +	if (order)
+&gt; +		settings.hugepages[order].enabled = THP_ALWAYS;
+&gt; +	thp_push_settings(&amp;settings);
+&gt; +
+&gt; +	p = alloc_aligned(size);
+&gt; +	*p = 1;
+&gt; +
+&gt; +	if (!is_range_backed_by_folio_orders(p, size, order,
+&gt; +					     pagemap_fd, kpageflags_fd)) {
+&gt; +		ksft_print_msg(&quot;order %d not detected after fault\n&quot;, order);
+&gt; +		ok = false;
+&gt; +	}
+&gt; +
+&gt; +	/* A lower order must be rejected: the folio is larger. */
+&gt; +	if (order &amp;&amp; is_range_backed_by_folio_orders(p, size, order - 1,
+&gt; +						     pagemap_fd,
+&gt; +						     kpageflags_fd)) {
+&gt; +		ksft_print_msg(&quot;order %d also reported as order %d\n&quot;,
+&gt; +			       order, order - 1);
+&gt; +		ok = false;
+&gt; +	}
+&gt; +
+&gt; +	/* Order 0 pages must not look like any large folio, and vice versa. */
+&gt; +	if (order &amp;&amp; is_range_backed_by_folio_orders(p, size, 0,
+&gt; +						     pagemap_fd,
+&gt; +						     kpageflags_fd)) {
+&gt; +		ksft_print_msg(&quot;order %d also reported as order 0\n&quot;, order);
+&gt; +		ok = false;
+&gt; +	}
+&gt; +
+&gt; +	munmap(p, size);
+&gt; +	thp_pop_settings();
+&gt; +
+&gt; +	ksft_test_result(ok, &quot;order %d classified\n&quot;, order);
+&gt; +}
+&gt; +
+&gt; +int main(void)
+&gt; +{
+&gt; +	struct thp_settings settings;
+&gt; +	unsigned long orders;
+&gt; +	int order;
+&gt; +
+&gt; +	ksft_print_header();
+&gt; +
+&gt; +	if (!thp_available())
+&gt; +		ksft_exit_skip(&quot;Transparent Hugepages not available\n&quot;);
+&gt; +
+&gt; +	pagemap_fd = open(&quot;/proc/self/pagemap&quot;, O_RDONLY);
+&gt; +	if (pagemap_fd &lt; 0)
+&gt; +		ksft_exit_fail_perror(&quot;open(/proc/self/pagemap)&quot;);
+&gt; +	kpageflags_fd = open(&quot;/proc/kpageflags&quot;, O_RDONLY);
+&gt; +	if (kpageflags_fd &lt; 0)
+&gt; +		ksft_exit_skip(&quot;open(\&quot;/proc/kpageflags\&quot;) requires root\n&quot;);
+
+No need to quote the file name I think.
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; Race and functional tests need to drive khugepaged in step: set up a
+&gt; layout, let one full scan pass over it, check the result.  The khugepaged
+&gt; selftest already waits for full_scans to advance by two, but only makes
+
+&quot;advance by two&quot;?
+
+&gt; progress if scan_sleep_millisecs happens to be short.
+&gt; 
+&gt; Lift it into khugepaged_full_pass() and drive it through sysfs: any store
+
+Lift what?
+
+&gt; to scan_sleep_millisecs wakes the daemon, so the barrier completes whatever
+&gt; the scan cadence.  A store can be lost when the daemon is between scans, so
+&gt; it keeps storing until the pass lands; a store to an awake daemon costs
+&gt; nothing and queues no extra pass.
+&gt; 
+&gt; One wake completes one pass only if the whole mm list fits in a scan batch,
+&gt; so callers need a large pages_to_scan.
+&gt; 
+&gt; Settings pushes must not start passes either.  A store to either sleep knob
+&gt; wakes the daemon, so thp_write_settings() now writes a khugepaged knob only
+&gt; when its value changes.  The other knobs do not wake, but writing them
+&gt; uniformly costs nothing.  thp_update_num() is exported for tests that want
+&gt; the same restraint.
+
+This very much elaborates on &quot;what&quot; and &quot;how&quot; and very little on &quot;why&quot;.
+I&#x27;d change the balance.
+
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/hugepage_settings.c b/tools/testing/selftests/mm/hugepage_settings.c
+&gt; index d7917dce3aba..992efee17b71 100644
+&gt; --- a/tools/testing/selftests/mm/hugepage_settings.c
+&gt; +++ b/tools/testing/selftests/mm/hugepage_settings.c
+&gt; @@ -183,6 +183,19 @@ void thp_read_settings(struct thp_settings *settings)
+&gt;  	}
+&gt;  }
+&gt;  
+&gt; +/*
+&gt; + * Write only on change: a store to either sleep knob wakes khugepaged --
+&gt; + * __sleep_millisecs_store() clears khugepaged_sleep_expire and wakes the
+&gt; + * queue -- and settings pushes/pops must not start scan passes nobody
+&gt; + * asked for; khugepaged_full_pass() is the only sanctioned wake.  The
+&gt; + * other knobs do not wake, but writing them the same way costs nothing.
+&gt; + */
+
+Hmm, the function name already tells that it only writes on change.
+Do we need this long text along with it?
+
+Surely &quot;khugepaged_full_pass() is ithe only sanctioned mode&quot; is out of
+line for infrastrucure helper description.
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; The mthp_khugepaged context runs the generic cases at a sub-PMD order,
+&gt; which answers how many folios of that order a range ends up with.  It
+&gt; cannot say which window they are in, so &quot;the populated window collapsed
+&gt; and its neighbour did not&quot; and &quot;one window collapsed twice&quot; look alike.
+&gt; 
+&gt; Add four cases that check each aligned window on its own, with the
+&gt; folio-order helpers in vm_util:
+&gt; 
+&gt; - collapse_order_single_window(): only the populated window collapses;
+&gt; - collapse_order_partial_window(): the default max_ptes_none lets a window
+&gt;   with one present PTE collapse;
+&gt; - collapse_order_max_ptes_none(): with max_ptes_none=0 a full window
+&gt;   collapses and one missing a page does not;
+&gt; - collapse_order_mixed_sources(): sources that are already large folios of
+&gt;   a smaller order collapse to the target.
+&gt; 
+&gt; Each case faults its region before MADV_HUGEPAGE with only the target
+&gt; order enabled, so the sources are order 0 and the result can only come
+&gt; from khugepaged.  They wait for a full pass rather than for the result to
+&gt; appear: without a completed pass, &quot;not collapsed&quot; and &quot;not scanned yet&quot;
+&gt; are the same thing.
+&gt; 
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/khugepaged.c b/tools/testing/selftests/mm/khugepaged.c
+&gt; index 5aa92de93ec1..56e364320145 100644
+&gt; --- a/tools/testing/selftests/mm/khugepaged.c
+&gt; +++ b/tools/testing/selftests/mm/khugepaged.c
+&gt; @@ -31,6 +31,8 @@ static unsigned long page_size;
+&gt;  static int hpage_pmd_nr;
+&gt;  static int anon_order;
+&gt;  static int collapse_order;
+&gt; +static int pagemap_fd = -1;
+&gt; +static int kpageflags_fd = -1;
+&gt;  
+&gt;  #define PID_SMAPS &quot;/proc/self/smaps&quot;
+&gt;  #define TEST_FILE &quot;collapse_test_file&quot;
+&gt; @@ -1261,6 +1263,216 @@ static void madvise_retracted_page_tables(struct collapse_context *c,
+&gt;  	ksft_test_result_report(exit_status, &quot;%s\n&quot;, __func__);
+&gt;  }
+&gt;  
+&gt; +/* Smallest order khugepaged will consider for mTHP collapse. */
+&gt; +#define MIN_MTHP_ORDER 2
+&gt; +
+&gt; +/*
+&gt; + * Order-parameterized collapse cases for the mthp_khugepaged context.  What
+&gt; + * they add over the generic cases run under that context is per-window
+&gt; + * detection: which aligned window collapsed, and which of its neighbours did
+&gt; + * not.  check_huge() answers how many folios of the order the range holds,
+&gt; + * which cannot tell one window from another.
+
+This comment again reads like in the context of the changes driven by
+the current prompt.
+
+&gt; + *
+&gt; + * The region is faulted before MADV_HUGEPAGE, and the target order is only
+&gt; + * enabled for madvise, so the sources are always order 0 and the collapse
+&gt; + * product can only have come from khugepaged.
+&gt; + */
+
+Hmm, what claude tries to tell us here?
+
+&gt; +static size_t mthp_window_size(void)
+&gt; +{
+&gt; +	return page_size &lt;&lt; collapse_order;
+&gt; +}
+&gt; +
+&gt; +static void mthp_push_target_order(void)
+&gt; +{
+&gt; +	struct thp_settings settings = *thp_current_settings();
+&gt; +	int i;
+&gt; +
+&gt; +	/*
+&gt; +	 * The target order, for madvise only, and nothing else enabled: the
+&gt; +	 * cases fault their region before MADV_HUGEPAGE, so the sources are
+&gt; +	 * order 0 whatever -s asked the fault path for.  That matters for the
+&gt; +	 * cases built around a hole -- a large source folio would fill it in
+&gt; +	 * and the window would collapse after all.
+&gt; +	 * collapse_order_mixed_sources enables the source order it wants on
+&gt; +	 * top of this.
+&gt; +	 */
+&gt; +	settings.thp_enabled = THP_NEVER;
+&gt; +	for (i = 0; i &lt; NR_ORDERS; i++)
+&gt; +		settings.hugepages[i].enabled = THP_NEVER;
+&gt; +	settings.hugepages[collapse_order].enabled = THP_MADVISE;
+&gt; +	thp_push_settings(&amp;settings);
+&gt; +}
+&gt; +
+&gt; +static bool window_collapsed(void *p, size_t len)
+&gt; +{
+&gt; +	return is_range_backed_by_folio_orders(p, len, collapse_order,
+&gt; +					       pagemap_fd, kpageflags_fd);
+&gt; +}
+&gt; +
+&gt; +/* No aligned window in [p, p + len) is backed at the target order. */
+&gt; +static bool window_not_collapsed(void *p, size_t len)
+
+I&#x27;d expect window_not_collapsed to be !window_collapsed.
+Maybe we need to add some order notion to both of them, like
+exact_order, any_order or something like that?
+
+&gt; +{
+&gt; +	size_t window = mthp_window_size();
+&gt; +	char *addr = p;
+&gt; +
+&gt; +	for (; len &gt;= window; addr += window, len -= window) {
+&gt; +		if (window_collapsed(addr, window))
+&gt; +			return false;
+&gt; +	}
+&gt; +	return true;
+&gt; +}
+&gt; +
+&gt; +static bool khugepaged_wait_full_pass(void)
+&gt; +{
+&gt; +	/* Wait up to 30 seconds for the pass to complete. */
+
+Isn&#x27;t it clear from the call? And do we really need this wrapper?
+
+&gt; +	return khugepaged_full_pass(30);
+&gt; +}
+&gt; +
+&gt; +static void collapse_order_single_window(struct collapse_context *c,
+&gt; +					 struct mem_ops *ops)
+&gt; +{
+&gt; +	size_t window = mthp_window_size();
+&gt; +	void *p;
+&gt; +
+&gt; +	mthp_push_target_order();
+&gt; +
+&gt; +	p = ops-&gt;setup_area(1);
+&gt; +	ops-&gt;fault(p, window, 2 * window);
+&gt; +	if (!window_not_collapsed(p, hpage_pmd_size))
+
+!window_not_collapsed  reads weird
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; collapse_order_mixed_sources() faults its region as order-2 folios and
+&gt; collapses them to the -c target.  Order 2 sits below the contpte threshold
+&gt; on both arm64 page-size configurations, so nothing in this suite unfolds a
+&gt; contpte source on purpose.
+&gt; 
+&gt; Let -s name the source order alongside -c.  The case then faults at that
+&gt; order, keeping order 2 when -s is absent, and the source order has to be a
+&gt; supported mTHP order below the target.  The other mTHP cases are
+&gt; unaffected: mthp_push_target_order() enables only the target order.
+&gt; 
+&gt; &quot;-s 5 -c 7&quot; on arm64/64K then collapses contpte-mapped sources into a
+&gt; larger mTHP.
+
+I&#x27;d fold it into the previous patch.
+
+-- 
+Sincerely yours,
+Mike.</pre>
+</details>
+<a href="https://lore.kernel.org/r/178721523515.2799959.13983972214223576467.b4-review@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: race condition, retry</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Mike Rapoport</span>
+<a class="date-chip" href="../2026-08-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-20">2026-08-20</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Mike Rapoport suggested that the while condition in waitpid() should not be inside a loop, and also requested changes to run mTHP cases once per supported anon THP order below the PMD when -c is absent.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">&gt; collapse_fork() checks that a fork-shared range collapses in the process
+&gt; that asks for it while the co-sharer keeps its own page, but the co-sharer
+&gt; sits still while that happens.
+
+co-sharer sounds awkward, can we use parent and child?
+
+&gt; Add a case where the co-sharer writes to the shared range throughout the
+&gt; collapse.  CoW has to keep the two sides apart under those writes: the
+&gt; collapsing child must see the content from before the fork, and the
+&gt; writing parent must see only its own writes.
+&gt; 
+&gt; The co-sharer unshares one page every 10ms, and only once the collapsing
+&gt; side says it is about to start.  Writing the range in a burst breaks CoW
+&gt; on all of it before the collapse begins, leaving the child to collapse
+&gt; pages that are already exclusive to it.
+&gt; 
+&gt; Nothing here is new behaviour: the case passes on mainline, and locks in
+&gt; isolation that collapse already provides.
+
+And that&#x27;s imporant because?
+
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/khugepaged.c b/tools/testing/selftests/mm/khugepaged.c
+&gt; index 392fd65fcc97..1d357143258a 100644
+&gt; --- a/tools/testing/selftests/mm/khugepaged.c
+&gt; +++ b/tools/testing/selftests/mm/khugepaged.c
+&gt; @@ -1218,6 +1218,97 @@ static void collapse_max_ptes_shared(struct collapse_context *c, struct mem_ops
+&gt;  	ksft_test_result_report(exit_status, &quot;%s\n&quot;, __func__);
+&gt;  }
+&gt;  
+&gt; +/*
+&gt; + * Content stays isolated while a co-sharer writes concurrently. A shared
+&gt; + * source is copied live (not frozen), relying on it being CoW - immutable
+&gt; + * for the duration of the copy; a co-sharer&#x27;s write goes to a CoW copy. The
+&gt; + * collapsing child must see the pre-fork content, the writing parent only
+&gt; + * its own writes.
+&gt; + */
+&gt; +static void collapse_fork_cow_race(struct collapse_context *c, struct mem_ops *ops)
+&gt; +{
+&gt; +	const unsigned long shared = 64 * page_size;
+&gt; +	const int stride = page_size / sizeof(int);
+&gt; +	int wstatus, child_status, i, n = shared / page_size;
+&gt; +	/* volatile: the loop below must really store, on every iteration */
+&gt; +	volatile int *ip;
+&gt; +	pid_t child;
+&gt; +	int sync[2];
+&gt; +	char go = 1;
+&gt; +	void *p;
+&gt; +
+&gt; +	p = ops-&gt;setup_area(1);
+&gt; +	ip = p;
+&gt; +	ops-&gt;fault(p, 0, shared);		/* shared prefix, pre-fork pattern */
+&gt; +	if (pipe(sync))
+&gt; +		ksft_exit_fail_perror(&quot;pipe()&quot;);
+&gt; +
+&gt; +	ksft_print_msg(&quot;Fork, collapse in the child while the parent rewrites...&quot;);
+&gt; +	child = fork();
+&gt; +	if (!child) {
+&gt; +		int collapse_status;
+&gt; +
+&gt; +		close(sync[0]);
+&gt; +		ops-&gt;fault(p, shared, hpage_pmd_size);	/* private remainder */
+&gt; +		/* Start the parent unsharing, and give it a head start. */
+&gt; +		if (write(sync[1], &amp;go, 1) != 1)
+&gt; +			_exit(KSFT_FAIL);
+&gt; +		usleep(5000);
+&gt; +		c-&gt;collapse(&quot;Collapse a range shared with a writing co-sharer&quot;,
+&gt; +			    p, 1, ops, true);
+&gt; +		collapse_status = exit_status;
+&gt; +		for (i = 0; i &lt; n; i++)
+&gt; +			if (ip[i * stride] != i + 0xdead0000)
+&gt; +				break;
+&gt; +		if (i == n)
+&gt; +			success(&quot;OK&quot;);
+&gt; +		else
+&gt; +			fail(&quot;Fail: child content&quot;);
+&gt; +		/* The content check must not bury a failed collapse. */
+&gt; +		if (exit_status != KSFT_FAIL)
+&gt; +			exit_status = collapse_status;
+&gt; +		ops-&gt;cleanup_area(p, hpage_pmd_size);
+&gt; +		_exit(exit_status);
+&gt; +	}
+&gt; +
+&gt; +	close(sync[1]);
+&gt; +	if (read(sync[0], &amp;go, 1) != 1)
+&gt; +		ksft_exit_fail_msg(&quot;child never reached the collapse\n&quot;);
+&gt; +
+&gt; +	/*
+&gt; +	 * Unshare one page at a time.  A burst would break CoW on all of them
+&gt; +	 * in microseconds -- wait_for_scan() does not even poll for TICK --
+&gt; +	 * and the child would collapse pages already exclusive to it.
+&gt; +	 */
+&gt; +	i = 0;
+&gt; +	do {
+&gt; +		if (i &lt; n)
+&gt; +			ip[i * stride] = i + 0xbeef0000;
+&gt; +		i++;
+&gt; +		usleep(10 * 1000);
+&gt; +	} while (waitpid(child, &amp;wstatus, WNOHANG) == 0);
+
+Can we please not put waitpid() inside while condition?
+
+-- 
+Sincerely yours,
+Mike.
+
+---
+
+&gt; The mTHP collapse cases only run when the caller names both the context
+&gt; and an order, so a plain ./khugepaged covers the PMD contexts on anon and
+&gt; nothing else.  run_vmtests.sh pinned order 4 and covered no other.
+&gt; 
+&gt; Run the mTHP cases once per supported anon THP order below the PMD when
+&gt; -c is absent, and pull that context into both the no-argument invocation
+&gt; and &quot;all&quot;.  Around that:
+&gt; 
+&gt;   - -c still pins one order, and now says what is wrong instead of
+&gt;     printing the usage text.  An order at or below the -s source order is
+&gt;     skipped: the sources would already be the size being asked for.
+&gt; 
+&gt;   - Both orders end up as array indices and shift counts, so -s and -c
+&gt;     are range-checked before they get there.
+&gt; 
+&gt;   - The mTHP context has only anon cases, so a run that names a different
+&gt;     mem_type -- &quot;all:shmem&quot;, say -- drops it again rather than refusing
+&gt;     to start.  Naming both explicitly still refuses.
+&gt; 
+&gt;   - A case carries the order it was registered at, so a result names it:
+&gt; 
+&gt;       # Run test: collapse_single_mthp (mthp_khugepaged:anon, order 6)
+&gt; 
+&gt; On x86-64 with 4K pages that is orders 2 through 8, and ./khugepaged goes
+&gt; from 28 results to 77 in 21 seconds, so run_vmtests.sh can drop its
+&gt; pinned order-4 line.
+&gt; 
+&gt; Assisted-by: Claude-Code:claude-opus-5
+&gt; Tested-by: Muhammad Usama Anjum &lt;usama.anjum@arm.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt;
+&gt; diff --git a/tools/testing/selftests/mm/khugepaged.c b/tools/testing/selftests/mm/khugepaged.c
+&gt; index 1d357143258a..ba3dc1718e28 100644
+&gt; --- a/tools/testing/selftests/mm/khugepaged.c
+&gt; +++ b/tools/testing/selftests/mm/khugepaged.c
+&gt; @@ -31,6 +31,9 @@ static unsigned long page_size;
+&gt;  static int hpage_pmd_nr;
+&gt;  static int anon_order;
+&gt;  static int collapse_order;
+&gt; +static bool collapse_order_given;
+
+Maybe _set?  _defined? But surely not given ;-)
+
+-- 
+Sincerely yours,
+Mike.</pre>
+</details>
+<a href="https://lore.kernel.org/r/178721523517.2799959.13840101059380911989.b4-review@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>

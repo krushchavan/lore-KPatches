@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] btrfs: abort transaction before releasing tree_log_mutex on commit failure</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/698c480ec13cd6e74c2175924f614b7e324e6cc3.1787099421.git.loemra.dev@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-19</strong><div class="date-range-nav">Active on: <a href="#2026-08-19">2026-08-19</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a bug in the Btrfs file system where, on transaction commit failure, the tree log mutex is released before aborting the transaction. This allows a concurrent fsync workload to write superblocks that point to tree blocks never written to disk, causing a parent transid mismatch on the next mount.</div></div>
+    <div class="date-range">Submitted: <strong>2026-08-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a> &bull; <a href="#2026-08-19">2026-08-19</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes a bug in the Btrfs file system where, on transaction commit failure, the tree log mutex is released before aborting the transaction. This allows a subsequent log sync to write superblocks that point to tree blocks not yet written to disk, causing a parent transid mismatch on next mount. The patch restores the correct ordering by aborting the transaction while still holding the tree log mutex, which records the fs error and prevents the superblock from being written.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-19">
 <div class="review-comment">
@@ -248,83 +248,25 @@
 <a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
 </div>
-<div class="review-comment-text">Approved the patch with a Reviewed-by tag, indicating that it addresses a legitimate bug in the Btrfs file system and meets code quality standards.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On Tue, Aug 18, 2026 at 05:40:10PM -0700, Leo Martins wrote:
-&gt; When transaction metadata writeout fails in btrfs_commit_transaction(),
-&gt; the current code only logs the error, drops tree_log_mutex and then goes
-&gt; through cleanup_transaction(), which aborts the transaction and records
-&gt; the fs error.
-&gt; 
-&gt; That is too late for the tree log side. A log sync can already be
-&gt; waiting on tree_log_mutex, because the committing transaction is moved
-&gt; to TRANS_STATE_UNBLOCKED while that mutex is held, which lets fsyncs
-&gt; join the next transaction and queue up in btrfs_sync_log(). Once the
-&gt; failed commit drops tree_log_mutex, such a log sync acquires it, sees
-&gt; BTRFS_FS_ERROR() still clear, and writes super_for_commit. That
-&gt; superblock holds the roots prepared for the transaction that has just
-&gt; failed to write out its metadata, so it can point at tree blocks that
-&gt; never reached the disk, and the next mount fails with a parent transid
-&gt; mismatch.
-&gt; 
-&gt; Commit 165ea85f1483 (&quot;btrfs: do not write supers if we have an fs
-&gt; error&quot;) fixed this class of problem by making btrfs_sync_log() check for
-&gt; an fs error right after taking tree_log_mutex. That check only works if
-&gt; the commit path publishes the fs error before it releases the same
-&gt; mutex, and commit 68d4ece9c30e (&quot;btrfs: don&#x27;t call
-&gt; btrfs_handle_fs_error() in btrfs_commit_transaction()&quot;) removed the only
-&gt; thing that did so.
-&gt; 
-&gt; Restore the ordering by aborting the transaction while tree_log_mutex is
-&gt; still held. We have a transaction handle here, so this does not need to
-&gt; bring back the btrfs_handle_fs_error() call: __btrfs_abort_transaction()
-&gt; records the fs error itself, which is all btrfs_sync_log() looks at, and
-&gt; the error message put in its place is kept.
-&gt; 
-&gt; This is what commit 3810ab40afa5 (&quot;btrfs: abort transaction on error in
-&gt; write_all_supers()&quot;) already does for the next call in this function.
-&gt; 
-&gt; This is reproducible on an unmodified kernel by failing the first
-&gt; couple of bios of a transaction commit with fail_make_request while a
-&gt; concurrent fsync workload keeps log syncs queued on tree_log_mutex.
-&gt; 
-&gt; Fixes: 68d4ece9c30e (&quot;btrfs: don&#x27;t call btrfs_handle_fs_error() in btrfs_commit_transaction()&quot;)
-&gt; Cc: stable@vger.kernel.org # 7.0+
-
-Reviewed-by: Boris Burkov &lt;boris@bur.io&gt;
-
-&gt; Signed-off-by: Leo Martins &lt;loemra.dev@gmail.com&gt;
-&gt; ---
-&gt;  fs/btrfs/transaction.c | 6 ++++++
-&gt;  1 file changed, 6 insertions(+)
-&gt; 
-&gt; diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
-&gt; index 13a7e5f4e08c..ed850bf0546a 100644
-&gt; --- a/fs/btrfs/transaction.c
-&gt; +++ b/fs/btrfs/transaction.c
-&gt; @@ -2583,6 +2583,12 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
-&gt;  	ret = btrfs_write_and_wait_transaction(trans);
-&gt;  	if (unlikely(ret)) {
-&gt;  		btrfs_err(fs_info, &quot;error while writing out transaction: %pe&quot;, ERR_PTR(ret));
-&gt; +		/*
-&gt; +		 * Abort before releasing tree_log_mutex, so a log sync waiting
-&gt; +		 * on it sees the fs error and skips writing super_for_commit
-&gt; +		 * for this failed transaction. See btrfs_sync_log().
-&gt; +		 */
-&gt; +		btrfs_abort_transaction(trans, ret);
-&gt;  		mutex_unlock(&amp;fs_info-&gt;tree_log_mutex);
-&gt;  		goto scrub_continue;
-&gt;  	}
-&gt; -- 
-&gt; 2.53.0-Meta
-&gt; 
-
-</pre>
-</details>
-<div class="review-comment-signals">Signals: LGTM</div>
+<div class="review-comment-text">Gave Reviewed-by</div>
+<div class="reply-to-label">&#8627; replying to Leo Martins</div>
+<a href="https://lore.kernel.org/r/20260819202726.GA3622042@zen.localdomain" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-20">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">jlayton@meta.com</span>
+<a class="date-chip" href="../2026-08-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-20">2026-08-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Reviewed-by</div>
+<div class="reply-to-label">&#8627; replying to Leo Martins</div>
+<a href="https://lore.kernel.org/r/3a7777fb1f0678c88c2365a6a476167b5abc4e9d.camel@meta.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 </div>
 </div>
 </div>
