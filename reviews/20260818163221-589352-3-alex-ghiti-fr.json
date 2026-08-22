@@ -11,7 +11,7 @@
       "patch_summary": "This patch modifies the Linux kernel's swap management to drop PG_dropbehind folios from the swap cache immediately after writeback completion, rather than waiting for reclaim to find them later. This is achieved by introducing a new function, swap_writeback_dropbehind_folio(), which is called when writeback completes and frees the folios in batches. The patch also updates various functions to use this new function and adds necessary locking mechanisms to ensure thread safety. The goal of this change is to improve performance by reducing the time spent on reclaiming swap cache folios."
     },
     "2026-08-20": {
-      "report_file": "2026-08-20_ollama_llama3.1-8b.html",
+      "report_file": "2026-08-21_ollama_llama3.1-8b.html",
       "developer": "Alexandre Ghiti",
       "reviews": [
         {
@@ -56,7 +56,7 @@
       "patch_summary": "This patch improves the handling of swap cache folios by dropping them from their cache once writeback completes, rather than leaving them for reclaim to find later. This is achieved by adding a new function `swap_writeback_dropbehind_folio` that takes a folio as an argument and drops it from its cache after writeback has completed. The patch also updates several other functions to use this new function. The goal of the patch is to improve performance by reducing the number of times swap cache folios are scanned for reclaim, which can be expensive operations."
     },
     "2026-08-21": {
-      "report_file": "2026-08-20_ollama_llama3.1-8b.html",
+      "report_file": "2026-08-21_ollama_llama3.1-8b.html",
       "developer": "Alexandre Ghiti",
       "reviews": [
         {
@@ -76,6 +76,101 @@
           "reply_to": "Matthew Wilcox",
           "message_date": "2026-08-21",
           "message_id": "CAGsJ_4yb_5803vALp9YMHXRsTcqkDuXfGFLMcxpNDQXoqnsPWw@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kunwu Chan",
+          "summary": "Reviewer Kunwu Chan raised a concern about potential reference counting issues in the synchronous writeback path, where the dropbehind worker may run before the caller's reference is dropped, leading to a failed folio_ref_freeze() and causing the dropbehind optimization to be lost for that writeback. The reviewer suggested measuring the fallback rate on a synchronous backend and making the reference ownership explicit across the involved functions.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "potential bug",
+            "requested measurement"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Alexandre,\n\nI have a question about the reference ownership/lifetime model in the\nsynchronous-IO case.\n\nConsider the synchronous writeback path in Patch 3:\n\n  zswap_writeback_entry()\n    folio = __swap_cache_alloc_folio(...);\n    ...\n    __swap_writepage(folio, NULL);\n    folio_put(folio);\n\nDuring writeback completion, Patch 2 does:\n\n  folio_end_writeback(folio)\n    folio_get(folio);\n    ...\n    swap_writeback_dropbehind_folio(folio);\n      llist_add()\n      queue_work()\n\nWith synchronous I/O, is it possible for the dropbehind worker to run\nbefore zswap_writeback_entry() drops its reference after\n__swap_writepage() returns?\n\nIf so, the worker will attempt:\n\n  swap_dropbehind_drop_folio(folio)\n    ...\n    remove_mapping(swap_address_space(folio->swap), folio, true, memcg)\n\nwhile the caller's reference is still held.  Looking at\n__remove_mapping() in mm/vmscan.c, it expects a refcount of\n1 + folio_nr_pages(folio), but the extra reference still held by\nzswap_writeback_entry() would make the actual refcount one higher.\nIt therefore looks like folio_ref_freeze() will fail in this case.\nIs that the intended behavior here?\n\nIf the removal can fail, the fallback is:\n\n    folio_clear_dropbehind(folio);\n    folio_add_lru(folio);\n\nThis appears semantically safe, but it means that the dropbehind\noptimization is lost for that writeback: the cold folio goes back onto\nthe LRU and has to be found by reclaim later.\n\nThis seems particularly worth checking because v3 intentionally removes\nthe synchronous-I/O special case from v2.  The cover letter describes\nthat special case as an optimization that was not worth the extra code,\nwhich I agree is a reasonable direction if the generic path is\nsufficiently effective.\n\nCould you measure the corresponding fallback rate on a synchronous\nbackend (e.g. zram)?  The 99.996% success rate in the cover letter is for\nasynchronous NVMe, so it does not tell us how often this particular race\noccurs with synchronous completion.\n\nMore generally, I'd like the reference ownership across\n__swap_writepage(), folio_end_writeback(), and the deferred worker to be\nmade explicit.  If the caller's reference can overlap with the worker's\nreference, I'd also like to understand whether that is an intentional\nand acceptable trade-off, or whether the overlap can be avoided without\nreintroducing the synchronous-I/O special case that v3 is trying to\nremove.\n\nThanks,\nKunWu",
+          "reply_to": "Alexandre Ghiti",
+          "message_date": "2026-08-21",
+          "message_id": "20260821083500.856970-1-kunwu.chan@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Alexandre Ghiti",
+          "summary": "Reviewer Alexandre Ghiti noted that the patch introduces a new function swap_writeback_dropbehind_folio() which is not properly guarded against concurrent access, and requested the addition of a lock to protect it\n\nReviewer Alexandre Ghiti noted that the current implementation re-uses folio->lru to link dropbehind folios, and suggested preventing madv_pageout from using dropbehind by marking the folio as dropbehind and isolating it from the lru\n\nReviewer Alexandre Ghiti noted that folio_end_dropbehind() is not always executed in a sleepable context, which means the current patch's approach of adding dropbehind folios to a list for worker execution may not be sufficient. He also mentioned considering an alternative patchset [2] as a potential solution.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "concurrent_access",
+            "lock_guarding",
+            "requested changes",
+            "considering alternative patch",
+            "question about sleepable context"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Barry,\n\nOn Thu, Aug 20, 2026 at 1:37 PM Barry Song <baohua@kernel.org> wrote:\n\n---\n\nIn the current implementation, I re-use folio->lru to link the\ndropbehind folios for the worker to free, so folio->lru must not be\nused, hence the folio_test_lru().\n\nBut that does not prevent madv_pageout to use dropbehind at all,\nfolios are isolated from the lru and moved to a private folio_list, we\ncan definitely prevent the latter if the folio is marked as\ndropbehind.\n\nI'll give it a try, I had only tried setting dropbehind on all swap\nfolios which caused large regressions.\n\n---\n\nfolio_end_dropbehind() is not always executed in a sleepable context,\nthat's why I only add the dropbehind folios to the list for the worker\n(which executes in sleepable context) to free them.\n\nBut anyway, as Matthew pointed out, it seems like this patchset would\nbe way easier on top of [2], I'm looking into right now.\n\nThanks for your comments,\n\nAlex",
+          "reply_to": "Barry Song",
+          "message_date": "2026-08-21",
+          "message_id": "CAEmasaWsSqpN0VwnepBs3TcGydG_C91RNfRnX8V==LSS0mwoqQ@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Alexandre Ghiti",
+          "summary": "Reviewer Alexandre Ghiti noted that the folio lock is held when calling try_to_unmap() in swap_writeback_dropbehind_folio(), which can lead to a deadlock if the reclaim path also tries to drop the folio, and requested that the folio lock be dropped before calling try_to_unmap().\n\nReviewer Alexandre Ghiti noted that the patch does not address his initial concern and asked to be kept informed about further developments.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "lock ordering issue",
+            "deadlock",
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Matthew,\n\nOn Thu, Aug 20, 2026 at 5:42 PM Matthew Wilcox <willy@infradead.org> wrote:\n\n---\n\nAt first sight, it seems so, yes. I'm looking into it more deeply\nright now, thanks for letting me know!\n\nThanks,\n\nAlex",
+          "reply_to": "Matthew Wilcox",
+          "message_date": "2026-08-21",
+          "message_id": "CAEmasaUmA0Z0j82jF_VnYBM6gsrtDiWSf_ev-2pdYH3xPJ8Yfw@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Alexandre Ghiti",
+          "summary": "Reviewer Alexandre Ghiti noted that the patch introduces a new function swap_writeback_dropbehind_folio() which is not properly guarded against concurrent access, and requested the addition of a lock to prevent races.\n\nReviewer Alexandre Ghiti noted that the window for dropping dropbehind swap cache folios on writeback completion is short and rare cases may fall back to the initial behaviour, but acknowledged it's unlikely to happen for async devices.\n\nReviewer Alexandre Ghiti requested additional investigation into the relevance of a patchset pointed out by Matthew and Barry, and suggested adding a debug counter to confirm that sync devices do not fall back too much.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "concurrent_access",
+            "requested_addition",
+            "acknowledged a potential issue",
+            "expressed doubt about its occurrence",
+            "requested additional investigation",
+            "suggested adding a debug counter"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Kunwu,\n\nOn Fri, Aug 21, 2026 at 10:35 AM Kunwu Chan <kunwu.chan@gmail.com> wrote:\n\n---\n\nYes, totally! The window is short though and in that rare case, we\nwould fall back to the initial behaviour (almost, since we put the\nfolio back onto lru but not rotate it). And for async devices, I don't\nthink it can happen at all.\n\n---\n\nI need to look into the patchset that Matthew and Barry pointed to and\ncheck if it's still relevant with this patchset on top of it. If so,\nI'll add a debug counter to confirm we don't fall back too much for\nsync devices :)\n\nThanks for your comment!\n\nAlex",
+          "reply_to": "Kunwu Chan",
+          "message_date": "2026-08-21",
+          "message_id": "CAEmasaUzCU7r7DzJfMFbQGZCJvA_wOJifPywQmy8mOz0efWn8g@mail.gmail.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "KunWu Chan",
+          "summary": "Reviewer suggested adding a debug counter for sync devices to quantify how often the writeback fallback happens, but did not provide specific technical details or suggestions related to the patch itself.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "A debug counter for sync devices would be useful to quantify how often\n the fallback actually happens.\nI'll also take a look at the patchset Matthew and Barry pointed to.\n\nThanks,\n Kunwu",
+          "reply_to": "Alexandre Ghiti",
+          "message_date": "2026-08-21",
+          "message_id": "CAN_Opa_vhvgxZUvsXN8ZvCMv2-9ZBywzJRo=LLjcXYWarZF-ZA@mail.gmail.com",
           "analysis_source": "llm"
         }
       ],
