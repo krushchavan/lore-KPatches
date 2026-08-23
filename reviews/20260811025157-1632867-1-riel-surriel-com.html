@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH v3 0/8] batch lookups in follow_page_mask()</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260811025157.1632867-1-riel@surriel.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-12</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-21</strong><div class="date-range-nav">Active on: <a href="#2026-08-21">2026-08-21</a> &bull; <a href="#2026-08-12">2026-08-12</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-12</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-22</strong><div class="date-range-nav">Active on: <a href="#2026-08-22">2026-08-22</a> &bull; <a href="#2026-08-21">2026-08-21</a> &bull; <a href="#2026-08-12">2026-08-12</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series improves the performance of follow_page_mask() by allowing it to batch lookups and reduce lock contention. The current implementation walks the page tables one page at a time, even when contiguous pages are requested. This series changes follow_page_mask() to return a count and an array of pages, instead of a single struct page, enabling more efficient handling of large folios. Patches 1-4 prepare for this change by refactoring and splitting existing functions. Patch 5 optimizes huge page paths, patch 6 simplifies the handling of subpages, and patches 7 and 8 implement batched lookups and refcount batching, respectively. The series includes benchmark results showing a significant performance improvement.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0">
@@ -478,6 +478,102 @@ John Hubbard</pre>
 <div class="reply-to-label">&#8627; replying to Rik Riel</div>
 <a href="https://lore.kernel.org/r/fe9f0bb5-73e3-4509-951d-e529e37011fd@nvidia.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">John Hubbard</span>
+<a class="date-chip" href="../2026-08-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-22">2026-08-22</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that marking a page dirty in follow_page_mask() can lead to issues if not coordinated with the filesystem, and agreed that this is one of several problems
+
+Reviewer noted that ext4_page_mkwrite() and other drivers cannot run set_page_dirty() on a file-backed page because it requires preparation steps like sb_start_pagefault(), file_update_time(), and filemap_invalidate_lock_shared() to be executed before folio_mark_dirty(). The reviewer suggested that the filesystem needs a way to be told before the device writes, which is where lease proposals come in.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, I agree about that problem, but it&#x27;s not the only one. It turns
+out that the only thing worse than failing to mark a page dirty is
+marking it dirty without coordinating with the filesystem.
+
+---
+
+Well...on a file-backed page, marking it dirty is the *last* step of
+a sequence, and a driver cannot run the earlier steps.
+
+ext4_page_mkwrite() into ext4_block_page_mkwrite() runs it in this
+order:
+
+	sb_start_pagefault(inode-&gt;i_sb);	/* freeze protection */
+	file_update_time(vma-&gt;vm_file);
+	filemap_invalidate_lock_shared(mapping);	/* truncate */
+	ext4_journal_start(inode, EXT4_HT_WRITE_PAGE, credits);
+	ext4_block_write_begin(handle, folio, 0, len, get_block);
+	folio_mark_dirty(folio);
+	ext4_journal_stop(handle);
+	folio_wait_stable(folio);
+
+A set_page_dirty() at the driver&#x27;s write site is that
+folio_mark_dirty(), but with none of the preparation above it.
+
+ext4 documents this case already, in ext4_journalled_dirty_folio() on
+the data=journal path:
+
+  * ... except for the case when someone
+  * had the page pinned and dirtied the page through this pin (e.g. by doing
+  * direct IO to it). In that case we&#x27;d need to attach buffers here to the
+  * transaction but we cannot due to lock ordering.
+
+Its workaround is folio_set_checked(), which defers the real work to
+ext4_writepages(). If ext4 can&#x27;t do the preparation from inside the
+dirty call, a driver can&#x27;t either.
+
+So for a file-backed page there&#x27;s nothing the driver can add. What&#x27;s
+missing is a way for the filesystem to be told before the device
+writes, and to revoke the pin when it needs to, which is where the
+lease proposals come in. None of that exists today.
+
+And yes, unpin_user_pages_dirty_lock() is in the same awkward mess.
+
+thanks,
+-- 
+John Hubbard</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Rik Riel</div>
+<a href="https://lore.kernel.org/r/42d8fc20-4ee6-4bed-b2b4-3f968bd29f5d@nvidia.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreed, noted, requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-08-22">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik Riel (author)</span>
+<a class="date-chip" href="../2026-08-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-22">2026-08-22</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing a concern about drivers failing to mark pages dirty after writing to them, and has agreed to create patches to fix this issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Not just filesystems.
+
+I found about two dozen places where drivers
+fail to mark a page dirty after writing to
+it, after obtaining the page from GUP.
+
+I&#x27;ll get out patches for that, unless there&#x27;s
+some reason I shouldn&#x27;t.
+
+-- 
+All Rights Reversed.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to John Hubbard</div>
+<a href="https://lore.kernel.org/r/f86ca125a9b63cdab8edeb3c3b02a29141f18c1a.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a problem, agreed to fix</div>
+</div>
+</div>
 </div>
 </div>
 </div>
