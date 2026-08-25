@@ -2,7 +2,7 @@
   "date": "2026-08-24",
   "report_file": "2026-08-24_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-08-25 06:15 UTC",
+  "last_updated": "2026-08-25 06:17 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -929,6 +929,94 @@
         }
       ],
       "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Johannes Weiner",
+      "primary_email": "hannes@cmpxchg.org",
+      "patches_submitted": [],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [RFC PATCH 16/57] mm/collapse: freeze the sources behind migration entries",
+          "message_id": "20260824154921.GA863036@cmpxchg.org",
+          "url": "https://lore.kernel.org/all/20260824154921.GA863036@cmpxchg.org/",
+          "date": "2026-08-24T15:49:33Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch modifies the behavior of folio_put() to handle a race condition when shrinking memory. It ensures that even if there's a concurrent refcount decrease, the partially_mapped state will be properly cleaned up and stats updated.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Usama Arif",
+              "summary": "Reviewer noted that the current implementation of clearing partially_mapped state in folio_put() can be incorrect if it races with folio_ref_freeze(), and suggested that the owner of the reference should decide how to handle this state",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "bug",
+                "requested change"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Kiryl's suggestion makes sense. I think there is a bug here. If we dont\nget the reference, whoever owns the reference should decide how partially_mapped\nis treated for that folio:\n\n- If its the last folio_put(), it will clear partially_mapped and cleanup\nafter itself.\n- If its folio_ref_freeze(), clearing partially_mapped is wrong (which we\nare currently doing in deferred_split_isolate)",
+              "reply_to": "Johannes Weiner",
+              "message_date": "2026-08-24",
+              "message_id": "f81160ac-0c7c-43f2-985f-43ab54a52358@linux.dev",
+              "analysis_source": "llm",
+              "email": "usama.arif@linux.dev"
+            },
+            {
+              "author": "Lance Yang",
+              "summary": "Reviewer Lance Yang noted that patch 16 introduces a state-loss bug when collapse rolls back a partially mapped folio because the deferred split queue entry and PG_partially_mapped flag are cleared before refcount is unfrozen, and suggested using LRU_SKIP instead of returning LRU_REMOVED to avoid this issue.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "state-loss bug",
+                "patch 16 has a real problem"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Yeah, returning LRU_SKIP looks right. I have this locally:\n\n---8<---\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex e771244f42f3..a269775129c4 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -3939,11 +3939,8 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n\n\n \tVM_WARN_ON_ONCE(!mapping && end);\n \t/*\n-\t * If this folio can be on the deferred split queue, lock out\n-\t * the shrinker before freezing the ref. If the shrinker sees\n-\t * a 0-ref folio, it assumes it beat folio_put() to the list\n-\t * lock and must clean up the LRU state - the same dequeue we\n-\t * will do below as part of the split.\n+\t * If this folio can be on the deferred split queue, hold the list_lru\n+\t * lock across the refcount freeze and dequeue.\n \t */\n \tdequeue_deferred = folio_test_anon(folio) && old_order > 1;\n \tif (dequeue_deferred) {\n@@ -4592,22 +4589,10 @@ static enum lru_status deferred_split_isolate(struct list_head *item,\n \tstruct folio *folio = container_of(item, struct folio, _deferred_list);\n \tstruct list_head *freeable = cb_arg;\n\n-\tif (folio_try_get(folio)) {\n-\t\tlist_lru_isolate_move(lru, item, freeable);\n-\t\treturn LRU_REMOVED;\n-\t}\n+\tif (!folio_try_get(folio))\n+\t\treturn LRU_SKIP;\n\n-\t/*\n-\t * We lost race with folio_put(). Read folio state before the\n-\t * isolate: folio_unqueue_deferred_split() checks list_empty()\n-\t * locklessly, so once removed the folio can be freed any time.\n-\t */\n-\tif (folio_test_partially_mapped(folio)) {\n-\t\tfolio_clear_partially_mapped(folio);\n-\t\tmod_mthp_stat(folio_order(folio),\n-\t\t\t      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);\n-\t}\n-\tlist_lru_isolate(lru, item);\n+\tlist_lru_isolate_move(lru, item, freeable);\n \treturn LRU_REMOVED;\n }\n---\n\nOne detail, though ...\n\ndeferred_split_isolate()'s assumption predates patch 16. Patch 16 lets\ncollapse_freeze_candidate() leave refcount at zero and later unfreeze it\non rollback.\n\nExisting split code takes a list_lru lock for deferred_split_lru before\nfolio_ref_freeze() and holds it through dequeue. The shrinker cannot see\nthat temporary zero.\n\ncollapse_freeze_candidate() does not take that lock and can roll back\nlater.\n\nSay a candidate has two source folios. After the first one is frozen,\ndeferred_split_isolate() can see refcount 0, dequeue it, clear\nPG_partially_mapped and decrement its accounting. If freezing the second\none fails, collapse rolls the first one back:\n\nstatic void collapse_unfreeze_candidate(struct mm_struct *mm,\n\t\t\t\t\tstruct collapse_candidate *cand,\n\t\t\t\t\tpte_t *pte, unsigned int nr_saved,\n\t\t\t\t\tunsigned int nr_frozen)\n{\n\tunsigned long addr = cand->addr;\n\tunsigned int i = 0;\n\n\twhile (i < nr_saved) {\n\t\tpte_t saved = cand->saved_ptes[i];\n\t\tstruct folio *folio;\n\t\tunsigned int nr, k;\n\n...\n\t\tfolio = pte_folio(saved);\n\t\tnr = collapse_saved_span_len(cand, i, nr_saved);\n\n\t\tfor (k = 0; k < nr; k++) {\n\t\t\tset_pte_at(mm, addr + k * PAGE_SIZE, pte + i + k,\n\t\t\t\t   cand->saved_ptes[i + k]);\n\t\t}\n\t\tif (i < nr_frozen) {\n\t\t\tfolio_ref_unfreeze(folio,\n\t\t\t\t\t   folio_expected_ref_count(folio) + 1);\n\t\t}\n\t\tfolio_unlock(folio);\n\t\tfolio_put(folio);\n\n\t\ti += nr;\n\t\taddr += nr * PAGE_SIZE;\n\t}\n}\n\nPTEs and the folio's refcount are restored, but its deferred split queue\nentry, PG_partially_mapped flag, and accounting are already gone. So yeah,\npatch 16 has a real state-loss bug when collapse rolls back a partially\nmapped folio.\n\nLRU_SKIP looks right. A failed folio_try_get() only says refcount is zero.\nIt cannot tell a final folio_put() from a temporary freeze. A final put\nstill reaches:\n\nvoid __folio_put(struct folio *folio)\n{\n...\n\tfolio_unqueue_deferred_split(folio);\n...\n}\n\nfolio_unqueue_deferred_split() takes the same list_lru lock and clears\nPG_partially_mapped + its accounting if the entry is still queued.\n\nCheers, Lance",
+              "reply_to": "Usama Arif",
+              "message_date": "2026-08-25",
+              "message_id": "20260825024434.39662-1-lance.yang@linux.dev",
+              "analysis_source": "llm",
+              "email": "lance.yang@linux.dev"
+            }
+          ],
+          "list_id": "linux-trace-kernel@vger.kernel.org"
+        }
+      ],
+      "patches_acked": [
+        {
+          "activity_type": "patch_acked",
+          "subject": "Re: [PATCH v2] mm/vmscan: fix comment logic in balance_pgdat",
+          "message_id": "20260824195917.GB863036@cmpxchg.org",
+          "url": "https://lore.kernel.org/all/20260824195917.GB863036@cmpxchg.org/",
+          "date": "2026-08-24T19:59:23Z",
+          "in_reply_to": null,
+          "ack_type": "Acked-by",
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "linux-kernel@vger.kernel.org"
+        }
+      ],
       "discussions_posted": [],
       "errors": []
     }
