@@ -238,9 +238,388 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 16/57] mm/collapse: freeze the sources behind migration entries</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260816224609.308019-17-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-16</strong><div class="date-range-nav">Active on: <a href="#2026-08-16">2026-08-16</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch freezes the sources behind migration entries in the Linux kernel&#x27;s memory management system, ensuring that faults and GUP-slow operations wait on a folio lock taken before the first entry becomes visible. The freeze is achieved by incrementing the expected reference count of the folio, preventing new references from being acquired while the copy operation runs. This patch also includes mechanisms for restoring displaced values in case of a failed copy attempt, and ensures that writeback operations are handled correctly.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-25</strong><div class="date-range-nav">Active on: <a href="#2026-08-25">2026-08-25</a> &bull; <a href="#2026-08-24">2026-08-24</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch freezes the sources behind migration entries in the Linux kernel&#x27;s memory management system, ensuring that faults and GUP-slow operations wait on a folio lock before accessing the source. The freeze is implemented using two barriers to maintain reachability order, preventing writeback from bypassing the freeze. A ranged TLB flush is used to ensure all frozen sources are updated before releasing the ptl lock. The patch also includes a mechanism for restoring displaced values in case of failure.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-08-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-24">2026-08-24</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern that the premise in deferred_split_isolate() is false: !folio_try_get() doesn&#x27;t mean lost race with folio_put(). They proposed a fix to return LRU_SKIP if the folio try get fails, and asked Johannes for clarification on their suggestion.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hm. So, the premise in deferred_split_isolate() is false:
+!folio_try_get() doesn&#x27;t mean lost race with folio_put().
+
+I think deferred_split_isolate() should do something like:
+
+      if (!folio_try_get(folio))
+              return LRU_SKIP;
+
+      list_lru_isolate_move(lru, item, freeable);
+      return LRU_REMOVED;
+
+Johannes, do I miss something?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Lance Yang</div>
+<a href="https://lore.kernel.org/r/aoxQnuEacGpzp2I7@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a fix is needed</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-24">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lance Yang</span>
+<a class="date-chip" href="../2026-08-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-24">2026-08-24</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that deferred_split_isolate() can remove a source folio from deferred_split_lru while its refcount is frozen by collapse_freeze_candidate(), which causes folio_try_get() to fail, and requested the lock be dropped before calling try_to_unmap().
+
+The reviewer noted that collapse_unfreeze_candidate() does not add the source folio back to the deferred split queue after restoring it, potentially leaving underused or partially mapped folios off the queue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Just one thing I was wondering about ... can deferred_split_isolate()
+remove a source folio from deferred_split_lru while its refcount is
+frozen by collapse_freeze_candidate()?
+
+Assume an earlier span belongs to an anonymous large folio on the
+deferred split queue, then a later span fails folio_trylock().
+collapse_freeze_candidate() continues after freezing each source folio
+and calls collapse_unfreeze_candidate() on a later failure:
+
+static noinline enum scan_result collapse_freeze_candidate(struct mm_struct *mm,
+		struct collapse_candidate *cand, pte_t *pte)
+{
+...
+	for (i = 0, addr = cand-&gt;addr; i &lt; nr_pages;) {
+...
+		if (!folio_trylock(folio)) {
+			folio_put(folio);
+			result = SCAN_PAGE_LOCK;
+			goto unfreeze;
+		}
+...
+		nr_saved = i + nr;
+
+		if (!folio_ref_freeze(folio,
+				      folio_expected_ref_count(folio) + 1)) {
+			result = SCAN_PAGE_COUNT;
+			goto unfreeze;
+		}
+		nr_frozen = nr_saved;
+
+		i += nr;
+		addr += nr * PAGE_SIZE;
+	}
+
+...
+unfreeze:
+	collapse_unfreeze_candidate(mm, cand, pte, nr_saved, nr_frozen);
+	return result;
+}
+
+folio_ref_freeze() takes the source folio&#x27;s refcount to zero:
+
+static inline int folio_ref_freeze(struct folio *folio, int count)
+{
+	return page_ref_freeze(&amp;folio-&gt;page, count);
+}
+
+static inline int page_ref_freeze(struct page *page, int count)
+{
+	int ret = likely(atomic_cmpxchg(&amp;page-&gt;_refcount, count, 0) == count);
+
+...
+	return ret;
+}
+
+While collapse_freeze_candidate() still holds the source folio lock,
+deferred_split_scan() can call deferred_split_isolate():
+
+static unsigned long deferred_split_scan(struct shrinker *shrink,
+		struct shrink_control *sc)
+{
+	LIST_HEAD(dispose);
+	struct folio *folio, *next;
+	int split = 0;
+	unsigned long isolated;
+
+	isolated = list_lru_shrink_walk_irq(&amp;deferred_split_lru, sc,
+					    deferred_split_isolate, &amp;dispose);
+}
+
+static enum lru_status deferred_split_isolate(struct list_head *item,
+					      struct list_lru_one *lru,
+					      void *cb_arg)
+{
+	struct folio *folio = container_of(item, struct folio, _deferred_list);
+	struct list_head *freeable = cb_arg;
+
+	if (folio_try_get(folio)) {
+		list_lru_isolate_move(lru, item, freeable);
+		return LRU_REMOVED;
+	}
+
+	/*
+	 * We lost race with folio_put(). Read folio state before the
+	 * isolate: folio_unqueue_deferred_split() checks list_empty()
+	 * locklessly, so once removed the folio can be freed any time.
+	 */
+	if (folio_test_partially_mapped(folio)) {
+		folio_clear_partially_mapped(folio);
+		mod_mthp_stat(folio_order(folio),
+			      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+	}
+	list_lru_isolate(lru, item);
+	return LRU_REMOVED;
+}
+
+And folio_try_get() fails because the source folio has a frozen refcount.
+deferred_split_isolate() treats the failure as a race with folio_put(),
+clears PG_partially_mapped and its MTHP_STAT_NR_ANON_PARTIALLY_MAPPED
+accounting when set, then removes the folio from deferred_split_lru ...
+
+---
+
+And collapse_unfreeze_candidate() restores the source PTEs and refcount,
+then unlocks and puts the source folio :)
+
+The source folio is not added back to the deferred split queue, so an
+underused or partially mapped folio can remain off the queue.
+
+Should collapse unqueue the source folio after folio_ref_freeze()
+succeeds, remember whether it was on the deferred split queue and whether
+PG_partially_mapped was set, then requeue it if
+collapse_unfreeze_candidate() restores the source folio?
+
+[...]
+
+Cheers, Lance</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20260824131224.73344-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: potential deadlock, lock ordering issue, potential bug</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-08-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-24">2026-08-24</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer questioned whether &#x27;freeze&#x27; means exclusive or non-exclusive locking, and asked who would clean up the partially_mapped state
+
+The reviewer suggested modifying the behavior of folio_put() to leave the item on the LRU when there is a race with the refcount going zero, allowing the other side to deal with/clean up the partially_mapped state as appropriate.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I suppose you mean, not exclusively. But it can also mean that. And
+then the question is, who cleans up the partially_mapped state.
+
+---
+
+Ah. The idea being: leave the item on the LRU when there is a race
+with the refcount going zero; and then it&#x27;s up to that other side to
+deal with/clean up the partially_mapped state as appropriate. Thus:
+
+folio_put()
+  __folio_put()
+    folio_unqueue_deferred_split()
+      if __list_lru_del():
+        // clear partially_mapped state &amp; stats
+
+will always succeed, even if it races with the shrinker. And you are
+also guaranteed on the collapse side that the state won&#x27;t vanish from
+underneath you.
+
+I think that should work. Usama?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20260824154921.GA863036@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: unclear locking semantics, cleanup responsibility, requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Usama Arif</span>
+<a class="date-chip" href="../2026-08-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-24">2026-08-24</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Usama Arif noted that if the reference to a folio is not obtained, the owner of the reference should decide how partially_mapped is treated for that folio, and suggested that clearing partially_mapped in folio_ref_freeze() is incorrect</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Kiryl&#x27;s suggestion makes sense. I think there is a bug here. If we dont
+get the reference, whoever owns the reference should decide how partially_mapped
+is treated for that folio:
+
+- If its the last folio_put(), it will clear partially_mapped and cleanup
+after itself.
+- If its folio_ref_freeze(), clearing partially_mapped is wrong (which we
+are currently doing in deferred_split_isolate)</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Johannes Weiner</div>
+<a href="https://lore.kernel.org/r/f81160ac-0c7c-43f2-985f-43ab54a52358@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: bug, requested change</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3" id="2026-08-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lance Yang</span>
+<a class="date-chip" href="../2026-08-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Lance Yang noted that patch 16 introduces a state-loss bug when collapse rolls back a partially mapped folio because deferred_split_isolate() can dequeue the folio and clear its PG_partially_mapped flag before freeze is rolled back, leaving it in an inconsistent state. He suggested using LRU_SKIP instead of returning LRU_REMOVED to avoid this issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yeah, returning LRU_SKIP looks right. I have this locally:
+
+---8&lt;---
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index e771244f42f3..a269775129c4 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3939,11 +3939,8 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
+
+ 	VM_WARN_ON_ONCE(!mapping &amp;&amp; end);
+ 	/*
+-	 * If this folio can be on the deferred split queue, lock out
+-	 * the shrinker before freezing the ref. If the shrinker sees
+-	 * a 0-ref folio, it assumes it beat folio_put() to the list
+-	 * lock and must clean up the LRU state - the same dequeue we
+-	 * will do below as part of the split.
++	 * If this folio can be on the deferred split queue, hold the list_lru
++	 * lock across the refcount freeze and dequeue.
+ 	 */
+ 	dequeue_deferred = folio_test_anon(folio) &amp;&amp; old_order &gt; 1;
+ 	if (dequeue_deferred) {
+@@ -4592,22 +4589,10 @@ static enum lru_status deferred_split_isolate(struct list_head *item,
+ 	struct folio *folio = container_of(item, struct folio, _deferred_list);
+ 	struct list_head *freeable = cb_arg;
+
+-	if (folio_try_get(folio)) {
+-		list_lru_isolate_move(lru, item, freeable);
+-		return LRU_REMOVED;
+-	}
++	if (!folio_try_get(folio))
++		return LRU_SKIP;
+
+-	/*
+-	 * We lost race with folio_put(). Read folio state before the
+-	 * isolate: folio_unqueue_deferred_split() checks list_empty()
+-	 * locklessly, so once removed the folio can be freed any time.
+-	 */
+-	if (folio_test_partially_mapped(folio)) {
+-		folio_clear_partially_mapped(folio);
+-		mod_mthp_stat(folio_order(folio),
+-			      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
+-	}
+-	list_lru_isolate(lru, item);
++	list_lru_isolate_move(lru, item, freeable);
+ 	return LRU_REMOVED;
+ }
+---
+
+One detail, though ...
+
+deferred_split_isolate()&#x27;s assumption predates patch 16. Patch 16 lets
+collapse_freeze_candidate() leave refcount at zero and later unfreeze it
+on rollback.
+
+Existing split code takes a list_lru lock for deferred_split_lru before
+folio_ref_freeze() and holds it through dequeue. The shrinker cannot see
+that temporary zero.
+
+collapse_freeze_candidate() does not take that lock and can roll back
+later.
+
+Say a candidate has two source folios. After the first one is frozen,
+deferred_split_isolate() can see refcount 0, dequeue it, clear
+PG_partially_mapped and decrement its accounting. If freezing the second
+one fails, collapse rolls the first one back:
+
+static void collapse_unfreeze_candidate(struct mm_struct *mm,
+					struct collapse_candidate *cand,
+					pte_t *pte, unsigned int nr_saved,
+					unsigned int nr_frozen)
+{
+	unsigned long addr = cand-&gt;addr;
+	unsigned int i = 0;
+
+	while (i &lt; nr_saved) {
+		pte_t saved = cand-&gt;saved_ptes[i];
+		struct folio *folio;
+		unsigned int nr, k;
+
+...
+		folio = pte_folio(saved);
+		nr = collapse_saved_span_len(cand, i, nr_saved);
+
+		for (k = 0; k &lt; nr; k++) {
+			set_pte_at(mm, addr + k * PAGE_SIZE, pte + i + k,
+				   cand-&gt;saved_ptes[i + k]);
+		}
+		if (i &lt; nr_frozen) {
+			folio_ref_unfreeze(folio,
+					   folio_expected_ref_count(folio) + 1);
+		}
+		folio_unlock(folio);
+		folio_put(folio);
+
+		i += nr;
+		addr += nr * PAGE_SIZE;
+	}
+}
+
+PTEs and the folio&#x27;s refcount are restored, but its deferred split queue
+entry, PG_partially_mapped flag, and accounting are already gone. So yeah,
+patch 16 has a real state-loss bug when collapse rolls back a partially
+mapped folio.
+
+LRU_SKIP looks right. A failed folio_try_get() only says refcount is zero.
+It cannot tell a final folio_put() from a temporary freeze. A final put
+still reaches:
+
+void __folio_put(struct folio *folio)
+{
+...
+	folio_unqueue_deferred_split(folio);
+...
+}
+
+folio_unqueue_deferred_split() takes the same list_lru lock and clears
+PG_partially_mapped + its accounting if the entry is still queued.
+
+Cheers, Lance</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/20260825024434.39662-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: state-loss bug, inconsistent state</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

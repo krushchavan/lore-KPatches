@@ -9,6 +9,112 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch freezes the sources behind migration entries in the Linux kernel's memory management system, ensuring that faults and GUP-slow operations wait on a folio lock taken before the first entry becomes visible. The freeze is achieved by incrementing the expected reference count of the folio, preventing new references from being acquired while the copy operation runs. This patch also includes mechanisms for restoring displaced values in case of a failed copy attempt, and ensures that writeback operations are handled correctly."
+    },
+    "2026-08-24": {
+      "report_file": "2026-08-24_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "The reviewer noted that deferred_split_isolate() can remove a source folio from deferred_split_lru while its refcount is frozen by collapse_freeze_candidate(), which causes folio_try_get() to fail, and requested the lock be dropped before calling try_to_unmap().\n\nThe reviewer noted that collapse_unfreeze_candidate() does not add the source folio back to the deferred split queue after restoring it, potentially leaving underused or partially mapped folios off the queue.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "potential deadlock",
+            "lock ordering issue",
+            "potential bug",
+            "requested change"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Just one thing I was wondering about ... can deferred_split_isolate()\nremove a source folio from deferred_split_lru while its refcount is\nfrozen by collapse_freeze_candidate()?\n\nAssume an earlier span belongs to an anonymous large folio on the\ndeferred split queue, then a later span fails folio_trylock().\ncollapse_freeze_candidate() continues after freezing each source folio\nand calls collapse_unfreeze_candidate() on a later failure:\n\nstatic noinline enum scan_result collapse_freeze_candidate(struct mm_struct *mm,\n\t\tstruct collapse_candidate *cand, pte_t *pte)\n{\n...\n\tfor (i = 0, addr = cand->addr; i < nr_pages;) {\n...\n\t\tif (!folio_trylock(folio)) {\n\t\t\tfolio_put(folio);\n\t\t\tresult = SCAN_PAGE_LOCK;\n\t\t\tgoto unfreeze;\n\t\t}\n...\n\t\tnr_saved = i + nr;\n\n\t\tif (!folio_ref_freeze(folio,\n\t\t\t\t      folio_expected_ref_count(folio) + 1)) {\n\t\t\tresult = SCAN_PAGE_COUNT;\n\t\t\tgoto unfreeze;\n\t\t}\n\t\tnr_frozen = nr_saved;\n\n\t\ti += nr;\n\t\taddr += nr * PAGE_SIZE;\n\t}\n\n...\nunfreeze:\n\tcollapse_unfreeze_candidate(mm, cand, pte, nr_saved, nr_frozen);\n\treturn result;\n}\n\nfolio_ref_freeze() takes the source folio's refcount to zero:\n\nstatic inline int folio_ref_freeze(struct folio *folio, int count)\n{\n\treturn page_ref_freeze(&folio->page, count);\n}\n\nstatic inline int page_ref_freeze(struct page *page, int count)\n{\n\tint ret = likely(atomic_cmpxchg(&page->_refcount, count, 0) == count);\n\n...\n\treturn ret;\n}\n\nWhile collapse_freeze_candidate() still holds the source folio lock,\ndeferred_split_scan() can call deferred_split_isolate():\n\nstatic unsigned long deferred_split_scan(struct shrinker *shrink,\n\t\tstruct shrink_control *sc)\n{\n\tLIST_HEAD(dispose);\n\tstruct folio *folio, *next;\n\tint split = 0;\n\tunsigned long isolated;\n\n\tisolated = list_lru_shrink_walk_irq(&deferred_split_lru, sc,\n\t\t\t\t\t    deferred_split_isolate, &dispose);\n}\n\nstatic enum lru_status deferred_split_isolate(struct list_head *item,\n\t\t\t\t\t      struct list_lru_one *lru,\n\t\t\t\t\t      void *cb_arg)\n{\n\tstruct folio *folio = container_of(item, struct folio, _deferred_list);\n\tstruct list_head *freeable = cb_arg;\n\n\tif (folio_try_get(folio)) {\n\t\tlist_lru_isolate_move(lru, item, freeable);\n\t\treturn LRU_REMOVED;\n\t}\n\n\t/*\n\t * We lost race with folio_put(). Read folio state before the\n\t * isolate: folio_unqueue_deferred_split() checks list_empty()\n\t * locklessly, so once removed the folio can be freed any time.\n\t */\n\tif (folio_test_partially_mapped(folio)) {\n\t\tfolio_clear_partially_mapped(folio);\n\t\tmod_mthp_stat(folio_order(folio),\n\t\t\t      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);\n\t}\n\tlist_lru_isolate(lru, item);\n\treturn LRU_REMOVED;\n}\n\nAnd folio_try_get() fails because the source folio has a frozen refcount.\ndeferred_split_isolate() treats the failure as a race with folio_put(),\nclears PG_partially_mapped and its MTHP_STAT_NR_ANON_PARTIALLY_MAPPED\naccounting when set, then removes the folio from deferred_split_lru ...\n\n---\n\nAnd collapse_unfreeze_candidate() restores the source PTEs and refcount,\nthen unlocks and puts the source folio :)\n\nThe source folio is not added back to the deferred split queue, so an\nunderused or partially mapped folio can remain off the queue.\n\nShould collapse unqueue the source folio after folio_ref_freeze()\nsucceeds, remember whether it was on the deferred split queue and whether\nPG_partially_mapped was set, then requeue it if\ncollapse_unfreeze_candidate() restores the source folio?\n\n[...]\n\nCheers, Lance",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-24",
+          "message_id": "20260824131224.73344-1-lance.yang@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author addressed a concern that the premise in deferred_split_isolate() is false: !folio_try_get() doesn't mean lost race with folio_put(). They proposed a fix to return LRU_SKIP if the folio try get fails, and asked Johannes for clarification on their suggestion.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledges a fix is needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Hm. So, the premise in deferred_split_isolate() is false:\n!folio_try_get() doesn't mean lost race with folio_put().\n\nI think deferred_split_isolate() should do something like:\n\n      if (!folio_try_get(folio))\n              return LRU_SKIP;\n\n      list_lru_isolate_move(lru, item, freeable);\n      return LRU_REMOVED;\n\nJohannes, do I miss something?",
+          "reply_to": "Lance Yang",
+          "message_date": "2026-08-24",
+          "message_id": "aoxQnuEacGpzp2I7@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Johannes Weiner",
+          "summary": "Reviewer questioned whether 'freeze' means exclusive or non-exclusive locking, and asked who would clean up the partially_mapped state\n\nThe reviewer suggested modifying the behavior of folio_put() to leave the item on the LRU when there is a race with the refcount going zero, allowing the other side to deal with/clean up the partially_mapped state as appropriate.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "unclear locking semantics",
+            "cleanup responsibility",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "I suppose you mean, not exclusively. But it can also mean that. And\nthen the question is, who cleans up the partially_mapped state.\n\n---\n\nAh. The idea being: leave the item on the LRU when there is a race\nwith the refcount going zero; and then it's up to that other side to\ndeal with/clean up the partially_mapped state as appropriate. Thus:\n\nfolio_put()\n  __folio_put()\n    folio_unqueue_deferred_split()\n      if __list_lru_del():\n        // clear partially_mapped state & stats\n\nwill always succeed, even if it races with the shrinker. And you are\nalso guaranteed on the collapse side that the state won't vanish from\nunderneath you.\n\nI think that should work. Usama?",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-24",
+          "message_id": "20260824154921.GA863036@cmpxchg.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Usama Arif",
+          "summary": "Reviewer Usama Arif noted that if the reference to a folio is not obtained, the owner of the reference should decide how partially_mapped is treated for that folio, and suggested that clearing partially_mapped in folio_ref_freeze() is incorrect",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "bug",
+            "requested change"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Kiryl's suggestion makes sense. I think there is a bug here. If we dont\nget the reference, whoever owns the reference should decide how partially_mapped\nis treated for that folio:\n\n- If its the last folio_put(), it will clear partially_mapped and cleanup\nafter itself.\n- If its folio_ref_freeze(), clearing partially_mapped is wrong (which we\nare currently doing in deferred_split_isolate)",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-08-24",
+          "message_id": "f81160ac-0c7c-43f2-985f-43ab54a52358@linux.dev",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch freezes the sources behind migration entries in the Linux kernel's memory management system, ensuring that faults and GUP-slow operations wait on a folio lock before accessing the source. The freeze is implemented using two barriers to maintain reachability order, preventing writeback from bypassing the freeze. A ranged TLB flush is used to ensure all frozen sources are updated before releasing the ptl lock. The patch also includes a mechanism for restoring displaced values in case of failure."
+    },
+    "2026-08-25": {
+      "report_file": "2026-08-24_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "Lance Yang noted that patch 16 introduces a state-loss bug when collapse rolls back a partially mapped folio because deferred_split_isolate() can dequeue the folio and clear its PG_partially_mapped flag before freeze is rolled back, leaving it in an inconsistent state. He suggested using LRU_SKIP instead of returning LRU_REMOVED to avoid this issue.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "state-loss bug",
+            "inconsistent state"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Yeah, returning LRU_SKIP looks right. I have this locally:\n\n---8<---\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex e771244f42f3..a269775129c4 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -3939,11 +3939,8 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n\n\n \tVM_WARN_ON_ONCE(!mapping && end);\n \t/*\n-\t * If this folio can be on the deferred split queue, lock out\n-\t * the shrinker before freezing the ref. If the shrinker sees\n-\t * a 0-ref folio, it assumes it beat folio_put() to the list\n-\t * lock and must clean up the LRU state - the same dequeue we\n-\t * will do below as part of the split.\n+\t * If this folio can be on the deferred split queue, hold the list_lru\n+\t * lock across the refcount freeze and dequeue.\n \t */\n \tdequeue_deferred = folio_test_anon(folio) && old_order > 1;\n \tif (dequeue_deferred) {\n@@ -4592,22 +4589,10 @@ static enum lru_status deferred_split_isolate(struct list_head *item,\n \tstruct folio *folio = container_of(item, struct folio, _deferred_list);\n \tstruct list_head *freeable = cb_arg;\n\n-\tif (folio_try_get(folio)) {\n-\t\tlist_lru_isolate_move(lru, item, freeable);\n-\t\treturn LRU_REMOVED;\n-\t}\n+\tif (!folio_try_get(folio))\n+\t\treturn LRU_SKIP;\n\n-\t/*\n-\t * We lost race with folio_put(). Read folio state before the\n-\t * isolate: folio_unqueue_deferred_split() checks list_empty()\n-\t * locklessly, so once removed the folio can be freed any time.\n-\t */\n-\tif (folio_test_partially_mapped(folio)) {\n-\t\tfolio_clear_partially_mapped(folio);\n-\t\tmod_mthp_stat(folio_order(folio),\n-\t\t\t      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);\n-\t}\n-\tlist_lru_isolate(lru, item);\n+\tlist_lru_isolate_move(lru, item, freeable);\n \treturn LRU_REMOVED;\n }\n---\n\nOne detail, though ...\n\ndeferred_split_isolate()'s assumption predates patch 16. Patch 16 lets\ncollapse_freeze_candidate() leave refcount at zero and later unfreeze it\non rollback.\n\nExisting split code takes a list_lru lock for deferred_split_lru before\nfolio_ref_freeze() and holds it through dequeue. The shrinker cannot see\nthat temporary zero.\n\ncollapse_freeze_candidate() does not take that lock and can roll back\nlater.\n\nSay a candidate has two source folios. After the first one is frozen,\ndeferred_split_isolate() can see refcount 0, dequeue it, clear\nPG_partially_mapped and decrement its accounting. If freezing the second\none fails, collapse rolls the first one back:\n\nstatic void collapse_unfreeze_candidate(struct mm_struct *mm,\n\t\t\t\t\tstruct collapse_candidate *cand,\n\t\t\t\t\tpte_t *pte, unsigned int nr_saved,\n\t\t\t\t\tunsigned int nr_frozen)\n{\n\tunsigned long addr = cand->addr;\n\tunsigned int i = 0;\n\n\twhile (i < nr_saved) {\n\t\tpte_t saved = cand->saved_ptes[i];\n\t\tstruct folio *folio;\n\t\tunsigned int nr, k;\n\n...\n\t\tfolio = pte_folio(saved);\n\t\tnr = collapse_saved_span_len(cand, i, nr_saved);\n\n\t\tfor (k = 0; k < nr; k++) {\n\t\t\tset_pte_at(mm, addr + k * PAGE_SIZE, pte + i + k,\n\t\t\t\t   cand->saved_ptes[i + k]);\n\t\t}\n\t\tif (i < nr_frozen) {\n\t\t\tfolio_ref_unfreeze(folio,\n\t\t\t\t\t   folio_expected_ref_count(folio) + 1);\n\t\t}\n\t\tfolio_unlock(folio);\n\t\tfolio_put(folio);\n\n\t\ti += nr;\n\t\taddr += nr * PAGE_SIZE;\n\t}\n}\n\nPTEs and the folio's refcount are restored, but its deferred split queue\nentry, PG_partially_mapped flag, and accounting are already gone. So yeah,\npatch 16 has a real state-loss bug when collapse rolls back a partially\nmapped folio.\n\nLRU_SKIP looks right. A failed folio_try_get() only says refcount is zero.\nIt cannot tell a final folio_put() from a temporary freeze. A final put\nstill reaches:\n\nvoid __folio_put(struct folio *folio)\n{\n...\n\tfolio_unqueue_deferred_split(folio);\n...\n}\n\nfolio_unqueue_deferred_split() takes the same list_lru lock and clears\nPG_partially_mapped + its accounting if the entry is still queued.\n\nCheers, Lance",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-08-25",
+          "message_id": "20260825024434.39662-1-lance.yang@linux.dev",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch freezes the sources behind migration entries in the Linux kernel's memory management system, ensuring that faults and GUP-slow operations wait on a folio lock before accessing the source. The freeze is implemented using two barriers to maintain reachability order, preventing writeback from bypassing the freeze. A ranged TLB flush is used to ensure all frozen sources are updated before releasing the ptl lock. The patch also includes a mechanism for restoring displaced values in case of failure."
     }
   }
 }

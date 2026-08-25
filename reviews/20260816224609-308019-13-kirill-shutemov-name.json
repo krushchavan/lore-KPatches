@@ -9,6 +9,48 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch allocates a destination per candidate in the mm/collapse mechanism. The destination is a folio of the candidate's order, charged to the memcg, and allows for deferred-split list entry while sleeping. It also introduces new functions collapse_alloc(), collapse_provision(), and collapse_deposit() to handle allocation and reclaiming of memory. The patch aims to improve the efficiency and reliability of the mm/collapse mechanism by reducing lock contention and allowing for more flexible memory management."
+    },
+    "2026-08-24": {
+      "report_file": "2026-08-24_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "Lance Yang noted that folio_memcg_alloc_deferred() passes GFP_KERNEL to the deferred_split_lru allocation, which includes __GFP_DIRECT_RECLAIM, potentially bypassing the direct reclaim stripping in collapse_provision(). He suggested modifying folio_memcg_alloc_deferred() to use the gfp with direct reclaim stripped.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested change",
+            "potential issue"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "One small nit: folio_memcg_alloc_deferred() passes GFP_KERNEL to the\ndeferred_split_lru allocation.\n\nAt the full series tip, collapse_round() invokes it after\ncollapse_freeze() and before collapse_putback(), while faults on the\nsource migration entries wait:\n\nstatic void collapse_round(struct mm_struct *mm, unsigned long pmd_addr,\n\t\t\t   struct collapse_control *cc)\n{\n...\n\tcollapse_freeze(vma, cc, pmd);\n\tcollapse_provision(mm, cc);\n...\n\tcollapse_putback(vma, cc);\n...\n}\n\ncollapse_provision() strips direct reclaim before calling\ncollapse_alloc():\n\nstatic void collapse_provision(struct mm_struct *mm,\n\t\t\t       struct collapse_control *cc)\n{\n\tconst gfp_t gfp = cc->policy.gfp & ~__GFP_DIRECT_RECLAIM;\n...\n\t\tresult = collapse_alloc(mm, cc, cand, gfp);\n...\n}\n\ncollapse_alloc() uses that gfp for the charge, then calls\nfolio_memcg_alloc_deferred():\n\nstatic enum scan_result collapse_alloc(struct mm_struct *mm,\n\t\t\t\t       struct collapse_control *cc,\n\t\t\t\t       struct collapse_candidate *cand,\n\t\t\t\t       gfp_t gfp)\n{\n...\n\tif (unlikely(mem_cgroup_charge(folio, mm, gfp)) ||\n\t    folio_memcg_alloc_deferred(folio)) {\n...\n\t}\n...\n}\n\nThe helper substitutes GFP_KERNEL:\n\nint folio_memcg_alloc_deferred(struct folio *folio)\n{\n...\n\treturn folio_memcg_list_lru_alloc(folio, &deferred_split_lru, GFP_KERNEL);\n}\n\nWhen this metadata has not been allocated for a memcg yet,\nfolio_memcg_list_lru_alloc() can take its blocking slow branch:\n\nint folio_memcg_list_lru_alloc(struct folio *folio, struct list_lru *lru,\n\t\t\t       gfp_t gfp)\n{\n...\n\t/* Fast path when list_lru heads already exist */\n\trcu_read_lock();\n\tmemcg = folio_memcg(folio);\n\tres = memcg_list_lru_allocated(memcg, lru);\n\trcu_read_unlock();\n\tif (likely(res))\n\t\treturn 0;\n\n\t/* Allocation may block, pin the memcg */\n\tmemcg = get_mem_cgroup_from_folio(folio);\n\tres = __memcg_list_lru_alloc(memcg, lru, gfp);\n...\n}\n\nGFP_KERNEL includes __GFP_DIRECT_RECLAIM:\n\n...\n#define __GFP_DIRECT_RECLAIM\t((__force gfp_t)___GFP_DIRECT_RECLAIM) /* Caller can reclaim */\n#define __GFP_KSWAPD_RECLAIM\t((__force gfp_t)___GFP_KSWAPD_RECLAIM) /* kswapd can wake */\n#define __GFP_RECLAIM ((__force gfp_t)(___GFP_DIRECT_RECLAIM|___GFP_KSWAPD_RECLAIM))\n\n...\n#define GFP_KERNEL\t(__GFP_RECLAIM | __GFP_IO | __GFP_FS)\n\nThis only affects calls that find the metadata missing; after it has been\ninstalled, later calls take the fast branch. Still, it bypasses the gfp\nwith direct reclaim stripped for the freeze window. Could\nfolio_memcg_alloc_deferred() take that gfp here?\n\n[...]\n\nCheers, Lance",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-24",
+          "message_id": "20260824112005.63097-1-lance.yang@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author acknowledged that passing down GFP flags is necessary and agreed to make the change.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "acknowledged a fix",
+            "agreed to make a change"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Right. Passing down gfp is the right thing to do here.\n\nThanks, will fix.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Lance Yang",
+          "message_date": "2026-08-24",
+          "message_id": "aow636Xhrof8hj38@thinkstation",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch allocates a destination per candidate in the collapse mechanism. The destination is a folio of the candidate's order, charged to the memcg, and is used when the system is frozen. The allocation process involves two main functions: `collapse_alloc` and `collapse_provision`. `collapse_alloc` handles the allocation for one candidate with the given GFP flags, while `collapse_provision` is responsible for requesting allocations from the collapse mechanism without direct reclaim. The patch also introduces a new function called `collapse_deposit`, which secures page table allocations ahead of freezing. Overall, this patch aims to improve the efficiency and reliability of the collapse mechanism by providing a dedicated destination for each candidate."
     }
   }
 }
