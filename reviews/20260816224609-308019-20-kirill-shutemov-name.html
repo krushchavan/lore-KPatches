@@ -238,9 +238,224 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 19/57] mm/collapse: install a PMD leaf as the terminal layer</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260816224609.308019-20-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-16</strong><div class="date-range-nav">Active on: <a href="#2026-08-16">2026-08-16</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch installs a PMD leaf as the terminal layer in the mm/collapse code. It does this by first verifying that the pmd is valid, then detaching the old table and depositing a fresh one under the protection of the pmd lock. The patch ensures that no pmd_none() window exists during this process, preventing faults from escaping to the pte level. This approach allows PMD collapse to run under mmap_read like other operations in the code. The patch also handles aborts and ensures that the deposited table is quiescent, while the detached table is freed after all walkers have finished.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-25</strong><div class="date-range-nav">Active on: <a href="#2026-08-25">2026-08-25</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch installs a PMD (Page Map Directory) leaf as the terminal layer in the mm/collapse code. It does this by verifying, detaching, and then depositing a fresh PMD table under the pmd lock, ensuring that no pmd_none() window exists during the operation. This approach allows PMD collapse to run under mmap_read like other operations, and it handles potential racing conditions and aborts. The patch also ensures that the detached table is not quiesced immediately, but rather held until walkers finish with it, resulting in a one-time cost of a transient table page per PMD collapse.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-08-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lance Yang</span>
+<a class="date-chip" href="../2026-08-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Lance Yang noted that the patch does not handle the PAE case correctly and referenced a specific commit (146b42e07494) where pmdp_get_lockless_sync() was added for this purpose, requesting that the patch be updated to include this functionality.
+
+Reviewer Lance Yang noted that the current implementation of collapse_install_pmd() does not include pmdp_get_lockless_sync() between pmdp_collapse_flush() and map_anon_folio_pmd_nopf(), which can cause split-PMD readers to observe unmatched halves across the transition from old PMD to new leaf PMD. Lance suggested adding pmdp_get_lockless_sync() right after pmdp_collapse_flush() to prevent this issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">@Hugh, who added pmdp_get_lockless_sync() for the PAE case in
+146b42e07494.
+
+On Sun, Aug 16, 2026 at 11:45:31PM +0100, Kiryl Shutsemau wrote:
+
+---
+
+Well, git history spells out why pmdp_get_lockless_sync() is needed here.
+
+146b42e07494 added PAE safety because pmdp_get_lockless() can assemble a
+pmd_low + pmd_high pair that never belonged to the same PMD value.
+
+1d65b771bc08 then put pmdp_get_lockless_sync() right after
+pmdp_collapse_flush() (with pmd lock + pte lock held), and 1043173eb5eb
+used the same placement in collapse_pte_mapped_thp().
+
+Current implementation spells out the reader-side rule as well:
+
+#if CONFIG_PGTABLE_LEVELS &gt; 2
+static inline pmd_t pmdp_get_lockless(pmd_t *pmdp)
+{
+	pmd_t pmd;
+
+	do {
+		pmd.pmd_low = pmdp-&gt;pmd_low;
+		smp_rmb();
+		pmd.pmd_high = pmdp-&gt;pmd_high;
+		smp_rmb();
+	} while (unlikely(pmd.pmd_low != pmdp-&gt;pmd_low));
+
+	return pmd;
+}
+#define pmdp_get_lockless pmdp_get_lockless
+#define pmdp_get_lockless_sync() tlb_remove_table_sync_one()
+#endif /* CONFIG_PGTABLE_LEVELS &gt; 2 */
+
+#if defined(CONFIG_GUP_GET_PXX_LOW_HIGH) &amp;&amp; \
+	(defined(CONFIG_SMP) || defined(CONFIG_PREEMPT_RCU))
+/*
+ * See the comment above ptep_get_lockless() in include/linux/pgtable.h:
+ * the barriers in pmdp_get_lockless() cannot guarantee that the value in
+ * pmd_high actually belongs with the value in pmd_low; but holding interrupts
+ * off blocks the TLB flush between present updates, which guarantees that a
+ * successful __pte_offset_map() points to a page from matched halves.
+ */
+static unsigned long pmdp_get_lockless_start(void)
+{
+	unsigned long irqflags;
+
+	local_irq_save(irqflags);
+	return irqflags;
+}
+static void pmdp_get_lockless_end(unsigned long irqflags)
+{
+	local_irq_restore(irqflags);
+}
+...
+#endif
+
+pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
+{
+	unsigned long irqflags;
+	pmd_t pmdval;
+
+	rcu_read_lock();
+	irqflags = pmdp_get_lockless_start();
+	pmdval = pmdp_get_lockless(pmd);
+	pmdp_get_lockless_end(irqflags);
+
+	if (pmdvalp)
+		*pmdvalp = pmdval;
+	if (unlikely(pmd_none(pmdval) || !pmd_present(pmdval)))
+		goto nomap;
+	if (unlikely(pmd_trans_huge(pmdval)))
+		goto nomap;
+	if (unlikely(pmd_bad(pmdval))) {
+		pmd_clear_bad(pmd);
+		goto nomap;
+	}
+	return __pte_map(&amp;pmdval, addr);
+nomap:
+	rcu_read_unlock();
+	return NULL;
+}
+
+Hmm, Patch #19 still has the present table PMD -&gt; none -&gt; present leaf
+PMD transition. collapse_install_pmd() does pmdp_collapse_flush() and
+installs the new PMD through map_anon_folio_pmd_nopf() without
+pmdp_get_lockless_sync() in between. pte_free_defer() keeps the old table
+alive for RCU readers, but it can&#x27;t stop pmdp_get_lockless() in
+__pte_offset_map() from assembling halves across that transition.
+
+FWIW, pmdp_get_lockless_sync() is an empty inline when pmdp_get_lockless()
+doesn&#x27;t use the pmd_low/pmd_high reader. On x86,
+CONFIG_GUP_GET_PXX_LOW_HIGH is selected only by X86_PAE, so other x86
+configs wouldn&#x27;t pay the IPI cost.
+
+@Hugh, do I miss something?
+
+Could we keep pmdp_get_lockless_sync() right after pmdp_collapse_flush(),
+before map_anon_folio_pmd_nopf() (and while the locks are still held)?
+
+Maybe:
+
+---8&lt;---
+diff --git a/mm/collapse.c b/mm/collapse.c
+index 7c10888031f7..cf4e57b598f9 100644
+--- a/mm/collapse.c
++++ b/mm/collapse.c
+@@ -1585,6 +1585,7 @@ static void collapse_install_pmd(struct vm_area_struct *vma,
+ 	 * is why the helper shoots down a pte range rather than a pmd.
+ 	 */
+ 	old_pmd = pmdp_collapse_flush(vma, cand-&gt;addr, pmd);
++	pmdp_get_lockless_sync();
+ 	old_table = pmd_pgtable(old_pmd);
+
+ 	/*
+@@ -1601,14 +1602,11 @@ static void collapse_install_pmd(struct vm_area_struct *vma,
+ 	 * construction, which is why collapse_alloc() secured one.
+ 	 *
+ 	 * The detached table is not.  GUP-fast and RCU pte walks that read the
+-	 * old PMD before pmdp_collapse_flush() may still be inside it, and on
+-	 * broadcast-TLBI arches that flush expels nobody.  Quiescing it would
+-	 * take an IPI (tlb_remove_table_sync_one()), which has nowhere to go
+-	 * here: outside the pmd lock it opens a pmd_none window a fault can fill,
+-	 * inside it is a broadcast under a spinlock.  So it goes to
+-	 * pte_free_defer(), which holds the free until those walkers finish, as
+-	 * retract_page_tables() does.  One transient table page per PMD collapse
+-	 * is what that costs.
++	 * old PMD before pmdp_collapse_flush() may still be inside it.
++	 * pmdp_get_lockless_sync() keeps split-PMD readers from observing
++	 * unmatched halves across the transition, while pte_free_defer() holds
++	 * the free until RCU readers finish.  One transient table page per PMD
++	 * collapse is what that costs.
+ 	 */
+ 	pgtable_trans_huge_deposit(mm, pmd, cand-&gt;deposit);
+ 	map_anon_folio_pmd_nopf(cand-&gt;new_folio, pmd, vma, cand-&gt;addr);
+---
+
+Cheers, Lance</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20260825122354.98021-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: patch needs update, PAE case not handled, requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jann Horn</span>
+<a class="date-chip" href="../2026-08-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Jann Horn questioned the atomicity of PMD table updates, pointing out that pmdp_collapse_flush() clears the PMD entry while holding the PMD table spinlock, but codepaths like zap_pmd_range() may not take this lock and can thus race with MADV_DONTNEED or zap_vma_range(), potentially making the zap ineffective.
+
+Reviewer Jann Horn noted that the patch&#x27;s claim of no pmd_none() window existing is incorrect because concurrent rmap-walks into the PMD can occur, potentially looking at stale PTEs.
+
+The reviewer questioned whether the old table contains migration entries at the point when its spinlock is dropped and it&#x27;s scheduled for freeing, suggesting that zeroing all PTEs in the old table before dropping its lock could prevent a concurrent pte_offset_map_rw_nolock() from seeing dangling migration entries.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">What do you mean by &quot;atomic&quot; and &quot;no pmd_none() window ever exists&quot;?
+Is that supposed to be with respect to a subset of readers?
+
+While the PMD table spinlock is held, you clear the PMD entry
+(pmdp_collapse_flush) and set it to a new value
+(map_anon_folio_pmd_nopf). But codepaths that walk page tables don&#x27;t
+take that spinlock unless they already know they&#x27;re in a THP case.
+
+zap_pmd_range() does not lock the PMD table before checking
+pmd_none(), and if that is true, it skips over the PMD. I think this
+means that THP collapse can race with MADV_DONTNEED or zap_vma_range()
+such that the zap wrongly has no effect?
+
+---
+
+To be clear, we can concurrently rmap-walk into the PMD, right?
+Because we might be looking at a different folio which was created in
+the parent process or something like that? And so a
+page_vma_mapped_walk() without PVMW_SYNC might look at stale PTEs?
+(Which may or may not be fine, but would not be what this commit
+message claims.)
+
+---
+
+What does old_table contain at this point - migration entries? I
+wonder if we should zero all the PTEs inside it before dropping its
+spinlock and scheduling its freeing, so that a concurrent
+pte_offset_map_rw_nolock()+spin_lock() wouldn&#x27;t see dangling migration
+entries. (I&#x27;m not sure if we actually have a codepath that does that,
+but even if not, this seems like it might cause problems later.)</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/CAG48ez1fiCzTMATN07HHfzvUGFuZ5gELNpZXdXx=ySa7nihxmA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: atomicity, race condition, concern about correctness</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

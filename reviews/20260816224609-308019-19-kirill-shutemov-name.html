@@ -238,9 +238,117 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 18/57] mm/collapse: install the destinations at PTE level</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260816224609.308019-19-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-16</strong><div class="date-range-nav">Active on: <a href="#2026-08-16">2026-08-16</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch installs destinations at the PTE (page table entry) level as part of a larger effort to collapse memory. It fills in the installation process for sub-PMD candidates, including verification and abort mechanisms. The verify function checks if the window is still valid to publish, while the abort function undoes frozen candidates that cannot be published due to various reasons such as machine checks or racing MADV_DONTNEED operations. The patch also includes a terminal layer for PMD-order candidates and updates the collapse.c file with new code.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-25</strong><div class="date-range-nav">Active on: <a href="#2026-08-25">2026-08-25</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds functionality to install the destinations at PTE level in the mm/collapse code. It includes a verify step to ensure that the window is still the round&#x27;s to publish, and an abort step to undo a frozen candidate that cannot be published. The patch also handles publishing, which involves updating the destination&#x27;s rmap and LRU insertion before its PTEs are updated. Additionally, it adds a terminal layer for PMD-order candidates and includes code to handle zapped slots and racing MADV_DONTNEED operations.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-08-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lance Yang</span>
+<a class="date-chip" href="../2026-08-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Lance Yang noted that KSM zero-page accounting gets out of sync when a saved zero PTE is restored in the collapse_abort_candidate() function, as it does not drop the counters if the PTE was previously marked dirty by ksm_map_zero_page(). He suggested adding a new function collapse_unmap_zero_pages() to handle this case and proposed modifying the collapse_install_pmd() and collapse_install() functions to call this new function.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Well ... KSM zero-page accounting gets out of sync here.
+
+Say a saved zero PTE came from KSM. ksm_map_zero_page() has already
+bumped global + per-mm counters. ksm_might_unmap_zero_page() uses its|
+dirty bit to drop them again later:
+
+#define is_ksm_zero_pte(pte)	(is_zero_pfn(pte_pfn(pte)) &amp;&amp; pte_dirty(pte))
+
+static inline void ksm_map_zero_page(struct mm_struct *mm)
+{
+	atomic_long_inc(&amp;ksm_zero_pages);
+	atomic_long_inc(&amp;mm-&gt;ksm_zero_pages);
+}
+
+static inline void ksm_might_unmap_zero_page(struct mm_struct *mm, pte_t pte)
+{
+	if (is_ksm_zero_pte(pte)) {
+		atomic_long_dec(&amp;ksm_zero_pages);
+		atomic_long_dec(&amp;mm-&gt;ksm_zero_pages);
+	}
+}
+
+Right, once a candidate reaches install, those counters stay valid only
+if collapse_abort_candidate() restores the saved PTE. A successful PTE
+install doesn&#x27;t restore it. Neither does an abort after the slot was
+refilled or the PTE table disappeared. Patch #19 has the same
+successful-install case in collapse_install_pmd() ...
+
+I was thinking of something like this:
+
+---8&lt;---
+diff --git a/mm/collapse.c b/mm/collapse.c
+index 7c10888031f7..68b37e706341 100644
+--- a/mm/collapse.c
++++ b/mm/collapse.c
+@@ -8,6 +8,7 @@
+ #include &lt;linux/highmem.h&gt;
+ #include &lt;linux/huge_mm.h&gt;
+ #include &lt;linux/hugetlb.h&gt;	/* x86 flush_tlb_range() uses hstate_vma() */
++#include &lt;linux/ksm.h&gt;
+ #include &lt;linux/leafops.h&gt;
+ #include &lt;linux/math64.h&gt;
+ #include &lt;linux/memcontrol.h&gt;
+@@ -1430,6 +1431,8 @@ static void collapse_abort_candidate(struct vm_area_struct *vma,
+ 		if (is_zero_pfn(pte_pfn(saved))) {
+ 			if (pte &amp;&amp; pte_none(ptep_get(pte + i)))
+ 				set_pte_at(mm, addr, pte + i, saved);
++			else
++				ksm_might_unmap_zero_page(mm, saved);
+ 			continue;
+ 		}
+
+@@ -1499,6 +1502,16 @@ static bool collapse_verify_candidate(struct collapse_candidate *cand,
+ 	return true;
+ }
+
++static void collapse_unmap_zero_pages(struct mm_struct *mm,
++				      struct collapse_candidate *cand)
++{
++	const unsigned int nr_pages = candidate_nr_pages(cand);
++	unsigned int i;
++
++	for (i = 0; i &lt; nr_pages; i++)
++		ksm_might_unmap_zero_page(mm, cand-&gt;saved_ptes[i]);
++}
++
+ /*
+  * The PMD terminal layer: verify, detach the table, deposit a fresh one and
+  * install the leaf, as one atomic section under the pmd lock.  A pmd_none window
+@@ -1616,6 +1629,7 @@ static void collapse_install_pmd(struct vm_area_struct *vma,
+ 	/* Slots with no source gain anon memory that no zap accounted */
+ 	if (nr_populated)
+ 		add_mm_counter(mm, MM_ANONPAGES, nr_populated);
++	collapse_unmap_zero_pages(mm, cand);
+ 	cand-&gt;deposit = NULL;
+ 	cand-&gt;new_folio = NULL;	/* ownership: the mapping */
+ 	cand-&gt;state = CAND_INSTALLED;
+@@ -1708,6 +1722,7 @@ static void collapse_install(struct vm_area_struct *vma,
+ 		/* Slots with no source gain anon memory that no zap accounted */
+ 		if (nr_populated)
+ 			add_mm_counter(mm, MM_ANONPAGES, nr_populated);
++		collapse_unmap_zero_pages(mm, cand);
+ 		cand-&gt;new_folio = NULL;	/* ownership: the mappings */
+ 		cand-&gt;state = CAND_INSTALLED;
+ 	}
+---
+
+Cheers, Lance</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20260825064851.87309-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
