@@ -11,7 +11,7 @@
       "patch_summary": "This patch installs a PMD leaf as the terminal layer in the mm/collapse code. It does this by first verifying that the pmd is valid, then detaching the old table and depositing a fresh one under the protection of the pmd lock. The patch ensures that no pmd_none() window exists during this process, preventing faults from escaping to the pte level. This approach allows PMD collapse to run under mmap_read like other operations in the code. The patch also handles aborts and ensures that the deposited table is quiescent, while the detached table is freed after all walkers have finished."
     },
     "2026-08-25": {
-      "report_file": "2026-08-25_ollama_llama3.1-8b.html",
+      "report_file": "2026-08-26_ollama_llama3.1-8b.html",
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
@@ -52,6 +52,54 @@
           "reply_to": "Kiryl Shutsemau",
           "message_date": "2026-08-25",
           "message_id": "CAG48ez1fiCzTMATN07HHfzvUGFuZ5gELNpZXdXx=ySa7nihxmA@mail.gmail.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch installs a PMD (Page Map Directory) leaf as the terminal layer in the mm/collapse code. It does this by verifying, detaching, and then depositing a fresh PMD table under the pmd lock, ensuring that no pmd_none() window exists during the operation. This approach allows PMD collapse to run under mmap_read like other operations, and it handles potential racing conditions and aborts. The patch also ensures that the detached table is not quiesced immediately, but rather held until walkers finish with it, resulting in a one-time cost of a transient table page per PMD collapse."
+    },
+    "2026-08-26": {
+      "report_file": "2026-08-26_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author addressed a concern about the need for synchronization in pmdp_get_lockless_sync() and agreed to add it, providing an updated code snippet that includes this function call.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "agreed_to_add_synchronization",
+            "provided_updated_code"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Yes, I will put pmdp_get_lockless_sync() there.\n\nHere's what I got to my tree:\n\n      /*\n       * Nothing fallible sits past here.  No anon_vma_lock_write either: rmap\n       * walks on the sources are unreachable -- refcounts frozen, folio locks\n       * held from freeze to putback -- non-rmap pte walkers see migration\n       * entries, pmd-level observers see the old table or the leaf and never an\n       * intermediate, and fork, mremap and munmap take a write lock where the\n       * round holds a read lock.\n       *\n       * The flush inside pmdp_collapse_flush() is the round's second over this\n       * range: the freeze displaced every leaf here and flushed before dropping\n       * the ptl, and the verify above proved nothing has been mapped since.\n       * What it covers is the paging-structure caches -- a CPU may still hold\n       * the pmd-to-table link, for a table that is about to be freed -- which\n       * is why the helper shoots down a pte range rather than a pmd.\n       *\n       * If pmd_t is too wide to load in one access, a lockless walker reads\n       * it half at a time.  Such a walker holds interrupts off, so an\n       * interrupt between two present values is what keeps it from assembling\n       * halves of both; the flush above does not always send one.\n       * pmdp_get_lockless_sync() does, and is an empty inline wherever the\n       * entry loads atomically.\n       */\n      old_pmd = pmdp_collapse_flush(vma, cand->addr, pmd);\n      pmdp_get_lockless_sync();\n      old_table = pmd_pgtable(old_pmd);\n\n      /*\n       * The smp_wmb() in __folio_mark_uptodate() orders the copied data before\n       * the install below publishes it.\n       */\n      __folio_mark_uptodate(cand->new_folio);\n\n      /*\n       * Deposit a freshly allocated table, not the one just detached: a\n       * deposited table has to be quiescent, because whoever withdraws it frees\n       * it immediately (zap_huge_pmd()) with nothing to hold a lockless walker\n       * off first.  A table that has never been reachable is quiescent by\n       * construction, which is why collapse_alloc() secured one.\n       *\n       * The detached table is not quiescent.  GUP-fast and RCU pte walks that\n       * read the old PMD before pmdp_collapse_flush() may still be inside it,\n       * and on broadcast-TLBI arches that flush expels nobody.  Quiescing it\n       * would take an IPI in a pmd_none window, which this design does not\n       * have.  So the table goes to pte_free_defer(), which holds the free\n       * until those walkers finish, as retract_page_tables() does.  One\n       * transient table page per PMD collapse is what that costs.\n       */\n      pgtable_trans_huge_deposit(mm, pmd, cand->deposit);\n      map_anon_folio_pmd_nopf(cand->new_folio, pmd, vma, cand->addr);\n\nAny objections?\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Lance Yang",
+          "message_date": "2026-08-26",
+          "message_id": "ao8jHveJqHegERGF@thinkstation",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledges a real race condition with MADV_DONTNEED and proposes installing a pmd_mkinvalid() entry to serialize walkers on the pmd lock, but expresses uncertainty about the idea's sanity.\n\nAuthor acknowledged that the PMD lock prevents faults during installation, agreed to reword the patch description in response to a prior concern about pmd_none().\n\nAuthor acknowledged that the PMD install code should be consistent in its locking behavior, agreed to update the wording to reflect this consistency.\n\nThe author acknowledges that Jann Horn's feedback about rmap walks reaching the range is correct and agrees that a walk cannot act on a source because it takes the folio lock, which is held from freeze to putback.\n\nThe author acknowledges that the ptl should be cleared before installing a PMD, but notes that this is not necessary for pte_offset_map_rw_nolock() callers as they already perform a recheck of the pmd.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledges a problem",
+            "expresses uncertainty",
+            "acknowledged a technical point",
+            "agreed to revise wording",
+            "acknowledged feedback",
+            "agreed to update",
+            "acknowledges feedback",
+            "agrees with concern",
+            "acknowledged fix needed",
+            "clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Yes, the race with MADV_DONTNEED you point out is real. Thanks for\nflagging this.\n\nThe idea I want to explore is installing a pmd_mkinvalid() entry rather\nthan none in pmdp_collapse_flush(), so walkers have to serialize on the\npmd lock.\n\nBut it was a long day, I am not sure if the idea is sane.\n\n---\n\nRight.\n\nThey are all at pte level, in the table being detached. What\nkeeps a fault out during the install is the pmd lock: pmd_install() takes\nit before it can put a table back.\n\nI will fix wording once the pmd_none() question above is settled.\n\n---\n\nUpstream.\n\ntry_collapse_pte_mapped_thp() and retract_page_tables() nest the pte ptl\ninside the pmd lock the same way.\n\nI will update wording here.\n\n---\n\nAgain, wording should be better here.\n\nA walk can reach the range, but it cannot act on a source: that takes the\nfolio lock, which the round holds from freeze to putback.\n\n---\n\nYes.  I will clear it under the ptl before it goes.\n\nNot for the pattern you name, though: a pte_offset_map_rw_nolock() caller\nowes a pmd_same() recheck and page_vma_mapped_walk() does it.\n\nThe exposure is the plain pte_offset_map() callers -- pagewalk.c,\nmemory-failure.c, swap_state.c and a dozen more -- none of which\nrechecks the pmd.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Jann Horn",
+          "message_date": "2026-08-26",
+          "message_id": "ao8okZ-A7cnvoju6@thinkstation",
           "analysis_source": "llm"
         }
       ],

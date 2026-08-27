@@ -1,0 +1,81 @@
+{
+  "thread_id": "ao9YFgBQJEy-85iB@linux.dev",
+  "subject": "[PATCH] mm: memcg: use ratelimited stats flush in obj_cgroup_may_zswap()",
+  "url": "https://lore.kernel.org/all/ao9YFgBQJEy-85iB@linux.dev/",
+  "dates": {
+    "2026-08-26": {
+      "report_file": "2026-08-26_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer Yosry Ahmed noted that the original mechanism used in commit 42a300353577 had issues with atomic updates on all parents, leading to inaccurate reads by up to MEMCG_CHARGE_BATCH * nr_cpus * nr_children, and proposed a different approach where the update side always iterates per-CPU counters in all parents and the read side always iterates per-CPU counters in this cgroup for accuracy.\n\nReviewer noted that decompression is a performance-critical code path and expressed concern about potential regression from using ratelimited stats flush\n\nReviewer Yosry Ahmed pointed out that the proposed approach's main concern is read latency, not update latency, and suggested that if it works for in-kernel consumers, it should also work for userspace consumers.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "potential regression",
+            "requested evaluation of stats",
+            "consideration of userspace consumers"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "IIUC, in that commit, the update side modifies one per-CPU per-cgroup\ncounters, and when those counters exceed a threshold atomic updates\nare performed on all parents, which I think is the slow side. Then,\nthe read side just reads the potentially stale atomic. That was\nproblematic because:\n(1) The update side can end up performing atomic updates on all parents.\n(2) The read side can be inaccurate by up to MEMCG_CHARGE_BATCH *\nnr_cpus * nr_children\n\nWhat I am proposing in (c) is different:\n\n(1) The update side always updates per-CPU per-cgroup counters in all\nthe parents. It never does atomic operations. The parent iteration is\nnot cheap, but it is cheaper than atomics for sure and we already do\nparent iteration today in some cases in memcg_rstat_updated(). So the\n\"slow\" path should be the same as today.\n(2) The read side always iterates per-CPU counters in this cgroup, so\nit's always accurate. This might be more expensive on an rstat flush\non average (e.g. if memcg_vmstats_needs_flush() skips the flush), but\nit is much more consistent and the tail latency is much better.\n\n---\n\nWell, decompression is in the fault path, that's performance critical\nto some extent (although not like other stats updated by networking).\nAnyway, I think the update path shouldn't regress much with the\napproach described in (c).\n\n---\n\nI think in the proposed approach (c) the main concern is actually read\nlatency, not update latency. So if it works for in-kernel consumers it\nshould definitely work for userspace consumers as well?",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-08-26",
+          "message_id": "CAO9r8zO6VWRGh3CbqyymSkEaw6gFd6AKYQgZE_rTQP7svWEMfw@mail.gmail.com",
+          "email": "yosry@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author addressed Yosry Ahmed's concern about performance impact of memcg_rstat_updated by explaining that the parent traversal is short-circuited when the flush threshold is hit, but acknowledged significant CPU usage at Meta scale.\n\nAuthor responded to concerns about the suitability of ratelimited stats flush for zswap, stating that it's unclear whether this approach will work and suggesting that evaluation is needed at production scale rather than through benchmarks.\n\nAuthor responded to concerns about performance impact of ratelimited stats flush, explaining that decompression and minor page faults are on micro-second and nano-second scales respectively, making the upward traversal cheap.\n\nAuthor responded to Yosry Ahmed's concern about the performance implications of using a ratelimited stats flush in obj_cgroup_may_zswap(). The author explained that they were mainly thinking about kernel consumers which have strict staleness requirements, and that rstat flushing is more expensive than their proposed mechanism. They also suggested that once this special mechanism is implemented, it could potentially replace the existing ratelimited flush code.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged a technical issue",
+            "provided explanation",
+            "unclear",
+            "evaluation_needed",
+            "acknowledged performance concern",
+            "provided technical explanation",
+            "clarification",
+            "potential future change"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yes but that parent traversal is short circuited when we hit the flush\nthreshold. At Meta scale, we have observed significant cpus being spent on\nmemcg_rstat_updated before that.\n\n---\n\nIt might be or not. Usually such things are more clear at scale in production\ninstead of benchmarks.\n\n---\n\nDecompression is on the scale of micro-seconds (and I suspect the simple minor\npage faults are on nano-seconds scale) and the upward traversal is definitely\nmuch cheaper and will be a noise there.\n\n---\n\nHere I was mainly talking about consumers which has more strict staleness\nrequirements and those are mainly kernel consumers. Rstat flushing is definitely\nmore expensive than this for-each-cpu traversal and most of the time they just\nneed it for one or very small set of stats.\n\nI am imagining once we have this special mechanism for selected stats, we can\npotentially remove ratelimited flush and stats update threshold code.",
+          "reply_to": "Yosry Ahmed",
+          "message_date": "2026-08-26",
+          "message_id": "ao9q-m9k-NMxDvA1@linux.dev",
+          "email": "shakeel.butt@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Yosry Ahmed",
+          "summary": "Reviewer questioned whether the upward per-CPU traversal is indeed expensive, suggesting that it might be caused by concurrent flushers and cache line bouncing\n\nreviewer expressed hope for transitioning all stats flushing to the new scheme if it works well and suggested collecting production data to inform the decision",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "uncertainty",
+            "questioning",
+            "hope",
+            "suggestion"
+          ],
+          "has_inline_review": true,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Interesting. So the upward per-CPU traversal takes time? Perhaps due\nto concurrent flushers causing the cachelines to bounce?\n\n---\n\nYeah that's the hope. I was basically saying that I am hoping for\nmore, to transition everything to this flushing scheme if it works\nwell.\n\nAnyway, as you mentioned, ideally we need production data to proceed.\nJoanne, is this something that you are trying to collect by any\nchance? :)",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-08-26",
+          "message_id": "CAO9r8zPqJncFKQbF3tGe1d4sg-4dLQ3dQRGze_vab26wWrXTqA@mail.gmail.com",
+          "email": "yosry@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the obj_cgroup_may_zswap() function to use a rate-limited statistics flush instead of the current approach, which is expensive for kernel consumers that require strict staleness. The change aims to reduce the overhead of memcg_rstat_updated and make it more efficient at scale in production environments. By introducing a special mechanism for selected stats, the patch potentially paves the way for removing rate-limited flush and statistics update threshold code altogether."
+    }
+  }
+}

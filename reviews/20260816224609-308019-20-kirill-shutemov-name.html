@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 19/57] mm/collapse: install a PMD leaf as the terminal layer</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260816224609.308019-20-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-25</strong><div class="date-range-nav">Active on: <a href="#2026-08-25">2026-08-25</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-26</strong><div class="date-range-nav">Active on: <a href="#2026-08-26">2026-08-26</a> &bull; <a href="#2026-08-25">2026-08-25</a> &bull; <a href="#2026-08-16">2026-08-16</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch installs a PMD (Page Map Directory) leaf as the terminal layer in the mm/collapse code. It does this by verifying, detaching, and then depositing a fresh PMD table under the pmd lock, ensuring that no pmd_none() window exists during the operation. This approach allows PMD collapse to run under mmap_read like other operations, and it handles potential racing conditions and aborts. The patch also ensures that the detached table is not quiesced immediately, but rather held until walkers finish with it, resulting in a one-time cost of a transient table page per PMD collapse.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-25">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Lance Yang</span>
-<a class="date-chip" href="../2026-08-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<a class="date-chip" href="../2026-08-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
@@ -401,12 +401,89 @@ Cheers, Lance</pre>
 <a href="https://lore.kernel.org/r/20260825122354.98021-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: patch needs update, PAE case not handled, requested changes</div>
 </div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-08-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-26">2026-08-26</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about the need for synchronization in pmdp_get_lockless_sync() and agreed to add it, providing an updated code snippet that includes this function call.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, I will put pmdp_get_lockless_sync() there.
+
+Here&#x27;s what I got to my tree:
+
+      /*
+       * Nothing fallible sits past here.  No anon_vma_lock_write either: rmap
+       * walks on the sources are unreachable -- refcounts frozen, folio locks
+       * held from freeze to putback -- non-rmap pte walkers see migration
+       * entries, pmd-level observers see the old table or the leaf and never an
+       * intermediate, and fork, mremap and munmap take a write lock where the
+       * round holds a read lock.
+       *
+       * The flush inside pmdp_collapse_flush() is the round&#x27;s second over this
+       * range: the freeze displaced every leaf here and flushed before dropping
+       * the ptl, and the verify above proved nothing has been mapped since.
+       * What it covers is the paging-structure caches -- a CPU may still hold
+       * the pmd-to-table link, for a table that is about to be freed -- which
+       * is why the helper shoots down a pte range rather than a pmd.
+       *
+       * If pmd_t is too wide to load in one access, a lockless walker reads
+       * it half at a time.  Such a walker holds interrupts off, so an
+       * interrupt between two present values is what keeps it from assembling
+       * halves of both; the flush above does not always send one.
+       * pmdp_get_lockless_sync() does, and is an empty inline wherever the
+       * entry loads atomically.
+       */
+      old_pmd = pmdp_collapse_flush(vma, cand-&gt;addr, pmd);
+      pmdp_get_lockless_sync();
+      old_table = pmd_pgtable(old_pmd);
+
+      /*
+       * The smp_wmb() in __folio_mark_uptodate() orders the copied data before
+       * the install below publishes it.
+       */
+      __folio_mark_uptodate(cand-&gt;new_folio);
+
+      /*
+       * Deposit a freshly allocated table, not the one just detached: a
+       * deposited table has to be quiescent, because whoever withdraws it frees
+       * it immediately (zap_huge_pmd()) with nothing to hold a lockless walker
+       * off first.  A table that has never been reachable is quiescent by
+       * construction, which is why collapse_alloc() secured one.
+       *
+       * The detached table is not quiescent.  GUP-fast and RCU pte walks that
+       * read the old PMD before pmdp_collapse_flush() may still be inside it,
+       * and on broadcast-TLBI arches that flush expels nobody.  Quiescing it
+       * would take an IPI in a pmd_none window, which this design does not
+       * have.  So the table goes to pte_free_defer(), which holds the free
+       * until those walkers finish, as retract_page_tables() does.  One
+       * transient table page per PMD collapse is what that costs.
+       */
+      pgtable_trans_huge_deposit(mm, pmd, cand-&gt;deposit);
+      map_anon_folio_pmd_nopf(cand-&gt;new_folio, pmd, vma, cand-&gt;addr);
+
+Any objections?
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Lance Yang</div>
+<a href="https://lore.kernel.org/r/ao8jHveJqHegERGF@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreed_to_add_synchronization, provided_updated_code</div>
+</div>
+</div>
+</div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Jann Horn</span>
-<a class="date-chip" href="../2026-08-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<a class="date-chip" href="../2026-08-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
@@ -453,6 +530,81 @@ but even if not, this seems like it might cause problems later.)</pre>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/CAG48ez1fiCzTMATN07HHfzvUGFuZ5gELNpZXdXx=ySa7nihxmA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: atomicity, race condition, concern about correctness</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-08-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-26">2026-08-26</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges a real race condition with MADV_DONTNEED and proposes installing a pmd_mkinvalid() entry to serialize walkers on the pmd lock, but expresses uncertainty about the idea&#x27;s sanity.
+
+Author acknowledged that the PMD lock prevents faults during installation, agreed to reword the patch description in response to a prior concern about pmd_none().
+
+Author acknowledged that the PMD install code should be consistent in its locking behavior, agreed to update the wording to reflect this consistency.
+
+The author acknowledges that Jann Horn&#x27;s feedback about rmap walks reaching the range is correct and agrees that a walk cannot act on a source because it takes the folio lock, which is held from freeze to putback.
+
+The author acknowledges that the ptl should be cleared before installing a PMD, but notes that this is not necessary for pte_offset_map_rw_nolock() callers as they already perform a recheck of the pmd.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, the race with MADV_DONTNEED you point out is real. Thanks for
+flagging this.
+
+The idea I want to explore is installing a pmd_mkinvalid() entry rather
+than none in pmdp_collapse_flush(), so walkers have to serialize on the
+pmd lock.
+
+But it was a long day, I am not sure if the idea is sane.
+
+---
+
+Right.
+
+They are all at pte level, in the table being detached. What
+keeps a fault out during the install is the pmd lock: pmd_install() takes
+it before it can put a table back.
+
+I will fix wording once the pmd_none() question above is settled.
+
+---
+
+Upstream.
+
+try_collapse_pte_mapped_thp() and retract_page_tables() nest the pte ptl
+inside the pmd lock the same way.
+
+I will update wording here.
+
+---
+
+Again, wording should be better here.
+
+A walk can reach the range, but it cannot act on a source: that takes the
+folio lock, which the round holds from freeze to putback.
+
+---
+
+Yes.  I will clear it under the ptl before it goes.
+
+Not for the pattern you name, though: a pte_offset_map_rw_nolock() caller
+owes a pmd_same() recheck and page_vma_mapped_walk() does it.
+
+The exposure is the plain pte_offset_map() callers -- pagewalk.c,
+memory-failure.c, swap_state.c and a dozen more -- none of which
+rechecks the pmd.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jann Horn</div>
+<a href="https://lore.kernel.org/r/ao8okZ-A7cnvoju6@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a problem, expresses uncertainty, acknowledged a technical point</div>
+</div>
+</div>
 </div>
 </div>
 </div>
