@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 00/12] mm: PMD-level swap entries for anonymous THPs</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260818131202.494754-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-19</strong><div class="date-range-nav">Active on: <a href="#2026-08-19">2026-08-19</a> &bull; <a href="#2026-08-18">2026-08-18</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-27</strong><div class="date-range-nav">Active on: <a href="#2026-08-27">2026-08-27</a> &bull; <a href="#2026-08-19">2026-08-19</a> &bull; <a href="#2026-08-18">2026-08-18</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces PMD-level swap entries for anonymous THPs (Transparent Huge Pages) to allow them to survive the swap round-trip without needing khugepaged to collapse the range later. The PMD swap entry is a compact page-table encoding for HPAGE_PMD_NR consecutive swap slots, and does not promise that the swap cache always contains one PMD-sized folio. When the cache has split or per-slot state, users can either inspect individual slots directly or split the PMD swap entry and retry through the PTE path. The series is ordered so every consumer can handle PMD swap entries before the swap-out producer starts installing them.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-18">
@@ -5507,6 +5507,1221 @@ Cheers, Lance
 </div>
 <div class="review-comment-text">Gave Acked-by</div>
 <a href="https://lore.kernel.org/r/aoWuiUGAGXgUNZBP@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-27">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Luiz Capitulino</span>
+<a class="date-chip" href="../2026-08-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-27">2026-08-27</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Luiz Capitulino noted that the PMD swap entry paths are not fully exercised by do_huge_pmd_swap_page(), which only retrieves the folio from the swap cache and does not use the swapin_sync() code path, and suggested a workaround to trigger reclaim manually after swap-out but before swap-in. Additionally, he questioned whether AI was used to generate the code due to its uniformity and unnecessary complexity.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 2026-08-18 09:09, Usama Arif wrote:
+&gt; Exercise the PMD swap entry paths.  Each test gets a fresh PMD-mapped
+&gt; THP from fixture setup, fills it with a page-distinct pattern, swaps it
+&gt; out with MADV_PAGEOUT, and verifies that thp_swpout_pmd increased.
+&gt; 
+&gt; The tests are:
+&gt; 
+&gt;    - basic: fault in a swapped PMD and verify its contents.
+&gt;    - fork: verify parent and child can fault in the shared swap entry.
+&gt;    - fork_cow: verify parent and child writes remain isolated.
+&gt;    - write: fault in by writing one byte and preserve the rest of the THP.
+&gt;    - rwp_swapin: verify userfaultfd RWP survives PMD-order swap-in.
+&gt;    - munmap: unmap the full entry and check that VmSwap drops.
+&gt;    - mprotect: change full-range protections without faulting the entry in.
+&gt;    - split_mprotect: change half-range protections and verify the data.
+&gt;    - split_munmap: unmap half, drop its accounting, and preserve the rest.
+&gt;    - uffdio_move: move the entry and RWP state, then fault it in at dst.
+&gt;    - mremap: force the entry to a new aligned address and verify the data.
+&gt;    - pagemap: verify swapped bits and consecutive swap-slot offsets.
+&gt;    - mincore: walk the entry without faulting it in.
+&gt;    - madvise_free: release the slots, clear the entry, and verify zeroes.
+&gt;    - madvise_willneed: prefetch the entry and verify subsequent swap-in.
+&gt;    - swapoff: unuse the entry and preserve data and PMD/RWP state.
+&gt; 
+&gt; Fixture teardown owns the mappings and file descriptors and restores
+&gt; swap after assertion failures.  PMD_SWAP_DEVICE remains optional for
+&gt; swapoff.
+&gt; 
+&gt; Distinguish an environment that cannot allocate a PMD THP from a failure
+&gt; to install a PMD swap entry, so the former skips while the latter fails.
+&gt; Also check VmSwap accounting, pagemap slot offsets, swapped state after
+&gt; non-faulting operations, and PMD restoration when zswap does not require
+&gt; PTE fallback.
+&gt; 
+&gt; Register the test with run_vmtests.sh and the default kselftest runner.
+
+Thanks for addressing the comments against v5, here&#x27;s two general
+comments:
+
+1. On looking a bit closer at this, I realized that during swap-in
+do_huge_pmd_swap_page() is retrieving the folio from the swap cache
+and not exercising the swapin_sync() code path (at least this is the case
+on a KVM a guest). I was able to workaround this on a test app by running
+it from a cgroup and triggering reclaim manually after swap-out but before
+swap-in. I&#x27;m not sure how complex it would be for you to implement this though
+
+2. Did you use AI to generate this code? If yes, please add the
+Assisted-by tag. I&#x27;m saying this because the code is weirdly uniform
+and there&#x27;s a bit of uneeded complexity
+
+Small nits below, but the parts that I reviewed look good to me.
+
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; ---
+&gt;   tools/testing/selftests/mm/Makefile         |   2 +
+&gt;   tools/testing/selftests/mm/ksft_pmd_swap.sh |   4 +
+&gt;   tools/testing/selftests/mm/pmd_swap.c       | 742 ++++++++++++++++++++
+&gt;   tools/testing/selftests/mm/run_vmtests.sh   |   4 +
+&gt;   4 files changed, 752 insertions(+)
+&gt;   create mode 100755 tools/testing/selftests/mm/ksft_pmd_swap.sh
+&gt;   create mode 100644 tools/testing/selftests/mm/pmd_swap.c
+&gt; 
+&gt; diff --git a/tools/testing/selftests/mm/Makefile b/tools/testing/selftests/mm/Makefile
+&gt; index 2d5366196e309..dafa3a482451d 100644
+&gt; --- a/tools/testing/selftests/mm/Makefile
+&gt; +++ b/tools/testing/selftests/mm/Makefile
+&gt; @@ -104,6 +104,7 @@ TEST_GEN_FILES += guard-regions
+&gt;   TEST_GEN_FILES += merge
+&gt;   TEST_GEN_FILES += rmap
+&gt;   TEST_GEN_FILES += folio_split_race_test
+&gt; +TEST_GEN_FILES += pmd_swap
+&gt;   
+&gt;   ifneq ($(ARCH),arm64)
+&gt;   TEST_GEN_FILES += soft-dirty
+&gt; @@ -165,6 +166,7 @@ TEST_PROGS += ksft_mremap.sh
+&gt;   TEST_PROGS += ksft_pagemap.sh
+&gt;   TEST_PROGS += ksft_pfnmap.sh
+&gt;   TEST_PROGS += ksft_pkey.sh
+&gt; +TEST_PROGS += ksft_pmd_swap.sh
+&gt;   TEST_PROGS += ksft_process_madv.sh
+&gt;   TEST_PROGS += ksft_process_mrelease.sh
+&gt;   TEST_PROGS += ksft_rmap.sh
+&gt; diff --git a/tools/testing/selftests/mm/ksft_pmd_swap.sh b/tools/testing/selftests/mm/ksft_pmd_swap.sh
+&gt; new file mode 100755
+&gt; index 0000000000000..0f070b4729a89
+&gt; --- /dev/null
+&gt; +++ b/tools/testing/selftests/mm/ksft_pmd_swap.sh
+&gt; @@ -0,0 +1,4 @@
+&gt; +#!/bin/sh -e
+&gt; +# SPDX-License-Identifier: GPL-2.0
+&gt; +
+&gt; +./run_vmtests.sh -t pmd_swap
+&gt; diff --git a/tools/testing/selftests/mm/pmd_swap.c b/tools/testing/selftests/mm/pmd_swap.c
+&gt; new file mode 100644
+&gt; index 0000000000000..30911ef6480f3
+&gt; --- /dev/null
+&gt; +++ b/tools/testing/selftests/mm/pmd_swap.c
+&gt; @@ -0,0 +1,742 @@
+&gt; +// SPDX-License-Identifier: GPL-2.0
+&gt; +/* Test PMD-level swap entries and their users. */
+&gt; +#define _GNU_SOURCE
+&gt; +#include &lt;stdio.h&gt;
+&gt; +#include &lt;stdlib.h&gt;
+&gt; +#include &lt;string.h&gt;
+&gt; +#include &lt;unistd.h&gt;
+&gt; +#include &lt;sys/mman.h&gt;
+&gt; +#include &lt;sys/wait.h&gt;
+&gt; +#include &lt;fcntl.h&gt;
+&gt; +#include &lt;errno.h&gt;
+&gt; +#include &lt;stdint.h&gt;
+&gt; +#include &lt;sys/random.h&gt;
+&gt; +#include &lt;sys/swap.h&gt;
+&gt; +#include &lt;sys/syscall.h&gt;
+&gt; +#include &lt;sys/ioctl.h&gt;
+&gt; +#include &lt;poll.h&gt;
+&gt; +#include &lt;pthread.h&gt;
+&gt; +#include &lt;linux/userfaultfd.h&gt;
+&gt; +#include &lt;time.h&gt;
+&gt; +
+&gt; +#include &quot;kselftest_harness.h&quot;
+&gt; +#include &quot;vm_util.h&quot;
+&gt; +
+&gt; +#define ZSWAP_ENABLED_PATH &quot;/sys/module/zswap/parameters/enabled&quot;
+&gt; +
+&gt; +/* pagemap: bits 0-54 hold the PFN, or type|offset for a swap entry. */
+&gt; +#define PM_PFRAME_MASK		((1ULL &lt;&lt; 55) - 1)
+&gt; +/* Must match MAX_SWAPFILES_SHIFT in include/linux/swap.h. */
+&gt; +#define MAX_SWAPFILES_SHIFT	5
+&gt; +
+&gt; +static bool check_swapped(int pagemap_fd, char *addr, unsigned long size)
+&gt; +{
+&gt; +	unsigned long off;
+&gt; +
+&gt; +	for (off = 0; off &lt; size; off += getpagesize())
+&gt; +		if (!pagemap_is_swapped(pagemap_fd, addr + off))
+&gt; +			return false;
+&gt; +	return true;
+&gt; +}
+&gt; +
+&gt; +static bool zswap_enabled(void)
+&gt; +{
+&gt; +	char enabled = 0;
+&gt; +	FILE *f;
+&gt; +
+&gt; +	f = fopen(ZSWAP_ENABLED_PATH, &quot;r&quot;);
+&gt; +	if (!f)
+&gt; +		return false;
+&gt; +
+&gt; +	if (fscanf(f, &quot; %c&quot;, &amp;enabled) != 1)
+&gt; +		enabled = 0;
+&gt; +	fclose(f);
+&gt; +
+&gt; +	return enabled == &#x27;Y&#x27; || enabled == &#x27;y&#x27; || enabled == &#x27;1&#x27;;
+&gt; +}
+&gt; +
+&gt; +static bool swap_available(unsigned long required_bytes)
+&gt; +{
+&gt; +	unsigned long required_kb = (required_bytes + 1023) / 1024;
+&gt; +	unsigned long size_kb, used_kb;
+&gt; +	char line[256];
+&gt; +	bool ret = false;
+&gt; +	FILE *f;
+&gt; +
+&gt; +	f = fopen(&quot;/proc/swaps&quot;, &quot;r&quot;);
+&gt; +	if (!f)
+&gt; +		return false;
+&gt; +
+&gt; +	/* Skip the header. */
+&gt; +	if (!fgets(line, sizeof(line), f))
+&gt; +		goto out;
+&gt; +
+&gt; +	while (fgets(line, sizeof(line), f)) {
+&gt; +		if (sscanf(line, &quot;%*s %*s %lu %lu&quot;, &amp;size_kb, &amp;used_kb) == 2 &amp;&amp;
+&gt; +		    size_kb &gt;= used_kb &amp;&amp; size_kb - used_kb &gt;= required_kb) {
+&gt; +			ret = true;
+&gt; +			break;
+&gt; +		}
+&gt; +	}
+&gt; +
+&gt; +out:
+&gt; +	fclose(f);
+&gt; +	return ret;
+&gt; +}
+&gt; +
+&gt; +static unsigned long read_vm_event(const char *name)
+&gt; +{
+&gt; +	char line[256];
+&gt; +	size_t name_len = strlen(name);
+&gt; +	unsigned long val = 0;
+&gt; +	FILE *f;
+&gt; +
+&gt; +	f = fopen(&quot;/proc/vmstat&quot;, &quot;r&quot;);
+&gt; +	if (!f)
+&gt; +		return 0;
+&gt; +	while (fgets(line, sizeof(line), f)) {
+&gt; +		if (!strncmp(line, name, name_len) &amp;&amp; line[name_len] == &#x27; &#x27;) {
+&gt; +			val = strtoul(line + name_len + 1, NULL, 10);
+&gt; +			break;
+&gt; +		}
+&gt; +	}
+&gt; +	fclose(f);
+&gt; +	return val;
+&gt; +}
+
+Maybe put this in vm_util.c as you made it generic?
+
+&gt; +
+&gt; +static unsigned int random_seed(void)
+&gt; +{
+&gt; +	unsigned int seed;
+&gt; +
+&gt; +	if (getrandom(&amp;seed, sizeof(seed), 0) != sizeof(seed))
+&gt; +		seed = (unsigned int)time(NULL);
+&gt; +	return seed;
+&gt; +}
+&gt; +
+&gt; +static unsigned char pattern_byte(unsigned int seed, unsigned long off)
+&gt; +{
+&gt; +	return (unsigned char)(seed + off + (off &gt;&gt; 8) + (off &gt;&gt; 16));
+&gt; +}
+
+The shifting is not wrong, but I&#x27;m not sure it&#x27;s necessary.
+
+&gt; +
+&gt; +static void fill_pattern(char *buf, unsigned long size, unsigned int seed)
+&gt; +{
+&gt; +	unsigned long i;
+&gt; +
+&gt; +	for (i = 0; i &lt; size; i++)
+&gt; +		buf[i] = (char)pattern_byte(seed, i);
+&gt; +}
+&gt; +
+&gt; +static bool verify_pattern_range(char *buf, unsigned long size,
+&gt; +				 unsigned int seed, unsigned long offset)
+&gt; +{
+&gt; +	unsigned long i;
+&gt; +
+&gt; +	for (i = 0; i &lt; size; i++)
+&gt; +		if ((unsigned char)buf[i] != pattern_byte(seed, offset + i))
+&gt; +			return false;
+&gt; +	return true;
+&gt; +}
+&gt; +
+&gt; +static bool verify_pattern(char *buf, unsigned long size, unsigned int seed)
+&gt; +{
+&gt; +	return verify_pattern_range(buf, size, seed, 0);
+&gt; +}
+&gt; +
+&gt; +static bool verify_zero(char *buf, unsigned long size)
+&gt; +{
+&gt; +	unsigned long i;
+&gt; +
+&gt; +	for (i = 0; i &lt; size; i++)
+&gt; +		if (buf[i])
+&gt; +			return false;
+&gt; +	return true;
+&gt; +}
+&gt; +
+&gt; +/*
+&gt; + * mmap an anonymous PMD-aligned region of pmd_size bytes. Over-allocates
+&gt; + * by one PMD and trims the unaligned head/tail so the returned address is
+&gt; + * PMD-aligned (required for whole-PMD UFFDIO_MOVE).
+&gt; + */
+&gt; +static char *mmap_pmd_aligned(unsigned long pmd_size)
+&gt; +{
+&gt; +	unsigned long pad = pmd_size;
+&gt; +	char *raw, *aligned;
+&gt; +
+&gt; +	raw = mmap(NULL, pmd_size + pad, PROT_READ | PROT_WRITE,
+&gt; +		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+&gt; +	if (raw == MAP_FAILED)
+&gt; +		return MAP_FAILED;
+&gt; +
+&gt; +	aligned = (char *)(((uintptr_t)raw + pmd_size - 1) &amp; ~(pmd_size - 1));
+&gt; +	if (aligned != raw)
+&gt; +		munmap(raw, aligned - raw);
+&gt; +	if (aligned + pmd_size != raw + pmd_size + pad)
+&gt; +		munmap(aligned + pmd_size,
+&gt; +		       (raw + pmd_size + pad) - (aligned + pmd_size));
+&gt; +	return aligned;
+&gt; +}
+&gt; +
+&gt; +enum swap_thp_result {
+&gt; +	SWAP_THP_OK,
+&gt; +	SWAP_THP_UNAVAILABLE,
+&gt; +	SWAP_THP_FAILED,
+&gt; +};
+&gt; +
+&gt; +/* Per-process swapped size in bytes, from /proc/self/status VmSwap. */
+&gt; +static unsigned long read_vmswap(void)
+&gt; +{
+&gt; +	char line[256];
+&gt; +	unsigned long kb = 0;
+&gt; +	FILE *f;
+&gt; +
+&gt; +	f = fopen(&quot;/proc/self/status&quot;, &quot;r&quot;);
+&gt; +	if (!f)
+&gt; +		return 0;
+&gt; +	while (fgets(line, sizeof(line), f)) {
+&gt; +		if (!strncmp(line, &quot;VmSwap:&quot;, 7)) {
+&gt; +			kb = strtoul(line + 7, NULL, 10);
+&gt; +			break;
+&gt; +		}
+&gt; +	}
+&gt; +	fclose(f);
+&gt; +	return kb * 1024;
+&gt; +}
+&gt; +
+&gt; +static bool swap_out_pmd(char *mem, unsigned long pmd_size, int pagemap_fd)
+&gt; +{
+&gt; +	unsigned long before = read_vm_event(&quot;thp_swpout_pmd&quot;);
+&gt; +	unsigned long after;
+&gt; +
+&gt; +	if (madvise(mem, pmd_size, MADV_PAGEOUT)) {
+&gt; +		ksft_print_msg(&quot;MADV_PAGEOUT failed: %s\n&quot;, strerror(errno));
+&gt; +		return false;
+&gt; +	}
+&gt; +	if (!check_swapped(pagemap_fd, mem, pmd_size)) {
+&gt; +		ksft_print_msg(&quot;MADV_PAGEOUT did not swap the whole PMD range\n&quot;);
+&gt; +		return false;
+&gt; +	}
+&gt; +
+&gt; +	after = read_vm_event(&quot;thp_swpout_pmd&quot;);
+&gt; +	ksft_print_msg(&quot;thp_swpout_pmd: %lu -&gt; %lu\n&quot;, before, after);
+&gt; +	return after &gt; before;
+&gt; +}
+&gt; +
+&gt; +static char *alloc_fill_swap_thp(unsigned long pmd_size, int pagemap_fd,
+&gt; +				 unsigned int seed, enum swap_thp_result *res)
+&gt; +{
+&gt; +	char *mem;
+&gt; +
+&gt; +	*res = SWAP_THP_UNAVAILABLE;
+&gt; +
+&gt; +	mem = mmap_pmd_aligned(pmd_size);
+&gt; +	if (mem == MAP_FAILED)
+&gt; +		return MAP_FAILED;
+&gt; +
+&gt; +	if (madvise(mem, pmd_size, MADV_HUGEPAGE)) {
+&gt; +		ksft_print_msg(&quot;MADV_HUGEPAGE failed: %s\n&quot;, strerror(errno));
+&gt; +		munmap(mem, pmd_size);
+&gt; +		return MAP_FAILED;
+&gt; +	}
+&gt; +	fill_pattern(mem, pmd_size, seed);
+&gt; +
+&gt; +	if (!check_huge_anon(mem, pmd_size, 1, pmd_size)) {
+&gt; +		munmap(mem, pmd_size);
+&gt; +		return MAP_FAILED;
+&gt; +	}
+&gt; +	*res = SWAP_THP_FAILED;
+&gt; +
+&gt; +	if (!swap_out_pmd(mem, pmd_size, pagemap_fd)) {
+&gt; +		munmap(mem, pmd_size);
+&gt; +		return MAP_FAILED;
+&gt; +	}
+&gt; +
+&gt; +	*res = SWAP_THP_OK;
+&gt; +	return mem;
+&gt; +}
+
+Is the enum really needed? Maybe just have a bool *swap_failed instead?
+
+&gt; +
+&gt; +struct rwp_access_args {
+&gt; +	unsigned char *addr;
+&gt; +	unsigned char expected;
+&gt; +	bool write;
+&gt; +	bool ok;
+&gt; +};
+&gt; +
+&gt; +static void *rwp_access_thread(void *data)
+&gt; +{
+&gt; +	struct rwp_access_args *args = data;
+&gt; +
+&gt; +	if (args-&gt;write)
+&gt; +		*args-&gt;addr = args-&gt;expected;
+&gt; +	args-&gt;ok = *args-&gt;addr == args-&gt;expected;
+&gt; +	return NULL;
+&gt; +}
+&gt; +
+&gt; +static int register_rwp(char *addr, unsigned long size, bool protect)
+&gt; +{
+&gt; +	struct uffdio_register reg = {};
+&gt; +	struct uffdio_rwprotect rwp = {};
+&gt; +	struct uffdio_api api = {};
+&gt; +	int uffd;
+&gt; +
+&gt; +	uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+&gt; +	if (uffd &lt; 0)
+&gt; +		return -1;
+&gt; +
+&gt; +	api.api = UFFD_API;
+&gt; +	api.features = UFFD_FEATURE_RWP;
+&gt; +	if (ioctl(uffd, UFFDIO_API, &amp;api) ||
+&gt; +	    !(api.features &amp; UFFD_FEATURE_RWP))
+&gt; +		goto error;
+&gt; +
+&gt; +	reg.range.start = (unsigned long)addr;
+&gt; +	reg.range.len = size;
+&gt; +	reg.mode = UFFDIO_REGISTER_MODE_RWP;
+&gt; +	if (ioctl(uffd, UFFDIO_REGISTER, &amp;reg))
+&gt; +		goto error;
+&gt; +
+&gt; +	if (!protect)
+&gt; +		return uffd;
+&gt; +
+&gt; +	rwp.range.start = (unsigned long)addr;
+&gt; +	rwp.range.len = size;
+&gt; +	rwp.mode = UFFDIO_RWPROTECT_MODE_RWP;
+&gt; +	if (!ioctl(uffd, UFFDIO_RWPROTECT, &amp;rwp))
+&gt; +		return uffd;
+&gt; +
+&gt; +error:
+&gt; +	close(uffd);
+&gt; +	return -1;
+&gt; +}
+&gt; +
+&gt; +static bool expect_rwp_fault(int uffd, char *addr, unsigned long size,
+&gt; +			     unsigned char expected, bool write)
+&gt; +{
+&gt; +	struct rwp_access_args args = {
+&gt; +		.addr = (unsigned char *)addr,
+&gt; +		.expected = expected,
+&gt; +		.write = write,
+&gt; +	};
+&gt; +	struct uffdio_rwprotect rwp = {
+&gt; +		.range = {
+&gt; +			.start = (unsigned long)addr,
+&gt; +			.len = size,
+&gt; +		},
+&gt; +	};
+&gt; +	struct pollfd pollfd = {
+&gt; +		.fd = uffd,
+&gt; +		.events = POLLIN,
+&gt; +	};
+&gt; +	struct uffd_msg msg = {};
+&gt; +	pthread_t thread;
+&gt; +	bool saw_rwp = false;
+&gt; +	int ret;
+&gt; +
+&gt; +	if (pthread_create(&amp;thread, NULL, rwp_access_thread, &amp;args))
+&gt; +		return false;
+&gt; +
+&gt; +	ret = poll(&amp;pollfd, 1, 5000);
+&gt; +	if (ret == 1 &amp;&amp; (pollfd.revents &amp; POLLIN) &amp;&amp;
+&gt; +	    read(uffd, &amp;msg, sizeof(msg)) == (ssize_t)sizeof(msg)) {
+&gt; +		saw_rwp = msg.event == UFFD_EVENT_PAGEFAULT &amp;&amp;
+&gt; +			  (msg.arg.pagefault.flags &amp; UFFD_PAGEFAULT_FLAG_RWP);
+&gt; +	}
+&gt; +
+&gt; +	/* Resolve the access even on failure so the worker cannot remain blocked. */
+&gt; +	ioctl(uffd, UFFDIO_RWPROTECT, &amp;rwp);
+&gt; +	if (pthread_join(thread, NULL))
+&gt; +		return false;
+&gt; +	return saw_rwp &amp;&amp; args.ok;
+&gt; +}
+&gt; +
+&gt; +FIXTURE(pmd_swap)
+&gt; +{
+&gt; +	unsigned long pmd_size;
+&gt; +	unsigned long mem_len;
+&gt; +	int pagemap_fd;
+&gt; +	int uffd;
+&gt; +	unsigned int seed;
+&gt; +	bool zswap_enabled;
+&gt; +	bool swap_disabled;
+&gt; +	const char *swap_dev;
+&gt; +	char *mem;
+&gt; +	char *aux;
+&gt; +};
+&gt; +
+&gt; +FIXTURE_SETUP(pmd_swap)
+&gt; +{
+&gt; +	enum swap_thp_result res;
+&gt; +
+&gt; +	self-&gt;pagemap_fd = -1;
+&gt; +	self-&gt;uffd = -1;
+&gt; +	self-&gt;mem = MAP_FAILED;
+&gt; +	self-&gt;aux = MAP_FAILED;
+&gt; +	self-&gt;mem_len = 0;
+&gt; +	self-&gt;swap_disabled = false;
+&gt; +	self-&gt;swap_dev = getenv(&quot;PMD_SWAP_DEVICE&quot;);
+&gt; +	if (!strcmp(_metadata-&gt;name, &quot;swapoff&quot;) &amp;&amp; !self-&gt;swap_dev)
+&gt; +		SKIP(return, &quot;PMD_SWAP_DEVICE env var not set\n&quot;);
+
+This seeems to be specific to the swapoff test? If yes, it would be
+better to have it contained in the test itself not the fixture.
+
+&gt; +
+&gt; +	self-&gt;pmd_size = read_pmd_pagesize();
+&gt; +	if (!self-&gt;pmd_size)
+&gt; +		SKIP(return, &quot;Cannot determine PMD size\n&quot;);
+&gt; +
+&gt; +	self-&gt;pagemap_fd = open(&quot;/proc/self/pagemap&quot;, O_RDONLY);
+&gt; +	if (self-&gt;pagemap_fd &lt; 0)
+&gt; +		SKIP(return, &quot;Cannot open /proc/self/pagemap\n&quot;);
+&gt; +
+&gt; +	if (!swap_available(self-&gt;pmd_size))
+&gt; +		SKIP(return, &quot;No active swap device has enough free space\n&quot;);
+&gt; +
+&gt; +	self-&gt;seed = random_seed();
+&gt; +	self-&gt;zswap_enabled = zswap_enabled();
+&gt; +	self-&gt;mem = alloc_fill_swap_thp(self-&gt;pmd_size, self-&gt;pagemap_fd,
+&gt; +					self-&gt;seed, &amp;res);
+&gt; +	if (self-&gt;mem == MAP_FAILED) {
+&gt; +		ASSERT_NE(res, SWAP_THP_FAILED);
+&gt; +		SKIP(return, &quot;Could not create swapped THP\n&quot;);
+&gt; +	}
+&gt; +	self-&gt;mem_len = self-&gt;pmd_size;
+&gt; +}
+&gt; +
+&gt; +FIXTURE_TEARDOWN(pmd_swap)
+&gt; +{
+&gt; +	int swap_err = 0;
+&gt; +	int swap_ret = 0;
+&gt; +
+&gt; +	if (self-&gt;swap_disabled) {
+&gt; +		swap_ret = swapon(self-&gt;swap_dev, 0);
+&gt; +		swap_err = errno;
+&gt; +	}
+&gt; +	if (self-&gt;uffd &gt;= 0)
+&gt; +		close(self-&gt;uffd);
+&gt; +	if (self-&gt;aux != MAP_FAILED)
+&gt; +		munmap(self-&gt;aux, self-&gt;pmd_size);
+&gt; +	if (self-&gt;mem != MAP_FAILED)
+&gt; +		munmap(self-&gt;mem, self-&gt;mem_len);
+&gt; +	if (self-&gt;pagemap_fd &gt;= 0)
+&gt; +		close(self-&gt;pagemap_fd);
+&gt; +
+&gt; +	EXPECT_EQ(swap_ret, 0) {
+&gt; +		TH_LOG(&quot;swapon(%s) failed: %s&quot;, self-&gt;swap_dev,
+&gt; +		       strerror(swap_err));
+&gt; +	}
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, basic)
+&gt; +{
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, fork)
+&gt; +{
+&gt; +	pid_t pid;
+&gt; +	int status;
+&gt; +
+&gt; +	pid = fork();
+&gt; +	ASSERT_GE(pid, 0);
+&gt; +
+&gt; +	if (pid == 0)
+&gt; +		_exit(verify_pattern(self-&gt;mem, self-&gt;pmd_size,
+&gt; +				     self-&gt;seed) ? 0 : 1);
+&gt; +
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +
+&gt; +	ASSERT_EQ(waitpid(pid, &amp;status, 0), pid);
+&gt; +	ASSERT_TRUE(WIFEXITED(status));
+&gt; +	ASSERT_EQ(WEXITSTATUS(status), 0);
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, fork_cow)
+&gt; +{
+&gt; +	unsigned int parent_seed = self-&gt;seed;
+&gt; +	unsigned int child_seed = ~self-&gt;seed;
+&gt; +	unsigned int new_seed = self-&gt;seed ^ 0xa5a5a5a5;
+&gt; +	int release_child[2];
+&gt; +	bool parent_ok;
+&gt; +	char c = 0;
+&gt; +	pid_t pid;
+&gt; +	int status, ret;
+&gt; +
+&gt; +	ASSERT_EQ(pipe(release_child), 0);
+&gt; +
+&gt; +	pid = fork();
+&gt; +	ASSERT_GE(pid, 0);
+&gt; +
+&gt; +	if (pid == 0) {
+&gt; +		close(release_child[1]);
+&gt; +		if (read(release_child[0], &amp;c, 1) != 1)
+&gt; +			_exit(1);
+&gt; +		if (!verify_pattern(self-&gt;mem, self-&gt;pmd_size, parent_seed))
+&gt; +			_exit(2);
+&gt; +		fill_pattern(self-&gt;mem, self-&gt;pmd_size, child_seed);
+&gt; +		if (!verify_pattern(self-&gt;mem, self-&gt;pmd_size, child_seed))
+&gt; +			_exit(3);
+&gt; +		_exit(0);
+&gt; +	}
+&gt; +
+&gt; +	close(release_child[0]);
+&gt; +	fill_pattern(self-&gt;mem, self-&gt;pmd_size, new_seed);
+&gt; +	parent_ok = verify_pattern(self-&gt;mem, self-&gt;pmd_size, new_seed);
+&gt; +	ret = write(release_child[1], &amp;c, 1);
+&gt; +	close(release_child[1]);
+&gt; +	ASSERT_EQ(waitpid(pid, &amp;status, 0), pid);
+&gt; +	ASSERT_EQ(ret, 1);
+&gt; +	ASSERT_TRUE(parent_ok);
+&gt; +	ASSERT_TRUE(WIFEXITED(status));
+&gt; +	ASSERT_EQ(WEXITSTATUS(status), 0);
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, new_seed));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, write)
+&gt; +{
+&gt; +	self-&gt;mem[0] = 0xbb;
+&gt; +	ASSERT_EQ(self-&gt;mem[0], (char)0xbb);
+&gt; +	ASSERT_TRUE(verify_pattern_range(self-&gt;mem + 1, self-&gt;pmd_size - 1,
+&gt; +					 self-&gt;seed, 1));
+&gt; +	if (!self-&gt;zswap_enabled)
+&gt; +		ASSERT_TRUE(check_huge_anon(self-&gt;mem, self-&gt;pmd_size, 1,
+&gt; +					    self-&gt;pmd_size));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, rwp_swapin)
+&gt; +{
+&gt; +	self-&gt;uffd = register_rwp(self-&gt;mem, self-&gt;pmd_size, true);
+&gt; +	if (self-&gt;uffd &lt; 0)
+&gt; +		SKIP(return, &quot;Userfaultfd RWP unsupported\n&quot;);
+&gt; +
+&gt; +	ASSERT_TRUE(expect_rwp_fault(self-&gt;uffd, self-&gt;mem, self-&gt;pmd_size,
+&gt; +				     pattern_byte(self-&gt;seed, 0), false));
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, munmap)
+&gt; +{
+&gt; +	unsigned long swap_before, swap_after;
+&gt; +	int ret;
+&gt; +
+&gt; +	swap_before = read_vmswap();
+&gt; +	ASSERT_GE(swap_before, self-&gt;pmd_size);
+&gt; +
+&gt; +	ret = munmap(self-&gt;mem, self-&gt;pmd_size);
+&gt; +	if (!ret) {
+&gt; +		self-&gt;mem = MAP_FAILED;
+&gt; +		self-&gt;mem_len = 0;
+&gt; +	}
+&gt; +	ASSERT_EQ(ret, 0);
+&gt; +
+&gt; +	swap_after = read_vmswap();
+&gt; +	ASSERT_LE(swap_after, swap_before - self-&gt;pmd_size);
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, mprotect)
+&gt; +{
+&gt; +	ASSERT_EQ(mprotect(self-&gt;mem, self-&gt;pmd_size, PROT_READ), 0);
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;mem,
+&gt; +				  self-&gt;pmd_size));
+&gt; +	ASSERT_EQ(mprotect(self-&gt;mem, self-&gt;pmd_size,
+&gt; +			   PROT_READ | PROT_WRITE), 0);
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;mem,
+&gt; +				  self-&gt;pmd_size));
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, split_mprotect)
+&gt; +{
+&gt; +	unsigned long half = self-&gt;pmd_size / 2;
+&gt; +
+&gt; +	ASSERT_EQ(mprotect(self-&gt;mem, half, PROT_READ), 0);
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;mem,
+&gt; +				  self-&gt;pmd_size));
+&gt; +	ASSERT_EQ(mprotect(self-&gt;mem, half, PROT_READ | PROT_WRITE), 0);
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, split_munmap)
+&gt; +{
+&gt; +	unsigned long half = self-&gt;pmd_size / 2;
+&gt; +	unsigned long swap_before = read_vmswap();
+&gt; +	unsigned long i;
+&gt; +	char *base = self-&gt;mem;
+&gt; +	int ret;
+&gt; +
+&gt; +	ASSERT_GE(swap_before, half);
+&gt; +	ret = munmap(base, half);
+&gt; +	if (!ret) {
+&gt; +		self-&gt;mem = base + half;
+&gt; +		self-&gt;mem_len = half;
+&gt; +	}
+&gt; +	ASSERT_EQ(ret, 0);
+&gt; +	ASSERT_LE(read_vmswap(), swap_before - half);
+&gt; +
+&gt; +	for (i = 0; i &lt; half; i += getpagesize())
+&gt; +		ASSERT_TRUE(pagemap_is_swapped(self-&gt;pagemap_fd,
+&gt; +					       self-&gt;mem + i));
+&gt; +	ASSERT_TRUE(verify_pattern_range(self-&gt;mem, half, self-&gt;seed, half));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, uffdio_move)
+&gt; +{
+&gt; +	struct uffdio_register reg = {};
+&gt; +	struct uffdio_move move = {};
+&gt; +	struct uffdio_api api = {};
+&gt; +	bool rwp;
+&gt; +
+&gt; +	self-&gt;aux = mmap_pmd_aligned(self-&gt;pmd_size);
+&gt; +	if (self-&gt;aux == MAP_FAILED)
+&gt; +		SKIP(return, &quot;Could not mmap aligned dst\n&quot;);
+&gt; +	ASSERT_EQ(madvise(self-&gt;aux, self-&gt;pmd_size, MADV_HUGEPAGE), 0);
+&gt; +
+&gt; +	self-&gt;uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+&gt; +	if (self-&gt;uffd &lt; 0)
+&gt; +		SKIP(return, &quot;userfaultfd unavailable\n&quot;);
+&gt; +
+&gt; +	api.api = UFFD_API;
+&gt; +	api.features = UFFD_FEATURE_MOVE | UFFD_FEATURE_RWP;
+&gt; +	if (ioctl(self-&gt;uffd, UFFDIO_API, &amp;api) ||
+&gt; +	    !(api.features &amp; UFFD_FEATURE_MOVE))
+&gt; +		SKIP(return, &quot;UFFD_FEATURE_MOVE unsupported\n&quot;);
+&gt; +	rwp = api.features &amp; UFFD_FEATURE_RWP;
+&gt; +
+&gt; +	reg.range.start = (unsigned long)self-&gt;aux;
+&gt; +	reg.range.len = self-&gt;pmd_size;
+&gt; +	reg.mode = UFFDIO_REGISTER_MODE_MISSING |
+&gt; +		   (rwp ? UFFDIO_REGISTER_MODE_RWP : 0);
+&gt; +	ASSERT_EQ(ioctl(self-&gt;uffd, UFFDIO_REGISTER, &amp;reg), 0);
+&gt; +
+&gt; +	move.dst = (unsigned long)self-&gt;aux;
+&gt; +	move.src = (unsigned long)self-&gt;mem;
+&gt; +	move.len = self-&gt;pmd_size;
+&gt; +	ASSERT_EQ(ioctl(self-&gt;uffd, UFFDIO_MOVE, &amp;move), 0);
+&gt; +	ASSERT_EQ(move.move, self-&gt;pmd_size);
+&gt; +
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;aux,
+&gt; +				  self-&gt;pmd_size));
+&gt; +	if (rwp)
+&gt; +		ASSERT_TRUE(expect_rwp_fault(self-&gt;uffd, self-&gt;aux,
+&gt; +					     self-&gt;pmd_size,
+&gt; +					     pattern_byte(self-&gt;seed, 0), false));
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;aux, self-&gt;pmd_size, self-&gt;seed));
+&gt; +	if (!self-&gt;zswap_enabled)
+&gt; +		ASSERT_TRUE(check_huge_anon(self-&gt;aux, self-&gt;pmd_size, 1,
+&gt; +					    self-&gt;pmd_size));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, mremap)
+&gt; +{
+&gt; +	char *new_mem, *dst;
+&gt; +
+&gt; +	self-&gt;aux = mmap_pmd_aligned(self-&gt;pmd_size);
+&gt; +	if (self-&gt;aux == MAP_FAILED)
+&gt; +		SKIP(return, &quot;Could not mmap aligned dst\n&quot;);
+&gt; +	dst = self-&gt;aux;
+&gt; +
+&gt; +	new_mem = mremap(self-&gt;mem, self-&gt;pmd_size, self-&gt;pmd_size,
+&gt; +			 MREMAP_MAYMOVE | MREMAP_FIXED, dst);
+&gt; +	if (new_mem != MAP_FAILED) {
+&gt; +		self-&gt;mem = new_mem;
+&gt; +		self-&gt;aux = MAP_FAILED;
+&gt; +	}
+&gt; +	ASSERT_NE(new_mem, MAP_FAILED);
+&gt; +	ASSERT_EQ(new_mem, dst);
+&gt; +
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, new_mem, self-&gt;pmd_size));
+&gt; +	ASSERT_TRUE(verify_pattern(new_mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, pagemap)
+&gt; +{
+&gt; +	uint64_t entry, first = 0;
+&gt; +	unsigned long off;
+&gt; +
+&gt; +	for (off = 0; off &lt; self-&gt;pmd_size; off += getpagesize()) {
+&gt; +		entry = pagemap_get_entry(self-&gt;pagemap_fd, self-&gt;mem + off);
+&gt; +		ASSERT_TRUE(entry &amp; (1ULL &lt;&lt; 62));
+&gt; +		ASSERT_FALSE(entry &amp; (1ULL &lt;&lt; 63));
+&gt; +
+&gt; +		if (entry &amp; PM_PFRAME_MASK) {
+&gt; +			uint64_t idx = off / getpagesize();
+&gt; +
+&gt; +			if (!off)
+&gt; +				first = entry &amp; PM_PFRAME_MASK;
+&gt; +			ASSERT_EQ(entry &amp; PM_PFRAME_MASK,
+&gt; +				  first + (idx &lt;&lt; MAX_SWAPFILES_SHIFT));
+&gt; +		}
+&gt; +	}
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, mincore)
+&gt; +{
+&gt; +	unsigned long pages = self-&gt;pmd_size / getpagesize();
+&gt; +	unsigned char vec[pages];
+&gt; +
+&gt; +	ASSERT_EQ(mincore(self-&gt;mem, self-&gt;pmd_size, vec), 0);
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;mem,
+&gt; +				  self-&gt;pmd_size));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, madvise_free)
+&gt; +{
+&gt; +	unsigned long swap_before = read_vmswap();
+&gt; +	unsigned long i;
+&gt; +
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;mem,
+&gt; +				  self-&gt;pmd_size));
+&gt; +	ASSERT_GE(swap_before, self-&gt;pmd_size);
+&gt; +	ASSERT_EQ(madvise(self-&gt;mem, self-&gt;pmd_size, MADV_FREE), 0);
+&gt; +	for (i = 0; i &lt; self-&gt;pmd_size; i += getpagesize())
+&gt; +		ASSERT_FALSE(pagemap_is_swapped(self-&gt;pagemap_fd,
+&gt; +						self-&gt;mem + i));
+&gt; +	ASSERT_LE(read_vmswap(), swap_before - self-&gt;pmd_size);
+&gt; +	ASSERT_TRUE(verify_zero(self-&gt;mem, self-&gt;pmd_size));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, madvise_willneed)
+&gt; +{
+&gt; +	ASSERT_EQ(madvise(self-&gt;mem, self-&gt;pmd_size, MADV_WILLNEED), 0);
+&gt; +	ASSERT_TRUE(check_swapped(self-&gt;pagemap_fd, self-&gt;mem,
+&gt; +				  self-&gt;pmd_size));
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +	if (!self-&gt;zswap_enabled)
+&gt; +		ASSERT_TRUE(check_huge_anon(self-&gt;mem, self-&gt;pmd_size, 1,
+&gt; +					    self-&gt;pmd_size));
+&gt; +}
+&gt; +
+&gt; +TEST_F(pmd_swap, swapoff)
+&gt; +{
+&gt; +	int ret, err;
+&gt; +
+&gt; +	self-&gt;uffd = register_rwp(self-&gt;mem, self-&gt;pmd_size, true);
+&gt; +
+&gt; +	ret = swapoff(self-&gt;swap_dev);
+&gt; +	err = errno;
+&gt; +	if (!ret)
+&gt; +		self-&gt;swap_disabled = true;
+&gt; +	ASSERT_EQ(ret, 0) {
+&gt; +		TH_LOG(&quot;swapoff(%s) failed: %s&quot;, self-&gt;swap_dev, strerror(err));
+&gt; +	}
+&gt; +
+&gt; +	/*
+&gt; +	 * Check residency before touching the memory. If we read
+&gt; +	 * first, a bug that left a PMD swap entry in place after swapoff
+&gt; +	 * would silently trigger do_huge_pmd_swap_page() and reinstall a
+&gt; +	 * PMD mapping, masking the regression.
+&gt; +	 */
+&gt; +	if (!self-&gt;zswap_enabled)
+&gt; +		ASSERT_TRUE(check_huge_anon(self-&gt;mem, self-&gt;pmd_size, 1,
+&gt; +					    self-&gt;pmd_size));
+&gt; +	if (self-&gt;uffd &gt;= 0)
+&gt; +		ASSERT_TRUE(expect_rwp_fault(self-&gt;uffd, self-&gt;mem,
+&gt; +					     self-&gt;pmd_size,
+&gt; +					     pattern_byte(self-&gt;seed, 0), false));
+&gt; +	ASSERT_TRUE(verify_pattern(self-&gt;mem, self-&gt;pmd_size, self-&gt;seed));
+&gt; +
+&gt; +	ret = swapon(self-&gt;swap_dev, 0);
+&gt; +	err = errno;
+&gt; +	if (!ret)
+&gt; +		self-&gt;swap_disabled = false;
+&gt; +	ASSERT_EQ(ret, 0) {
+&gt; +		TH_LOG(&quot;swapon(%s) failed: %s&quot;, self-&gt;swap_dev, strerror(err));
+&gt; +	}
+&gt; +}
+&gt; +
+&gt; +TEST_HARNESS_MAIN
+&gt; diff --git a/tools/testing/selftests/mm/run_vmtests.sh b/tools/testing/selftests/mm/run_vmtests.sh
+&gt; index d09f9f6a384ee..ff53ff28c0042 100755
+&gt; --- a/tools/testing/selftests/mm/run_vmtests.sh
+&gt; +++ b/tools/testing/selftests/mm/run_vmtests.sh
+&gt; @@ -69,6 +69,8 @@ separated by spaces:
+&gt;   	test pagemap_scan IOCTL
+&gt;   - pfnmap
+&gt;   	tests for VM_PFNMAP handling
+&gt; +- pmd_swap
+&gt; +	tests for PMD-level swap entries
+&gt;   - process_madv
+&gt;   	test for process_madv
+&gt;   - cow
+&gt; @@ -399,6 +401,8 @@ CATEGORY=&quot;pagemap&quot; run_test ./pagemap_ioctl
+&gt;   
+&gt;   CATEGORY=&quot;pfnmap&quot; run_test ./pfnmap
+&gt;   
+&gt; +CATEGORY=&quot;pmd_swap&quot; run_test ./pmd_swap
+&gt; +
+&gt;   # COW tests
+&gt;   CATEGORY=&quot;cow&quot; run_test ./cow
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/5c39f3bb-6639-46df-a25a-77b77522daf9@redhat.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NEEDS_REVIEW, CODE_COMPLEXITY</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Luiz Capitulino</span>
+<a class="date-chip" href="../2026-08-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-27">2026-08-27</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Luiz Capitulino noted that the set_pmd_swap_entry() function does not check if the PMD size is exact, which can lead to false reporting of success and corruption of MM_ANONPAGES/MM_SWAPENTS accounting. He requested a precondition check for an exact PMD-size folio.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 2026-08-18 09:09, Usama Arif wrote:
+&gt; When reclaim swaps out a PMD-mapped anonymous THP today, the PMD is
+&gt; split into HPAGE_PMD_NR PTE-level swap entries via TTU_SPLIT_HUGE_PMD
+&gt; before unmap.  This series introduces a PMD-level swap entry so the
+&gt; huge mapping can survive the swap round-trip and do_huge_pmd_swap_page()
+&gt; can restore the PMD mapping directly on swap-in, without waiting for
+&gt; khugepaged to collapse the range later.
+&gt; 
+&gt; The PMD swap entry is a compact page-table encoding for HPAGE_PMD_NR
+&gt; consecutive swap slots.  swap_map accounting remains per-slot and is
+&gt; unchanged.  Importantly, a PMD swap entry does not promise that the swap
+&gt; cache always contains one PMD-sized folio.  While the cache is empty or
+&gt; contains one PMD-sized folio, PMD-level handling can proceed.  Once the
+&gt; cache has split/per-slot state, users either inspect the individual
+&gt; slots directly (mincore) or split the PMD swap entry and retry through
+&gt; the PTE path (fault, swapoff, MADV_WILLNEED, UFFDIO_MOVE).  Likewise,
+&gt; if any slot is still backed by zswap&#x27;s per-page store, PMD-order
+&gt; swap-in consumers split and let the PTE path load the range page by page;
+&gt; an all-on-disk range can still be read back as one PMD-sized folio.
+&gt; 
+&gt; The series is ordered so every consumer can handle PMD swap entries
+&gt; before the swap-out producer starts installing them.  The swap-out patch
+&gt; is the last functional change.
+&gt; 
+&gt; Notes on zswap:
+&gt; 
+&gt;    Native PMD-order zswap load/store is intentionally left for a follow-up.
+&gt;    Alexandre Ghiti is currently working this.
+&gt;    This series can still preserve PMD swap entries while zswap is enabled:
+&gt;    zswap stores the THP as order-0 entries, and PMD-order swap-in
+&gt;    consumers split any range that has zswap entries before reading it.  If
+&gt;    zswap has written the whole range back to disk, or the swap cache still
+&gt;    contains one PMD-sized folio, PMD-level handling can proceed.
+&gt; 
+&gt; Testing:
+&gt; 
+&gt;    The 16 pmd_swap selftests pass on x86_64 with zswap both disabled and
+&gt;    enabled.  PMD_SWAP_DEVICE was set, so the swapoff test ran in both
+&gt;    configurations.
+
+I ran the pmd_swap selftests with zswap disabled on x86_64 and arm64, it
+worked (noting the fact that on swap-in we may be retrieving the folio
+from the swap cache as I commented on the kselftest patch).
+
+&gt; 
+&gt; v5 -&gt; v6: https://lore.kernel.org/all/20260722152043.2273289-1-usama.arif@linux.dev/
+&gt; - Add patch 1 to rename pmd_to_softleaf_folio() to
+&gt;    pmd_softleaf_to_folio().  No functional change. (Dev Jain)
+&gt; - Patch 2: warn when pmd_softleaf_to_folio() is given a non-PFN
+&gt;    softleaf rather than silently returning NULL. (Dev Jain)
+&gt; - Patch 4: bound the fork extend-table fallback to one retry, re-read
+&gt;    the PMD under its lock, normalize unrecoverable copy_huge_pmd() errors
+&gt;    to -ENOMEM so copy_pmd_range() cannot clear and leak the source swap
+&gt;    PMD, and drop a redundant thp_migration_supported() gate.
+&gt; - Patch 5: check multi-page swap-cache insertions for zswap-backed slots
+&gt;    in __swap_cache_add_check() under the cluster lock, both before
+&gt;    allocation and before insertion, and reject mixed zswap/disk state
+&gt;    with -EBUSY. (Yosry Ahmed, Nhat Pham)
+&gt; - Patch 6: on a failed non-uptodate PMD-order read, remove the large
+&gt;    folio from swap cache before splitting so order-0
+&gt;    fallback retries individual slots rather than poisoning the whole
+&gt;    2 MiB range; retain hardware-poisoned folios for per-subpage handling.
+&gt; - Patch 7: make HMM snapshot mode report a PMD swap entry as non-resident,
+&gt;    matching PTE swap entries, rather than HMM_PFN_ERROR.  Drop redundant
+&gt;    thp_migration_supported() gates and simplify non-present PMD handling.
+&gt; - Patch 8: factor PMD MADV_WILLNEED prefetch into
+&gt;    swapin_pmd_swap_entry(), split and retry through PTEs after any
+&gt;    PMD-order swapin failure, and replace the racy folio_test_locked()
+&gt;    plus folio_lock() sequence with folio_trylock().
+&gt; - Patch 9: guard PMD-swap UFFDIO_MOVE code with CONFIG_THP_SWAP, clarify
+&gt;    RWP marker propagation, and reject a PMD swap entry at the destination
+&gt;    with -EEXIST so UFFDIO_MOVE cannot loop forever on -EAGAIN.
+&gt; - Patch 10: honor current THP/VMA policy before PMD-order swap-in, recheck
+&gt;    that the PMD is still the original swap entry before splitting for PTE
+&gt;    fallback, and provide the CONFIG_TRANSPARENT_HUGEPAGE wp_huge_pmd()
+&gt;    declaration/stub needed by THP=n builds.
+&gt; - Patch 11: make an invalid set_pmd_swap_entry() walk context warn and
+&gt;    return -EINVAL instead of falsely reporting success and corrupting the
+&gt;    MM_ANONPAGES/MM_SWAPENTS accounting, and add an exact PMD-size folio
+&gt;    precondition check. (Luiz Capitulino)
+&gt; - Patch 12: use /proc/swaps for prerequisite detection, check
+&gt;    MADV_HUGEPAGE, and distinguish an environment that cannot allocate a
+&gt;    PMD THP (SKIP) from a swap-out validation failure (FAIL).  Add
+&gt;    partial-mprotect and partial-munmap split coverage.  Strengthen
+&gt;    munmap/MADV_FREE VmSwap accounting, pagemap slot-offset checks, and
+&gt;    mprotect/mremap swapped-state checks; force mremap to move, check
+&gt;    munmap()&#x27;s return, and mark the UFFDIO_MOVE destination MADV_HUGEPAGE
+&gt;    before asserting PMD restoration.  Move common setup and cleanup into
+&gt;    one fixture, merge the swapoff fixture, remove the redundant cycles
+&gt;    test, and make the data pattern differ between base pages so the split
+&gt;    tests can detect incorrect slot ordering.  Order fork-COW so the parent
+&gt;    writes while the child still holds the untouched shared swap entry.
+&gt;    (Luiz Capitulino)
+&gt; - Clarify commit messages throughout.  Retain TTU_SPLIT_HUGE_PMD after
+&gt;    prototyping its removal: removing it here requires an extra rmap walk
+&gt;    and broadens the series beyond PMD swap entries. (Matthew Wilcox)
+&gt; - Rebase onto akpm/mm-new from 15 August (4b65683fd25f).
+&gt; 
+&gt; v4 -&gt; v5: https://lore.kernel.org/all/20260713133613.2707815-1-usama.arif@linux.dev/
+&gt; - Commit message improvements for almost all patches (Yosry for zswap patch)
+&gt; - Patch 1: make pmd_to_softleaf_folio() reject softleaf entries that do
+&gt;    not encode a PFN, so a PMD swap offset is never interpreted as one.
+&gt;    PMD swap entries remain valid softleaf entries for classification.
+&gt;    (sashiko)
+&gt; - Patch 2: use the existing pmd_swp_uffd() helper and force freeze=false
+&gt;    for PMD swap entries, which have no struct page for the migration-entry
+&gt;    freeze path. (sashiko)
+&gt; - Patch 3: document that the caller&#x27;s page-table or swap-cache reference
+&gt;    pins every source slot while a partial PMD-sized duplication is rolled
+&gt;    back.  Keep the pre-existing PTE fork retry behavior outside this
+&gt;    series. (sashiko)
+&gt; - Patch 5: split to the PTE path rather than mapping a PMD-sized folio
+&gt;    containing a hardware-poisoned subpage, and restore PAGE_NONE when
+&gt;    swapoff restores a UFFD marker in an RWP VMA. (sashiko)
+&gt; - Patch 6: account SwapPss for a PMD swap entry one slot at a time because
+&gt;    the slots can have different swap reference counts.
+&gt; - Patch 7: if PMD-order MADV_WILLNEED encounters newly populated per-page
+&gt;    zswap state, revalidate and remove the failed clean PMD-sized cache
+&gt;    folio before retrying through PTEs.
+&gt; - Patch 8: mark a moved PMD swap entry for UFFD when the UFFDIO_MOVE
+&gt;    destination VMA is RWP-registered. (sashiko)
+&gt; - Patch 9: restore PAGE_NONE for UFFD RWP swap-in, preserve the original
+&gt;    write-fault state through swap-slot release and COW handling, remove
+&gt;    the unnecessary LRU drain, and prevent PTE batching from mapping a
+&gt;    poisoned subpage. (sashiko)
+&gt; - Patch 10: add and document thp_swpout_pmd, which counts PMD mappings
+&gt;    replaced by PMD-level swap entries rather than swapped folios.
+&gt; - Patch 11: register pmd_swap with the default mm selftest runner, preserve
+&gt;    errno across UFFDIO_MOVE cleanup, check swapoff residency before the
+&gt;    first memory access, add a parent-side write and verification to the
+&gt;    fork+COW test, and add RWP regression coverage for swap-in, UFFDIO_MOVE,
+&gt;    and swapoff. (sashiko)
+&gt; - Keep do_huge_pmd_swap_page() in patch 9.  Patches 6 and 7 only add
+&gt;    consumers; patch 10 remains the first producer, so no PMD swap entry
+&gt;    can reach those paths before the fault handler is present. (sashiko)
+&gt; - Rebase onto latest akpm/mm-new from 22 July (5e0603ba185a)
+&gt; 
+&gt; v3 -&gt; v4: https://lore.kernel.org/all/20260703173903.3789516-1-usama.arif@linux.dev/
+&gt; - Patch 1: guard the new arch-specific pmd_swp_mkexclusive /
+&gt;    pmd_swp_exclusive / pmd_swp_clear_exclusive helpers on arm64,
+&gt;    loongarch, powerpc, riscv, s390, and x86 with
+&gt;    CONFIG_ARCH_HAS_PMD_SOFTLEAVES, matching the pattern already
+&gt;    used for pmd_swp_soft_dirty.  Also fixes the redefinition-vs-
+&gt;    generic-fallback build errors kernel test robot reported on
+&gt;    i386-allnoconfig-bpf and riscv-allnoconfig-bpf, and rewraps
+&gt;    the patch 1 commit message paragraphs to ~75 columns.
+&gt;    (sashiko, kernel test robot, Usama Arif)
+&gt; - Patch 2: switch the trailing folio_remove_rmap_pmd() gate in
+&gt;    __split_huge_pmd_locked() from *pmd to old_pmd, old_pmd retains
+&gt;    the original present-or-non-present classification for every
+&gt;    branch above. (sashiko)
+&gt; - Patch 3: teach swap_retry_table_alloc() (and the underlying
+&gt;    swap_extend_table_alloc()) to accept an nr parameter and scan
+&gt;    every slot in [ci_off, ci_off + nr) before committing an
+&gt;    extend-table allocation.  (sashiko)
+&gt; - Patch 4: rename zswap_range_has_entry() to zswap_is_present() so
+&gt;    the same helper serves both single-slot (nr=1) and range queries,
+&gt;    and switch the implementation from XA_STATE + xas_find() to
+&gt;    xa_find(), which handles RCU locking and internal-retry markers
+&gt;    itself.  Rename the callers in patches 5, 7, 9. (Yosry)
+&gt; - Patch 9: refuse to map a swap-cache folio in do_huge_pmd_swap_page()
+&gt;    when folio_contain_hwpoisoned_page() reports a poisoned subpage;
+&gt;    split the PMD swap entry so do_swap_page() can return
+&gt;    VM_FAULT_HWPOISON per subpage instead of the PMD handler mapping
+&gt;    the corrupted memory as one THP.  Mirrors the PageHWPoison check
+&gt;    the PTE swap-in path already performs. (sashiko)
+&gt; - Patch 9: note explicitly in the commit message that PMD-order
+&gt;    swap-in deliberately skips the order-0 readahead paths, order-0
+&gt;    readahead would populate per-page swap-cache state and force the
+&gt;    PMD swap entry to split before the fault could finish. (Kairui)
+&gt; - Patch 10: move mm_prepare_for_swap_entries() into
+&gt;    set_pmd_swap_entry() between folio_dup_swap() and set_pmd_at()
+&gt;    so this mm is on init_mm.mmlist before any swap PMD referencing
+&gt;    slots with a non-zero swap_map becomes visible.  Matches the PTE
+&gt;    swap-out ordering. (sashiko)
+&gt; - rebase onto latest akpm/mm-new (61cccb8363fcc282d4ae0555b8739dd227f5ad0b)
+&gt; 
+&gt; 
+&gt; v2 -&gt; v3: https://lore.kernel.org/all/20260602142537.198755-1-usama.arif@linux.dev/
+&gt; - Clarified the PMD swap entry rule: it is a compact encoding for
+&gt;    HPAGE_PMD_NR swap slots, not a guarantee that swap cache always has
+&gt;    one PMD-sized folio. (Lance Yang)
+&gt; - Swapoff, fault, MADV_WILLNEED, and UFFDIO_MOVE now classify the
+&gt;    whole PMD swap-cache range and split/retry through the PTE path for
+&gt;    split/per-slot cache state. (Lance Yang)
+&gt; - mincore handles PMD swap entries without assuming one lookup covers
+&gt;    a split swap-cache range. (Lance Yang)
+&gt; - UFFDIO_MOVE rechecks all HPAGE_PMD_NR slots before moving an empty
+&gt;    PMD swap-cache range, avoiding stale rmap metadata for per-slot
+&gt;    cached folios.
+&gt; - Added a standalone zswap prerequisite patch from Alexandre that
+&gt;    distinguishes all-on-disk large-folio ranges from ranges with
+&gt;    per-page zswap entries.
+&gt; - Replaced the global zswap-ever-enabled policy with per-range zswap
+&gt;    checks: PMD swap entries can still be installed while zswap is
+&gt;    enabled, and PMD-order swap-in consumers split when the range has
+&gt;    per-page zswap state.
+&gt; - Added a mincore selftest and updated MADV_WILLNEED coverage so the
+&gt;    test checks that the PMD swap entry remains in place until first
+&gt;    touch.  Total pmd_swap coverage is now 14 tests.
+&gt; 
+&gt; 
+&gt; v1 -&gt; v2: https://lore.kernel.org/all/20260427100553.2754667-1-usama.arif@linux.dev/
+&gt; - Patch 1: convert two additional softleaf_to_pmd() callers that
+&gt;    landed in mm-unstable since v1 (mm/debug_vm_pgtable.c,
+&gt;    mm/migrate_device.c) (Dev)
+&gt; - Patch 2: rename helper ensure_on_mmlist() to
+&gt;    mm_prepare_for_swap_entries() to better describe its purpose
+&gt;    (David)
+&gt; - Patch 3: drop VM_WARN_ON_ONCE(!pmd_is_migration_entry) as
+&gt;    Dev posted it as a separate patch.
+&gt; - Patch 5 (new): move softleaf_to_folio() inside the device-private
+&gt;    branch in migrate_vma_collect_pmd(); same class of fix as patch 4
+&gt;    but for the migrate-device PMD walker.
+&gt; - Patch 6 (new): rename CONFIG_ARCH_ENABLE_THP_MIGRATION to
+&gt;    CONFIG_ARCH_HAS_PMD_SOFTLEAVES so the gate that now drives
+&gt;    swap-entry support too is named for what it actually controls
+&gt;    (PMD softleaf entries), not just migration. (Dev)
+&gt; - Patch 7: add the missing pmd_swp_exclusive / mkexclusive /
+&gt;    clear_exclusive helpers for powerpc.
+&gt; - Patches 10 and 14: use upstream swapin_sync() (bundles
+&gt;    swap_cache_alloc_folio + swap_read_folio + the -EEXIST race
+&gt;    retry) instead of the bespoke swapin_alloc_pmd_folio() helper
+&gt;    from v1; do_swap_page and shmem_swapin_folio use the same
+&gt;    helper (Kairui)
+&gt; - Patch 10: construct a stack vm_fault for the swapoff swap-in so
+&gt;    the allocator can resolve a mempolicy, mirroring how the PTE
+&gt;    swapoff path (unuse_pte_range) already does it.
+&gt; - Patch 11: extend coverage to check_pmd_state() in khugepaged so a
+&gt;    swapped-out PMD-mapped THP is treated as SCAN_PMD_MAPPED (matches
+&gt;    the existing migration-entry handling). Route PMD swap entries in the
+&gt;    pmd_trans_huge_lock() branch of mincore_pte_range() through
+&gt;    mincore_pmd_swap() so a swapped-out PMD-mapped THP isn&#x27;t reported as
+&gt;    resident.
+&gt; - Patch 12 (new): handle PMD swap entries in MADV_WILLNEED via
+&gt;    swapin_sync(BIT(HPAGE_PMD_ORDER)); a naive order-0 read-ahead
+&gt;    would force the subsequent fault to split.
+&gt; - Patch 13: refuse UFFDIO_MOVE with -EBUSY if the swap-cache folio
+&gt;    was split between swap-out and the move, matching
+&gt;    move_pages_pte()&#x27;s rejection of large folios; otherwise only one
+&gt;    of the 512 anon-rmaps would be re-anchored to dst_vma.
+&gt; - Patch 16: alloc_fill_swap_thp() now uses the existing
+&gt;    mmap_pmd_aligned() helper so tests don&#x27;t flake/skip based on VA
+&gt;    placement; new MADV_WILLNEED test that watches the PMD-order
+&gt;    mTHP swpin counter; swapoff test restructured to use the
+&gt;    kselftest_harness ASSERT cleanup blocks (no double swapoff, no
+&gt;    verify-after-munmap).
+&gt; - Collected Acks and Reviews.
+&gt; 
+&gt; [1] https://lore.kernel.org/all/20260630164143.1595669-1-usama.arif@linux.dev/
+&gt;   
+&gt; Alexandre Ghiti (1):
+&gt;    mm: zswap: add range lookup for large-folio swapin
+&gt; 
+&gt; Usama Arif (11):
+&gt;    mm: rename pmd_to_softleaf_folio() to pmd_softleaf_to_folio()
+&gt;    mm: add PMD swap entry detection support
+&gt;    mm: add PMD swap entry splitting support
+&gt;    mm: handle PMD swap entries in fork path
+&gt;    mm: swap in PMD swap entries as whole THPs during swapoff
+&gt;    mm: handle PMD swap entries in non-present PMD walkers
+&gt;    mm: handle PMD swap entries in MADV_WILLNEED
+&gt;    mm: handle PMD swap entries in UFFDIO_MOVE
+&gt;    mm: handle PMD swap entry faults on swap-in
+&gt;    mm: install PMD swap entries on swap-out
+&gt;    selftests/mm: add PMD swap entry tests
+&gt; 
+&gt;   Documentation/admin-guide/mm/transhuge.rst   |   5 +
+&gt;   arch/arm64/include/asm/pgtable.h             |   6 +
+&gt;   arch/loongarch/include/asm/pgtable.h         |  19 +
+&gt;   arch/powerpc/include/asm/book3s/64/pgtable.h |  17 +
+&gt;   arch/riscv/include/asm/pgtable.h             |  15 +
+&gt;   arch/s390/include/asm/pgtable.h              |  17 +
+&gt;   arch/x86/include/asm/pgtable.h               |  17 +
+&gt;   fs/proc/task_mmu.c                           |  46 +-
+&gt;   include/linux/huge_mm.h                      |  16 +
+&gt;   include/linux/leafops.h                      |  30 +-
+&gt;   include/linux/pgtable.h                      |  17 +
+&gt;   include/linux/swap.h                         |   4 +-
+&gt;   include/linux/vm_event_item.h                |   1 +
+&gt;   include/linux/zswap.h                        |   6 +
+&gt;   mm/hmm.c                                     |  11 +-
+&gt;   mm/huge_memory.c                             | 607 ++++++++++++++-
+&gt;   mm/internal.h                                |  42 ++
+&gt;   mm/khugepaged.c                              |   6 +
+&gt;   mm/madvise.c                                 | 120 ++-
+&gt;   mm/memory.c                                  |  47 +-
+&gt;   mm/mincore.c                                 |  45 +-
+&gt;   mm/rmap.c                                    |  19 +
+&gt;   mm/swap.h                                    |  22 +-
+&gt;   mm/swap_state.c                              |  54 ++
+&gt;   mm/swapfile.c                                | 209 +++++-
+&gt;   mm/userfaultfd.c                             |  14 +
+&gt;   mm/vmscan.c                                  |   9 +-
+&gt;   mm/vmstat.c                                  |   1 +
+&gt;   mm/zswap.c                                   |  46 +-
+&gt;   tools/testing/selftests/mm/Makefile          |   2 +
+&gt;   tools/testing/selftests/mm/ksft_pmd_swap.sh  |   4 +
+&gt;   tools/testing/selftests/mm/pmd_swap.c        | 742 +++++++++++++++++++
+&gt;   tools/testing/selftests/mm/run_vmtests.sh    |   4 +
+&gt;   33 files changed, 2104 insertions(+), 116 deletions(-)
+&gt;   create mode 100755 tools/testing/selftests/mm/ksft_pmd_swap.sh
+&gt;   create mode 100644 tools/testing/selftests/mm/pmd_swap.c
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/12b62e83-51a3-4e3f-8ac4-244cc876f0d3@redhat.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>

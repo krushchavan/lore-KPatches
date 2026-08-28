@@ -4,29 +4,67 @@
   "url": "https://lore.kernel.org/all/20260826162101.1314941-3-kirill@shutemov.name/",
   "dates": {
     "2026-08-26": {
-      "report_file": "2026-08-26_ollama_llama3.1-8b.html",
+      "report_file": "2026-08-27_ollama_llama3.1-8b.html",
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
           "author": "Zi Yan",
-          "summary": "Identified a great cleanup opportunity and expressed appreciation for the effort. Mentioned that the change affects another contributor's series and assumed it would be picked up soon.",
-          "sentiment": "POSITIVE",
+          "summary": "Reviewer Zi Yan noted that the patch affects another contributor's (Kairui) cleanup series and requested it be picked up before Kairui's larger series.\n\nGave Reviewed-by",
+          "sentiment": "NEUTRAL",
           "sentiment_signals": [
-            "APPROVAL"
+            "NEEDS_WORK"
           ],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
-          "raw_body": "On Wed Aug 26, 2026 at 12:20 PM EDT, Kiryl Shutsemau wrote:\n> From: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\n>\n> __folio_freeze_and_split_unmapped() takes the deferred split list_lru lock\n> across the freeze. It is only there to stop deferred_split_scan() from\n> touching the folio under split.\n>\n> With deferred_split_isolate() fixed, the workaround can be dropped.\n>\n> Unqueue the folio after folio_ref_freeze(), the way\n> __folio_migrate_mapping() does: folio_unqueue_deferred_split() needs a\n> zero refcount and a memcg still set, and both hold there.\n>\n> If the split is called from deferred_split_scan(), the unqueue is a\n> no-op -- the folio is already removed from the list. But\n> PG_partially_mapped is still set, so it has to be cleared here or\n> MTHP_STAT_NR_ANON_PARTIALLY_MAPPED never comes back down.\n>\n> Assisted-by: Claude-Code:claude-opus-5\n> Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n> ---\n>  mm/huge_memory.c | 44 +++++++++++++-------------------------------\n>  1 file changed, 13 insertions(+), 31 deletions(-)\n\n+Kairui, since the change affects his cleanup series. I assume this will\nbe picked up sooner than Kairui's large series.\n\n>\n> diff --git a/mm/huge_memory.c b/mm/huge_memory.c\n> index 6281ed993243..c84e8cbc986d 100644\n> --- a/mm/huge_memory.c\n> +++ b/mm/huge_memory.c\n> @@ -3931,41 +3931,27 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n\n>  \tstruct folio *end_folio = folio_next(folio);\n>  \tstruct folio *new_folio, *next;\n>  \tint old_order = folio_order(folio);\n> -\tstruct list_lru_one *lru;\n> -\tbool dequeue_deferred;\n>  \tint ret = 0;\n>  \n>  \tVM_WARN_ON_ONCE(!mapping && end);\n> -\t/*\n> -\t * If this folio can be on the deferred split queue, lock out\n> -\t * the shrinker before freezing the ref. If the shrinker sees\n> -\t * a 0-ref folio, it assumes it beat folio_put() to the list\n> -\t * lock and must clean up the LRU state - the same dequeue we\n> -\t * will do below as part of the split.\n> -\t */\n> -\tdequeue_deferred = folio_test_anon(folio) && old_order > 1;\n> -\tif (dequeue_deferred) {\n> -\t\tstruct mem_cgroup *memcg;\n>  \n> -\t\trcu_read_lock();\n> -\t\tmemcg = folio_memcg(folio);\n> -\t\tlru = list_lru_lock(&deferred_split_lru,\n> -\t\t\t\t    folio_nid(folio), &memcg);\n> -\t}\n>  \tif (folio_ref_freeze(folio, folio_cache_ref_count(folio) + 1)) {\n>  \t\tstruct swap_cluster_info *ci = NULL;\n>  \t\tstruct lruvec *lruvec;\n>  \n> -\t\tif (dequeue_deferred) {\n> -\t\t\t__list_lru_del(&deferred_split_lru, lru,\n> -\t\t\t\t       &folio->_deferred_list, folio_nid(folio));\n> -\t\t\tif (folio_test_partially_mapped(folio)) {\n> -\t\t\t\tfolio_clear_partially_mapped(folio);\n> -\t\t\t\tmod_mthp_stat(old_order,\n> -\t\t\t\t\tMTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);\n> -\t\t\t}\n> -\t\t\tlist_lru_unlock(lru);\n> -\t\t\trcu_read_unlock();\n> +\t\t/* Take off the deferred split queue while frozen and memcg set */\n> +\t\tfolio_unqueue_deferred_split(folio);\n> +\n> +\t\t/*\n> +\t\t * deferred_split_scan() takes the folio off the queue before it\n> +\t\t * splits it, so the unqueue above finds an empty list and\n> +\t\t * leaves PG_partially_mapped set.\n> +\t\t * Clear it here: the flag does not survive the split.\n> +\t\t */\n> +\t\tif (folio_test_partially_mapped(folio)) {\n> +\t\t\tfolio_clear_partially_mapped(folio);\n> +\t\t\tmod_mthp_stat(old_order,\n> +\t\t\t\t      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);\n>  \t\t}\n>  \n>  \t\tif (mapping) {\n> @@ -4067,10 +4053,6 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n\n>  \t\tif (ci)\n>  \t\t\tswap_cluster_unlock(ci);\n>  \t} else {\n> -\t\tif (dequeue_deferred) {\n> -\t\t\tlist_lru_unlock(lru);\n> -\t\t\trcu_read_unlock();\n> -\t\t}\n>  \t\treturn -EAGAIN;\n>  \t}\n>  \n\nThis is a great cleanup. Thanks.\n\nReviewed-by: Zi Yan <ziy@nvidia.com>\n\n-- \nBest Regards,\nYan, Zi\n\n\n",
-          "reply_to": "",
+          "raw_body": "+Kairui, since the change affects his cleanup series. I assume this will\nbe picked up sooner than Kairui's large series.",
+          "reply_to": "Kiryl Shutsemau",
           "message_date": "2026-08-26",
-          "message_id": "",
+          "message_id": "DKZ1J2U9OT92.LM8445YM68HK@nvidia.com",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series aims to improve the handling of deferred splits in the huge_memory module. The first patch, [PATCH 2/5], specifically addresses a double-put bug by removing the folio from the deferred split queue after it has been frozen and its memory control group is still set. This change ensures that the folio's reference count remains valid during the split process."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the behavior of __folio_freeze_and_split_unmapped in the Linux kernel's huge_memory module. It removes a workaround that was previously necessary due to issues with deferred_split_isolate, and instead unqueues the folio from the deferred split list after it has been frozen and its memory control group is still set. This change ensures that the PG_partially_mapped flag is cleared after splitting, which is necessary for accurate statistics tracking."
+    },
+    "2026-08-27": {
+      "report_file": "2026-08-27_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Gave Acked-by",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by"
+          ],
+          "raw_body": "",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-27",
+          "message_id": "c3b713c5-ff65-4f83-a8c7-5cea4ad13873@kernel.org",
+          "analysis_source": "heuristic"
+        },
+        {
+          "author": "Johannes Weiner",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-08-27",
+          "message_id": "20260827165914.GD3004@cmpxchg.org",
+          "analysis_source": "heuristic"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the behavior of __folio_freeze_and_split_unmapped in the Linux kernel's huge_memory module. It removes a workaround that was previously necessary due to issues with deferred_split_isolate, and instead unqueues the folio from the deferred split list after it has been frozen and its memory control group is still set. This change ensures that the PG_partially_mapped flag is cleared after splitting, which is necessary for accurate statistics tracking."
     }
   }
 }

@@ -1,0 +1,49 @@
+{
+  "thread_id": "20260827163838.1813081-1-usama.arif@linux.dev",
+  "subject": "[PATCH 1/5] mm/huge_memory: do not touch frozen folios in deferred_split_isolate()",
+  "url": "https://lore.kernel.org/all/20260827163838.1813081-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-08-27": {
+      "report_file": "2026-08-27_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Usama Arif",
+          "summary": "Raised a concern about ZONE_DEVICE folios being left on the deferred-split list when memcg is disabled, suggesting that they should be dequeued in free_zone_device_folio().",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "CONCERN"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Zi Yan",
+          "summary": "Confirmed that coherent ZONE_DEVICE folios should be dequeued, but noted that this is a pre-existing issue and requires a separate patch to fix.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "QUESTION"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Thu Aug 27, 2026 at 12:38 PM EDT, Usama Arif wrote:\n> On Wed, 26 Aug 2026 17:20:57 +0100 Kiryl Shutsemau <kirill@shutemov.name> wrote:\n>\n>> From: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\n>> \n>> deferred_split_isolate() probes each queued folio with folio_try_get().\n>> folio_try_get() failure is treated as a lost race with folio_put(): clear\n>> PG_partially_mapped, correct MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, take\n>> the folio off the queue.\n>> \n>> The folio_put() race is the most common case for !folio_try_get(), but\n>> it is not the only option. Another scenario is folio_ref_freeze().\n>> \n>> A zero refcount in such cases does not mean the folio is going away.  It\n>> means \"don't touch me\" and current deferred_split_isolate() doesn't\n>> respect it. It can lead to unqueueing folios from the deferred list for\n>> no reason:\n>> \n>>     CPU 0                            CPU 1\n>>     ---------------------------      ------------------------------\n>>     freeze a mapped folio            deferred_split_scan()\n>>       folio_ref_freeze()               folio_try_get() fails\n>>                                        folio_clear_partially_mapped()\n>>                                        NR_ANON_PARTIALLY_MAPPED--\n>>                                        folio off the queue\n>>     give up, put it back\n>>       folio_ref_unfreeze()\n>> \n>> The folio is still partially mapped, but it is no longer a split candidate.\n>> Nothing queues it again until part of it is unmapped once more.\n>> \n>> Skip the folio instead: whoever freezes the folio, owns it and owner is\n>> responsible for its fate. It also covers the folio_put() case:\n>> __folio_put() unqueues the folio via folio_unqueue_deferred_split().\n>> \n>> Reported-by: Lance Yang <lance.yang@linux.dev>\n>> Link: https://lore.kernel.org/all/20260824131224.73344-1-lance.yang@linux.dev/\n>> Assisted-by: Claude-Code:claude-opus-5\n>> Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n>> ---\n>>  mm/huge_memory.c | 19 ++++---------------\n>>  1 file changed, 4 insertions(+), 15 deletions(-)\n>> \n>> diff --git a/mm/huge_memory.c b/mm/huge_memory.c\n>> index ced400f72d43..6281ed993243 100644\n>> --- a/mm/huge_memory.c\n>> +++ b/mm/huge_memory.c\n>> @@ -4590,22 +4590,11 @@ static enum lru_status deferred_split_isolate(struct list_head *item,\n>>  \tstruct folio *folio = container_of(item, struct folio, _deferred_list);\n>>  \tstruct list_head *freeable = cb_arg;\n>>  \n>> -\tif (folio_try_get(folio)) {\n>> -\t\tlist_lru_isolate_move(lru, item, freeable);\n>> -\t\treturn LRU_REMOVED;\n>> -\t}\n>> +\t/* Lost race to folio_put() or the folio is under folio_ref_freeze() */\n>> +\tif (!folio_try_get(folio))\n>> +\t\treturn LRU_SKIP;\n>\n> I think we might have a problem here for ZONE_DEVICE folios?\n\nFor coherent ZONE_DEVICE folios, yes. IIRC, private ZONE_DEVICE folios\nare not added to deferred split queue.\n>\n> This assumes the final put always dequeues the folio, but ZONE_DEVICE folios\n> bypass the generic folio_unqueue_deferred_split() path.\n> With memcg disabled, this can leave a recycled folio linked on the\n> deferred-split list?\n>\n> Should we dequeue folios in free_zone_device_folio()?\n\nI think so, before mem_cgroup_uncharge().\n\nBut it is a pre-existing issue. We need a separate patch unqueuing\nfolios in free_zone_device_folio() to fix commit a30b48bf1b24\n(\"mm/migrate_device: implement THP migration of zone device pages\").\n\n>>  \n>> -\t/*\n>> -\t * We lost race with folio_put(). Read folio state before the\n>> -\t * isolate: folio_unqueue_deferred_split() checks list_empty()\n>> -\t * locklessly, so once removed the folio can be freed any time.\n>> -\t */\n>> -\tif (folio_test_partially_mapped(folio)) {\n>> -\t\tfolio_clear_partially_mapped(folio);\n>> -\t\tmod_mthp_stat(folio_order(folio),\n>> -\t\t\t      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);\n>> -\t}\n>> -\tlist_lru_isolate(lru, item);\n>> +\tlist_lru_isolate_move(lru, item, freeable);\n>>  \treturn LRU_REMOVED;\n>>  }\n>>  \n>> -- \n>> 2.54.0\n>> \n>> \n\n\n\n-- \nBest Regards,\nYan, Zi\n\n",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-08-27",
+          "message_id": "",
+          "email": "ziy@nvidia.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "The patch aims to prevent frozen folios from being touched in deferred_split_isolate(), but concerns arise about ZONE_DEVICE folios and their interaction with memcg."
+    }
+  }
+}
