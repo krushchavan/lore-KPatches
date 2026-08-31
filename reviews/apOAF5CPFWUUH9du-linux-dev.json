@@ -1,0 +1,79 @@
+{
+  "thread_id": "apOAF5CPFWUUH9du@linux.dev",
+  "subject": "[syzbot] [mm?] WARNING in __mod_zone_page_state",
+  "url": "https://lore.kernel.org/all/apOAF5CPFWUUH9du@linux.dev/",
+  "dates": {
+    "2026-08-29": {
+      "report_file": "2026-08-30_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author acknowledged the need to disable preemption before calling stat update functions and suggested taking local locks like neighboring functions as a possible solution.\n\nAuthor identified the root cause of the issue as a missing lru lock acquisition in __munlock_folio, proposed a fix by adding local locks and reordering event counting, and plans to run tests before submitting a formal patch.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "suggested a possible solution",
+            "acknowledged fix needed",
+            "planned revision"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "+hugh\n\nOn Sat, Aug 29, 2026 at 04:03:35PM -0700, Shakeel Butt wrote:\n\n---\n\nAfter looking deeper and it seems like __munlock_folio is the only one which\nhave a code path where lru lock with irq disabled is not done before call\n__zone_stat_mod_folio. I think we can easily fix __munlock_folio without\nacquiring local_locks here.\n\nSomething like below. I will run some tests before proposing a formal patch.\n\ndiff --git a/mm/mlock.c b/mm/mlock.c\nindex efa6716e4dfb..9ab8042671f1 100644\n--- a/mm/mlock.c\n+++ b/mm/mlock.c\n@@ -141,11 +141,20 @@ static struct lruvec *__munlock_folio(struct folio *folio, struct lruvec *lruvec\n \n munlock:\n \tif (folio_test_clear_mlocked(folio)) {\n-\t\t__zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n+\t\tenum vm_event_item item;\n+\n \t\tif (isolated || !folio_test_unevictable(folio))\n-\t\t\t__count_vm_events(UNEVICTABLE_PGMUNLOCKED, nr_pages);\n+\t\t\titem = UNEVICTABLE_PGMUNLOCKED;\n \t\telse\n-\t\t\t__count_vm_events(UNEVICTABLE_PGSTRANDED, nr_pages);\n+\t\t\titem = UNEVICTABLE_PGSTRANDED;\n+\n+\t\tif (isolated) {\n+\t\t\t__zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n+\t\t\t__count_vm_events(item, nr_pages);\n+\t\t} else {\n+\t\t\tzone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n+\t\t\tcount_vm_events(item, nr_pages);\n+\t\t}\n \t}\n \n \t/* folio_evictable() has to be checked *after* clearing Mlocked */",
+          "reply_to": "",
+          "message_date": "2026-08-29",
+          "message_id": "apOAF5CPFWUUH9du@linux.dev",
+          "email": "shakeel.butt@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Hugh Dickins",
+          "summary": "Reviewer noted that mlock_drain_remote() does not take the local_lock, which is unusual for a function taking the folio lock, and requested it to take the local_lock instead, but expressed uncertainty about potential PREEMPT_RT implications.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Thanks for looking into this, Shakeel, but I don't think complicating\n__munlock_folio() is at all the right fix. This is peculiar to the use\nby mlock_drain_remote(), isn't it? Which is not taking the usual local_lock\nbecause the CPU is going offline. I would say, just take the local_lock in\nmlock_drain_remote(), but (I haven't read the history) for all I know,\nthere may be PREEMPT_RT reasons why that would be completely wrong.\n\nHugh",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-08-29",
+          "message_id": "a2288e73-5001-2104-1e7a-2b383e7edd61@google.com",
+          "email": "hughd@google.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author acknowledged a concern about preemption being disabled in the stat update functions, agreed to explore an alternative solution (local_lock approach), and provided a revised patch that uses accessors which serialize themselves.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Thanks Hugh, I will explore the local_lock approach. BTW I simplified the\nfix to the following. is this still making things more complicated?\n\ndiff --git a/mm/mlock.c b/mm/mlock.c\nindex efa6716e4dfb..fa30ffed76ab 100644\n--- a/mm/mlock.c\n+++ b/mm/mlock.c\n@@ -141,11 +141,16 @@ static struct lruvec *__munlock_folio(struct folio *folio, struct lruvec *lruvec\n \n munlock:\n \tif (folio_test_clear_mlocked(folio)) {\n-\t\t__zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n+\t\t/*\n+\t\t * This runs both with and without the lruvec lock held, and\n+\t\t * mlock_drain_remote() reaches it fully preemptible, so use\n+\t\t * the accessors that serialize themselves.\n+\t\t */\n+\t\tzone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n \t\tif (isolated || !folio_test_unevictable(folio))\n-\t\t\t__count_vm_events(UNEVICTABLE_PGMUNLOCKED, nr_pages);\n+\t\t\tcount_vm_events(UNEVICTABLE_PGMUNLOCKED, nr_pages);\n \t\telse\n-\t\t\t__count_vm_events(UNEVICTABLE_PGSTRANDED, nr_pages);\n+\t\t\tcount_vm_events(UNEVICTABLE_PGSTRANDED, nr_pages);\n \t}\n \n \t/* folio_evictable() has to be checked *after* clearing Mlocked */\n--",
+          "reply_to": "Hugh Dickins",
+          "message_date": "2026-08-29",
+          "message_id": "apO7GDwIgyhdn3t7@linux.dev",
+          "email": "shakeel.butt@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch addresses a warning in the __mod_zone_page_state function, which is called when updating page statistics. The issue arises because this function requires preemption to be disabled, but it's being called on an offlined CPU where preemption isn't necessarily disabled. To fix this, the patch likely introduces local locks or similar synchronization mechanisms to ensure that per-CPU data access is properly synchronized."
+    },
+    "2026-08-30": {
+      "report_file": "2026-08-30_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [],
+      "analysis_source": "llm",
+      "patch_summary": "This patch addresses a warning in the __mod_zone_page_state function, which is called when updating page statistics. The issue arises because this function requires preemption to be disabled, but it's being called on an offlined CPU where preemption isn't necessarily disabled. To fix this, the patch likely introduces local locks or similar synchronization mechanisms to ensure that per-CPU data access is properly synchronized."
+    }
+  }
+}

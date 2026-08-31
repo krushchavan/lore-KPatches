@@ -238,18 +238,18 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 00/14] nfsd/sunrpc: harden the netlink listener set interface</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260828-nfsd-nl-hang-v3-0-55026685c75d@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-28</strong><div class="date-range-nav">Active on: <a href="#2026-08-28">2026-08-28</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to harden the netlink listener set interface in the NFS daemon (nfsd) and sunrpc code. The main goal is to prevent unnecessary timeouts when communicating with rpcbind, which can lead to hangs and other issues. The patches introduce several changes to improve the registration and deregistration of listeners, including stopping the registration process once rpcbind stops answering.</div></div>
+    <div class="date-range">Submitted: <strong>2026-08-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-30</strong><div class="date-range-nav">Active on: <a href="#2026-08-30">2026-08-30</a> &bull; <a href="#2026-08-28">2026-08-28</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series, submitted by Jeff Layton, aims to harden the netlink listener set interface in the NFS daemon and SunRPC code. The main goal is to prevent hangs caused by syzbot, a kernel testing tool. To achieve this, the patches modify the rpcbind registration process to handle failures more robustly. Specifically, when a registration fails, it will no longer leave behind entries that point to closed ports. Additionally, several test cases have been updated to ensure correct behavior in various scenarios. This patch series sets the foundation for further work on moving the rpcbind registration into userland.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-28">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Jeff Layton</span>
+<span class="review-author">Jeff Layton (author)</span>
 <a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Posted the patch series for review, highlighting its focus on hardening the netlink listener set interface and preventing unnecessary timeouts when communicating with rpcbind.</div>
+<div class="review-comment-text">The author addressed a concern about the performance impact of a nested loop in nfsd_nl_listener_set_doit(), which can spin for a long time under sv_lock when dealing with large listener lists. The author added a check to reject requests that carry more than NFSD_NL_LISTENER_MAX (1024) entries, and explained that this limit is far above any realistic configuration.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">nfsd_nl_listener_set_doit() matches each requested listener against the
@@ -322,21 +322,77 @@ index 5331b89c4281..b6f4d66f612a 100644
  		if (err &lt; 0)
 
 -- 
-2.55.0
-
-</pre>
+2.55.0</pre>
 </details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-1-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: addressed concern, added check</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-30">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Chuck Lever</span>
+<a class="date-chip" href="../2026-08-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-30">2026-08-30</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer, Chuck Lever, pointed out that rpcb_register_call() incorrectly classifies all failures except -EPROTONOSUPPORT as &#x27;no answer&#x27;, leading to incorrect handling of errors such as -ENOMEM, -ERESTARTSYS, and auth-related errors. He noted that these errors should be treated differently from &#x27;no answer&#x27; cases, which are silently converted to success for vs_rpcb_optnl versions.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">If I&#x27;m reading this correctly, rpcb_register_call() classifies
+every failure except -EPROTONOSUPPORT as &quot;no answer&quot;.
+
+rpc_call_sync() returns negative errnos that are not &quot;no answer&quot;:
+pre-dispatch local failures (-ENOMEM from rpc_new_task()), a fatal
+signal (-ERESTARTSYS), and reply-derived errors from
+rpc_verify_header(): -EPFNOSUPPORT, -EOPNOTSUPP, -EIO, -EACCES
+(auth error), -EKEYREJECTED. All of these show that rpcbind *did*
+answer.
+
+Now they become -ENAVAIL, get counted in sv_rpcb_failures, are
+silently converted to success for a vs_rpcb_optnl version, and
+reach userspace as a synthesized -ETIMEDOUT for mandatory versions.
+
+Consequences:
+
+* The commit message says &quot;-EACCES continues to mean a FALSE
+  reply,&quot; but the RPC layer&#x27;s auth -EACCES is rewritten to
+  -ENAVAIL before the two can be told apart. Its &quot;one of two
+  ways&quot; failure taxonomy is not what the code implements.
+
+* &quot;rpcbind not running&quot; (-ECONNREFUSED/-ENOENT) and every
+  other transport error reach nfsd&#x27;s listener_set ack, the
+  svc_register/svc_unregister tracepoints, and the printk
+  as indistinguishable ETIMEDOUT/ENAVAIL, which IMO is an
+  observability regression.
+
+* -ERESTARTSYS -&gt; -ETIMEDOUT drops syscall-restart semantics
+  on a fatal signal during registration.
+
+I&#x27;m probably missing something.
+
+
+-- 
+Chuck Lever (Come to NFS bake-a-thon! https://nfsv4bat.org)</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jeff Layton</div>
+<a href="https://lore.kernel.org/r/c42d685f-18e7-4f38-8ce2-3d8e5402e9f1@app.fastmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: incorrect error handling, observability regression</div>
+</div>
+</div>
 </div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Jeff Layton</span>
+<span class="review-author">Jeff Layton (author)</span>
 <a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Posted patch 7/14, which stops svc_register() once rpcbind stops answering. The change aims to prevent unnecessary timeouts and improve the registration process.</div>
+<div class="review-comment-text">The author addressed a concern about nfsd_mutex being held for the whole listener teardown and rebuild, explaining that it&#x27;s necessary to prevent a TASK_KILLABLE usermode helper upcall from running under nfsd_mutex. The author added a check in nfsd_nl_validate_listeners() to reject unsupported transport names before taking nfsd_mutex.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">nfsd_nl_listener_set_doit() holds nfsd_mutex for the whole listener
@@ -409,21 +465,21 @@ index b6f4d66f612a..d8135f38e69f 100644
  			return -EINVAL;
 
 -- 
-2.55.0
-
-</pre>
+2.55.0</pre>
 </details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-2-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
 </div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Jeff Layton</span>
+<span class="review-author">Jeff Layton (author)</span>
 <a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Posted patch 8/14, which stops the svc_unregister() sweep once rpcbind stops answering. The change aims to prevent unnecessary timeouts and improve the deregistration process.</div>
+<div class="review-comment-text">The author addressed a concern about svc_register() overwriting earlier registration errors, agreeing to modify the code to keep the first error instead of the last.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">svc_register() assigns every pg_rpcbind_set() result to the same &quot;error&quot;
@@ -465,21 +521,21 @@ index 8297bad2b177..4f402bbf97ba 100644
  		}
 
 -- 
-2.55.0
-
-</pre>
+2.55.0</pre>
 </details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-3-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, agreed to restructure</div>
 </div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Jeff Layton</span>
+<span class="review-author">Jeff Layton (author)</span>
 <a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Posted patch 9/14, which stops unregistering listeners once rpcbind stops answering. The change aims to prevent unnecessary timeouts and improve the deregistration process.</div>
+<div class="review-comment-text">The author addressed a concern that the local rpcbind client&#x27;s synchronous calls under nfsd_mutex can cause a long stall, leading to hung-task watchdog warnings. The author explained that shortening the stall by bounding the client&#x27;s attempts is not a free fix and does not remove the stall entirely; instead, they acknowledged that making registration asynchronous is necessary for a real fix.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">The kernel&#x27;s local rpcbind client uses the transport defaults: a 10s major
@@ -553,10 +609,503 @@ index 6aa372188c86..0aa376b82a52 100644
  	struct rpc_clnt *clnt, *clnt4;
 
 -- 
-2.55.0
-
-</pre>
+2.55.0</pre>
 </details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-4-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a problem, explained reasoning</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern that the LISTENER_SET operation does not provide enough information to userland when a registration fails, specifically which entry failed. The author added code to record and report the attribute and transport name of the failing entry.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">nfsd_nl_listener_set_doit() returns the raw errno from
+svc_xprt_create_from_sa() and sets no extack. A failed LISTENER_SET
+therefore tells userland only &quot;Address already in use&quot;, or whatever else
+the transport returned. It never tells userland which entry failed.
+
+Record the attribute and the transport name of the entry whose errno the
+call returns, and report both after the loop. NL_SET_BAD_ATTR() names the
+entry, which the message alone cannot do: a request can carry several
+entries with the same transport name.
+
+The rejections in nfsd_nl_validate_listeners() other than -E2BIG and the
+unsupported transport name still carry no extack. This patch does not
+change them.
+
+Assisted-by: LLM
+Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+---
+ fs/nfsd/nfsctl.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/fs/nfsd/nfsctl.c b/fs/nfsd/nfsctl.c
+index d8135f38e69f..6cbdcee4b733 100644
+--- a/fs/nfsd/nfsctl.c
++++ b/fs/nfsd/nfsctl.c
+@@ -2089,7 +2089,9 @@ static int nfsd_nl_validate_listeners(struct genl_info *info)
+ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct net *net = genl_info_net(info);
++	const struct nlattr *bad_attr = NULL;
+ 	struct svc_xprt *xprt, *tmp;
++	const char *bad_xprt = NULL;
+ 	const struct nlattr *attr;
+ 	struct svc_serv *serv;
+ 	LIST_HEAD(permsocks);
+@@ -2208,8 +2210,22 @@ int nfsd_nl_listener_set_doit(struct sk_buff *skb, struct genl_info *info)
+ 		ret = svc_xprt_create_from_sa(serv, xcl_name, net, sa, 0,
+ 					      current_cred());
+ 		/* always save the latest error */
+-		if (ret &lt; 0)
++		if (ret &lt; 0) {
++			bad_attr = attr;
++			bad_xprt = xcl_name;
+ 			err = ret;
++		}
++	}
++
++	/*
++	 * The ack carries the errno of the last entry that failed. Point at
++	 * that entry as well, since several entries can share a transport
++	 * name and the errno alone cannot tell them apart.
++	 */
++	if (err) {
++		NL_SET_BAD_ATTR(info-&gt;extack, bad_attr);
++		NL_SET_ERR_MSG_FMT(info-&gt;extack, &quot;cannot create %s listener&quot;,
++				   bad_xprt);
+ 	}
+ 
+ 	if (!serv-&gt;sv_nrthreads &amp;&amp; list_empty(&amp;nn-&gt;nfsd_serv-&gt;sv_permsocks))
+
+-- 
+2.55.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-5-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, added new code</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the behavior of svc_register() when an rpcbind registration fails, explaining that it currently waits for each listener individually and cannot learn if the first call already failed. The author proposed introducing a new errno -ENAVAIL to indicate this case, which would be handled differently than existing -EACCES errors.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">A caller that creates many listeners in one operation calls svc_register()
+once for each of them. Every call waits for the local rpcbind on its own,
+so a rpcbind that never answers costs the caller one timeout per listener.
+The caller has no way to learn that the first call already failed.
+
+An rpcbind failure can occur one of two ways: either rpcbind fails to
+respond, or it can respond with -EACCES to indicate that the user
+doesn&#x27;t own the current record.
+
+Give the first case its own errno. rpcb_register_call() returns -ENAVAIL
+when the call got no answer, and the existing -EACCES continues to mean a
+FALSE reply.
+
+svc_generic_rpcbind_set() has to let -ENAVAIL past vs_rpcb_optnl, since it
+is not a refusal. svc_register() applies vs_rpcb_optnl to it instead, so a
+v4-only server still creates its listeners, and then keeps a running total
+in serv-&gt;sv_rpcb_failures. -ENAVAIL never escapes svc_register().
+
+svc_rpcb_failure_count() reports the total. A caller reads the count
+before it starts and compares as it goes to determine if there have been
+errors.
+
+The users of this infrastructure will be added in later patches.
+
+Assisted-by: LLM
+Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+---
+ include/linux/sunrpc/clnt.h |  3 ++-
+ include/linux/sunrpc/svc.h  |  7 +++++--
+ net/sunrpc/rpcb_clnt.c      | 10 +++++++---
+ net/sunrpc/svc.c            | 42 +++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 55 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index 3c2b8c355ab3..30344c0d6a9d 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -199,7 +199,8 @@ struct rpc_xprt	*rpc_task_get_xprt(struct rpc_clnt *clnt,
+ 
+ int		rpcb_create_local(struct net *);
+ void		rpcb_put_local(struct net *);
+-int		rpcb_register(struct net *, u32, u32, int, unsigned short);
++int		rpcb_register(struct net *net, u32 prog, u32 vers, int prot,
++			      unsigned short port);
+ int		rpcb_v4_register(struct net *net, const u32 program,
+ 				 const u32 version,
+ 				 const struct sockaddr *address,
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index 2db1b9ec5658..5fa9417e034d 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -78,6 +78,7 @@ struct svc_serv {
+ 	unsigned int		sv_max_payload;	/* datagram payload size */
+ 	unsigned int		sv_max_mesg;	/* max_payload + 1 page for overheads */
+ 	unsigned int		sv_xdrsize;	/* XDR buffer size */
++	atomic_t		sv_rpcb_failures; /* unanswered rpcbind calls */
+ 	struct list_head	sv_permsocks;	/* all permanent sockets */
+ 	struct list_head	sv_tempsocks;	/* all temporary sockets */
+ 	int			sv_tmpcnt;	/* count of temporary &quot;valid&quot; sockets */
+@@ -451,6 +452,7 @@ int sunrpc_set_pool_mode(const char *val);
+ int sunrpc_get_pool_mode(char *val, size_t size);
+ void svc_rpcb_cleanup(struct svc_serv *serv, struct net *net);
+ int svc_bind(struct svc_serv *serv, struct net *net);
++unsigned int svc_rpcb_failure_count(struct svc_serv *serv);
+ struct svc_serv *svc_create(struct svc_program *, unsigned int,
+ 			    int (*threadfn)(void *data));
+ bool		   svc_rqst_replace_page(struct svc_rqst *rqstp,
+@@ -471,8 +473,9 @@ unsigned int	   svc_serv_maxthreads(const struct svc_serv *serv);
+ int		   svc_pool_stats_open(struct svc_info *si, struct file *file);
+ void		   svc_process(struct svc_rqst *rqstp);
+ void		   svc_process_bc(struct rpc_rqst *req, struct svc_rqst *rqstp);
+-int		   svc_register(const struct svc_serv *, struct net *, const int,
+-				const unsigned short, const unsigned short);
++int		   svc_register(struct svc_serv *serv, struct net *net,
++				const int family, const unsigned short proto,
++				const unsigned short port);
+ 
+ void		   svc_wake_up(struct svc_serv *);
+ void		   svc_reserve(struct svc_rqst *rqstp, int space);
+diff --git a/net/sunrpc/rpcb_clnt.c b/net/sunrpc/rpcb_clnt.c
+index 0aa376b82a52..c680137f0fca 100644
+--- a/net/sunrpc/rpcb_clnt.c
++++ b/net/sunrpc/rpcb_clnt.c
+@@ -412,7 +412,8 @@ static struct rpc_clnt *rpcb_create(struct net *net, const char *nodename,
+ 	return rpc_create(&amp;args);
+ }
+ 
+-static int rpcb_register_call(struct sunrpc_net *sn, struct rpc_clnt *clnt, struct rpc_message *msg, bool is_set)
++static int rpcb_register_call(struct sunrpc_net *sn, struct rpc_clnt *clnt,
++			      struct rpc_message *msg, bool is_set)
+ {
+ 	int flags = RPC_TASK_NOCONNECT;
+ 	int error, result = 0;
+@@ -422,8 +423,10 @@ static int rpcb_register_call(struct sunrpc_net *sn, struct rpc_clnt *clnt, stru
+ 	msg-&gt;rpc_resp = &amp;result;
+ 
+ 	error = rpc_call_sync(clnt, msg, flags);
+-	if (error &lt; 0)
++	if (error == -EPROTONOSUPPORT)
+ 		return error;
++	if (error &lt; 0)
++		return -ENAVAIL;
+ 
+ 	if (!result)
+ 		return -EACCES;
+@@ -463,7 +466,8 @@ static int rpcb_register_call(struct sunrpc_net *sn, struct rpc_clnt *clnt, stru
+  * IN6ADDR_ANY (ie available for all AF_INET and AF_INET6
+  * addresses).
+  */
+-int rpcb_register(struct net *net, u32 prog, u32 vers, int prot, unsigned short port)
++int rpcb_register(struct net *net, u32 prog, u32 vers, int prot,
++		  unsigned short port)
+ {
+ 	struct rpcbind_args map = {
+ 		.r_prog		= prog,
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index 4f402bbf97ba..54f8e8b0bf28 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1179,10 +1179,40 @@ int svc_generic_rpcbind_set(struct net *net,
+ 	error = svc_rpcbind_set_version(net, progp, version,
+ 					family, proto, port);
+ 
++	/* -ENAVAIL is not a refusal, so vs_rpcb_optnl must not swallow it. */
++	if (error == -ENAVAIL)
++		return error;
++
+ 	return (vers-&gt;vs_rpcb_optnl) ? 0 : error;
+ }
+ EXPORT_SYMBOL_GPL(svc_generic_rpcbind_set);
+ 
++/**
++ * svc_rpcb_failure_count - local rpcbind calls for @serv that got no answer
++ * @serv: RPC service to query
++ *
++ * svc_register() adds one for each of its calls that got no answer. A reply
++ * that refuses one entry does not count, because rpcbind answered and the
++ * next entry may still succeed.
++ *
++ * The count is kept per serv rather than per net. The local rpcbind client
++ * is per-net and lockd shares it, but a count that another service can move
++ * says nothing about this serv&#x27;s own calls.
++ *
++ * This is for callers that cannot see the svc_register() return, because a
++ * transport class sits in between. Such a caller reads the count before it
++ * starts and compares as it goes, so there is no state to reset between
++ * operations. The count never resets, and callers must not attach meaning
++ * to the value itself.
++ *
++ * Return: the number of unanswered calls since this serv was created.
++ */
++unsigned int svc_rpcb_failure_count(struct svc_serv *serv)
++{
++	return atomic_read(&amp;serv-&gt;sv_rpcb_failures);
++}
++EXPORT_SYMBOL_GPL(svc_rpcb_failure_count);
++
+ /**
+  * svc_register - register an RPC service with the local portmapper
+  * @serv: svc_serv struct for the service to register
+@@ -1193,10 +1223,11 @@ EXPORT_SYMBOL_GPL(svc_generic_rpcbind_set);
+  *
+  * Service is registered for any address in the passed-in protocol family
+  */
+-int svc_register(const struct svc_serv *serv, struct net *net,
++int svc_register(struct svc_serv *serv, struct net *net,
+ 		 const int family, const unsigned short proto,
+ 		 const unsigned short port)
+ {
++	bool			noanswer = false;
+ 	unsigned int		p, i;
+ 	int			error = 0;
+ 
+@@ -1208,10 +1239,16 @@ int svc_register(const struct svc_serv *serv, struct net *net,
+ 		struct svc_program *progp = &amp;serv-&gt;sv_programs[p];
+ 
+ 		for (i = 0; i &lt; progp-&gt;pg_nvers; i++) {
++			const struct svc_version *vers = progp-&gt;pg_vers[i];
+ 			int ret;
+ 
+ 			ret = progp-&gt;pg_rpcbind_set(net, progp, i,
+ 					family, proto, port);
++			if (ret == -ENAVAIL) {
++				noanswer = true;
++				ret = (vers &amp;&amp; vers-&gt;vs_rpcb_optnl) ?
++					0 : -ETIMEDOUT;
++			}
+ 			if (ret &lt; 0) {
+ 				printk(KERN_WARNING &quot;svc: failed to register &quot;
+ 					&quot;%sv%u RPC service (errno %d).\n&quot;,
+@@ -1223,6 +1260,9 @@ int svc_register(const struct svc_serv *serv, struct net *net,
+ 		}
+ 	}
+ 
++	if (noanswer)
++		atomic_inc(&amp;serv-&gt;sv_rpcb_failures);
++
+ 	return error;
+ }
+ 
+
+-- 
+2.55.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-6-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the inefficiency of svc_register() walking every program and version when an error occurs, explaining that it pays a penalty of twice the timeout time for each program. The author proposed to stop the program loop too when the call gets no answer.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">svc_register() walks every program and every version. The break on error
+leaves the version loop only, so a program whose call to the local rpcbind
+timed out is followed by the next program timing out in the same way. With
+the 1s bound on the local rpcbind client, an nfsd serv pays 2s for that,
+once for nfsd and once for nfsacl.
+
+Stop the program loop too, but only when the call got no answer.
+
+Assisted-by: LLM
+Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+---
+ net/sunrpc/svc.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index 54f8e8b0bf28..e437e99a0b36 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1258,6 +1258,10 @@ int svc_register(struct svc_serv *serv, struct net *net,
+ 				break;
+ 			}
+ 		}
++
++		/* Give up on trying to register anything if it didn&#x27;t respond */
++		if (noanswer)
++			break;
+ 	}
+ 
+ 	if (noanswer)
+
+-- 
+2.55.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-7-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the rpcbind entry clearing mechanism in svc_unregister(). They explained that it clears entries for non-hidden programs and versions, and that this results in multiple timeouts under nfsd_mutex when a local rpcbind never replies. The author agreed to give up after the first call that gets no answer.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">svc_unregister() clears the rpcbind entry for every non-hidden program and
+version. svc_rpcb_setup() runs it to drop stale entries when a serv binds,
+and svc_rpcb_cleanup() runs it when one goes away. An nfsd serv with v3 and
+v4 enabled sweeps four or five entries, so a local rpcbind that never
+replies costs that many timeouts, twice per NFSD_CMD_LISTENER_SET, all
+under nfsd_mutex.
+
+Give up after the first call that gets no answer.
+
+Assisted-by: LLM
+Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+---
+ net/sunrpc/svc.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index e437e99a0b36..bccaeb8dfba8 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1277,8 +1277,8 @@ int svc_register(struct svc_serv *serv, struct net *net,
+  * any &quot;inet6&quot; entries anyway.  So a PMAP_UNSET should be sufficient
+  * in this case to clear all existing entries for [program, version].
+  */
+-static void __svc_unregister(struct net *net, const u32 program, const u32 version,
+-			     const char *progname)
++static int __svc_unregister(struct net *net, const u32 program, const u32 version,
++			    const char *progname)
+ {
+ 	int error;
+ 
+@@ -1292,6 +1292,7 @@ static void __svc_unregister(struct net *net, const u32 program, const u32 versi
+ 		error = rpcb_register(net, program, version, 0, 0);
+ 
+ 	trace_svc_unregister(progname, version, error);
++	return error;
+ }
+ 
+ /*
+@@ -1318,10 +1319,13 @@ static void svc_unregister(const struct svc_serv *serv, struct net *net)
+ 				continue;
+ 			if (progp-&gt;pg_vers[i]-&gt;vs_hidden)
+ 				continue;
+-			__svc_unregister(net, progp-&gt;pg_prog, i, progp-&gt;pg_name);
++			if (__svc_unregister(net, progp-&gt;pg_prog, i,
++					     progp-&gt;pg_name) == -ENAVAIL)
++				goto out;
+ 		}
+ 	}
+ 
++out:
+ 	rcu_read_lock();
+ 	sighand = rcu_dereference(current-&gt;sighand);
+ 	spin_lock_irqsave(&amp;sighand-&gt;siglock, flags);
+
+-- 
+2.55.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-8-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Jeff Layton (author)</span>
+<a class="date-chip" href="../2026-08-28_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-28">2026-08-28</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed a concern about rpcbind timeouts during listener set removal, explaining that one failure would trigger the same timeout for all remaining listeners and proposing to clear XPT_RPCB_UNREG on every transport in the same net when the call gets no answer. A fix is planned.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">svc_delete_xprt() unregisters each listener it destroys. One
+NFSD_CMD_LISTENER_SET that removes listeners therefore pays one local
+rpcbind timeout for each of them, under nfsd_mutex, on top of the one the
+create loop already bounds.
+
+One failure is enough to know that the rest of the teardown will not fare
+better. When the call gets no answer, clear XPT_RPCB_UNREG on every
+remaining transport in the same net.
+
+Assisted-by: LLM
+Signed-off-by: Jeff Layton &lt;jlayton@kernel.org&gt;
+---
+ net/sunrpc/svc_xprt.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/net/sunrpc/svc_xprt.c b/net/sunrpc/svc_xprt.c
+index 40040af588fb..7e471c92f23a 100644
+--- a/net/sunrpc/svc_xprt.c
++++ b/net/sunrpc/svc_xprt.c
+@@ -1101,6 +1101,22 @@ static void call_xpt_users(struct svc_xprt *xprt)
+ 	spin_unlock(&amp;xprt-&gt;xpt_lock);
+ }
+ 
++/*
++ * If rpcbind stops answering, every listener still to be destroyed would
++ * only wait out the same timeout again. Drop the flag on all of the
++ * remaining listeners.
++ */
++static void svc_xprt_clear_rpcb_unreg(struct svc_serv *serv, struct net *net)
++{
++	struct svc_xprt *xprt;
++
++	spin_lock_bh(&amp;serv-&gt;sv_lock);
++	list_for_each_entry(xprt, &amp;serv-&gt;sv_permsocks, xpt_list)
++		if (xprt-&gt;xpt_net == net)
++			clear_bit(XPT_RPCB_UNREG, &amp;xprt-&gt;xpt_flags);
++	spin_unlock_bh(&amp;serv-&gt;sv_lock);
++}
++
+ /*
+  * Remove a dead transport
+  */
+@@ -1115,11 +1131,15 @@ static void svc_delete_xprt(struct svc_xprt *xprt)
+ 		struct svc_sock *svsk = container_of(xprt, struct svc_sock,
+ 						     sk_xprt);
+ 		struct socket *sock = svsk-&gt;sk_sock;
++		unsigned int failures = svc_rpcb_failure_count(serv);
+ 
+ 		if (svc_register(serv, xprt-&gt;xpt_net, sock-&gt;sk-&gt;sk_family,
+ 				 sock-&gt;sk-&gt;sk_protocol, 0) &lt; 0)
+ 			pr_warn(&quot;failed to unregister %s with rpcbind\n&quot;,
+ 				xprt-&gt;xpt_class-&gt;xcl_name);
++
++		if (svc_rpcb_failure_count(serv) != failures)
++			svc_xprt_clear_rpcb_unreg(serv, xprt-&gt;xpt_net);
+ 	}
+ 
+ 	if (test_and_set_bit(XPT_DEAD, &amp;xprt-&gt;xpt_flags))
+
+-- 
+2.55.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260828-nfsd-nl-hang-v3-9-55026685c75d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a concern, planned a fix</div>
 </div>
 </div>
 </div>
