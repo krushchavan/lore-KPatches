@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] memcg: clear FLUSHING_CACHED_CHARGE on cpu offline</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260828192419.3057939-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-28</strong><div class="date-range-nav">Active on: <a href="#2026-08-28">2026-08-28</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a bug where the FLUSHING_CACHED_CHARGE flag is not cleared when a CPU goes offline, leading to stock draining issues. The fix involves clearing both stocks after draining them in the memcg_hotplug_cpu_dead() function.</div></div>
+    <div class="date-range">Submitted: <strong>2026-08-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-31</strong><div class="date-range-nav">Active on: <a href="#2026-08-31">2026-08-31</a> &bull; <a href="#2026-08-28">2026-08-28</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a bug in the memcg (memory cgroup) code where FLUSHING_CACHED_CHARGE is not cleared when a CPU goes offline, leading to stock draining issues. The fix involves clearing both stocks after draining them, ensuring that the flag is reset for the dead CPU.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-28">
 <div class="review-comment">
@@ -253,6 +253,104 @@
 <div class="review-comment-text">Confirmed the solution is correct and thorough, with a safety analysis performed by an AI. Provided a Reviewed-by tag.</div>
 <div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
 <div class="review-comment-signals">Signals: LGTM</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-08-31">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Rik van Riel</span>
+<a class="date-chip" href="../2026-08-31_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-31">2026-08-31</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Found the same solution independently using AI and provided a Reviewed-by tag.</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-08-31_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-31">2026-08-31</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Suspected the issue went back to a previous fix and suggested clearing the bit directly in drain_obj_stock or drain_stock_fully for code simplification.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri 28-08-26 12:24:19, Shakeel Butt wrote:
+&gt; Sashiko [1] reported that memcg_hotplug_cpu_dead() drains the stocks
+&gt; of the CPU which went away but leaves FLUSHING_CACHED_CHARGE alone.
+&gt; 
+&gt; The flag can be set at that point: drain_all_stock() may have claimed
+&gt; the stock and queued the drain work shortly before the CPU went down.
+&gt; workqueue_offline_cpu() unbinds the per-cpu workers, so such a pending
+&gt; work item is executed by an unbound worker on some other CPU, where
+&gt; drain_local_memcg_stock() operates on this_cpu_ptr() and thus drains
+&gt; and clears the flag of that other CPU instead.  Nothing clears the flag
+&gt; of the dead CPU, so drain_all_stock() would skip its stock forever once
+&gt; the CPU comes back online.
+&gt; 
+&gt; Clear the flag of both stocks after draining them.
+&gt; 
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; Reported-by: Sashiko &lt;sashiko-bot@kernel.org&gt;
+&gt; Link: https://sashiko.dev/#/patchset/20260828135036.7d44361f%40fangorn [1]
+
+I suspect this goes all the way down to
+Fixes: 26fe61684449 (&quot;memcg: fix percpu cached charge draining frequency&quot;)
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+
+Btw. is there any good reason why we are not clearing the bit directly
+in drain_obj_stock resp. drain_stock_fully. Doing so would simplify the
+code flow and prevent from bugs like this one.
+
+&gt; ---
+&gt;  mm/memcontrol.c | 16 ++++++++++++++--
+&gt;  1 file changed, 14 insertions(+), 2 deletions(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index e082aa68fa5c..872115c6b0f2 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2378,9 +2378,21 @@ void drain_all_stock(struct mem_cgroup *root_memcg)
+&gt;  
+&gt;  static int memcg_hotplug_cpu_dead(unsigned int cpu)
+&gt;  {
+&gt; +	struct memcg_stock_pcp *memcg_st = &amp;per_cpu(memcg_stock, cpu);
+&gt; +	struct obj_stock_pcp *obj_st = &amp;per_cpu(obj_stock, cpu);
+&gt; +
+&gt;  	/* no need for the local lock */
+&gt; -	drain_obj_stock(&amp;per_cpu(obj_stock, cpu));
+&gt; -	drain_stock_fully(&amp;per_cpu(memcg_stock, cpu));
+&gt; +	drain_obj_stock(obj_st);
+&gt; +	drain_stock_fully(memcg_st);
+&gt; +
+&gt; +	/*
+&gt; +	 * A drain work queued before the CPU went away is executed by an
+&gt; +	 * unbound worker on some other CPU and clears that CPU&#x27;s flag, so
+&gt; +	 * clear the flags here to make these stocks drainable again once
+&gt; +	 * the CPU comes back online.
+&gt; +	 */
+&gt; +	clear_bit(FLUSHING_CACHED_CHARGE, &amp;memcg_st-&gt;flags);
+&gt; +	clear_bit(FLUSHING_CACHED_CHARGE, &amp;obj_st-&gt;flags);
+&gt;  
+&gt;  	return 0;
+&gt;  }
+&gt; -- 
+&gt; 2.53.0-Meta
+
+-- 
+Michal Hocko
+SUSE Labs
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
 </div>
 </div>
 </div>
