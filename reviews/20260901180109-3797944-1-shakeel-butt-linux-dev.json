@@ -1,0 +1,36 @@
+{
+  "thread_id": "20260901180109.3797944-1-shakeel.butt@linux.dev",
+  "subject": "[PATCH] mm/mlock: use the IRQ-safe accessor for NR_MLOCK in __munlock_folio()",
+  "url": "https://lore.kernel.org/all/20260901180109.3797944-1-shakeel.butt@linux.dev/",
+  "dates": {
+    "2026-09-01": {
+      "report_file": "2026-09-01_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Hugh Dickins",
+          "summary": "Acknowledged the bug and its fix, suggested adding Reported-by and Closes tags to credit syzbot for reporting a related issue.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "ACKNOWLEDGED"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Acked-by",
+            "Reported-by",
+            "Closes"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 1 Sep 2026, Shakeel Butt wrote:\n\n> NR_MLOCK is updated from interrupt context.  __free_pages_prepare() clears\n> a stray PG_mlocked and adjusts NR_MLOCK, and a folio can reach it with the\n> flag still set from a bio completion handler:\n> \n>   __free_pages_ok+0x6af/0x7a0\n>   <IRQ>\n>   __bio_release_pages+0xde/0x260\n>   __iomap_dio_bio_end_io+0x16e/0x1a0\n>   blk_update_request+0x14b/0x3d0\n>   blk_mq_end_request+0x18/0x30\n>   blk_done_softirq+0x49/0x60\n> \n> The folio gets there like this.  A MAP_SHARED file mapping is mlocked, so\n> its page cache folios carry PG_mlocked, and an O_DIRECT write sourced from\n> that mapping GUP-pins those same folios.  munlock() then runs\n> mlock_vma_pages_range(), which clears VM_LOCKED before walking the page\n> tables to munlock each folio.  A concurrent hole punch reaches the folio\n> through the rmap (i_mmap_rwsem, not mmap_lock) and can land inside that\n> window: __folio_remove_rmap() -> munlock_vma_folio() sees VM_LOCKED\n> already clear, so it neither queues the folio on the mlock batch nor takes\n> a reference, and the pte it clears makes the pending mlock_pte_range()\n> walk skip the folio at its !pte_present() check.  filemap_remove_folio()\n> then drops the page cache reference, leaving the bio's pin as the last\n> one, released from the completion handler above.\n\nI'm hardly ashamed to admit that I've not tried to digest\nthat paragraph. You're writing about the rare fallback cases when\nPG_mlocked is cleared late, and unevictable_pgs_cleared incremented to\nnotify us of that defect: yes, I accept that might happen at interrupt\ntime, and so we ought not to take the __shortcut in __munlock_folio()\nwhich you fix  below.\n\n> \n> So __zone_stat_mod_folio() here needs interrupts disabled, not merely\n> preemption, and __munlock_folio() has a path where they are not: when the\n> folio has already been taken off the LRU by somebody else the function\n> jumps straight to the counter update without taking the lruvec lock.  The\n> read-modify-write of the per-CPU NR_MLOCK diff can then be interrupted by\n> the softirq above, and one of the two decrements is lost, leaving Mlocked\n> in /proc/meminfo permanently overstated.\n> \n> Use zone_stat_mod_folio().  mod_zone_state()'s this_cpu_try_cmpxchg() is\n> atomic against a same-CPU interrupt and retries, and on the path where the\n> lruvec lock is held its cost is negligible next to the lock itself.\n> \n> The UNEVICTABLE_PG* events are deliberately left on the __ accessors:\n> they occupy different vm_event_states slots from the UNEVICTABLE_PGCLEARED\n> that __free_pages_prepare() bumps, and nothing updates those two from\n> interrupt context.\n> \n> Fixes: 2fbb0c10d1e8 (\"mm/munlock: mlock_page() munlock_page() batch by pagevec\")\n> Cc: <stable@vger.kernel.org>\n\nOkay: just a wrong stat, but it ought to go back to 0, so Cc stable yes.\n\n> Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nAcked-by: Hugh Dickins <hughd@google.com>\n\nBut I do think you (or Andrew :-) should include\n\nReported-by: syzbot+cd2073ee6d958a8d0fcd@syzkaller.appspotmail.com\nCloses: https://lore.kernel.org/linux-mm/6a931c5a.08e933ee.dbf97.0093.GAE@google.com/\n\nThat was indeed reporting a different way to get a WARNING from this,\nwhen offlining a CPU: but it should be acknowledged for bringing you\nhere, and we should tell syzbot it's fixed by this.\n\nI've been trying to work out whether you're going to come back in a\nday or two, changing the __count_vm_events() too: and had raised in\nthat thread the question of why lru_add_drain()'s __count_vm_events\nwere not also reported by syzbot; but now I can see\n * vm counters are allowed to be racy. Use raw_cpu_ops to avoid the\n * local_irq_disable overhead.\nand realize that they're not a problem; so this looks complete, we\nshouldn't need local_lock()ing in mlock_drain_remote() after all.\n\nThanks,\nHugh\n\n> ---\n>  mm/mlock.c | 2 +-\n>  1 file changed, 1 insertion(+), 1 deletion(-)\n> \n> diff --git a/mm/mlock.c b/mm/mlock.c\n> index efa6716e4dfb..39215a3eab1f 100644\n> --- a/mm/mlock.c\n> +++ b/mm/mlock.c\n> @@ -141,7 +141,7 @@ static struct lruvec *__munlock_folio(struct folio *folio, struct lruvec *lruvec\n>  \n>  munlock:\n>  \tif (folio_test_clear_mlocked(folio)) {\n> -\t\t__zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n> +\t\tzone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n>  \t\tif (isolated || !folio_test_unevictable(folio))\n>  \t\t\t__count_vm_events(UNEVICTABLE_PGMUNLOCKED, nr_pages);\n>  \t\telse\n> -- \n> 2.53.0-Meta\n\n",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-09-01",
+          "message_id": "",
+          "email": "hughd@google.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch fixes a bug in the mlock code where NR_MLOCK is updated from interrupt context, leading to incorrect values being reported in /proc/meminfo. The fix uses zone_stat_mod_folio() instead of __zone_stat_mod_folio(), which provides atomic access to per-CPU counters and prevents lost decrements."
+    }
+  }
+}

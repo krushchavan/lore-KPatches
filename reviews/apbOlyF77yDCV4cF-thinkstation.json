@@ -1,0 +1,227 @@
+{
+  "thread_id": "apbOlyF77yDCV4cF@thinkstation",
+  "subject": "[PATCH 01/12] mm/huge_memory: zap deposited page tables after an RCU grace period",
+  "url": "https://lore.kernel.org/all/apbOlyF77yDCV4cF@thinkstation/",
+  "dates": {
+    "2026-09-01": {
+      "report_file": "2026-09-01_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledged the potential performance issue with call_rcu() on each PMD, especially in the zap_huge_pmd() path, and suggested leveraging mmu_gather if available to reduce the number of RCU calls.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged a potential issue",
+            "suggested an alternative solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Hm. So it is call_rcu() on each PMD. It might be costly, especially for\nzap_huge_pmd() path: 512 call_rcu() per-GB of unmapped THPs.\n\nDo we want leverage mmu_gather if caller has it?",
+          "reply_to": "",
+          "message_date": "2026-09-01",
+          "message_id": "apbOlyF77yDCV4cF@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "Reviewer questioned the cost of calling call_rcu() 512 times per GB of unmapped THPs, suggesting it would not be costly and may even increase softirq time, but requested hard data to support this claim.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested evidence",
+            "skeptical tone"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I mean, I'm not sure in which respect that'd be costly, 512 is not a big number\nto a computer, and repeated call_rcu() invocations should just queue more\noperations no?\n\nIt won't be costly at the time of the calls obviously as its deferred. Maybe\nincrease some time spent in softirq but again is 512x that big of a deal?\n\nI'm not sure how you'd both defer the free and somehow utilise mmu_gather here\neither really, certainly not without it becoming extremely messy.\n\nBut yeah I'd want to see hard data on that before I really believe that's a\nproblem :)",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-09-01",
+          "message_id": "apbcoMTVlL42G5tg@gremlin",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jason Gunthorpe",
+          "summary": "Reviewer Jason Gunthorpe noted that the current implementation of call_rcu() on each PMD can be costly, especially for large THPs, and suggested leveraging mmu_gather to thread pages to be freed onto a linked list in struct page memory. This approach would allow for a single call_rcu using the rcu head of the struct page of the head of the list, which clears the entire linked list of pages.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested optimization"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The less costly version is to thread the page to be freed onto the\nmmu_gather through a linked list in the struct page memory. This is\nsuper cheap since it is just a singly linked list operation.\n\nThen when the mmu_gather is flushed it does a single call_rcu using\nthe rcu head of the struct page of the head of the list. The callback\nclears the entire linked list of pages.\n\nSince you have to tlb flush anyhow, it makes sense to always use the\nmmu_gather. For example the design I ended up with for iommupt\naccumulates all the invalidations and all the free-able memory into a\ngather then invalidates and frees.\n\nThis allows maximizing the tlbi efficiency too. You can't do call_srcu\nuntil you flush the tlb and if you call once per table then you are\nalso tlb flushing once per table too.\n\nSo if the kernel really does want to clear out 512 leaf tables the\noptimal implementation is one range tlbi for 512 entries followed by\none call_rcu to free the memory. Hence the gather..\n\nJason\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-09-01",
+          "message_id": "20260901142408.GA56830@ziepe.ca",
+          "email": "jgg@ziepe.ca",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "Reviewer Lorenzo (ARM) pointed out that the patch is batching up page table frees individually using call_rcu(), which he believes will not cause observable problems, and suggested that adding additional complexity to address potential issues is unnecessary without clear demonstration of their impact.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "reviewer expressed skepticism about the necessity of addressing a potential issue",
+            "reviewer questioned the likelihood of observable problems"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I think there's some confusion here.\n\nThis isn't the path in which a page table is being freed, the _deposited_\ntable is zapped, in zap_deposited_table().\n\nThat is, the page table kept in reserve for THP split, that is not\ncurrently mapped.\n\nIt amounts to a __free_pages() call.\n\nThe TLB operations are in e.g. zap_huge_pmd() etc. and nobody has\ncomplained about inefficiencies there.\n\nSo, unless I'm missing something here, TLB flushes play no role in this\nwhatsoever.\n\nThe issue Kiryl raised was that instead of immediately freeing page tables,\nthey are now batched up individually by call_rcu().\n\nI personally find it difficult to imagine the numbers here would be\nproblematic or certainly cause anything observable beyond what is\nobservable now.\n\nSo I'm going to have to say, unless it can be clearly demonstrated this is\nproblematic, I don't think there's any reason to add additional complexity\nhere.",
+          "reply_to": "Jason Gunthorpe",
+          "message_date": "2026-09-01",
+          "message_id": "apbiB51hjm-9pRzf@gremlin",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author is addressing concerns about hitting DEFAULT_MAX_RCU_BLIMIT and triggering rcu_force_quiescent_state() during munmap(), which can be disruptive to the system. The author agrees that measuring munmap() overhead would be nice, but does not provide a plan for addressing the issue or restructuring the patch.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges problem",
+            "no fix planned"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "It would be nice to measure munmap() overhead here.\n\nI am worried about hitting DEFAULT_MAX_RCU_BLIMIT and trigger\nrcu_force_quiescent_state() which can be disruptive to the system.\n\nDEFAULT_MAX_RCU_BLIMIT is 10K, so it is ~20G of THP unmapped on x86.\n\nmunmap() of 64G worth of THP should be enough to demonstrate the\nproblem.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "",
+          "message_date": "2026-09-01",
+          "message_id": "apbuO_QveZNAz3ns@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "Reviewer Lorenzo (ARM) questioned the significance of RCU saturation as a problem, pointing out that it already occurs on most architectures and has not been reported as an issue. He suggested demonstrating why this situation is different from existing cases and noted that freeing large amounts of memory at once will be slow regardless of the approach used.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "questioning significance",
+            "requested demonstration"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I mean you're going to hit that from RCU freeing page tables already, which\nmost architectures already do right?\n\nSo if RCU saturation is a problem, that problem already exists, but I've\nnot heard of that being a problem at all?\n\nSo you're going to have to demonstrate why this situation is markedly\ndifferent from that. And it's the same scale.\n\nOverall I think freeing 64 GiB of mapped memory all at once will inevitably\nbe a slow operation, freeing them directly will also be a lengthily process.\n\nAnd also it seems to me that RCU mishandling heavy load to the point of\ncausing system instability should a bug filed with RCU no?\n\nAlso note pte_free_defer() is already used in retract_page_tables() so a large\ncollapse could also hit this problem?\n\nI'm not sure I'm convinced there's an issue here.",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-09-01",
+          "message_id": "apbvoN6ttgHfI_xg@gremlin",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Liam Howlett",
+          "summary": "Reviewer suggested packing page table pointers into a contiguous data structure to avoid pointer chasing through a linked list, potentially improving performance and reducing overhead.\n\nReviewer Liam Howlett expressed skepticism about the need to measure munmap() overhead, suggesting it would not prove anything significant and that other system activities would dominate performance at high RCU linked list sizes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "skepticism",
+            "questioning"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "If you are going through the trouble of doing this on your side with a\ncustom rcu callback, it might be better to pack the pointers in a way\nthat does not need to pointer chase through a linked list.\n\n---\n\nI'm not sure what that would prove besides checking if your number is\ncorrect?  You'll see a slow down once you hit 10K of objects in the rcu\nlinked list.  And that will depend on what the system is doing as well,\nso there will be a slow down since other things are happening on the\nsystem before 20GB of THP is unleashed towards munmap().\n\nOne of these does use 5.12% of the RCU items that need to wait for a\ngrace period to be released, but testing it would be rather tricky and\nthe numbers won't really show much..?\n\nForm my understanding and experience with rcu and freeing massive\nnumbers of objects, you gain more from the lower lock contention than\nyou lose when you hit 10K objects.\n\nThe trade off is in the Android setup, where they have restricted RCU to\na slower core.  Combined with another RCU setting, it was causing slow\ndown when we overwhelmed the queue multiple times.\n\nSo this should actually be faster unless you are doing 20GB of THP\nunmapping on Android or a device configured the same way.  Considering\nthe cost of RAM, we should be okay for a few phone iterations.\n\nDo you have munmap() performance dependent workload that you are\nconcerned about regressing?\n\nThanks,\nLiam\n\n\n\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-09-01",
+          "message_id": "kasi4mkjkt56wxsrmphm5o2qfg2lwsdxf3tlmzx5tq6t7uez74@kozleoavd6r2",
+          "email": "liam@infradead.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jason Gunthorpe",
+          "summary": "Reviewer noted that struct page has only 8 bytes of memory, making it impossible to allocate in certain paths, and expressed uncertainty about alternative options.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "uncertainty",
+            "impossibility"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Well, I have 8 bytes of memory in a struct page and can't allocate in\nthese paths, so IDK there is another option..\n\nJason\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Liam Howlett",
+          "message_date": "2026-09-01",
+          "message_id": "20260901160616.GD56830@ziepe.ca",
+          "email": "jgg@ziepe.ca",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author addressed Lorenzo's concern about hitting DEFAULT_MAX_RCU_BLIMIT and triggering rcu_force_quiescent_state(), explaining that tlb_remove_table() batches into struct mmu_table_batch, which reduces the number of call_rcu() calls to MAX_TABLE_BATCH.\n\nAuthor addressed Lorenzo's concern about hitting DEFAULT_MAX_RCU_BLIMIT and triggering rcu_force_quiescent_state() during munmap(), stating that a quick test showed no measurable difference in wall time for 40G of THPs, but acknowledging an increase in softirqs as expected. The objection is retracted.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "acknowledged a concern",
+            "provided an explanation",
+            "objection_retracted",
+            "test_confirms_no_issue"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Not at the same rate -- tlb_remove_table() batches into struct\nmmu_table_batch. One call_rcu() per MAX_TABLE_BATCH.\n\n---\n\nI did quick test and I don't see a measurable difference in munmap()\nwall time of 40G of THPs. I see ~17x more softirqs, but this is\nexpected.\n\nThe objection is retracted.\n\nWe can return to this later if it is going to be visible anywhere.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-09-01",
+          "message_id": "apcFUthh0XSFg3JQ@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledged the reviewer's concern about hitting DEFAULT_MAX_RCU_BLIMIT and triggering rcu_force_quiescent_state(), but emphasized that the exit(2) path is performance critical for many workloads, implying no immediate fix planned.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged concern",
+            "emphasized performance criticality"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "exit(2) path is performance critical for many workloads. Like, if you\nneed to restart VM.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Liam Howlett",
+          "message_date": "2026-09-01",
+          "message_id": "apcHiE7jDQaFYXOM@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Liam Howlett",
+          "summary": "reviewer believes the patch does not demonstrate a measurable impact of hitting DEFAULT_MAX_RCU_BLIMIT, suggesting it would be difficult to create a scenario where this has a noticeable effect and even harder to make it slower",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested additional testing or demonstration of the issue"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "That is not enough to see any impact, although less overall work would\nbe done during the exit call.\n\nIt would be very difficult to come up with a scenario that this would\nhave a measurable difference and an even harder time to come up with one\nthat is slower.\n\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-09-01",
+          "message_id": "px4uwbuq4ixucmjzudxulldk5l2tbuymaoaheyc624jdznnac6@px5wkmxqjmfo",
+          "email": "liam@infradead.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch updates the contract for free_pgtables() and revises the documentation to reflect these changes, ensuring consistency and clarity in kernel behavior."
+    }
+  }
+}

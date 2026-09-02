@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] memcg: avoid charging the root memcg from obj_cgroup_charge_pages()</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260829023251.474083-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-29</strong><div class="date-range-nav">Active on: <a href="#2026-08-29">2026-08-29</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">The patch addresses a memory leak in the memcg (memory cgroup) charging mechanism by avoiding the root memcg from being charged when an object is reparented. This is achieved by using try_charge() instead of try_charge_memcg(), which short circuits the root memcg. The change restores symmetry with obj_cgroup_uncharge_pages().</div></div>
+    <div class="date-range">Submitted: <strong>2026-08-29</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-01</strong><div class="date-range-nav">Active on: <a href="#2026-09-01">2026-09-01</a> &bull; <a href="#2026-08-29">2026-08-29</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch fixes an issue where the root memory cgroup (memcg) is being charged incorrectly when a task migrates from a child cgroup to the root cgroup. The problem occurs because the obj_cgroup_charge_pages() function resolves the object cgroup (objcg) to its memcg and calls try_charge_memcg(), which does not short circuit the root memcg. This leads to an asymmetric charge, where the root&#x27;s page counter grows but is never uncharged. The patch uses try_charge() instead of try_charge_memcg(), which returns early for the root memcg and restores symmetry with obj_cgroup_uncharge_pages().</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-08-29">
 <div class="review-comment">
@@ -250,76 +250,31 @@
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a memory leak in the memcg charging mechanism when an object is reparented. Suggested using try_charge() to avoid charging the root memcg, which restores symmetry with obj_cgroup_uncharge_pages().</div>
+<div class="review-comment-text">Reviewer Muchun Song approved the patch, giving it a &#x27;Reviewed-by&#x27; tag.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">
-
-&gt; On Aug 29, 2026, at 10:32, Shakeel Butt &lt;shakeel.butt@linux.dev&gt; wrote:
-&gt; 
-&gt; obj_cgroup_charge_pages() resolves the objcg to its memcg and calls
-&gt; try_charge_memcg(), which does not short circuit the root memcg.  That
-&gt; memcg can be the root memcg: obj_cgroup_is_root() reflects the memcg the
-&gt; objcg was created for and is never updated, while memcg_reparent_objcgs()
-&gt; does redirect objcg-&gt;memcg to the parent on rmdir.  An objcg of a dying
-&gt; child of root therefore passes every obj_cgroup_is_root() filter but
-&gt; resolves to the root memcg.
-&gt; 
-&gt; Folios keep the objcg they were charged with, so this is easy to reach
-&gt; through zswap: allocate anon memory in a cgroup, move the task out,
-&gt; remove the cgroup, then write to the root cgroup&#x27;s memory.reclaim.  The
-&gt; reclaimed folios are charged through the reparented objcg and end up in
-&gt; refill_stock() with the root memcg:
-&gt; 
-&gt;  WARNING: mm/memcontrol.c:2198 at refill_stock+0x644/0x940
-&gt;   refill_stock+0x644/0x940
-&gt;   try_charge_memcg+0x12d6/0x1570
-&gt;   __obj_cgroup_charge+0x35/0xf0
-&gt;   obj_cgroup_charge+0x1de/0x210
-&gt;   obj_cgroup_charge_zswap+0x83/0x270
-&gt;   zswap_store+0x1620/0x2000
-&gt;   swap_writeout+0x94c/0x14c0
-&gt;   shrink_folio_list+0x3388/0x52b0
-&gt;   [...]
-&gt;   try_to_free_mem_cgroup_pages+0x30d/0x830
-&gt;   user_proactive_reclaim+0x504/0x840
-&gt;   memory_reclaim+0x1f/0x30
-&gt; 
-&gt; Beyond the warning, the charge is asymmetric: obj_cgroup_uncharge_pages()
-&gt; skips refill_stock() for the root memcg, so the root&#x27;s page counter grows
-&gt; and is never uncharged.  It is not user visible, since memory.current is
-&gt; not exposed on the root, but it is a leak.
-&gt; 
-&gt; Use try_charge(), which returns early for the root memcg, restoring the
-&gt; symmetry with obj_cgroup_uncharge_pages().
-&gt; 
-&gt; The above sequence was scripted into a standalone reproducer (zswap on,
-&gt; swap on a virtio disk, 512MB of anon memory faulted in inside a child of
-&gt; the root cgroup, the task then migrated to the root cgroup, the child
-&gt; removed, followed by &quot;echo 600M swappiness=max &gt; memory.reclaim&quot; on the
-&gt; root) and run in a CONFIG_DEBUG_VM=y VM.  It reproduces the splat on the
-&gt; first zswap store of a reparented folio, with the same call chain as the
-&gt; report.  With this patch applied the splat is gone while the zswap store
-&gt; count over the run is unchanged, so the same path is still exercised.
-&gt; cgroup selftests test_zswap, test_kmem and test_memcontrol show no new
-&gt; failures.
-&gt; 
-&gt; Fixes: 20d6c1725228 (&quot;memcg: avoid refill_stock for root memcg&quot;)
-&gt; Reported-by: Farhad Alemi &lt;farhad.alemi@berkeley.edu&gt;
-&gt; Closes: https://lore.kernel.org/all/CA+0ovCgWzUMK+nNbbtH7eV65Ca=fDN4Ozu7iASgryjvv8Tk8zQ@mail.gmail.com/
-&gt; Cc: stable@vger.kernel.org
-&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
-
-LGTM.
+<pre class="raw-body-text">LGTM.
 
 Reviewed-by: Muchun Song &lt;muchun.song@linux.dev&gt;
 
-Thanks.
-
-
-</pre>
+Thanks.</pre>
 </details>
-<div class="review-comment-signals">Signals: LGTM</div>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/17E1B73A-F6CD-422D-B7C9-95EB581F0ED3@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-09-01">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-09-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-01">2026-09-01</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Reviewed-by</div>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/20260901164741.GJ3004@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 </div>
 </div>
 </div>

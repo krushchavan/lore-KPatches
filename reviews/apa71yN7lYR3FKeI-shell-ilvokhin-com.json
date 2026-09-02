@@ -1,0 +1,45 @@
+{
+  "thread_id": "apa71yN7lYR3FKeI@shell.ilvokhin.com",
+  "subject": "[PATCH] rseq: defer time slice extension yield for sys_futex_wake",
+  "url": "https://lore.kernel.org/all/apa71yN7lYR3FKeI@shell.ilvokhin.com/",
+  "dates": {
+    "2026-09-01": {
+      "report_file": "2026-09-01_ollama_llama3.1-8b.html",
+      "developer": "Dmitry Ilvokhin",
+      "reviews": [
+        {
+          "author": "Dmitry Ilvokhin",
+          "summary": "Asked about publicly available implementation of a mutex combining rseq time-slice extensions and futexes, expressed interest in learning more about their interaction.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Alice Ryhl",
+          "summary": "Provided pseudocode for a mutex implementation combining rseq time-slice extensions and futexes, discussed potential issues with preemption while holding the lock.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Sep 01, 2026 at 11:49:43AM +0000, Dmitry Ilvokhin wrote:\n> On Mon, Aug 31, 2026 at 12:57:26PM +0000, Alice Ryhl wrote:\n> > When a task is granted an rseq scheduler time slice extension, it is\n> > expected to finish its critical section and relinquish the CPU via\n> > rseq_slice_yield(2). If the task issues any other system call while a\n> > grant is active, rseq_syscall_enter_work() forces an immediate\n> > reschedule on syscall entry via cond_resched(). This may cause\n> > significant latency penalty for userspace lock implementations that use\n> > rseq time slice extensions when unlocking the futex.\n> > \n> > In a userspace mutex unlock sequence:\n> > 1. The lock is released in userspace.\n> > 2. If there are waiters, the unlocking thread calls sys_futex_wake()\n> >    to wake a sleeping waiter.\n> \n> Just out of curiosity, is there any publicly available implementation of\n> a mutex that combines rseq time-slice extensions and futexes?\n> \n> I'm interested in learning more about how these two mechanisms interact\n> with each other.\n\nThis came up while I was looking into implementing one for use in Tokio.\nThere, we have quite a few cases where we have a doubly linked list\nprotected by a mutex, and I really really want to avoid preemption while\nthat lock is held. Some of those locks are known problems for contention\nin Tokio.\n\nBut that implementation is still WIP.\n\nSome pseudocode:\n\nstruct rseq_futex {\n    // 0 = unlocked, 1 = locked, 2 = contended\n    int futex;\n};\n\nvoid mutex_lock(struct rseq_futex *mutex) {\n    for (;;) {\n        __rseq_abi.slice_ctrl.request = 1;\n        int expected = 0;\n        // Change state from 0 -> 1 to lock.\n        if (compare_exchange(&mutex->futex, &expected, 1))\n            return;\n\n        // lock is taken, use slow-path\n        bool was_granted = __rseq_abi.slice_ctrl.granted;\n        __rseq_abi.slice_ctrl.request = 0;\n\n        // If the state is not already 2, then change it so that\n        // mutex_unlock() knows to wake us up.\n        if (expected == 2 || compare_exchange(&mutex->futex, &expected, 2)) {\n            // State is 2, we can sleep until that changes.\n            futex_wait(&mutex->futex, 2);\n        } else if (was_granted) {\n            rseq_slice_yield();\n        }\n    }\n}\n\nvoid mutex_unlock(struct rseq_futex *mutex) {\n    // Unlock the mutex and return whether it was contended.\n    int prev = atomic_swap(&mutex->futex, 0);\n\n    // End the time slice extension for the critical region\n    bool was_granted = __rseq_abi.slice_ctrl.granted;\n    __rseq_abi.slice_ctrl.request = 0;\n\n    if (prev == 2) {\n        futex_wake(&mutex->futex);\n    } else if (was_granted) {\n        rseq_slice_yield();\n    }\n}\n\nThough now that I think more about it, perhaps unlock should look like\nthis, to avoid a preemption point just immediately before futex_wake().\n\nvoid mutex_unlock(struct rseq_futex *mutex) {\n    // Unlock the mutex and return whether it was contended.\n    int prev = atomic_exchange(&mutex->futex, 0);\n\n    // Wake up contended waiters\n    if (prev == 2)\n        futex_wake(&mutex->futex);\n\n    // End the time slice extension for the critical region\n    bool was_granted = __rseq_abi.slice_ctrl.granted;\n    __rseq_abi.slice_ctrl.request = 0;\n\n    if (was_granted)\n        rseq_slice_yield();\n}\n\n",
+          "reply_to": "",
+          "message_date": "2026-09-01",
+          "message_id": "",
+          "email": "aliceryhl@google.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Patch proposes deferring time slice extension yield for sys_futex_wake in rseq implementation."
+    }
+  }
+}
