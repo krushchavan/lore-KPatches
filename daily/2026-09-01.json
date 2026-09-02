@@ -2,7 +2,7 @@
   "date": "2026-09-01",
   "report_file": "2026-09-01_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-09-02 06:53 UTC",
+  "last_updated": "2026-09-02 07:06 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -2243,6 +2243,489 @@
       "primary_email": "riel@surriel.com",
       "patches_submitted": [],
       "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Shakeel Butt",
+      "primary_email": "shakeel.butt@linux.dev",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] mm/mlock: use the IRQ-safe accessor for NR_MLOCK in __munlock_folio()",
+          "message_id": "20260901180109.3797944-1-shakeel.butt@linux.dev",
+          "url": "https://lore.kernel.org/all/20260901180109.3797944-1-shakeel.butt@linux.dev/",
+          "date": "2026-09-01T18:01:22Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260901180109.3797944-1-shakeel.butt@linux.dev",
+              "url": "https://lore.kernel.org/all/20260901180109.3797944-1-shakeel.butt@linux.dev/",
+              "subject": "[PATCH] mm/mlock: use the IRQ-safe accessor for NR_MLOCK in __munlock_folio()",
+              "date": "2026-09-01T18:01:22Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch fixes a bug in the mlock code where NR_MLOCK is updated from interrupt context, leading to incorrect values being reported in /proc/meminfo. The fix uses zone_stat_mod_folio() instead of __zone_stat_mod_folio(), which provides atomic access to per-CPU counters and prevents lost decrements.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Hugh Dickins",
+              "summary": "Acknowledged the bug and its fix, suggested adding Reported-by and Closes tags to credit syzbot for reporting a related issue.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [
+                "ACKNOWLEDGED"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Acked-by",
+                "Reported-by",
+                "Closes"
+              ],
+              "raw_body": "On Tue, 1 Sep 2026, Shakeel Butt wrote:\n\n> NR_MLOCK is updated from interrupt context.  __free_pages_prepare() clears\n> a stray PG_mlocked and adjusts NR_MLOCK, and a folio can reach it with the\n> flag still set from a bio completion handler:\n> \n>   __free_pages_ok+0x6af/0x7a0\n>   <IRQ>\n>   __bio_release_pages+0xde/0x260\n>   __iomap_dio_bio_end_io+0x16e/0x1a0\n>   blk_update_request+0x14b/0x3d0\n>   blk_mq_end_request+0x18/0x30\n>   blk_done_softirq+0x49/0x60\n> \n> The folio gets there like this.  A MAP_SHARED file mapping is mlocked, so\n> its page cache folios carry PG_mlocked, and an O_DIRECT write sourced from\n> that mapping GUP-pins those same folios.  munlock() then runs\n> mlock_vma_pages_range(), which clears VM_LOCKED before walking the page\n> tables to munlock each folio.  A concurrent hole punch reaches the folio\n> through the rmap (i_mmap_rwsem, not mmap_lock) and can land inside that\n> window: __folio_remove_rmap() -> munlock_vma_folio() sees VM_LOCKED\n> already clear, so it neither queues the folio on the mlock batch nor takes\n> a reference, and the pte it clears makes the pending mlock_pte_range()\n> walk skip the folio at its !pte_present() check.  filemap_remove_folio()\n> then drops the page cache reference, leaving the bio's pin as the last\n> one, released from the completion handler above.\n\nI'm hardly ashamed to admit that I've not tried to digest\nthat paragraph. You're writing about the rare fallback cases when\nPG_mlocked is cleared late, and unevictable_pgs_cleared incremented to\nnotify us of that defect: yes, I accept that might happen at interrupt\ntime, and so we ought not to take the __shortcut in __munlock_folio()\nwhich you fix  below.\n\n> \n> So __zone_stat_mod_folio() here needs interrupts disabled, not merely\n> preemption, and __munlock_folio() has a path where they are not: when the\n> folio has already been taken off the LRU by somebody else the function\n> jumps straight to the counter update without taking the lruvec lock.  The\n> read-modify-write of the per-CPU NR_MLOCK diff can then be interrupted by\n> the softirq above, and one of the two decrements is lost, leaving Mlocked\n> in /proc/meminfo permanently overstated.\n> \n> Use zone_stat_mod_folio().  mod_zone_state()'s this_cpu_try_cmpxchg() is\n> atomic against a same-CPU interrupt and retries, and on the path where the\n> lruvec lock is held its cost is negligible next to the lock itself.\n> \n> The UNEVICTABLE_PG* events are deliberately left on the __ accessors:\n> they occupy different vm_event_states slots from the UNEVICTABLE_PGCLEARED\n> that __free_pages_prepare() bumps, and nothing updates those two from\n> interrupt context.\n> \n> Fixes: 2fbb0c10d1e8 (\"mm/munlock: mlock_page() munlock_page() batch by pagevec\")\n> Cc: <stable@vger.kernel.org>\n\nOkay: just a wrong stat, but it ought to go back to 0, so Cc stable yes.\n\n> Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nAcked-by: Hugh Dickins <hughd@google.com>\n\nBut I do think you (or Andrew :-) should include\n\nReported-by: syzbot+cd2073ee6d958a8d0fcd@syzkaller.appspotmail.com\nCloses: https://lore.kernel.org/linux-mm/6a931c5a.08e933ee.dbf97.0093.GAE@google.com/\n\nThat was indeed reporting a different way to get a WARNING from this,\nwhen offlining a CPU: but it should be acknowledged for bringing you\nhere, and we should tell syzbot it's fixed by this.\n\nI've been trying to work out whether you're going to come back in a\nday or two, changing the __count_vm_events() too: and had raised in\nthat thread the question of why lru_add_drain()'s __count_vm_events\nwere not also reported by syzbot; but now I can see\n * vm counters are allowed to be racy. Use raw_cpu_ops to avoid the\n * local_irq_disable overhead.\nand realize that they're not a problem; so this looks complete, we\nshouldn't need local_lock()ing in mlock_drain_remote() after all.\n\nThanks,\nHugh\n\n> ---\n>  mm/mlock.c | 2 +-\n>  1 file changed, 1 insertion(+), 1 deletion(-)\n> \n> diff --git a/mm/mlock.c b/mm/mlock.c\n> index efa6716e4dfb..39215a3eab1f 100644\n> --- a/mm/mlock.c\n> +++ b/mm/mlock.c\n> @@ -141,7 +141,7 @@ static struct lruvec *__munlock_folio(struct folio *folio, struct lruvec *lruvec\n>  \n>  munlock:\n>  \tif (folio_test_clear_mlocked(folio)) {\n> -\t\t__zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n> +\t\tzone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);\n>  \t\tif (isolated || !folio_test_unevictable(folio))\n>  \t\t\t__count_vm_events(UNEVICTABLE_PGMUNLOCKED, nr_pages);\n>  \t\telse\n> -- \n> 2.53.0-Meta\n\n",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-09-01",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "hughd@google.com"
+            }
+          ],
+          "list_id": "stable@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] memcg: avoid charging the root memcg from obj_cgroup_charge_pages()",
+          "message_id": "20260829023251.474083-1-shakeel.butt@linux.dev",
+          "url": "https://lore.kernel.org/all/20260829023251.474083-1-shakeel.butt@linux.dev/",
+          "date": "2026-08-29T02:32:55Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-08-29",
+          "patch_version": 1,
+          "series_patch_count": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260829023251.474083-1-shakeel.butt@linux.dev",
+              "url": "https://lore.kernel.org/all/20260829023251.474083-1-shakeel.butt@linux.dev/",
+              "subject": "[PATCH] memcg: avoid charging the root memcg from obj_cgroup_charge_pages()",
+              "date": "2026-08-29T02:32:55Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch fixes an issue where the root memory cgroup (memcg) is being charged incorrectly when a task migrates from a child cgroup to the root cgroup. The problem occurs because the obj_cgroup_charge_pages() function resolves the object cgroup (objcg) to its memcg and calls try_charge_memcg(), which does not short circuit the root memcg. This leads to an asymmetric charge, where the root's page counter grows but is never uncharged. The patch uses try_charge() instead of try_charge_memcg(), which returns early for the root memcg and restores symmetry with obj_cgroup_uncharge_pages().",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Muchun Song",
+              "summary": "Reviewer Muchun Song approved the patch, giving it a 'Reviewed-by' tag.",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "LGTM.\n\nReviewed-by: Muchun Song <muchun.song@linux.dev>\n\nThanks.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-08-29",
+              "message_id": "17E1B73A-F6CD-422D-B7C9-95EB581F0ED3@linux.dev",
+              "analysis_source": "llm",
+              "email": "muchun.song@linux.dev"
+            },
+            {
+              "author": "Johannes Weiner",
+              "summary": "Gave Reviewed-by",
+              "sentiment": "POSITIVE",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-09-01",
+              "message_id": "20260901164741.GJ3004@cmpxchg.org",
+              "analysis_source": "heuristic",
+              "email": "hannes@cmpxchg.org"
+            }
+          ],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] selftests: cover kernfs dentry revalidation",
+          "message_id": "20260829022825.407836-1-shakeel.butt@linux.dev",
+          "url": "https://lore.kernel.org/all/20260829022825.407836-1-shakeel.butt@linux.dev/",
+          "date": "2026-08-29T02:28:39Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-08-29",
+          "patch_version": 1,
+          "series_patch_count": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260829022825.407836-1-shakeel.butt@linux.dev",
+              "url": "https://lore.kernel.org/all/20260829022825.407836-1-shakeel.butt@linux.dev/",
+              "subject": "[PATCH] selftests: cover kernfs dentry revalidation",
+              "date": "2026-08-29T02:28:39Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "The patch adds selftests to cover kernfs dentry revalidation, which is a critical correctness backstop for kernfs nodes that appear and disappear from kernel contexts without VFS operations. The tests exercise various scenarios such as cgroup subtree control, network interface renaming, sysfs namespace tagging, and concurrent mkdir/rmdir. Additionally, the patch includes tests to ensure that walking cached dentries does not invalidate them.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "Shakeel Butt",
+              "summary": "Acknowledged that there are some issues to be addressed, but did not provide any specific technical concerns or suggestions.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Fri, Aug 28, 2026 at 07:28:25PM -0700, Shakeel Butt wrote:\n> kernfs_test only exercised two xattr calls, so nothing covered the part\n> of kernfs most exposed to userspace: the dentry cache.\n> \n> kernfs nodes appear and disappear from kernel contexts with no VFS\n> operation driving them, and removal cannot reliably unhash the cached\n> dentries, so ->d_revalidate() is the correctness backstop. It had no\n> test at all.\n> \n> Add tests that drive kernfs from kernel context rather than through VFS\n> create/unlink:\n> \n>  - writing cgroup.subtree_control makes the kernel add and remove files\n>    in every child cgroup, exercising both the negative-dentry revision\n>    check and the deactivation check,\n>  - renaming a network interface renames the sysfs node underneath an\n>    already cached dentry,\n>  - sysfs in a fresh network namespace must show only that namespace's\n>    interfaces, covering the KERNFS_NS tagging paths,\n>  - lookup hammered against concurrent mkdir/rmdir must only ever see\n>    success or an errno meaning \"it went away\",\n>  - removal-while-open, readdir duplicate detection and a\n>    seekdir()/telldir() round trip over kernfs_dir_pos()'s hash cookie.\n> \n> Also the other direction: walking already cached dentries must not\n> invalidate them. That is not merely a lost optimisation --\n> d_invalidate() calls detach_mounts(), so a revalidation that wrongly\n> fails silently tears down any mount underneath the directory.\n> \n> Both filesystems are needed: cgroup2 has no ->rename and is not\n> namespace tagged, and sysfs cannot be mounted with a controllable set of\n> children. The config fragment keeps a kernel built via kselftest-merge\n> from reporting a pass while running almost nothing.\n> \n> Verified the suite reacts to a broken backstop rather than passing:\n> stubbing kernfs_dir_changed() to return false turns 8 of the 11 tests\n> red.\n> \n> Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nSashiko raised couple of issues, so I will address those and send v2.\n\n",
+              "reply_to": "",
+              "message_date": "2026-09-01",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "shakeel.butt@linux.dev"
+            }
+          ],
+          "list_id": "driver-core@lists.linux.dev"
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v4 1/6] mm/memcontrol: make lru_zone_size atomic and simplify sanity check",
+          "message_id": "apcalL6-QoWVVdhv@linux.dev",
+          "url": "https://lore.kernel.org/all/apcalL6-QoWVVdhv@linux.dev/",
+          "date": "2026-09-01T18:35:03Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v4 1/6] mm/memcontrol: make lru_zone_size atomic and simplify sanity check",
+          "message_id": "apcJgcFLHKZfI40m@linux.dev",
+          "url": "https://lore.kernel.org/all/apcJgcFLHKZfI40m@linux.dev/",
+          "date": "2026-09-01T17:37:18Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch makes the lru_zone_size variable atomic and simplifies a sanity check in the memory control code. The change is motivated by the desire for cleaner code, as the current implementation can be costly and may not always catch actual leaks. The patch also clarifies the behavior difference between the new read-side approach and the previous update-side warning system.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Kairui Song",
+              "summary": "Reviewer Kairui Song questioned the necessity of making lru_zone_size atomic, citing performance concerns and suggesting that 'long' should be used instead to avoid overhead in a busy/hot path.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "performance concern",
+                "suggested alternative"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "These were all part of the MGLRU-FG prerequisite, so I sent them\ntogether. I can split it out.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-09-02",
+              "message_id": "CAMgjq7C=k_nzwiM_MTcjVjWMTGf=s8oRaUBY00dCvLbP4EiHnQ@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "ryncsn@gmail.com"
+            },
+            {
+              "author": "Shakeel Butt (author)",
+              "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledged a fix is needed",
+                "agreed to restructure"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Wed, Sep 02, 2026 at 02:11:24AM +0800, Kairui Song wrote:\n[...]",
+              "reply_to": "Kairui Song",
+              "message_date": "2026-09-01",
+              "message_id": "apcalL6-QoWVVdhv@linux.dev",
+              "analysis_source": "llm",
+              "email": "shakeel.butt@linux.dev"
+            }
+          ],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH] selftests: cover kernfs dentry revalidation",
+          "message_id": "apbgQnHeMKDyVHPg@linux.dev",
+          "url": "https://lore.kernel.org/all/apbgQnHeMKDyVHPg@linux.dev/",
+          "date": "2026-09-01T14:26:23Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm-chunked-no-replies",
+          "review_comments": [],
+          "list_id": "driver-core@lists.linux.dev"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v4 1/6] mm/memcontrol: make lru_zone_size atomic and simplify sanity check",
+          "message_id": "apZVe8UHZ1CNo4r1@linux.dev",
+          "url": "https://lore.kernel.org/all/apZVe8UHZ1CNo4r1@linux.dev/",
+          "date": "2026-09-01T04:38:13Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch makes the lru_zone_size variable atomic and simplifies a sanity check in the memory control code. The change is motivated by the desire for cleaner code, as the current implementation can be costly and may not always catch actual leaks. The patch also clarifies the behavior difference between the new read-side approach and the previous update-side warning system.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Kairui Song",
+              "summary": "reviewer questioned the use of atomic long instead of plain long, explaining that it was a defensive design against leaks or races and that atomic long is more immune to race conditions\n\nReviewer Kairui Song questioned the use of atomic long instead of just long for lru_zone_size, citing that checking in the reader side is lighter and cleaner code-wise, tolerates deferred accounting false positives, and does not affect anything besides two readers. They also expressed skepticism about warning on the writer side helping catch real leaks.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "questioning technical choice",
+                "request for justification",
+                "requested changes",
+                "suggested alternative approach"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Long is fine too; I was just trying to be defensive. The original\ncheck was a defensive design for leaks or races, and atomic long is\nmore immune to race conditions. See below for the other conditions.\n\n---\n\nI think I described that in the commit message. Commit ca707239e8a7\nintroduced the original emptiness check. The goal was to fix an\nover-busy reclaim scenario: upon underflow, an unsigned long returns\nan extremely large value. The reclaimer calculates the page number to\nscan based on that value, and thus enters a busy loop trying to\nreclaim much more than the actual usage. It's really a defensive\ndesign or workaround.\n\nAnd later commit b4536f0c829c just removed that emptiness check,\nleaving only the underflow check. So at this point we are just\ndefending against underflow. Currently, I don't believe there are any\nknown leaks or underflow issues in mainline, still purely a defensive\ndesign.\n\nReading these counters (mem_cgroup_get_zone_lru_size()) is much rare\nthan updating them: the only readers are reclaimer - per loop, each\nloop will scan a large chunk of folios. Or during reparenting - per\nchild.\n\nWriters, however, operate on every LRU folio.\n\nSo checking it in the reader side is much lighter and cleaner code-wise.\n\nChecking in the reader side also tolerates deferred accounting false\npositives: if a folio is added to / removed from LRU but have the\naccounting happens later, that's fine, but might cause a temporary\nunderflow (there shouldn't be such usage right now, but cleanly the\noldest commit I mentioned is trying to catch something). It should\njust proceed without performing extra operations on the counter or\nraising a warning on the updater side.\n\nThe underflow won't affect anything besides the two readers mentioned\nabove (reclaimer and reparenting).\n\nBesides, I don't think warning on the writer side will help catch the\nreal leak either, it just adds overhead to a busy path. The folio\ntriggering the underflow is very unlikely to be the one leaking the\ncount. And if that leak is actually caused by a race, the atomic long\nchange should cure it.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-09-01",
+              "message_id": "CAMgjq7D6V4eTZJ1Q1Xf2J6yTCq=JjvzT-W-HHX6EnMfzm3BK1g@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "ryncsn@gmail.com"
+            },
+            {
+              "author": "Shakeel Butt (author)",
+              "summary": "Author agreed to simplify the patch by reverting to a non-atomic 'long' type for lru_zone_size in the hot update path due to performance concerns.\n\nAuthor acknowledged that the current update-side sanity check has limitations and can't always catch actual leaks, agreed to move the warning to the read side for cleaner code and better location of warnings.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "agreed",
+                "performance",
+                "acknowledged a limitation",
+                "agreed to make changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "Unless we really need it, let's stay with \"long\" for now. As you mentioned below\nthis is busy/hot path, no need to add overhead of atomic here.\n\n---\n\nI think you are going and looking too much into the history of this warning. I\nthink you just need to explain that the current warning in the update side\nalready can't always catch the actual leak and is costly. Moving to read side\nmake the code cleaner and warnings will be at the location where the consumers\nwe care about are going to consume it. Also add couple of sentences on behavior\ndifference it will have i.e. warning on flipping into negative vs we will\ncontinue to operate even in negative but only warn on negative consumption.\n\nAnother question: why is this patch part of this series? Just some orthogonal\ncleanups or are they related?",
+              "reply_to": "Kairui Song",
+              "message_date": "2026-09-01",
+              "message_id": "apcJgcFLHKZfI40m@linux.dev",
+              "analysis_source": "llm",
+              "email": "shakeel.butt@linux.dev"
+            },
+            {
+              "author": "Kairui Song",
+              "summary": "Reviewer Kairui Song questioned the necessity of making lru_zone_size atomic, citing performance concerns and suggesting that 'long' should be used instead to avoid overhead in a busy/hot path.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "performance concern",
+                "suggested alternative"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "These were all part of the MGLRU-FG prerequisite, so I sent them\ntogether. I can split it out.",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-09-02",
+              "message_id": "CAMgjq7C=k_nzwiM_MTcjVjWMTGf=s8oRaUBY00dCvLbP4EiHnQ@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "ryncsn@gmail.com"
+            },
+            {
+              "author": "Shakeel Butt (author)",
+              "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "acknowledged a fix is needed",
+                "agreed to restructure"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Wed, Sep 02, 2026 at 02:11:24AM +0800, Kairui Song wrote:\n[...]",
+              "reply_to": "Kairui Song",
+              "message_date": "2026-09-01",
+              "message_id": "apcalL6-QoWVVdhv@linux.dev",
+              "analysis_source": "llm",
+              "email": "shakeel.butt@linux.dev"
+            }
+          ],
+          "list_id": "cgroups@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH] memcg: Don't call schedule_work when no spinning is allowed",
+          "message_id": "apYXCL_GJs9Ovu0v@linux.dev",
+          "url": "https://lore.kernel.org/all/apYXCL_GJs9Ovu0v@linux.dev/",
+          "date": "2026-09-01T00:10:41Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "This patch modifies the memcg (memory cgroup) code to prevent unnecessary work scheduling when spinning is not allowed, simplifying the done_restock code path by returning early instead of adding complexity.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "David Stevens",
+              "summary": "Reviewer David Stevens noted that he found the issue via code inspection and was unable to trigger it in real-world scenarios, except by writing a hacky driver using alloc_pages_nolock(). He suggested instead of adding complexity, simply returning if spinning is not allowed on the done_restock path.\n\nReviewer David Stevens noted that returning from the done_restock path without triggering memcg reclaim could lead to missing MEMCG_HIGH events, which he considers a more serious issue than dropping userspace notifications.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes",
+                "suggested simplification",
+                "alternative patch"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I just found this via code inspection. I spent a little bit trying to\ntrigger it for real, but the only way I managed was by writing a hacky\ndriver absuing alloc_pages_nolock().\n\n---\n\nThere would be no guarantee that memcg reclaim would ever be\ntriggered, which also would also stop MEMCG_HIGH events from being\ngenerated. Overall that seems a more serious than just dropping\nuserspace notifications like is done for MEMCG_MAX.\n\nThat said, it is very much an edge case. I can send a patch with the\nsimpler fix if dropping the events is preferred.\n\n-David",
+              "reply_to": "Shakeel Butt",
+              "message_date": "2026-08-31",
+              "message_id": "CAOiLmNEV8b3TW_Q7+h5mYrZ1Nw73XcPFPUsapeYObLYajq_PJw@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "stevensd@google.com"
+            },
+            {
+              "author": "Michal Hocko",
+              "summary": "Reviewer Michal Hocko suggested simplifying the code by returning immediately on the done_restock path instead of adding complexity, implying that the current approach is too complicated and may not be necessary.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "simplification",
+                "complexity"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Yes, let's go simpler before making this more complex without any actual\nuser.\n\n-- \nMichal Hocko\nSUSE Labs",
+              "reply_to": "David Stevens",
+              "message_date": "2026-09-01",
+              "message_id": "apaKRS7TYhlGRRW3@tiehlicka",
+              "analysis_source": "llm",
+              "email": "mhocko@suse.com"
+            },
+            {
+              "author": "Johannes Weiner",
+              "summary": "reviewer prefers a simple return statement over more complex code, citing concerns about indefinite errors and potential future issues",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "NEEDS_SIMPLIFICATION",
+                "CONCERNED_ABOUT_ERROR_HANDLING"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I'm leaning that way too. It's an indefinite error, and it's a freely\nprogrammable surface.\n\nIMO, a few lines of relatively straight-forward, self-explanatory code\nis better than code that needs a comment and leaves a problem that\nsomebody in the future might run into.",
+              "reply_to": "David Stevens",
+              "message_date": "2026-09-01",
+              "message_id": "20260901142552.GG3004@cmpxchg.org",
+              "analysis_source": "llm",
+              "email": "hannes@cmpxchg.org"
+            },
+            {
+              "author": "Michal Hocko",
+              "summary": "Reviewer Michal Hocko expressed skepticism about the need for NMI-safe charges, pointing out that they are rare and temporary discrepancies due to userspace running.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "skepticism",
+                "questioning"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I am really curious about the indefinite error side of things. It has\nbeen my understanding that these NMI safe charges are a) rare and b)\nthere is userspace running so eventually any discrepancies would\nresolve so the excess is temporary.\n\n-- \nMichal Hocko\nSUSE Labs",
+              "reply_to": "Johannes Weiner",
+              "message_date": "2026-09-01",
+              "message_id": "apbyZgB_Zu-DK8pN@tiehlicka",
+              "analysis_source": "llm",
+              "email": "mhocko@suse.com"
+            },
+            {
+              "author": "David Stevens",
+              "summary": "Reviewer David Stevens pointed out that the patch's assumption about the done_restock code path being the only way to hit the issue is incorrect, and provided an alternative scenario where bpf_arena_alloc_pages() can also trigger this condition.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "additional test case found"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "I spent a bit longer looking, and this can be hit via bpf_arena_alloc_pages().\n\n-David",
+              "reply_to": "Michal Hocko",
+              "message_date": "2026-09-01",
+              "message_id": "CAOiLmNF6Qfc1M83fYFH030J7UKR=t8zKoW2pGbzeFakBnH9Ycg@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "stevensd@google.com"
+            },
+            {
+              "author": "Johannes Weiner",
+              "summary": "Reviewer Johannes Weiner expressed concern that the patch's approach to handling the !allow_spinning case is overly reliant on the 'luck of the common case', and suggested adding working code instead of a lengthy comment.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes",
+                "suggested alternative solution"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "So I think the question is what limits the error in both space and\ntime. When you say it's rare and userspace fixes it, it basically\nmeans the answer is: luck of the common case.\n\nBut that doesn't help the worst case that can be triggered.\n\nLike I said, if we need to have code to handle that !allow_spinning\ncase anyway, I'd rather just have a few lines of working code than a\n(lengthy) comment explaining the luck of the common case.",
+              "reply_to": "Michal Hocko",
+              "message_date": "2026-09-01",
+              "message_id": "20260901205946.GL3004@cmpxchg.org",
+              "analysis_source": "llm",
+              "email": "hannes@cmpxchg.org"
+            }
+          ],
+          "list_id": "cgroups@vger.kernel.org"
+        }
+      ],
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
