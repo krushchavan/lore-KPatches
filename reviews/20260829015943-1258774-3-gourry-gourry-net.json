@@ -11,7 +11,7 @@
       "patch_summary": "This patch removes the unnecessary copying of a nodemask in interleave node selectors, reducing memory usage and improving performance. The copy was only used to ensure consistency between the node count and the walk, but this is no longer necessary as bounds checking can be used instead. If an empty nodelist or weight is detected, the code falls back to using numa_node_id(). This change also removes a now-unused function read_once_policy_nodemask() and results in significant reductions in stack usage for certain functions."
     },
     "2026-09-02": {
-      "report_file": "2026-09-02_ollama_llama3.1-8b.html",
+      "report_file": "2026-09-04_ollama_llama3.1-8b.html",
       "developer": "Gregory Price",
       "reviews": [
         {
@@ -50,6 +50,48 @@
           "reply_to": "Rakie Kim",
           "message_date": "2026-09-02",
           "message_id": "apgzMZQPTxS9QtDy@gourry-fedora-PF4VCD3F",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch removes the unnecessary copying of a nodemask in interleave node selectors, which reduces memory usage and improves performance. The original copy was done to ensure consistency between the node count and the walk, but this is no longer necessary as bounds checking can be used instead. If an empty nodelist or weight is detected, the patch falls back to using numa_node_id(). This change affects several functions in the mm/mempolicy.c file, including weighted_interleave_nid() and interleave_nid(), which are used for allocating pages under a specific memory policy."
+    },
+    "2026-09-04": {
+      "report_file": "2026-09-04_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Rakie Kim",
+          "summary": "The reviewer pointed out a potential issue where the policy mask can change between two reads of the nodemask, leading to inconsistent bounds and skewing the distribution during allocation. They suggested adding a counter to the sum loop to address this issue.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "potential inconsistency",
+            "skewing the distribution"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Sorry, I did not explain that well. I was not suggesting moving the\nsum into the cookie loop or widening the SRCU section - only adding\nthe counter to the sum loop where it already is:\n\n\t/* calculate total, detect system default usage */\n\tnnodes = 0;\n\tfor_each_node_mask(node, pol->nodes) {\n\t\tweight_total += table ? table[node] : 1;\n\t\tnnodes++;\n\t}\n\nThe order of the function does not change, so the quick-exit path\nstill returns before this loop runs - the sum is not computed in\nthat case either way.\n\nWhat I had in mind is the gap between the two reads. Say the policy\nstarts with two nodes, every weight is 10, and 100 pages are\nrequested:\n\n\t/* the mask is {0,1} here */\n\tdo {\n\t\tcpuset_mems_cookie = read_mems_allowed_begin();\n\t\tnnodes = nodes_weight(pol->nodes);\t/* nnodes = 2 */\n\t} while (read_mems_allowed_retry(cpuset_mems_cookie));\n\n\t/* a rebind grows the mask to {0,1,2,3} at this point */\n\n\t/* calculate total, detect system default usage */\n\tfor_each_node_mask(node, pol->nodes)\n\t\tweight_total += ...;\t\t\t/* 10 * 4 = 40 */\n\n\trounds = rem_pages / weight_total;\t\t/* 100 / 40 = 2 */\n\n\tfor (i = 0; i < nnodes; i++)\t\t\t/* bounded by 2 */\n\t\t...\n\nThe distribution is planned from a total of 40, which spreads the\n100 pages over four nodes, but the walk is still bounded by the two\nnodes counted earlier. It places 60 pages and returns, and the\ncaller allocates the remaining 40 one page at a time. The mask does\nnot have to change again during the walk for this to happen.\n\nYou are right that a torn read during the walk still skews the\ndistribution, and this does not change that. It only removes the\ncase where the bound and the total start out inconsistent. If that\nis not worth the extra line, I am fine either way.\n\nThanks for looking at it.\n\nRakie Kim",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-04",
+          "message_id": "20260904080140.1992-1-rakie.kim@sk.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "The author is addressing Rakie Kim's concern about the patch causing incorrect distribution calculations due to the changing nodemask during a rebind operation. The author acknowledges that ensuring correct distributions would require locks or reworking the entire weight mechanism, and instead proposes keeping the change simple by cookieing the value that can cause a div/0 error.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledges fix is needed",
+            "proposes simpler solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Consider:\n\n\t/* nodemask: {0,1} */\n \tfor_each_node_mask(node, pol->nodes) {\n \t\tweight_total += ...;\n\t\tnnodes++;\n\t}\n \n \t/* a rebind grows the mask to {2,3,4,5} */\n \n \trounds = rem_pages / weight_total;\t\t/* 100 / 10 = 10 */\n \tfor (i = 0; i < nnodes; i++)\t\t\t/* bounded by 2 */\n \t\t...\n\nin this scenario every value is wrong.  The weight total was calculated\nbased on {0,1} and the loop will use {2,3} weights and ignore {4,5}\nentirely.\n\nIt's the nature of the mechanism and race - best we can do is ensure\nsafety.  Ensuring correct distributions would likely require locks or\nreworking the entire weight mechanism.\n\nI'd rather keep the change simple (cookie the value that can cause a\ndiv/0) and leave the math alone.\n\n~Gregory",
+          "reply_to": "Rakie Kim",
+          "message_date": "2026-09-04",
+          "message_id": "aprm5dwF_kWaOe44@gourry-fedora-PF4VCD3F",
           "analysis_source": "llm"
         }
       ],
