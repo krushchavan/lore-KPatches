@@ -238,111 +238,127 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 0/5] mm: sub-folio dirty tracking for PTE-mapped mmap writes</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260903182943.662461-1-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-03</strong><div class="date-range-nav">Active on: <a href="#2026-09-03">2026-09-03</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This RFC patch series proposes a new approach to tracking dirty state for PTE-mapped mmap writes, which currently dirties the entire folio even if only a subset of pages is written. The proposed solution harvests the hardware&#x27;s record of which parts of the folio were written through a mapping and hands the filesystem the runs that were dirty. This is achieved by modifying the iomap_writeback_folio() function to submit only the dirty ranges and adding a new a_ops-&gt;dirty_folio_range() interface.</div></div>
+    <div class="date-range">Submitted: <strong>2026-09-03</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-07</strong><div class="date-range-nav">Active on: <a href="#2026-09-07">2026-09-07</a> &bull; <a href="#2026-09-03">2026-09-03</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch set introduces sub-folio dirty tracking for PTE-mapped mmap writes, addressing the issue of large page cache folios being dirtied unnecessarily when a single byte is written through a shared file mapping. The problem arises because current implementations mark the entire folio as dirty, leading to inefficient writeback and increased minor fault counts. To solve this, the patch harvests hardware PTE dirty bits at page_mkwrite() time and provides the filesystem with the ranges that were actually modified, allowing for more targeted writeback. This approach is already implemented in XFS and is shown to reduce writeback by 99% on a large file system.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-09-03">
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-03">2026-09-03</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed a concern about the frequency of folio_mkclean() calls, explaining that it is always called once per folio, not once per page, and that mapping the entire folio is necessary to accurately count mlocked memory. The author confirmed that narrowing the dirtying to a subset of pages is not possible once the whole folio is mapped.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">It is always called, but once per folio, not once per page. It is the
+filesystem&#x27;s chance to preallocate whatever it needs to track dirty
+state for the *folio*.
+
+Later finish_fault() maps the folio. It tries to map it fully when it
+can, so a write fault creates up to 512 writable PTEs on x86. And we
+really do need to map the folio fully whenever we can. Otherwise we
+significantly undercount mlocked memory. See commit 19773df031bc
+(&quot;mm/fault: try to map the entire file folio in finish_fault()&quot;).
+
+And once the whole folio is mapped with writable PTEs we cannot narrow
+the dirtying to a subset of pages. Any of them can turn dirty at any
+time, with nothing to record it.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
+<a href="https://lore.kernel.org/r/apngWgs4OAVFij_7@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged concern, explained reasoning</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-03">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Pedro Falcato</span>
 <a class="date-chip" href="../2026-09-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-03">2026-09-03</a>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Raised concerns about the complexity of the proposed solution and suggested a single method of dirtying folios. Also questioned whether sub-page accounting makes sense, given that the whole folio is still dirty for reclaim purposes.</div>
+<div class="review-comment-text">Reviewer Pedro Falcato expressed uncertainty about the current state of a related patch series by Willy, but did not provide any specific technical feedback or concerns regarding the submitted patch.
+
+Reviewer Pedro Falcato questioned the assumption that page_mkwrite is not always called, pointing out that it is indeed invoked in do_shared_fault(), and requested clarification on when the described scenario occurs.
+
+Reviewer Pedro Falcato expressed concern that the patch introduces multiple methods for dirtying folios, contradicting the goal of having a single method.
+
+Reviewer Pedro Falcato noted that sub-folio dirty tracking does not make sense because the whole folio is still dirty, and requested additional logic to handle split file folios for reclaim purposes.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Sep 03, 2026 at 07:29:38PM +0100, Kiryl Shutsemau wrote:
-&gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
-&gt; 
-&gt; A store through a shared file mapping dirties the whole folio. With large
-&gt; page cache folios that turns a 4K store into 2M of writeback: one dirty
-&gt; bit per folio, and writeback has no way to know which part changed.
-&gt; 
-&gt; XFS already knows better. iomap tracks dirty state per block and
-&gt; iomap_writeback_folio() submits only the dirty ranges, and the buffered
-&gt; write path sets just the range it copied. Only the mmap path throws that
-&gt; away, because iomap_dirty_folio() covers the whole folio.
-&gt; 
-
-Hmm, I believe Willy already had some patches; I don&#x27;t know what came of
+<pre class="raw-body-text">Hmm, I believe Willy already had some patches; I don&#x27;t know what came of
 them (I think he&#x27;s out for now).
 
-&gt; Narrowing the dirtying at page_mkwrite() time does not work on its own:
-&gt; set_pte_range() batch-maps a whole folio writable on the first shared
-&gt; write fault, so the stores that follow never fault and never reach the
-&gt; filesystem.
+---
 
 Help me out here: in which case does this happen? page fault handling is a
 mess... I think page_mkwrite is always called, no? in do_shared_fault().
 
-&gt; 
-&gt; So harvest the hardware instead. folio_clear_dirty_for_io() already calls
-&gt; folio_mkclean(), whose rmap walk reads pte_dirty() for every entry of the
-&gt; folio and throws it away. Those bits are the only record of which parts
-&gt; of a large folio were written through a mapping. Collect them there and
-&gt; hand the filesystem the runs that were dirty, through a new
-&gt; a_ops-&gt;dirty_folio_range().
+---
 
 I think this goes against what we&#x27;re trying to pull off. We want a single
 method of dirtying folios, not 3.
 
 Ideally(tm) we would have a single mkwrite interface.
 
-&gt; 
-&gt; All of this is about PTE-mapped folios. A PMD-mapped folio has a single
-&gt; dirty bit for the 2M it maps, so there is nothing finer to harvest, and
-&gt; it keeps writing back whole. Keeping shared write faults off PMDs is a
-&gt; separate patch and not part of this posting.
-&gt; 
-&gt; On a 512M file in 2M folios on XFS, storing one byte per folio and
-&gt; calling msync() wrote 512M before and writes 1M after, with identical
-&gt; minor fault counts.
-
-But the effects are definitely nice though :)
-
-&gt; 
-&gt; Not addressed here:
-&gt; 
-&gt;  - Dirty accounting stays folio-granular. A 4K store still counts as 2M
-&gt;    against dirty_ratio and balance_dirty_pages().
+---
 
 That is correct; I don&#x27;t think doing subpage accounting makes any sense,
 the whole folio is still dirty, and for reclaim purposes can&#x27;t be thrown
-away (unless you added gnarly split logic for file folios as well).
-
-&gt;  - iomap_page_mkwrite() still allocates blocks for the whole folio.
-&gt;  - Filesystems without per-block dirty state see no change.
-&gt; 
-&gt; Kiryl Shutsemau (Meta) (5):
-&gt;   mm: let folio_mkclean() report which pages had dirty PTEs
-&gt;   mm: add a_ops-&gt;dirty_folio_range() and use the mkclean dirty harvest
-&gt;   mm: keep the mmap dirty range down to the faulting page
-&gt;   iomap: narrow page_mkwrite() dirtying to the faulting page
-&gt;   xfs: track mmap dirty state per block
-&gt; 
-&gt;  fs/iomap/buffered-io.c | 37 +++++++++++++-----
-&gt;  fs/xfs/xfs_aops.c      |  2 +-
-&gt;  include/linux/fs.h     |  3 ++
-&gt;  include/linux/iomap.h  |  2 +
-&gt;  include/linux/mm.h     |  1 +
-&gt;  include/linux/rmap.h   |  7 ++++
-&gt;  mm/memory.c            | 58 ++++++++++++++++++++++++++--
-&gt;  mm/page-writeback.c    | 87 +++++++++++++++++++++++++++++++++++++++---
-&gt;  mm/rmap.c              | 56 +++++++++++++++++++++------
-&gt;  9 files changed, 222 insertions(+), 31 deletions(-)
-&gt; 
-&gt; 
-&gt; base-commit: 0a0d1d55dad570724bf8c7ea83409639cfb4be9b
-&gt; -- 
-&gt; 2.54.0
-&gt; 
-
--- 
-Pedro
-</pre>
+away (unless you added gnarly split logic for file folios as well).</pre>
 </details>
-<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/apnO6MyHhCilamqJ@pedro-suse.lan" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: uncertainty, lack of technical feedback, requested clarification</div>
+</div>
+</div>
+<div class="thread-node depth-1" id="2026-09-07">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau</span>
+<a class="date-chip" href="../2026-09-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-07">2026-09-07</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kiryl Shutsemau agrees to remove the -&gt;dirty_folio() function, which makes little sense, and instead proposes bundling dirtying into -&gt;page_mkwrite(). He suggests that this distinction between making a folio writable and marking it dirty is meaningful, allowing filesystems to provide fine-grained dirty tracking through -&gt;dirty_folio_range().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Boris pointed me to Matthew&#x27;s proposal to remove -&gt;dirty_folio:
+
+https://lore.kernel.org/all/aoyWln-Gt-yvZQkE@casper.infradead.org
+
+I agree that the current -&gt;dirty_folio() makes little sense and that
+dirtying the folio can be bundled into -&gt;page_mkwrite(), as they are
+matched 1-to-1.
+
+My proposal makes the distinction between making the folio writable and
+making it dirty meaningful. -&gt;page_mkwrite() allocates whatever is needed
+on the filesystem side to track dirty state and drive writeback for the
+*folio*, while -&gt;dirty_folio_range() marks part of the folio dirty.
+
+We can still drop -&gt;dirty_folio(). A filesystem can provide
+-&gt;dirty_folio_range() if it wants fine-grained (sub-folio) dirty
+tracking.
+
+A separate question is whether we want to avoid installing a writable PMD
+entry for filesystems that want fine-grained dirty tracking. I have a
+patch for this, but it deserves a separate discussion once we agree that we
+want this for PTE-mapped folios first.
+
+Any feedback?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/ap6LFvuOuWf_BkGi@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreement with removing -&gt;dirty_folio(), proposed alternative solution</div>
+</div>
+</div>
 </div>
 </div>
 </div>

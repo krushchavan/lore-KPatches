@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 08/12] mm/collapse: separate scanning a PTE table from collapsing it</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/1a1bc537850bd7ef73bed5ac4985634bb8dd95e1.1788533997.git.kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-05</strong><div class="date-range-nav">Active on: <a href="#2026-09-05">2026-09-05</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-05</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-07</strong><div class="date-range-nav">Active on: <a href="#2026-09-07">2026-09-07</a> &bull; <a href="#2026-09-05">2026-09-05</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch separates the scanning of a PTE table from collapsing it into two distinct functions: collapse_scan_pmd() and collapse_run_pmd(). The scan function reads the PTE table under mmap_lock to determine if the range is worth collapsing, while the run function performs the actual collapse. This change improves code organization and allows for better tracing and reporting of collapse operations.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-05">
@@ -267,6 +267,155 @@ Yan, Zi</pre>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/DL7VP2ZBCB4J.9NUOEM7GWXR6@nvidia.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: inaccurate description, requested change</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-07">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-07">2026-09-07</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed Zi Yan&#x27;s concern about the scan_retract_only flag being set to true in collapse_scan_pmd, explaining that this is a necessary optimization for when the PMD folio is already in the page cache and only the PTE table needs to be retracted. The author plans to fold these changes into v2.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Will fold the patch below into v2:
+
+diff --git a/mm/collapse.h b/mm/collapse.h
+index 4baf2228d2c4..1ebbbf63fb25 100644
+--- a/mm/collapse.h
++++ b/mm/collapse.h
+@@ -95,13 +95,15 @@ struct collapse_control {
+ 	 *
+ 	 * The file side takes a reference while it still has the VMA, since a
+ 	 * file collapse works on the page cache and never sees one; the run is
+-	 * what gives it back.
++	 * what gives it back.  A scan that found the PMD folio already in the
++	 * cache leaves only the PTE table to retract.
+ 	 */
+ 	unsigned long scan_orders;
+ 	int scan_referenced;
+ 	int scan_unmapped;
+ 	struct file *scan_file;
+ 	pgoff_t scan_pgoff;
++	bool scan_retract_only;
+ };
+ 
+ /* Which orders a VMA may collapse to, zero when it may not collapse at all */
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 4ae292a6392e..403e5fee942d 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -2722,20 +2722,13 @@ static enum scan_result collapse_scan_file(struct mm_struct *mm,
+ 	else
+ 		cc-&gt;progress += HPAGE_PMD_NR;
+ 
+-	if (result == SCAN_SUCCEED) {
+-		if (present &lt; HPAGE_PMD_NR - max_ptes_none) {
+-			result = SCAN_EXCEED_NONE_PTE;
+-			count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
+-		} else {
+-			result = collapse_file(mm, addr, file, start, cc);
+-		}
+-		trace_mm_khugepaged_scan_file(mm, -1, file, present, swap,
+-					      SCAN_SUCCEED);
+-	} else {
+-		trace_mm_khugepaged_scan_file(mm, failed_pfn, file, present,
+-					      swap, result);
++	if (result == SCAN_SUCCEED &amp;&amp; present &lt; HPAGE_PMD_NR - max_ptes_none) {
++		result = SCAN_EXCEED_NONE_PTE;
++		count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
+ 	}
+ 
++	trace_mm_khugepaged_scan_file(mm, failed_pfn, file, present, swap,
++				      result);
+ 	return result;
+ }
+ 
+@@ -2758,6 +2751,9 @@ enum scan_result collapse_scan_pmd(struct vm_area_struct *vma,
+ 		unsigned long addr, struct collapse_control *cc,
+ 		unsigned long orders)
+ {
++	enum scan_result result;
++	pgoff_t pgoff;
++
+ 	mmap_assert_locked(vma-&gt;vm_mm);
+ 	/* Whatever the last scan found has to have been run by now */
+ 	if (WARN_ON_ONCE(cc-&gt;scan_file)) {
+@@ -2768,14 +2764,31 @@ enum scan_result collapse_scan_pmd(struct vm_area_struct *vma,
+ 	if (vma_is_anonymous(vma))
+ 		return collapse_scan_anon_pmd(vma, addr, cc, orders);
+ 
++	pgoff = linear_page_index(vma, addr);
++	result = collapse_scan_file(vma-&gt;vm_mm, addr, vma-&gt;vm_file, pgoff, cc);
++	switch (result) {
++	case SCAN_SUCCEED:
++		cc-&gt;scan_retract_only = false;
++		break;
++	case SCAN_PTE_MAPPED_HUGEPAGE:
++		/*
++		 * The page cache already holds the PMD folio; what is left is
++		 * to retract the PTE table, which is the run&#x27;s job.
++		 */
++		cc-&gt;scan_retract_only = true;
++		result = SCAN_SUCCEED;
++		break;
++	default:
++		return result;
++	}
++
+ 	/*
+ 	 * A file collapse works on the page cache and never sees a VMA, so take
+-	 * what it needs from this one while it is still here.  Judging the
+-	 * range needs the page cache and no lock, so it happens in the run.
++	 * what it needs from this one while it is still here.
+ 	 */
+ 	cc-&gt;scan_file = get_file(vma-&gt;vm_file);
+-	cc-&gt;scan_pgoff = linear_page_index(vma, addr);
+-	return SCAN_SUCCEED;
++	cc-&gt;scan_pgoff = pgoff;
++	return result;
+ }
+ 
+ enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
+@@ -2792,8 +2805,13 @@ enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
+ 
+ 	cc-&gt;scan_file = NULL;
+ 	pgoff = cc-&gt;scan_pgoff;
++
++	if (cc-&gt;scan_retract_only) {
++		result = SCAN_PTE_MAPPED_HUGEPAGE;
++		goto retract;
++	}
+ retry:
+-	result = collapse_scan_file(mm, addr, file, pgoff, cc);
++	result = collapse_file(mm, addr, file, pgoff, cc);
+ 
+ 	/* Dirty pages are worth a writeback and one more try, if asked for */
+ 	if (cc-&gt;policy.writeback_dirty &amp;&amp; result == SCAN_PAGE_DIRTY_OR_WRITEBACK &amp;&amp;
+@@ -2805,8 +2823,13 @@ enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
+ 		triggered_wb = true;
+ 		goto retry;
+ 	}
++retract:
+ 	fput(file);
+ 
++	/*
++	 * A PMD folio is in the page cache, whether the collapse just put it
++	 * there or found it: retract the PTE table, and map the PMD if asked.
++	 */
+ 	if (result == SCAN_PTE_MAPPED_HUGEPAGE) {
+ 		mmap_read_lock(mm);
+ 		if (collapse_test_exit_or_disable(mm))
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Zi Yan</div>
+<a href="https://lore.kernel.org/r/ap6hM1Mt0PFWloM1@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, optimization</div>
+</div>
+</div>
 </div>
 </div>
 </div>

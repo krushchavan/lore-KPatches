@@ -9,10 +9,10 @@
       "reviews": [
         {
           "author": "Gregory Price",
-          "summary": "Addressed a double-put bug in fuse_try_move_page() where the folio refcount drops to zero prematurely. Suggested adding an extra folio_get() before replace_page_cache_folio() to maintain the reference.",
-          "sentiment": "neutral",
+          "summary": "Addressed a double-put bug in fuse_try_move_page() and added an extra folio_get() before replace_page_cache_folio() to maintain the reference. Also, modified the per-VMA PID filter and read-only file mapping exclusion to allow promotion candidates to be added without removing existing filters.",
+          "sentiment": "positive",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "PATCH_LOOKS_GOOD"
           ],
           "has_inline_review": false,
           "tags_given": [],
@@ -26,15 +26,15 @@
         },
         {
           "author": "Gregory Price",
-          "summary": "Responded to Sashiko's concerns about the patch causing unneeded rescanning and potential issues with concurrent scanners. Provided additional context and explanations.",
+          "summary": "Responded to concerns about concurrent scanners and ptl lock contention, but acknowledged that the issue requires a more complex change to fully resolve.",
           "sentiment": "neutral",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "NEEDS_MORE_WORK"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n>  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n>  \t\t * cycle is consumed entirely by the large VMA.\n>  \t\t */\n> -\t\tvma->numab_state->slow_only = false;\n> +\t\tvma->numab_state->slow_only = ro_file;\n>  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n>  \t\t\tif (!(sysctl_numa_balancing_mode &\n>  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n\nSashiko thinks this causes unneeded rescanning, but I don't think it\ndoes. The cursor prevents it from restarting, and when we loop back\naround reset_ptenuma_scan() bumps the sequence.\n\nIt also had concerns about concurrent scanners and ptl lock contention,\nbut mm->numa_next_scan only admits one per scan period.\n\nEither way on a rewalk the scan hits pte_protnone() and moves on.\n\n~Gregory\n\n",
+          "raw_body": "On Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n>  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n>  \t\t * cycle is consumed entirely by the large VMA.\n>  \t\t */\n> -\t\tvma->numab_state->slow_only = false;\n> +\t\tvma->numab_state->slow_only = ro_file;\n>  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n>  \t\t\tif (!(sysctl_numa_balancing_mode &\n>  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n\nSashiko thinks this causes unneeded rescanning, but I don't think it\ndoes. The cursor prevents it from restarting, and when we loop back\naround reset_ptenuma_scan() bumps the sequence.\n\nIt also had concerns about concurrent scanners and ptl lock contention,\nbut mm->numa_next_scan only admits one per scan period.\n\nEither way on a rewalk the scan hits pte_protnone() and moves on.\n\n~Gregory\n",
           "reply_to": "",
           "message_date": "2026-09-04",
           "message_id": "",
@@ -42,25 +42,67 @@
           "is_maintainer": false
         },
         {
-          "author": "Sashiko",
-          "summary": "Raised concerns about the patch causing unneeded rescanning and potential issues with concurrent scanners. Provided specific examples and code snippets.",
-          "sentiment": "needs_work",
+          "author": "Gregory Price",
+          "summary": "Posted a follow-up reply to address concerns raised by Sashiko, including the issue of unneeded rescanning and ptl lock contention.",
+          "sentiment": "neutral",
           "sentiment_signals": [
-            "NEEDS_WORK"
+            "ADDRESSING_CONCERNS"
           ],
-          "has_inline_review": true,
+          "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "Gregory Price",
-          "message_date": "",
+          "raw_body": ">  \t\t/*\n>  \t\t * Do not scan the VMA if task has not accessed it, unless no other\n>  \t\t * VMA candidate exists.\n> +\t\t *\n> +\t\t * Force-scan only slow-tier folios when in tiering mode, as a large\n> +\t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n> +\t\t * cycle is consumed entirely by the large VMA.\n>  \t\t */\n> +\t\tvma->numab_state->slow_only = false;\n>  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n> -\t\t\tvma_pids_skipped = true;\n> -\t\t\ttrace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_PID_INACTIVE);\n> -\t\t\tcontinue;\n> +\t\t\tif (!(sysctl_numa_balancing_mode &\n> +\t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n> +\t\t\t\tvma_pids_skipped = true;\n> +\t\t\t\ttrace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_PID_INACTIVE);\n> +\t\t\t\tcontinue;\n> +\t\t\t}\n> +\t\t\tvma->numab_state->slow_only = true;\n>  \t\t}\n\nsashiko (correctly) reported that slow_only=false set unconditionally\nhere causes a VMA that's scanned over two passes to be prematurely\nre-admitted regardless of vma_is_accessed() activity.\n\nPatch looks simple:\n\n+               if (mm->numa_scan_offset <= vma->vm_start)\n+                       vma->numab_state->slow_only = false;\n\nand on patch two:\n\n-                       vma->numab_state->slow_only = false;\n+                       vma->numab_state->slow_only = ro_file;\n\nI'll follow up with a v2 next week after I test it.\n\n~Gregory\n\n\n---\n\nOn Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n>  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n>  \t\t * cycle is consumed entirely by the large VMA.\n>  \t\t */\n> -\t\tvma->numab_state->slow_only = false;\n> +\t\tvma->numab_state->slow_only = ro_file;\n>  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n>  \t\t\tif (!(sysctl_numa_balancing_mode &\n>  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n\nSashiko thinks this causes unneeded rescanning, but I don't think it\ndoes. The cursor prevents it from restarting, and when we loop back\naround reset_ptenuma_scan() bumps the sequence.\n\nIt also had concerns about concurrent scanners and ptl lock contention,\nbut mm->numa_next_scan only admits one per scan period.\n\nEither way on a rewalk the scan hits pte_protnone() and moves on.\n\n~Gregory\n\n\n---\n\nOn Fri, Sep 04, 2026 at 03:31:19PM -0400, Gregory Price wrote:\n> On Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> > @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n> >  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n> >  \t\t * cycle is consumed entirely by the large VMA.\n> >  \t\t */\n> > -\t\tvma->numab_state->slow_only = false;\n> > +\t\tvma->numab_state->slow_only = ro_file;\n> >  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n> >  \t\t\tif (!(sysctl_numa_balancing_mode &\n> >  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n> \n> Sashiko thinks this causes unneeded rescanning, but I don't think it\n> does. The cursor prevents it from restarting, and when we loop back\n> around reset_ptenuma_scan() bumps the sequence.\n> \n> It also had concerns about concurrent scanners and ptl lock contention,\n> but mm->numa_next_scan only admits one per scan period.\n> \n> Either way on a rewalk the scan hits pte_protnone() and moves on.\n> \n\nOn a second look, there are a few issues bundled in with this, and the\nchange required to handle the concurrent scan + mode=3 (_NORMAL |\n_TIERING) requires a bit more complex of a change to fully resolve.\n\nWill push a v2 after some additional testing - but that said the\nexisting tests still stand.  As-is, any mode with _TIERING set is very\nbroken at the moment because of the filtering mechanisms.\n\n~Gregory\n\n",
+          "reply_to": "",
+          "message_date": "2026-09-04",
           "message_id": "",
-          "email": "",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price",
+          "summary": "Announced that they will push a v2 after some additional testing, but stated that the existing tests still stand.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEW_VERSION_EXPECTED"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": ">  \t\t/*\n>  \t\t * Do not scan the VMA if task has not accessed it, unless no other\n>  \t\t * VMA candidate exists.\n> +\t\t *\n> +\t\t * Force-scan only slow-tier folios when in tiering mode, as a large\n> +\t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n> +\t\t * cycle is consumed entirely by the large VMA.\n>  \t\t */\n> +\t\tvma->numab_state->slow_only = false;\n>  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n> -\t\t\tvma_pids_skipped = true;\n> -\t\t\ttrace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_PID_INACTIVE);\n> -\t\t\tcontinue;\n> +\t\t\tif (!(sysctl_numa_balancing_mode &\n> +\t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n> +\t\t\t\tvma_pids_skipped = true;\n> +\t\t\t\ttrace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_PID_INACTIVE);\n> +\t\t\t\tcontinue;\n> +\t\t\t}\n> +\t\t\tvma->numab_state->slow_only = true;\n>  \t\t}\n\nsashiko (correctly) reported that slow_only=false set unconditionally\nhere causes a VMA that's scanned over two passes to be prematurely\nre-admitted regardless of vma_is_accessed() activity.\n\nPatch looks simple:\n\n+               if (mm->numa_scan_offset <= vma->vm_start)\n+                       vma->numab_state->slow_only = false;\n\nand on patch two:\n\n-                       vma->numab_state->slow_only = false;\n+                       vma->numab_state->slow_only = ro_file;\n\nI'll follow up with a v2 next week after I test it.\n\n~Gregory\n\n\n---\n\nOn Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n>  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n>  \t\t * cycle is consumed entirely by the large VMA.\n>  \t\t */\n> -\t\tvma->numab_state->slow_only = false;\n> +\t\tvma->numab_state->slow_only = ro_file;\n>  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n>  \t\t\tif (!(sysctl_numa_balancing_mode &\n>  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n\nSashiko thinks this causes unneeded rescanning, but I don't think it\ndoes. The cursor prevents it from restarting, and when we loop back\naround reset_ptenuma_scan() bumps the sequence.\n\nIt also had concerns about concurrent scanners and ptl lock contention,\nbut mm->numa_next_scan only admits one per scan period.\n\nEither way on a rewalk the scan hits pte_protnone() and moves on.\n\n~Gregory\n\n\n---\n\nOn Fri, Sep 04, 2026 at 03:31:19PM -0400, Gregory Price wrote:\n> On Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> > @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n> >  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n> >  \t\t * cycle is consumed entirely by the large VMA.\n> >  \t\t */\n> > -\t\tvma->numab_state->slow_only = false;\n> > +\t\tvma->numab_state->slow_only = ro_file;\n> >  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n> >  \t\t\tif (!(sysctl_numa_balancing_mode &\n> >  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n> \n> Sashiko thinks this causes unneeded rescanning, but I don't think it\n> does. The cursor prevents it from restarting, and when we loop back\n> around reset_ptenuma_scan() bumps the sequence.\n> \n> It also had concerns about concurrent scanners and ptl lock contention,\n> but mm->numa_next_scan only admits one per scan period.\n> \n> Either way on a rewalk the scan hits pte_protnone() and moves on.\n> \n\nOn a second look, there are a few issues bundled in with this, and the\nchange required to handle the concurrent scan + mode=3 (_NORMAL |\n_TIERING) requires a bit more complex of a change to fully resolve.\n\nWill push a v2 after some additional testing - but that said the\nexisting tests still stand.  As-is, any mode with _TIERING set is very\nbroken at the moment because of the filtering mechanisms.\n\n~Gregory\n\n",
+          "reply_to": "",
+          "message_date": "2026-09-04",
+          "message_id": "",
+          "email": "gourry@gourry.net",
           "is_maintainer": false
         }
       ],
       "analysis_source": "llm",
-      "patch_summary": "The patch series aims to stop VMA scan filters from gating promotion in the Linux kernel's NUMA (Non-Uniform Memory Access) implementation. Specifically, it addresses two issues: the per-VMA PID filter and read-only file mapping exclusion. The patches modify existing code to allow for more efficient promotion of pages between memory tiers."
+      "patch_summary": "This patch series aims to stop VMA scan filters from gating promotion in the Linux kernel's scheduler and NUMA (Non-Uniform Memory Access) subsystem. The current implementation applies a series of VMA-level filters before marking a VMA for hint faults, which can lead to issues with memory tiering. The patches modify the per-VMA PID filter and read-only file mapping exclusion to allow promotion candidates to be added without removing existing filters."
+    },
+    "2026-09-07": {
+      "report_file": "2026-09-07_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Gregory Price",
+          "summary": "Acknowledged that the existing tests still stand, but stated that any mode with _TIERING set is very broken at the moment due to filtering mechanisms.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "ISSUE_REMAINING"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Fri, Sep 04, 2026 at 03:31:19PM -0400, Gregory Price wrote:\n> On Fri, Sep 04, 2026 at 02:20:06PM -0400, Gregory Price wrote:\n> > @@ -4302,7 +4316,7 @@ static void task_numa_work(struct callback_head *work)\n> >  \t\t * VMA can cause others to become \"permanently unaccessed\" if a scan\n> >  \t\t * cycle is consumed entirely by the large VMA.\n> >  \t\t */\n> > -\t\tvma->numab_state->slow_only = false;\n> > +\t\tvma->numab_state->slow_only = ro_file;\n> >  \t\tif (!vma_pids_forced && !vma_is_accessed(mm, vma)) {\n> >  \t\t\tif (!(sysctl_numa_balancing_mode &\n> >  \t\t\t      NUMA_BALANCING_MEMORY_TIERING)) {\n> \n> Sashiko thinks this causes unneeded rescanning, but I don't think it\n> does. The cursor prevents it from restarting, and when we loop back\n> around reset_ptenuma_scan() bumps the sequence.\n> \n> It also had concerns about concurrent scanners and ptl lock contention,\n> but mm->numa_next_scan only admits one per scan period.\n> \n> Either way on a rewalk the scan hits pte_protnone() and moves on.\n> \n\nOn a second look, there are a few issues bundled in with this, and the\nchange required to handle the concurrent scan + mode=3 (_NORMAL |\n_TIERING) requires a bit more complex of a change to fully resolve.\n\nWill push a v2 after some additional testing - but that said the\nexisting tests still stand.  As-is, any mode with _TIERING set is very\nbroken at the moment because of the filtering mechanisms.\n\n~Gregory\n\n",
+          "reply_to": "",
+          "message_date": "2026-09-07",
+          "message_id": "",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series aims to stop VMA scan filters from gating promotion in the Linux kernel's scheduler and NUMA (Non-Uniform Memory Access) subsystem. The current implementation applies a series of VMA-level filters before marking a VMA for hint faults, which can lead to issues with memory tiering. The patches modify the per-VMA PID filter and read-only file mapping exclusion to allow promotion candidates to be added without removing existing filters."
     }
   }
 }
