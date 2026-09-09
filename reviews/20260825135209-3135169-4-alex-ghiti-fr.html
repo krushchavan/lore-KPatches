@@ -238,92 +238,92 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 3/3] mm: zswap: drop cold writeback folios via swap dropbehind</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260825135209.3135169-4-alex@ghiti.fr/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-25</strong><div class="date-range-nav">Active on: <a href="#2026-08-25">2026-08-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a performance issue in the zswap writeback mechanism by dropping cold folios from the swap cache after writeback completes, reducing unnecessary reclaim scans and keeping cold memory resident for shorter periods.</div></div>
+    <div class="date-range">Submitted: <strong>2026-08-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-08</strong><div class="date-range-nav">Active on: <a href="#2026-09-08">2026-09-08</a> &bull; <a href="#2026-08-25">2026-08-25</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch optimizes the zswap writeback process by dropping cold folios from the swap cache after they are written back to disk, rather than leaving them on the LRU for reclaim. This is done by allocating the folio off the LRU and marking it PG_dropbehind, which allows the swap dropbehind path to free the folio once writeback completes. The patch aims to reduce memory residency time for cold pages and improve system performance.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-08-25">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Yosry Ahmed</span>
-<a class="date-chip" href="../2026-08-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="review-author">Alexandre Ghiti</span>
+<a class="date-chip" href="../2026-09-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified an unnecessary check in the zswap_writeback_entry() function and suggested renaming a label to better indicate its purpose on the error path.</div>
+<div class="review-comment-text">Reviewer noted that folio_put() should be called before starting writeback to ensure the swap cache holds a reference to the folio, and suggested adding a comment to explain why this is necessary
+
+Reviewer noted that folio_put() should be called before starting writeback to ensure the swap cache holds a reference to the folio until dropbehind path frees it, preventing reclaim from freeing the folio prematurely.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Tue, Aug 25, 2026 at 6:55 AM Alexandre Ghiti &lt;alex@ghiti.fr&gt; wrote:
-&gt;
-&gt; zswap writeback decompresses an entry into a fresh swap cache folio and
-&gt; writes it back. The folio is cold by construction, yet it is left on the
-&gt; LRU for reclaim to find and free later, wasting a reclaim scan and keeping
-&gt; cold memory resident longer than necessary.
-&gt;
-&gt; Allocate the folio off the LRU and mark it PG_dropbehind so the swap
-&gt; dropbehind path frees it from the swap cache once writeback completes.
-&gt;
-&gt; Suggested-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
-&gt; Suggested-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
-&gt; Signed-off-by: Alexandre Ghiti &lt;alex@ghiti.fr&gt;
-&gt; ---
-&gt;  mm/zswap.c | 19 ++++++++++++++++---
-&gt;  1 file changed, 16 insertions(+), 3 deletions(-)
-&gt;
-&gt; diff --git a/mm/zswap.c b/mm/zswap.c
-&gt; index 8163e6c5f76c..d16822a516e8 100644
-&gt; --- a/mm/zswap.c
-&gt; +++ b/mm/zswap.c
-&gt; @@ -1013,7 +1013,6 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
-&gt;          */
-&gt;         if (IS_ERR(folio))
-&gt;                 return PTR_ERR(folio);
-&gt; -       folio_add_lru(folio);
-&gt;
-&gt;         /*
-&gt;          * folio is locked, and the swapcache is now secured against
-&gt; @@ -1046,12 +1045,26 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
-&gt;         /* folio is up to date */
-&gt;         folio_mark_uptodate(folio);
-&gt;
-&gt; -       /* move it to the tail of the inactive list after end_writeback */
-&gt; -       folio_set_reclaim(folio);
-&gt; +       folio_set_dropbehind(folio);
-&gt; +
-&gt; +       /*
-&gt; +        * Drop our reference before starting writeback so the swap cache holds
-&gt; +        * the only one: the drop in folio_end_writeback() needs that for
-&gt; +        * remove_mapping_reclaim() to succeed, otherwise the folio is handed
-&gt; +        * back to reclaim instead.
-&gt; +        *
-&gt; +        * Nothing can free the folio in the meantime: we hold the folio lock
-&gt; +        * until writeback starts, PG_writeback then blocks swap cache removal,
-&gt; +        * and folio_end_writeback() takes its own reference before clearing
-&gt; +        * PG_writeback and donates it to the drop.
-&gt; +        */
-&gt; +       folio_put(folio);
-&gt;
-&gt;         /* start writeback */
-&gt;         __swap_writepage(folio, NULL);
-&gt;
-&gt; +       return 0;
-&gt; +
-&gt;  out:
-&gt;         if (ret) {
+<pre class="raw-body-text">Hi Yosry,
 
-This check is now unneeded as ret should always be non-zero here, right?
+On Tue, Aug 25, 2026 at 5:52 PM Yosry Ahmed &lt;yosry@kernel.org&gt; wrote:
+
+---
+
+Sure, will do in v5.
+
+Thanks,
+
+Alex</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Yosry Ahmed</div>
+<a href="https://lore.kernel.org/r/CAEmasaX6L5Rghr0QSkv_x7kiJ9U-MaXwNBntePCkQBoyjOtP5g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-08-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Yosry Ahmed</span>
+<a class="date-chip" href="../2026-09-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-25">2026-08-25</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Yosry Ahmed noted that the check for ret being non-zero is unnecessary because it should always be true in this context, and suggested renaming the label to indicate it&#x27;s only an error path.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This check is now unneeded as ret should always be non-zero here, right?
 
 We should probably also rename the label to indicate that it&#x27;s only
-the error path. Maybe &quot;error&quot; or &quot;fail&quot;?
-
-&gt;                 swap_cache_del_folio(folio);
-&gt; --
-&gt; 2.53.0-Meta
-&gt;
-&gt;
-</pre>
+the error path. Maybe &quot;error&quot; or &quot;fail&quot;?</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
-<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+<a href="https://lore.kernel.org/r/CAO9r8zPsQ9J_mL-eYiNEZNu1LdxoVXL-mQ+=QMUvcT_71cf7cw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-1" id="2026-09-08">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kunwu Chan</span>
+<a class="date-chip" href="../2026-09-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-08">2026-09-08</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kunwu Chan confirmed that the patch addresses their previous concern about a refcount overlap by dropping the zswap reference before __swap_writepage(), ensuring that remove_mapping_reclaim() sees the expected refcount.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks for addressing this.
+
+I checked the refcount handoff in v4. Dropping the zswap reference before 
+__swap_writepage() removes the refcount overlap I was concerned about in v3. 
+The swapcache reference keeps the folio alive until writeback starts, and 
+folio_end_writeback() takes the completion reference before clearing 
+PG_writeback, so remove_mapping_reclaim() sees the expected refcount.
+
+Reviewed-by: Kunwu Chan &lt;kunwu.chan@gmail.com&gt;
+
+Thanks, 
+KunWu</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
+<a href="https://lore.kernel.org/r/20260908082416.2356617-1-kunwu.chan@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: Thanks for addressing this, Reviewed-by</div>
+</div>
+</div>
 </div>
 </div>
 </div>
