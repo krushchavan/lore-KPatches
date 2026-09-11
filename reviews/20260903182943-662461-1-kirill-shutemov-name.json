@@ -160,6 +160,50 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch set introduces sub-folio dirty tracking for PTE-mapped mmap writes, addressing the issue of large page cache folios being dirtied unnecessarily when a single byte is written through a shared file mapping. The problem arises because current implementations mark the entire folio as dirty, leading to inefficient writeback and increased minor fault counts. To solve this, the patch harvests hardware PTE dirty bits at page_mkwrite() time and provides the filesystem with the ranges that were actually modified, allowing for more targeted writeback. This approach is already implemented in XFS and is shown to reduce writeback by 99% on a large file system."
+    },
+    "2026-09-10": {
+      "report_file": "2026-09-10_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledged a mistake in the page_vma_mkclean_one() function and provided a fixup patch to correct it, indicating that the issue will be addressed in the next version of the patch (v2).",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a mistake",
+            "provided a fixup patch"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Good catch, thanks. I should have known better.\n\nFixup below.\n\ndiff --git a/mm/rmap.c b/mm/rmap.c\nindex aaf45ac79fa8..9b8b9428f802 100644\n--- a/mm/rmap.c\n+++ b/mm/rmap.c\n@@ -1140,6 +1140,15 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw,\n \t\t\tif (!pte_dirty(entry) && !pte_write(entry))\n \t\t\t\tcontinue;\n \n+\t\t\tflush_cache_page(vma, address, pte_pfn(entry));\n+\t\t\tentry = ptep_clear_flush(vma, address, pte);\n+\n+\t\t\t/*\n+\t\t\t * Take the dirty bit from what the clear returned, not\n+\t\t\t * from the value read above. The entry is writable, so\n+\t\t\t * the CPU can set the bit at any point before the\n+\t\t\t * clear, and the page table lock does not stop it.\n+\t\t\t */\n \t\t\tif (dirty_map && pte_dirty(entry)) {\n \t\t\t\tpgoff_t idx = linear_page_index(vma, address) -\n \t\t\t\t\t      pvmw->pgoff;\n@@ -1149,8 +1158,6 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw,\n \t\t\t\t__set_bit(idx, dirty_map);\n \t\t\t}\n \n-\t\t\tflush_cache_page(vma, address, pte_pfn(entry));\n-\t\t\tentry = ptep_clear_flush(vma, address, pte);\n \t\t\tentry = pte_wrprotect(entry);\n \t\t\tentry = pte_mkclean(entry);\n \t\t\tset_pte_at(vma->vm_mm, address, pte, entry);\n@@ -1170,12 +1177,14 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw,\n \t\t\tif (!pmd_dirty(entry) && !pmd_write(entry))\n \t\t\t\tcontinue;\n \n-\t\t\tif (dirty_map && pmd_dirty(entry))\n-\t\t\t\tbitmap_set(dirty_map, 0, pvmw->nr_pages);\n-\n \t\t\tflush_cache_range(vma, address,\n \t\t\t\t\t  address + HPAGE_PMD_SIZE);\n \t\t\tentry = pmdp_invalidate(vma, address, pmd);\n+\n+\t\t\t/* See the PTE case above */\n+\t\t\tif (dirty_map && pmd_dirty(entry))\n+\t\t\t\tbitmap_set(dirty_map, 0, pvmw->nr_pages);\n+\n \t\t\tentry = pmd_wrprotect(entry);\n \t\t\tentry = pmd_mkclean(entry);\n \t\t\tset_pmd_at(vma->vm_mm, address, pmd, entry);\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-09-10",
+          "message_id": "aqKxU5iOuWjK58Al@thinkstation",
+          "email": "kirill@shutemov.name",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author acknowledged a concern about the clearing of PG_reclaim and PG_readahead flags in folio_mark_dirty() and folio_mark_dirty_range(), agreed to move the clearing into mapping_dirty_range(), which is the correct place for it, and confirmed that this fix will be folded into v2.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "acknowledged a concern",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yes, good catch.\n\nFixup below moves the clearing into mapping_dirty_range(), which is the\none place that reaches the aops, and drops the copies in\nfolio_mark_dirty() and folio_mark_dirty_range().\n\nWill be folded into v2.\n\ndiff --git a/mm/page-writeback.c b/mm/page-writeback.c\nindex 39b54c25a9fa..4995219eb8be 100644\n--- a/mm/page-writeback.c\n+++ b/mm/page-writeback.c\n@@ -2760,6 +2760,20 @@ EXPORT_SYMBOL(folio_redirty_for_writepage);\n static bool mapping_dirty_range(struct address_space *mapping,\n \t\t\t\tstruct folio *folio, size_t off, size_t len)\n {\n+\t/*\n+\t * readahead/folio_deactivate could remain\n+\t * PG_readahead/PG_reclaim due to race with folio_end_writeback\n+\t * About readahead, if the folio is written, the flags would be\n+\t * reset. So no problem.\n+\t * About folio_deactivate, if the folio is redirtied,\n+\t * the flag will be reset. So no problem. but if the\n+\t * folio is used by readahead it will confuse readahead\n+\t * and make it restart the size rampup process. But it's\n+\t * a trivial problem.\n+\t */\n+\tif (folio_test_reclaim(folio))\n+\t\tfolio_clear_reclaim(folio);\n+\n \tif (!mapping->a_ops->dirty_folio_range)\n \t\treturn mapping->a_ops->dirty_folio(mapping, folio);\n \n@@ -2784,19 +2798,6 @@ bool folio_mark_dirty(struct folio *folio)\n \tstruct address_space *mapping = folio_mapping(folio);\n \n \tif (likely(mapping)) {\n-\t\t/*\n-\t\t * readahead/folio_deactivate could remain\n-\t\t * PG_readahead/PG_reclaim due to race with folio_end_writeback\n-\t\t * About readahead, if the folio is written, the flags would be\n-\t\t * reset. So no problem.\n-\t\t * About folio_deactivate, if the folio is redirtied,\n-\t\t * the flag will be reset. So no problem. but if the\n-\t\t * folio is used by readahead it will confuse readahead\n-\t\t * and make it restart the size rampup process. But it's\n-\t\t * a trivial problem.\n-\t\t */\n-\t\tif (folio_test_reclaim(folio))\n-\t\t\tfolio_clear_reclaim(folio);\n \t\treturn mapping_dirty_range(mapping, folio, 0,\n \t\t\t\t\t   folio_size(folio));\n \t}\n@@ -2821,11 +2822,8 @@ bool folio_mark_dirty_range(struct folio *folio, size_t off, size_t len)\n {\n \tstruct address_space *mapping = folio_mapping(folio);\n \n-\tif (likely(mapping)) {\n-\t\tif (folio_test_reclaim(folio))\n-\t\t\tfolio_clear_reclaim(folio);\n+\tif (likely(mapping))\n \t\treturn mapping_dirty_range(mapping, folio, off, len);\n-\t}\n \n \treturn noop_dirty_folio(mapping, folio);\n }\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-09-10",
+          "message_id": "aqLC3Uo6TaZ_3_v1@thinkstation",
+          "email": "kirill@shutemov.name",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch set introduces sub-folio dirty tracking for PTE-mapped mmap writes, addressing the issue of large page cache folios being dirtied unnecessarily when a single byte is written through a shared file mapping. The problem arises because current implementations mark the entire folio as dirty, leading to inefficient writeback and increased minor fault counts. To solve this, the patch harvests hardware PTE dirty bits at page_mkwrite() time and provides the filesystem with the ranges that were actually modified, allowing for more targeted writeback. This approach is already implemented in XFS and is shown to reduce writeback by 99% on a large file system."
     }
   }
 }

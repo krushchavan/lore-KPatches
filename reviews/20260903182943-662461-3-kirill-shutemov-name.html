@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 2/5] mm: add a_ops-&gt;dirty_folio_range() and use the mkclean dirty harvest</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260903182943.662461-3-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-03</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-09</strong><div class="date-range-nav">Active on: <a href="#2026-09-09">2026-09-09</a> &bull; <a href="#2026-09-03">2026-09-03</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-03</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-10</strong><div class="date-range-nav">Active on: <a href="#2026-09-10">2026-09-10</a> &bull; <a href="#2026-09-09">2026-09-09</a> &bull; <a href="#2026-09-03">2026-09-03</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch adds a new operation to the address_space_operations structure called dirty_folio_range(), which allows filesystems to mark specific ranges of a folio as dirty instead of the entire folio. It also introduces a new function folio_mark_dirty_range() that uses this new operation. The patch then updates the folio_clear_dirty_for_io() function to use folio_mkclean_dirtymap() and hand the dirty ranges to the filesystem, reducing unnecessary writes in cases where only part of a folio is modified.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-09">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Usama Arif</span>
-<a class="date-chip" href="../2026-09-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-09">2026-09-09</a>
+<a class="date-chip" href="../2026-09-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-09">2026-09-09</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
@@ -260,6 +260,93 @@ Do you need to clear PG_reclaim here?</pre>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/20260909105157.1627242-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: missing lock ordering, potential bug</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-10">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-10">2026-09-10</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a concern about redundant code in folio_mark_dirty() and folio_mark_dirty_range(), agreed to fix it by moving the clearing into mapping_dirty_range() in v2, which will be folded into the next version of the patch.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, good catch.
+
+Fixup below moves the clearing into mapping_dirty_range(), which is the
+one place that reaches the aops, and drops the copies in
+folio_mark_dirty() and folio_mark_dirty_range().
+
+Will be folded into v2.
+
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 39b54c25a9fa..4995219eb8be 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -2760,6 +2760,20 @@ EXPORT_SYMBOL(folio_redirty_for_writepage);
+ static bool mapping_dirty_range(struct address_space *mapping,
+ 				struct folio *folio, size_t off, size_t len)
+ {
++	/*
++	 * readahead/folio_deactivate could remain
++	 * PG_readahead/PG_reclaim due to race with folio_end_writeback
++	 * About readahead, if the folio is written, the flags would be
++	 * reset. So no problem.
++	 * About folio_deactivate, if the folio is redirtied,
++	 * the flag will be reset. So no problem. but if the
++	 * folio is used by readahead it will confuse readahead
++	 * and make it restart the size rampup process. But it&#x27;s
++	 * a trivial problem.
++	 */
++	if (folio_test_reclaim(folio))
++		folio_clear_reclaim(folio);
++
+ 	if (!mapping-&gt;a_ops-&gt;dirty_folio_range)
+ 		return mapping-&gt;a_ops-&gt;dirty_folio(mapping, folio);
+ 
+@@ -2784,19 +2798,6 @@ bool folio_mark_dirty(struct folio *folio)
+ 	struct address_space *mapping = folio_mapping(folio);
+ 
+ 	if (likely(mapping)) {
+-		/*
+-		 * readahead/folio_deactivate could remain
+-		 * PG_readahead/PG_reclaim due to race with folio_end_writeback
+-		 * About readahead, if the folio is written, the flags would be
+-		 * reset. So no problem.
+-		 * About folio_deactivate, if the folio is redirtied,
+-		 * the flag will be reset. So no problem. but if the
+-		 * folio is used by readahead it will confuse readahead
+-		 * and make it restart the size rampup process. But it&#x27;s
+-		 * a trivial problem.
+-		 */
+-		if (folio_test_reclaim(folio))
+-			folio_clear_reclaim(folio);
+ 		return mapping_dirty_range(mapping, folio, 0,
+ 					   folio_size(folio));
+ 	}
+@@ -2821,11 +2822,8 @@ bool folio_mark_dirty_range(struct folio *folio, size_t off, size_t len)
+ {
+ 	struct address_space *mapping = folio_mapping(folio);
+ 
+-	if (likely(mapping)) {
+-		if (folio_test_reclaim(folio))
+-			folio_clear_reclaim(folio);
++	if (likely(mapping))
+ 		return mapping_dirty_range(mapping, folio, off, len);
+-	}
+ 
+ 	return noop_dirty_folio(mapping, folio);
+ }
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/aqLC3Uo6TaZ_3_v1@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a concern, agreed to fix</div>
+</div>
+</div>
 </div>
 </div>
 </div>

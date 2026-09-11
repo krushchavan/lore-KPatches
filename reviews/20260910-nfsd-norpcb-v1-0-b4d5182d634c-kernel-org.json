@@ -1,0 +1,79 @@
+{
+  "thread_id": "20260910-nfsd-norpcb-v1-0-b4d5182d634c@kernel.org",
+  "subject": "[PATCH 0/5] nfsd/sunrpc: allow userland to handle rpcbind registration",
+  "url": "https://lore.kernel.org/all/20260910-nfsd-norpcb-v1-0-b4d5182d634c@kernel.org/",
+  "dates": {
+    "2026-09-10": {
+      "report_file": "2026-09-10_ollama_llama3.1-8b.html",
+      "developer": "Jeff Layton",
+      "reviews": [
+        {
+          "author": "Chuck Lever",
+          "summary": "Reviewer noted that the patch's documentation incorrectly states that listeners with an rpcbind netid are omitted from the reply, when in fact RDMA listeners have netids but were not registered by NFSD and thus are not a regression.\n\nThe reviewer, Chuck Lever, noted that the patch's listener_set reply is conditional on the userspace-rpcbind flag, which is not supported by the ynl (netlink) specification. He suggested either always sending a reply or removing the registration data from the listener-set and placing it in a separate get operation.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested correction to documentation",
+            "conditional reply",
+            "yneL limitation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "\"listeners that have an rpcbind netid\" overstates the set. RDMA\nlisteners have netids (rdma, rdma6) but are omitted from the\nreply.\n\nFollowing the way Solaris handles RDMA transport, NFSD never\nregistered RDMA itself, so that is not a regression, but the doc\nshould say what your filter actually selects.\n\n---\n\nThe spec declares an unconditional reply, but patch 4 sends one only\nwhen the request carried userspace-rpcbind. ynl has no way to express\na conditional reply, and no other in-tree spec does this.\n\nEither always send the reply (drop the userspace_rpcbind gate in\npatch 4, so a plain caller simply ignores it), or leave listener-set\nwithout a reply and put the registration data in a separate get\noperation. I lean toward always replying; that's is a little more\n\"declarative\".\n\n\n-- \nChuck Lever (Come to NFS bake-a-thon! https://nfsv4bat.org)",
+          "reply_to": "",
+          "message_date": "2026-09-10",
+          "message_id": "73066b7b-119a-47f4-9ca1-2f2432c3c6a3@slotpi15m67",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Chuck Lever",
+          "summary": "Reviewer Chuck Lever noted that the ownership check for rpcbind registration only enforces one direction, and proposed moving the mismatch test into nfsd_create_serv() to make both paths agree, which would require a different extack message but keep the same errno.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "This ownership check lives only in the netlink path, so it is\nenforced in one direction. Consider: the serv is created here with\nuserspace-rpcbind, then an old rpc.nfsd writes a socket fd to\n/proc/fs/nfsd/portlist. __write_ports_addfd() calls\nnfsd_create_serv(net, false), which returns 0 at the existing\n\"if (nn->nfsd_serv) return 0;\" without looking at the flag.\nsvc_addsock() then goes through svc_setup_socket() with pmap_register\nset, and svc_register() returns 0 early because sv_no_rpcbind is set.\nThe write succeeds, and the new listener is neither registered by the\nkernel nor reported to the userspace owner. The reverse order gets\n-EBUSY from the check above.\n\nMoving the mismatch test into nfsd_create_serv(), where every creator\nalready funnels, would make both paths agree. The extack message would\nneed a different home, but the errno is the important part.\n\n\n-- \nChuck Lever (Come to NFS bake-a-thon! https://nfsv4bat.org)",
+          "reply_to": "",
+          "message_date": "2026-09-10",
+          "message_id": "937d96b5-0163-40a0-af2e-76c0ce9c0834@slotpi15m67",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Chuck Lever",
+          "summary": "Chuck Lever noted that in userland rpcbind mode, if a listener creation fails due to an address already in use error, the kernel will only keep the last created listener and not tear it down, leading to unexpected behavior where nfsd is serving on the original port without being registered in rpcbind. He suggested either tearing down all listeners when any of them fail or sending a reply with the existing listeners whenever at least one exists.\n\nReviewer Chuck Lever noted that genlmsg_new() already adds GENL_HDRLEN via genlmsg_total_size(), causing the provided comment to double-count it and potentially mislead future developers, and suggested passing only the attribute payload.\n\nReviewer Chuck Lever suggested that a small helper function be added to emit one address nest for an xprt, called from both loops in nfsd_nl_listener_get_doit() and the loop in this patch, to keep them synchronized and avoid code drift.\n\nreviewer noted that the ACL block in nfsd_support_acl_version() is redundant and can be removed, as it only handles a special case for the ACL program",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "behavioral gap",
+            "unexpected behavior",
+            "harmless",
+            "mislead",
+            "requested changes",
+            "requested change"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The second sentence of the comment is not true after a partial\nfailure. Take a request with userspace-rpcbind carrying {tcp:2049,\ntcp:<port already in use>}. The creation loop continues past the\nsecond failure and keeps only the last errno. The 2049 xprt is on\nsv_permsocks, so the serv survives the list_empty() check below, but\nthis gate skips the reply and the caller sees -EADDRINUSE. nfsd is\nnow serving on 2049 with nothing registered in rpcbind, and the caller\nwas never told which listeners came up or which programs to register.\nThe same end state results when nfsd_nl_listener_set_msg() itself\nfails with -ENOMEM.\n\nIn kernel-owned mode the survivor would already have been registered\ninside svc_xprt_create_from_sa(), so this is a behavioral gap specific\nto the new mode. Either tear down the listeners that were created when\nany of them fails, or send the reply whenever at least one listener\nexists on the serv, regardless of err. The second keeps the existing\npartial-success semantics; the caller can then act on what it got.\n\n---\n\ngenlmsg_new() already adds GENL_HDRLEN via genlmsg_total_size(), so\nthis term double-counts it. Harmless, but the comment will mislead the\nnext person sizing a reply. Pass only the attribute payload here.\n\n---\n\nThis is the same nest emission as the loop in\nnfsd_nl_listener_get_doit(), apart from the XPT_RPCB_UNREG filter and\nthe errno (that one returns -EINVAL). A small helper that emits one\naddr nest for an xprt, called from both loops, would keep the two from\ndrifting, with the size accounting above as the third place to keep\nin step.\n\nAlso, as noted on patch 2, this filter selects TCP and UDP only; the\nspec doc should match.\n\n---\n\nThe ACL block is redundant with the first test. The ACL program has\npg_nvers = NFSD_ACL_NRVERS and pg_vers = nfsd_acl_version, whose\nslots 0 and 1 and any compiled-out version are NULL, and\nnfsd_support_acl_version() checks exactly that range and that array.\nDropping the block removes the function's only program-number special\ncase and the #if with it.\n\n\n-- \nChuck Lever (Come to NFS bake-a-thon! https://nfsv4bat.org)",
+          "reply_to": "",
+          "message_date": "2026-09-10",
+          "message_id": "a9efbd67-4a73-49f5-b65e-ea37074e419d@slotpi15m67",
+          "email": "cel@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series allows userland to handle rpcbind registration for nfsd listeners, providing a new optional flag in the netlink listener set interface that tells the kernel to skip rpcbind registration. This is done by adding a new userspace-rpcbind flag to the listener_set function and honouring it in the listener_set reply. The patch also includes changes to report registerable programs in the listener_set reply and exercises the userspace-rpcbind listener_set flag with selftests. The goal is to allow userland to handle rpcbind registration, while still keeping kernel handling of NLM registration intact."
+    }
+  }
+}

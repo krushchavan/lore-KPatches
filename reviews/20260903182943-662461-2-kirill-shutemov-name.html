@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 1/5] mm: let folio_mkclean() report which pages had dirty PTEs</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260903182943.662461-2-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-03</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-09</strong><div class="date-range-nav">Active on: <a href="#2026-09-09">2026-09-09</a> &bull; <a href="#2026-09-03">2026-09-03</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-03</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-10</strong><div class="date-range-nav">Active on: <a href="#2026-09-10">2026-09-10</a> &bull; <a href="#2026-09-09">2026-09-09</a> &bull; <a href="#2026-09-03">2026-09-03</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the folio_mkclean() function to report which pages had dirty PTEs by introducing a new function, folio_mkclean_dirtymap(). The latter takes a bitmap and sets a bit for every page of the folio whose entry was dirty. The original folio_mkclean() function is now a wrapper that passes no bitmap, preserving its existing behavior. This change allows downstream code to track which parts of a large folio were written through a mapping, rather than assuming the whole folio changed.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-09">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Usama Arif</span>
-<a class="date-chip" href="../2026-09-09_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-09">2026-09-09</a>
+<a class="date-chip" href="../2026-09-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-09">2026-09-09</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
@@ -292,6 +292,78 @@ pmdp_invalidate().</pre>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/20260909101212.894871-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: race condition, timing window</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-10">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-10_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-10">2026-09-10</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged a mistake in the patch and promised to fix it by restructuring the code in v2.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Good catch, thanks. I should have known better.
+
+Fixup below.
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index aaf45ac79fa8..9b8b9428f802 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1140,6 +1140,15 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw,
+ 			if (!pte_dirty(entry) &amp;&amp; !pte_write(entry))
+ 				continue;
+ 
++			flush_cache_page(vma, address, pte_pfn(entry));
++			entry = ptep_clear_flush(vma, address, pte);
++
++			/*
++			 * Take the dirty bit from what the clear returned, not
++			 * from the value read above. The entry is writable, so
++			 * the CPU can set the bit at any point before the
++			 * clear, and the page table lock does not stop it.
++			 */
+ 			if (dirty_map &amp;&amp; pte_dirty(entry)) {
+ 				pgoff_t idx = linear_page_index(vma, address) -
+ 					      pvmw-&gt;pgoff;
+@@ -1149,8 +1158,6 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw,
+ 				__set_bit(idx, dirty_map);
+ 			}
+ 
+-			flush_cache_page(vma, address, pte_pfn(entry));
+-			entry = ptep_clear_flush(vma, address, pte);
+ 			entry = pte_wrprotect(entry);
+ 			entry = pte_mkclean(entry);
+ 			set_pte_at(vma-&gt;vm_mm, address, pte, entry);
+@@ -1170,12 +1177,14 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw,
+ 			if (!pmd_dirty(entry) &amp;&amp; !pmd_write(entry))
+ 				continue;
+ 
+-			if (dirty_map &amp;&amp; pmd_dirty(entry))
+-				bitmap_set(dirty_map, 0, pvmw-&gt;nr_pages);
+-
+ 			flush_cache_range(vma, address,
+ 					  address + HPAGE_PMD_SIZE);
+ 			entry = pmdp_invalidate(vma, address, pmd);
++
++			/* See the PTE case above */
++			if (dirty_map &amp;&amp; pmd_dirty(entry))
++				bitmap_set(dirty_map, 0, pvmw-&gt;nr_pages);
++
+ 			entry = pmd_wrprotect(entry);
+ 			entry = pmd_mkclean(entry);
+ 			set_pmd_at(vma-&gt;vm_mm, address, pmd, entry);
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/aqKxU5iOuWjK58Al@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a mistake, promised to fix</div>
+</div>
+</div>
 </div>
 </div>
 </div>
