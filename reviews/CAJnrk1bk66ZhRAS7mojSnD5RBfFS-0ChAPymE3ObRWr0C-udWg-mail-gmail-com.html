@@ -238,118 +238,10 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>memcg stats flushing (WAS &quot;Re: [PATCH] fuse: disable default bdi strictlimiting&quot;)</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/CAJnrk1bk66ZhRAS7mojSnD5RBfFS+0ChAPymE3ObRWr0C_udWg@mail.gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-12</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a> &bull; <a href="#2026-08-18">2026-08-18</a> &bull; <a href="#2026-08-12">2026-08-12</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a> &bull; <a href="#2026-08-18">2026-08-18</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses the issue of stale memory cgroup (memcg) stats causing premature OOM kills by proposing a solution to reduce the overhead of updating and flushing these statistics. The idea is for memcg to accumulate updates on a per-CPU basis, then propagate them up to a global atomic counter when it reaches a certain threshold, eliminating the need for frequent flushing. This approach aims to scale better for large machines with many cores and focuses on reducing the number of stats that require flushing, specifically NR_FILE_DIRTY and NR_WRITEBACK in the writeback case.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-08-12">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Joanne Koong (author)</span>
-<a class="date-chip" href="../2026-08-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-12">2026-08-12</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author Joanne Koong addressed Yosry Ahmed&#x27;s concern about the impact of stale stats on various kernel components, specifically zswap, cachestat(), working set, and vmscan. She performed armchair analysis for each component, concluding that only vmscan is troublesome due to its reliance on accurate stats to determine whether reclaim can deactivate. Joanne acknowledged the potential issue in vmscan but did not propose a fix, instead suggesting that frequent flushing might not solve the problem and proposing alternative solutions such as keeping deactivation state for a period of time if refaults were observed.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Thanks for your guidance and insights on this, Yosry! Your responses
-have been very helpful.
-
-I&#x27;ll do some experimentation with this and try to get a sense of what
-the update costs are.
-
-One thing I was unclear about and have been looking at is how
-pervasive/important this issue is outside of the writeback case. It
-looks like there are roughly 4 other categories of users that rely on
-stats that can be 2s stale: zswap, cachestat(), working set, and
-vmscan.
-
-Of these, vmscan is the only one that looks troublesome. Some armchair
-analysis below:
-
-a) zswap (zswap_shrinker_count()): 2s of staleness looks fine. the
-stats are only used to calculate the compression ratio and the ratio
-scales a count that comes from a list_lru and *isn&#x27;t* stale. The ratio
-is an average over the whole pool, so it seems like that should be
-fairly steady across 2s. A stale result doesn&#x27;t seem too bad - afaict,
-it is a heuristic of how zswap should get weighed against the other
-shrinkers.
-
-b) cachestat() syscall (filemap_cachestat()): seems preferable to just
-rely on the 2s flusher worker. The results are returned back to
-userspace and not used for any internal kernel decision-making, seems
-ok to have one field in it (nr_recently_evicted) potentially be stale.
-Seems better to err on the side of less frequent flushing anyways, as
-the call path is invoked from unprivileged userspace and flushes the
-root memcg.
-
-c) workingset: looking at the original commits, the calculations are
-estimates that don&#x27;t require exact stats -
-
-refaulting (workingset_test_recent()): commit 9b3016154c91 (&quot;memcg:
-sync flush only if periodic flush is delayed&quot;)
-    Now the question: what are the side-effects of this change? The worst
-    that can happen is the refault codepath will see 4sec old lruvec stats
-    and may cause false (or missed) activations of the refaulted page which
-    may under-or-overestimate the workingset size.  Though that is not very
-    concerning as the kernel can already miss or do false activations.
-
-shadow-node shrinker (count_shadow_nodes()): commit d4a5b369ad6d (&quot;mm:
-ratelimit stat flush from workingset shrinker&quot;)
-    On further inspection it seems like we don&#x27;t really need
-    accurate stats in this function as it was already approximating the amount
-    of appropriate shadow entries to keep for maintaining the refault
-    information.
-
-d) vmscan (prepare_scan_control()): for determining whether reclaim
-can deactivate, there&#x27;s this logic
-
-                /*
-                 * When refaults are being observed, it means a new
-                 * workingset is being established. Deactivate to get
-                 * rid of any stale active pages quickly.
-                 */
-                refaults = lruvec_page_state(target_lruvec,
-                                WORKINGSET_ACTIVATE_ANON);
-                if (refaults != target_lruvec-&gt;refaults[WORKINGSET_ANON] ||
-                        inactive_is_low(target_lruvec, LRU_INACTIVE_ANON))
-                        sc-&gt;may_deactivate |= DEACTIVATE_ANON;
-                else
-                        sc-&gt;may_deactivate &amp;= ~DEACTIVATE_ANON;
-
-(and same for DEACTIVATE_FILE for file-backed folios)
-
-target_lruvec-&gt;refaults[] gets set at the end of the reclaim pass. It
-stores the same lruvec_page_state() value that prepare_scan_control()
-will read at the start of the next reclaim pass, which means if
-reclaim passes happen more frequently than the 2s flushes (eg under
-sustained/heavy memory pressure), this logic will incorrectly assume
-no refaults occurred and deactivation is disabled, which afaict means
-folios won&#x27;t be moved from the active -&gt; inactive list, and reclaim
-will start evicting pages from the inactive list that are hot (eg more
-refaults).
-
-This is from reading the code rather than a reproducer though, so I
-don&#x27;t know how much this matters in practice. Unlike for the writeback
-case, I don&#x27;t think flushign more frequently solves the problem. It
-would shrink the staleness window but not eliminate it. Maybe one
-solution is to keep the deactivation state for a period of time if
-refaults were observed.
-
-If it turns out iterating the parents and updating the per-CPU
-counters of the stat on updates is too expensive, perhaps it makes
-sense to keep the existing rstat logic as is and have caller-side
-workarounds, as only writeback and vmscan would require them.
-
-Thanks,
-Joanne</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Yosry Ahmed</div>
-<a href="https://lore.kernel.org/r/CAJnrk1Yoj7fqbzurmHkbA-vegpQu3cf-_dfvKor_VxuNhPR-AA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: no clear resolution signal, acknowledged potential issue but no proposed fix</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-08-18">
+<div class="thread-node depth-0" id="2026-08-18">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Yosry Ahmed</span>
@@ -406,7 +298,7 @@ it&#x27;s fine.</pre>
 <div class="review-comment-signals">Signals: requested changes, NEUTRAL, requested investigation</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-2" id="2026-08-20">
+<div class="thread-node depth-1" id="2026-08-20">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Joanne Koong (author)</span>
@@ -426,8 +318,6 @@ Joanne</pre>
 <div class="reply-to-label">&#8627; replying to Yosry Ahmed</div>
 <a href="https://lore.kernel.org/r/CAJnrk1ai-TqcudPoK-qFRYAJnUjBmg1kVa6Vxg3eDm5w5ivqSA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: asking_for_clarification</div>
-</div>
-</div>
 </div>
 </div>
 </div>
