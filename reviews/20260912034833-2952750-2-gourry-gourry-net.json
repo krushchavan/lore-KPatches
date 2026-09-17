@@ -4,29 +4,54 @@
   "url": "https://lore.kernel.org/all/20260912034833.2952750-2-gourry@gourry.net/",
   "dates": {
     "2026-09-12": {
-      "report_file": "2026-09-12_ollama_llama3.1-8b.html",
+      "report_file": "2026-09-16_ollama_llama3.1-8b.html",
       "developer": "Gregory Price",
       "reviews": [
         {
           "author": "Zi Yan",
-          "summary": "LGTM (Looks Good To Me), the patch fixes a bug and looks correct.",
+          "summary": "Gave Reviewed-by",
           "sentiment": "POSITIVE",
-          "sentiment_signals": [
-            "LGTM"
-          ],
+          "sentiment_signals": [],
           "has_inline_review": false,
           "tags_given": [
             "Reviewed-by"
           ],
-          "raw_body": "On Fri Sep 11, 2026 at 11:48 PM EDT, Gregory Price wrote:\n> mmap a VM_PFNMAP region whose ->huge_fault installs a PMD through\n> vmf_insert_pfn_pmd() - a vfio-pci MMIO BAR does this - then\n>\n> \tmbind(p, len, MPOL_BIND, &mask, maxnode, MPOL_MF_STRICT);\n>\n> With a stand-in module for the driver:\n>\n>   BUG: unable to handle page fault for address: fffff96dc0000008\n>   RIP: 0010:queue_folios_pte_range+0xaf/0x440\n>    walk_pgd_range+0x52b/0xaf0\n>    __walk_page_range+0x6a/0x1d0\n>    walk_page_range_mm_unsafe+0x193/0x230\n>    queue_pages_range+0x64/0xa0\n>    do_mbind+0x25e/0x640\n>\n> queue_folios_pmd(), inlined above, calls pmd_folio() on that PMD.  The pfn\n> is raw MMIO with no memmap entry, so the folio lands in unpopulated\n> vmemmap.  Neither guard stops the walk:\n>\n>   walk_page_test()         skips VM_PFNMAP, but queue_pages_walk_ops\n>                            supplies ->test_walk, so it never runs\n>   queue_pages_test_walk()  honours vma_migratable(), but only while\n>                            MPOL_MF_STRICT is clear\n>\n> A VM_MIXEDMAP vma needs neither flag, being vma_migratable(), so plain\n> mbind(MPOL_MF_MOVE) reaches this too - and there the bad folio carries on\n> into migrate_folio_add() and folio_isolate_lru().  mshv_vtl_low is such a\n> mapping.\n>\n> Use vm_normal_folio_pmd() and skip on NULL, as the PTE loop in\n> queue_folios_pte_range() already does with vm_normal_folio().  On the NULL\n> path, retain ACTION_CONTINUE handling for the huge zero PMD.\n>\n> mbind(MPOL_MF_STRICT) over a PMD mapped VM_PFNMAP region now returns 0\n> rather than -EIO.  The PTE loop already returned 0 there.\n>\n> Fixes: 3c8e44c9b369 (\"mm: mark special bits for huge pfn mappings when inject\")\n> Reported-by: sashiko-bot <sashiko-bot@kernel.org>\n> Closes: https://sashiko.dev/#/patchset/20260817220810.1175596-1-gourry%40gourry.net\n> Cc: stable@vger.kernel.org\n> Assisted-by: LLM\n> Signed-off-by: Gregory Price (Meta) <gourry@gourry.net>\n> Acked-by: David Hildenbrand (Arm) <david@kernel.org>\n> ---\n>  mm/mempolicy.c | 16 +++++++++-------\n>  1 file changed, 9 insertions(+), 7 deletions(-)\n>\nLGTM.\n\nReviewed-by: Zi Yan <ziy@nvidia.com>\n\n-- \nBest Regards,\nYan, Zi\n\n",
-          "reply_to": "",
+          "raw_body": "",
+          "reply_to": "Gregory Price",
           "message_date": "2026-09-12",
-          "message_id": "",
+          "message_id": "DLDDX69VL9OU.28J2AG7DBDTKR@nvidia.com",
+          "analysis_source": "heuristic"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the mm/mempolicy module where mbind() operations on VM_PFNMAP regions would fail due to incorrect handling of huge page mappings. The issue arises when trying to map a VFIO-pci MMIO BAR, which installs a PMD through vmf_insert_pfn_pmd(). The fix involves using the vm_normal_folio_pmd() function instead of pmd_folio(), and skipping on NULL folios while retaining ACTION_CONTINUE handling for huge zero PMDs. This change ensures that mbind(MPOL_MF_STRICT) operations succeed even when mapping VM_PFNMAP regions."
+    },
+    "2026-09-16": {
+      "report_file": "2026-09-16_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "reviewer questioned the continued use of pmd_folio() and suggested it might be obsolete, recommending a replacement with vm_normal_folio_pmd()\n\nLorenzo (ARM) noted that since the PMD is a leaf node, setting walk->action to ACTION_CONTINUE or not makes no difference in this specific case, and suggested simplifying the code by removing the check for ACTION_CONTINUE.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "questioning",
+            "suggestion",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "This makes me wonder if pmd_folio() is just generally defunct in favour of\nvm_normal_folio_pmd()?\n\n---\n\nSince you've already identified that this is a leaf PMD, is there really any\ndifference between setting walk->action to ACTION_CONTINUE or not?\n\nThere's nothing to descend to in the subtree here so either way you continue to\nthe next PMD entry don't you?\n\nSo there's a pmd_entry specified for both set of walk ops:\n\nstatic const struct mm_walk_ops queue_pages_walk_ops = {\n\t.hugetlb_entry\t\t= queue_folios_hugetlb,\n\t.pmd_entry\t\t= queue_folios_pte_range,\n\t.test_walk\t\t= queue_pages_test_walk,\n\t.walk_lock\t\t= PGWALK_RDLOCK,\n};\n\nstatic const struct mm_walk_ops queue_pages_lock_vma_walk_ops = {\n\t.hugetlb_entry\t\t= queue_folios_hugetlb,\n\t.pmd_entry\t\t= queue_folios_pte_range,\n\t.test_walk\t\t= queue_pages_test_walk,\n\t.walk_lock\t\t= PGWALK_WRLOCK,\n};\n\nBut no pte_entry or install_pte handlers.\n\nReading walk_pmd_range() in mm/pagewalk.c:\n\nstatic int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,\n\t\t\t  struct mm_walk *walk)\n{\n\tbool has_handler = ops->pte_entry;\n\t...\n\tbool has_install = ops->install_pte;\n\t...\n\n\tdo {\nagain:\n\t\twalk->action = ACTION_SUBTREE;\n\t\t...\n\t\tif (ops->pmd_entry)\n\t\t\terr = ops->pmd_entry(pmd, addr, next, walk);\n\t\tif (err)\n\t\t\tbreak;\n\n\t\tif (walk->action == ACTION_AGAIN)\n\t\t\tgoto again;\n\t\tif (walk->action == ACTION_CONTINUE)\n\t\t\tcontinue;\n\n\t\tif (!has_handler) { /* No handlers for lower page tables. */\n\t\t\tif (!has_install)\n\t\t\t\tcontinue; /* Nothing to do. */\n\t\t\t...\n\t\t}\n\t...\n\t} while (pmd++, addr = next, addr != end);\n\t...\n}\n\nIt seems that setting ACTION_CONTINUE or not makes no difference.\n\nThis is really just a long way of saying maybe you could just do:\n\n\tfolio = vm_normal_folio_pmd(walk->vma, addr, pmdval);\n\tif (!folio)\n\t\treturn;\n\n? :)",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-16",
+          "message_id": "aqpyp7ouLyxGhJDK@gremlin",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "The patch addresses a bug in the mm/mempolicy code where a VM_PFNMAP region's huge_fault installs a PMD through vmf_insert_pfn_pmd(), causing a folio to land in unpopulated vmemmap. The fix uses vm_normal_folio_pmd() instead of pmd_folio() and adds a NULL check to prevent the bad folio from carrying on into migrate_folio_add() and folio_isolate_lru()."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a bug in the mm/mempolicy module where mbind() operations on VM_PFNMAP regions would fail due to incorrect handling of huge page mappings. The issue arises when trying to map a VFIO-pci MMIO BAR, which installs a PMD through vmf_insert_pfn_pmd(). The fix involves using the vm_normal_folio_pmd() function instead of pmd_folio(), and skipping on NULL folios while retaining ACTION_CONTINUE handling for huge zero PMDs. This change ensures that mbind(MPOL_MF_STRICT) operations succeed even when mapping VM_PFNMAP regions."
     }
   }
 }

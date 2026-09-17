@@ -1,0 +1,35 @@
+{
+  "thread_id": "aqq8pWI0u1IZNWHT@cmpxchg.org",
+  "subject": "[PATCH v4] mm/page_alloc: avoid direct compaction for costly __GFP_NORETRY allocations",
+  "url": "https://lore.kernel.org/all/aqq8pWI0u1IZNWHT@cmpxchg.org/",
+  "dates": {
+    "2026-09-16": {
+      "report_file": "2026-09-16_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Andrew Morton",
+          "summary": "Andrew Morton noted that the patch does not address all cases where GFP_NORETRY allocations are made, specifically mentioning GFP_NOWAIT and ~__GFP_DIRECT_RECLAIM sites, which do not get watermark exemptions and were not intended to be exempted by the original rmqueue_buddy() change.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "issue",
+            "concern"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "v4:\n\nFrom: Salvatore Dipietro <dipiets@amazon.it>\nSubject: mm/page_alloc: avoid direct compaction for costly __GFP_NORETRY allocations\nDate: Fri, 4 Sep 2026 11:56:28 +0000\n\nCommit 5d8edfb900d5 (\"iomap: Copy larger chunks from userspace\")\nintroduced high-order folio allocations in the iomap buffered write path. \nWhen memory is fragmented, each failed costly-order allocation enters\n__alloc_pages_slowpath() which runs direct compaction and\ndrain_all_pages(), causing a 0.38x throughput drop on PostgreSQL pgbench\n(simple-update) with 1024 clients on a 96-vCPU arm64 system.\n\nThe root issue is that direct compaction is too expensive for hot\nallocation paths that have fallbacks to smaller allocations. \n__filemap_get_folio_mpol() already marks higher-order allocations with\n__GFP_NORETRY | __GFP_NOWARN, signalling that the caller can handle\nfailure.  However, the page allocator still attempts full direct\ncompaction for costly orders with __GFP_NORETRY, which is unnecessarily\naggressive when the caller will simply retry at a lower order.\n\nFor costly-order allocations with __GFP_NORETRY, clear\n__GFP_DIRECT_RECLAIM at the very start of the slowpath, before\ncan_direct_reclaim, can_compact and the nofail checks are evaluated.  This\nmakes the entire slowpath treat the request as non-blocking: no direct\nreclaim, no direct compaction and no drain_all_pages() IPI across every\nCPU.  kswapd (and in turn kcompactd) is still woken further down for\nbackground defragmentation, so compaction keeps working for long-term\nsystem health while being removed from the latency-critical direct\nallocation path.\n\nAllocations that also request __GFP_THISNODE are exempted.  That flag\npairing identifies the local-node-first THP attempt issued by\nalloc_pages_mpol() (mempolicy.c), which relies on direct compaction to\nform transparent huge pages.\n\nTest environment:\n  Hardware:  AWS EC2 m8g.24xlarge (96 vCPU, arm64)\n             12x 1TB IO2 32000 IOPS RAID0 XFS\n  OS:        AL2023\n  Kernel:    v7.3-rc1\n  Database:  PostgreSQL 18.4\n  Workload:  pgbench simple-update, 1024 clients, 96 threads, 1200s\n\nResults (average of 3 runs, TPS):\n\n  Config                   Avg TPS      % vs Baseline\n  baseline (no patch)       59,408       -\n  With this patch          155,409      +161.6%\n\nLink: https://lore.kernel.org/all/20260403193535.9970-1-dipiets@amazon.it/T/#t [v1]\nLink: https://lore.kernel.org/linux-mm/20260420161404.642-1-dipiets@amazon.it/T/#u [v2]\nLink: https://lore.kernel.org/all/20260710143437.12379-1-dipiets@amazon.it/T/#u [v3]\nLink: https://lore.kernel.org/20260904115629.3993331-1-dipiets@amazon.it\nFixes: 5d8edfb900d5 (\"iomap: Copy larger chunks from userspace\")\nSigned-off-by: Salvatore Dipietro <dipiets@amazon.it>\nSigned-off-by: Andrew Morton <akpm@linux-foundation.org>\nAcked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>\nAcked-by: Zi Yan <ziy@nvidia.com>\nReviewed-by: Johannes Weiner <hannes@cmpxchg.org>\nReviewed-by: Christoph Hellwig <hch@lst.de>\nCc: David Hildenbrand <david@redhat.com>\nCc: Michal Hocko <mhocko@suse.com>\nCc: Matthew Wilcox <willy@infradead.org>\nCc: Dave Chinner <dgc@kernel.org>\nCc: Ritesh Harjani <ritesh.list@gmail.com>\nCc: <stable@vger.kernel.org>\n---\n\n mm/page_alloc.c |   18 +++++++++++++++---\n 1 file changed, 15 insertions(+), 3 deletions(-)\n\n--- a/mm/page_alloc.c~mm-page_alloc-avoid-direct-compaction-for-costly-__gfp_noretry-allocations\n+++ a/mm/page_alloc.c\n@@ -4784,10 +4784,10 @@ static inline struct page *\n __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,\n \t\t\t\t\t\tstruct alloc_context *ac)\n {\n-\tbool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;\n-\tbool can_compact = can_direct_reclaim && gfp_compaction_allowed(gfp_mask);\n-\tbool nofail = gfp_mask & __GFP_NOFAIL;\n \tconst bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;\n+\tbool can_direct_reclaim;\n+\tbool can_compact;\n+\tbool nofail;\n \tstruct page *page = NULL;\n \tunsigned int alloc_flags;\n \tunsigned long did_some_progress;\n@@ -4802,6 +4802,18 @@ __alloc_pages_slowpath(gfp_t gfp_mask, u\n \tbool can_retry_reserves = true;\n \tunsigned long alloc_start_time = jiffies;\n \n+\t/*\n+\t * Costly __GFP_NORETRY callers have a cheap fallback, so don't stall\n+\t * them in reclaim or compaction. __GFP_THISNODE callers are exempt.\n+\t */\n+\tif (costly_order && (gfp_mask & __GFP_NORETRY) &&\n+\t    !(gfp_mask & __GFP_THISNODE))\n+\t\tgfp_mask &= ~__GFP_DIRECT_RECLAIM;\n+\n+\tcan_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;\n+\tcan_compact = can_direct_reclaim && gfp_compaction_allowed(gfp_mask);\n+\tnofail = gfp_mask & __GFP_NOFAIL;\n+\n \tif (unlikely(nofail)) {\n \t\t/*\n \t\t * Also we don't support __GFP_NOFAIL without __GFP_DIRECT_RECLAIM,\n_",
+          "reply_to": "",
+          "message_date": "2026-09-16",
+          "message_id": "20260916153540.9a3fb449f5b3fd481ca1b544@linux-foundation.org",
+          "email": "akpm@linux-foundation.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the rmqueue_buddy function in the Linux kernel's page allocation code to avoid direct compaction for costly __GFP_NORETRY allocations. The patch corrects an issue where non-blocking allocations were being allowed access to HIGHATOMIC reserves, which can lead to performance problems and incorrect behavior. It introduces a new flag combination ALLOC_MASK_ATOMIC to represent atomic allocations, and updates the rmqueue_buddy function to use this flag correctly. This change ensures that only true atomic allocations are granted access to HIGHATOMIC reserves, preventing potential issues with other types of non-blocking allocations."
+    }
+  }
+}
