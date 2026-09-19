@@ -2,7 +2,7 @@
   "date": "2026-09-18",
   "report_file": "2026-09-18_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-09-19 07:28 UTC",
+  "last_updated": "2026-09-19 07:29 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -2755,6 +2755,69 @@
           "analysis_source": "llm",
           "review_comments": [],
           "list_id": "linux-kernel@vger.kernel.org"
+        }
+      ],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "JP Kobryn",
+      "primary_email": "inwardvessel@gmail.com",
+      "patches_submitted": [],
+      "patches_reviewed": [],
+      "patches_acked": [
+        {
+          "activity_type": "patch_acked",
+          "subject": "Re: [PATCH bpf-next v12 1/2] mm/bpf: Add bpf_proactive_reclaim kfunc",
+          "message_id": "b115ece2-33a1-412e-ac25-38f339a13599@gmail.com",
+          "url": "https://lore.kernel.org/all/b115ece2-33a1-412e-ac25-38f339a13599@gmail.com/",
+          "date": "2026-09-18T19:45:06Z",
+          "in_reply_to": null,
+          "ack_type": "Reviewed-by",
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "The patch introduces a new bpf_proactive_reclaim kfunc, but reviewers raised concerns about the handling of special enum values and suggested changes to improve future-proofing.",
+          "analysis_source": "llm",
+          "review_comments": [
+            {
+              "author": "JP Kobryn",
+              "summary": "Raised concerns about special enum value handling and suggested changes to improve future-proofing. Approved the patch with conditions.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "special enum value handling",
+                "future-proofing"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "",
+              "reply_to": "",
+              "message_date": "",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": ""
+            },
+            {
+              "author": "Shakeel Butt",
+              "summary": "Requested that the author make the suggested changes and send a new version.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "On Fri, Sep 18, 2026 at 12:45:01PM -0700, JP Kobryn wrote:\n> On 9/17/26 11:58 PM, Hui Zhu wrote:\n> > From: Hui Zhu <zhuhui@kylinos.cn>\n> > \n> > BPF programs can observe memory pressure on a cgroup, e.g. refault\n> > stats via bpf_mem_cgroup_page_state(), but cannot act on it:\n> > triggering reclaim requires writing to memory.reclaim, which BPF\n> > cannot do.\n> > \n> > Add bpf_proactive_reclaim(), a sleepable kfunc performing one\n> > proactive reclaim pass on a memcg, like a write to memory.reclaim\n> > but without retrying until the target is reached, so that when and\n> > how hard to reclaim is BPF policy rather than hard-coded thresholds.\n> > The reclaim target of a single call is capped at MEMCG_CHARGE_BATCH,\n> > as high_work_func() does for memory.high; reclaiming more is left to\n> > the program, which can call the kfunc once per bpf_wq callback and\n> > stop at any point. It is limited to BPF_PROG_TYPE_SYSCALL, because\n> > other sleepable programs may run with filesystem locks held, on\n> > which the reclaim path could deadlock via filesystem shrinkers.\n> > \n> > Convert MIN_SWAPPINESS, MAX_SWAPPINESS and SWAPPINESS_ANON_ONLY from\n> > macros to an enum so that they are emitted into BTF and usable from\n> > BPF programs via vmlinux.h.\n> > \n> > Signed-off-by: Hui Zhu <zhuhui@kylinos.cn>\n> > Acked-by: Shakeel Butt <shakeel.butt@linux.dev>\n> > ---\n> >   mm/bpf_memcontrol.c | 62 ++++++++++++++++++++++++++++++++++++++++++++-\n> >   mm/internal.h       | 10 +++++---\n> >   2 files changed, 67 insertions(+), 5 deletions(-)\n> > \n> > diff --git a/mm/bpf_memcontrol.c b/mm/bpf_memcontrol.c\n> > index 716df49d7647..c5d7f29ade85 100644\n> > --- a/mm/bpf_memcontrol.c\n> > +++ b/mm/bpf_memcontrol.c\n> > @@ -8,6 +8,8 @@\n> >   #include <linux/memcontrol.h>\n> >   #include <linux/bpf.h>\n> > +#include \"internal.h\"\n> > +\n> >   __bpf_kfunc_start_defs();\n> >   /**\n> > @@ -159,6 +161,48 @@ __bpf_kfunc void bpf_mem_cgroup_flush_stats(struct mem_cgroup *memcg)\n> >   \tmem_cgroup_flush_stats(memcg);\n> >   }\n> > +/**\n> > + * bpf_proactive_reclaim - proactively reclaim memory from a memory cgroup\n> > + * @memcg: the target memory cgroup to reclaim from.\n> > + * @size: the amount of memory to reclaim, in bytes, clamped to\n> > + *        MEMCG_CHARGE_BATCH.\n> > + * @swappiness: the reclaim swappiness, in the range [MIN_SWAPPINESS,\n> > + *              SWAPPINESS_ANON_ONLY], or -1 to use the memcg's own\n> > + *              swappiness.\n> \n> The ANON_ONLY enumerator shouldn't be included as part of the range. I\n> would change this to [MIN_SWAPPINESS, MAX_SWAPPINESS] and then specify\n> that ANON_ONLY is a special mode like -1 is.\n> \n> > + *\n> > + * Performs one proactive reclaim pass on @memcg, like a write to\n> > + * memory.reclaim but without retrying until @size is reached. Call it\n> > + * repeatedly to reclaim more than one batch.\n> > + *\n> > + * Only available to BPF_PROG_TYPE_SYSCALL, because other sleepable programs\n> > + * may run with filesystem locks held, which the reclaim path can deadlock\n> > + * on via filesystem shrinkers.\n> > + *\n> > + * Return: The amount of memory reclaimed, in bytes, or a negative error.\n> > + */\n> > +__bpf_kfunc long bpf_proactive_reclaim(struct mem_cgroup *memcg,\n> > +\t\t\t\t       unsigned long size,\n> > +\t\t\t\t       int swappiness)\n> > +{\n> > +\tunsigned long nr_reclaimed;\n> > +\tunsigned long nr_pages;\n> > +\n> > +\tif (swappiness < -1 || swappiness > SWAPPINESS_ANON_ONLY)\n> > +\t\treturn -EINVAL;\n> \n> Related to the previous comment, you treat the special values as part of\n> the range. It works currently, but creates a layout dependency on the\n> enum. I think it would be more future-proof if you did:\n> \n> if (swappiness != -1 && swappiness != SWAPPINESS_ANON_ONLY) {\n> \tif (swappiness < MIN_SWAPPINESS || swappiness > MAX_SWAPPINESS)\n> \t\treturn -EINVAL;\n> }\n> \n> The previous comments I brought up are now resolved, so assuming you'll\n> make the changes above you can include:\n> \n> Reviewed-by: JP Kobryn <jp.kobryn@linux.dev>\n\nHui, please make these changes and just send this patch in next version.\n\n",
+              "reply_to": "JP Kobryn",
+              "message_date": "2026-09-18",
+              "message_id": "",
+              "analysis_source": "llm",
+              "email": "shakeel.butt@linux.dev"
+            }
+          ],
+          "list_id": "linux-kselftest@vger.kernel.org"
         }
       ],
       "discussions_posted": [],
