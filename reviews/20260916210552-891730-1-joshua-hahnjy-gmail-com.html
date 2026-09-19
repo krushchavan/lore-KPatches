@@ -238,20 +238,167 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v6 0/5] mm/page_counter: move stock from mem_cgroup to page_counter</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260916210552.891730-1-joshua.hahnjy@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-17</strong><div class="date-range-nav">Active on: <a href="#2026-09-17">2026-09-17</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to move the stock abstraction from mem_cgroup to page_counter, improving scalability and performance for future page_counters. The change involves decoupling the memsw and memory stocks in cgroup v1, which can lead to a different size of precharged cache for each. To preserve existing semantics, the patch preserves all draining, refilling, and uncharging behavior, including the uncharge path&#x27;s refills and direct uncharges.</div></div>
+    <div class="date-range">Submitted: <strong>2026-09-17</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-18</strong><div class="date-range-nav">Active on: <a href="#2026-09-18">2026-09-18</a> &bull; <a href="#2026-09-17">2026-09-17</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series moves the per-CPU cache of pre-charged pages, known as &#x27;stock&#x27;, from mem_cgroup to page_counter. This change is necessary to make future page_counters scalable and performant, particularly in scenarios where multiple new page_counters are introduced to a memcg. The existing seven-slot per-CPU design and drain policy are retained. For memcg v1 users, this decouples the memory and memsw stocks, potentially leading to different sizes of precharged cache for each. To prevent an invariant from being broken, the patch reports the larger value of memory and memsw usage_in_bytes for memsw reporting.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-17">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Sashiko</span>
+<span class="review-author">Joshua Hahn (author)</span>
 <a class="date-chip" href="../2026-09-17_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-17">2026-09-17</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the patch unconditionally reports the batched size to the caller even if excess was rejected by stock and uncharged from hierarchy, explained this is already existing behavior in vanilla memcg, and plans to fix it separately.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Sashiko raised one bug for the series:
+
+ @@ -192,11 +245,20 @@ bool page_counter_try_charge(struct page_counter *counter,
+  				WRITE_ONCE(c-&gt;watermark, new);
+  		}
+  	}
+ +	if (charge &gt; nr_pages)
+ +		page_counter_refill_stock(counter, charge - nr_pages);
+ +	if (nr_charged)
+ +		*nr_charged = charge;
+  	return true;
+
+ failed:
+
+And asked: Does this unconditionally report the batched size to the
+caller even if the excess was rejected by the stock and uncharged from
+the hierarchy?
+
+---
+
+This is true, but this is already the behavior for vanilla memcg.
+In this series I&#x27;m hoping to preserve all existing semantics without
+changing behaviors, so I can fix this problem in a separate issue.
+
+Specifically, in vanilla try_charge_memcg:
+
+done_restock:
+	if (batch &gt; nr_pages)
+		refill_stock(memcg, batch - nr_pages);
+
+...
+			current-&gt;memcg_nr_pages_over_high += batch;
+
+So I&#x27;ve just preserved the exact semantics that we used to have before.
+
+The problem isn&#x27;t that big anyways though, it&#x27;s a transient inflation
+in memcg_over_high and will be wiped on the next high handling run,
+and there is no effect on accounting or permanent inflations.
+
+So I think this issue is pre-existing and a minor transient inflation
+for memcg_over_high at best. If this looks problematic I can write an
+orthogonal fix separately.
+
+Thanks anyways, Sashiko!
+Joshua</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260917175701.2343946-1-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a problem, plans to fix separately</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-09-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-18">2026-09-18</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a potential issue with the patch, specifically that it unconditionally reports the batched size to the caller even if the excess was rejected by the stock and uncharged from the hierarchy. However, this is already the behavior for vanilla memcg, and Joshua plans to preserve all existing semantics without changing behaviors.</div>
+<div class="review-comment-text">The author acknowledges that the asynchronous draining mechanism may lead to futile reclaim retries, but is considering it acceptable due to its lower overhead compared to synchronous reclamation. They plan to separate the code move from the draining improvements and will address this issue in a follow-up patch.
+
+Author responded to reviewer feedback with a brief acknowledgement, but did not address any specific technical concerns or indicate plans for revision.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">So I was thinking about this part quite a bit in the older versions of
+this series where I changed the draining from being async to sync.
+
+If I understand the issue you saw in LTP correctly, it&#x27;s not one of
+actual memory OOMs but that there was stock that the memcg could use,
+just not in the current CPU that was trying to fulfill the charge,
+and also the draining for the remote CPUs did not happen in the time
+that it took to run through 16 retry attempts.
+
+IOW seems to me we are synchronously waiting for asynchronous drains.
+
+To me this did sound a little bit unfortunate since there really is
+memory that the memcg could have used, just cached in the &quot;wrong&quot;
+place (and for some reason that CPU is too busy to do the drain).
+One of the versions that I worked on previously (v4, [2]) used an atomic
+for the stock so that we just always do a synchronous drain via
+cmpxchg and we wouldn&#x27;t have the problem above.
+
+Obviously there are pros and cons. Synchronous means the reclaim path
+has the ability to reclaim more memory NOW and prevent futile reclaim
+retries, but also it makes each flushing operation more expensive as
+the cmpxchg operation is more expensive than acquiring a local trylock,
+even if it succeeds on the first try. 
+
+In my opinion just doing the synchronous reclamation makes a bit more
+sense to me since it gives a stronger guarantee that we are going to
+get the charges we need to fulfill the charge attempt NOW rather than
+spinning until some remote CPU gets scheduled to perform a local flush.
+
+But this is just personal taste, I haven&#x27;t really seen too much 
+evidence that we are wasting too much time on the reclaims. So maybe
+asynchronous drains are OK here. I can do some more digging in our
+production data to see if we&#x27;re ever just waiting for remote drains
+to finish.
+
+Anyways, I still intend on separating out the two efforts so that this
+one is just a simple code move (and make stock more scalable) for
+cgroup v2 users (and I hope not-so-big impact for cgroup v1 users)
+and I can work on removing the 7-slot limit and improving the draining
+as a follow-up work.
+
+---
+
+Thanks for your thoughts Michal. Have a great day!
+Joshua</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Michal Koutný</div>
+<a href="https://lore.kernel.org/r/20260918184947.3681164-1-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges potential issue, considers trade-offs, acknowledged the reviewer&#x27;s thoughts</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-18">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Koutný</span>
+<a class="date-chip" href="../2026-09-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-18">2026-09-18</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch does not handle the case where a page_counter is being drained while its stock is being updated, which could lead to an underflow of the page_counter&#x27;s count.
+
+Reviewer noted that the stock abstraction move from memcg to page_counter may reintroduce a previously fixed issue related to stockage imprecision, which could trigger OOM (Out of Memory) conditions, and requested further investigation.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi.
+
+On Thu, Sep 17, 2026 at 10:57:00AM -0700, Joshua Hahn &lt;joshua.hahnjy@gmail.com&gt; wrote:
+
+---
+
+It reminds me [1] where stockage imprecision could even trigger OOM but
+it was reportedly only visible in LTP.
+
+HTH,
+Michal
+
+[1] https://lore.kernel.org/all/20250530151858.672391-1-mkoutny@suse.com/</pre>
+</details>
 <div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
-<div class="review-comment-signals">Signals: no clear signal</div>
+<a href="https://lore.kernel.org/r/aqzulM8S63363Tr1@localhost.localdomain" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: drain while updating stock, underflow, imprecision</div>
+</div>
+</div>
 </div>
 </div>
 </div>

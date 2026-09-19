@@ -1,0 +1,116 @@
+{
+  "thread_id": "aq1Cwh9hNw4wWEUP@gourry-fedora-PF4VCD3F",
+  "subject": "[PATCH v2 3/4] sched/numa: scan read-only file mappings in tiering mode",
+  "url": "https://lore.kernel.org/all/aq1Cwh9hNw4wWEUP@gourry-fedora-PF4VCD3F/",
+  "dates": {
+    "2026-09-18": {
+      "report_file": "2026-09-18_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David expressed mild frustration that his request for assistance was being ignored and suggested involving another developer, Lorenzo, to provide help.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "mild frustration"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I understand, but I am not asking about much.\n\nMaybe Lorenzo can help us out.\n\n/me summons Lorenzo\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "c445a20c-ae83-4571-ae97-031ce7facc45@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "Lorenzo pointed out several issues with the patch, including using the new VMA flags API and checking for VMA_READ_BIT, which can be cleared but has no material impact on mapping. He suggested testing vma->vm_file && !vma_test(vma, VMA_MAYWRITE_BIT) instead of the current implementation, but noted that this would still have issues with drivers clearing VMA_MAYWRITE_BIT. Lorenzo proposed a new function, vma_maps_shared_readonly_file(), to correctly determine if a VMA is a shared mapping of a read-only file.\n\nReviewer noted that the patch description was overly verbose and apologized for making it too long.\n\nReviewer Lorenzo noted the patch's readability improvement, but mentioned they need to write a script to find call-outs in their own email thread.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested alternative implementation",
+            "acknowledgment",
+            "personal comment"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by",
+            "Acked-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Firstly you should use the new VMA flags API :)\n\nBut also it seems odd to check VMA_READ_BIT. You can have it cleared but\nmmap()'ing without PROT_READ but has no material impact on mapping since\nwrite implies read for everything afaik (that can have an impact on GUP\nthough).\n\nAlso note that (well my series changes it hopefully landing for next cycle :)\nMAP_PRIVATE-/dev/zero which is anon would satisfy this. But anyway :)\n\nAnyway in general then I wonder if this shouldn't be vma->vm_file &&\n!vma_test(vma, VMA_WRITE_BIT), but then it makes me wonder about whether\nyou care if somebody can mprotect() this writable?\n\nIn which case it'd be vma->vm_file && !vma_test(vma, VMA_MAYWRITE_BIT).\n\nEven then things can be weird, as some drivers will clear VMA_MAYWRITE_BIT\nfor definitely-not-normal-files, though with the intent of disabling\nwriteability altogether.\n\nFor read-only files, as David notes, we do something _weird_:\n\nunsigned long do_mmap(struct file *file, unsigned long addr,\n\t\t\tunsigned long len, unsigned long prot,\n\t\t\tunsigned long flags, vma_flags_t vma_flags,\n\t\t\tunsigned long pgoff, unsigned long *populate,\n\t\t\tstruct list_head *uf)\n{\n\t...\n\tif (file) {\n\t\t...\n\t\tswitch (flags & MAP_TYPE) {\n\t\t\t...\n\t\tcase MAP_SHARED_VALIDATE:\n\t\t\t...\n\t\t\tif (!(file->f_mode & FMODE_WRITE))\n\t\t\t\tvma_flags_clear(&vma_flags, VMA_MAYWRITE_BIT,\n\t\t\t\t\t\tVMA_SHARED_BIT);\n\t\t\t...\n\t\t}\n\t\t...\n\t}\n\t...\n}\n\nSo they become !VMA_SHARED_BIT, !VMA_MAYWRITE_BIT. So it's good you don't\ncheck VMA_SHARED_BIT :)\n\nIf you map a read-only file MAP_PRIVATE as readable/writeable they will\nactually have VMA_WRITE_BIT, VMA_MAYWRITE_BIT set because the writes CoW\ninstead.\n\nAnyway, I'm guessing what you want here is:\n\n- Exclude MAP_PRIVATE mappings\n- Cannot in any universe write to the damn thing\n\nWhich seems like you'd want to test:\n\nIn which case the test should be something like:\n\n\treturn vma_test(vma, VMA_MAYSHARE_BIT) &&\n\t\t!vma_test(vma, VMA_MAYWRITE_BIT);\n\nBUT that isn't enough.\n\nBecause in actual fact (sigh) some drivers clear VMA_MAYWRITE_BIT (but they\nkeep VMA_SHARED_BIT) and write-sealing a memfd gives you VMA_SHARED &&\n!VMA_MAYWRITE_BIT (which is what vma_is_shared_maywrite() is for for\ninstance).\n\nSo if you _truly_ want to know if something has a _shared_ mapping of a\nread-only file It has to be like this:\n\n/**\n * vma_maps_shared_readonly_file() - Is @vma a shared mapping of a read-only\n * file?\n * @vma: The VMA to check.\n *\n * Upon mapping a read-only file with MAP_SHARED[_VALIDATE] mmap() will clear\n * VMA_SHARED_BIT and VMA_MAYWRITE_BIT.\n *\n * The VMA_MAYSHARE_BIT is retained to differentiate against mappings mapped\n * with MAP_PRIVATE.\n *\n * Some drivers clear VMA_MAYWRITE_BIT but by convention retain VMA_SHARED_BIT.\n * This is also true for write-sealed memfd's.\n *\n * Returns: true if the VMA is a shared mapping of a read-only file or false,\n * otherwise.\n */\nstatic inline bool vma_maps_shared_readonly_file(const struct vm_area_struct *vma)\n{\n\t/* Shared mappings of read-only files clear VMA_SHARED_BIT. */\n\tif (vma_test(vma, VMA_SHARED_BIT))\n\t\treturn false;\n\n\t/* But MAP_SHARED mappings retain VMA_MAYSHARE_BIT. */\n\tif (!vma_test(vma, VMA_MAYSHARE_BIT))\n\t\treturn false;\n\n\t/* Shared mappings of read-only files also clear VMA_MAYWRITE_BIT. */\n\tVM_WARN_ON_ONCE(vma_test(vma, VMA_MAYWRITE_BIT));\n\n\treturn true;\n}\n\nThe assert here is because nothing else clears VMA_SHARED_BIT like this, but to\nprotect from future changes that might somehow allow this could be:\n\n\treturn !vma_test(vma, VMA_MAYWRITE_BIT);\n\nNote that my 40 patch behemoth establishes some actual invariants on this kind\nof stuff and introduces some 'VMA checks via semantics' stuff (and eliminates\nVM_SPECIAL!) so if adding something like this I'd maybe base it on that.\n\nObviously if what you need semantically differs from this then do that\ninstead.\n\n---\n\nIt turns out I made it probably too much, or at least too many words :P\nSorry.\n\n---\n\nReminds me that I must schlo... write a script to find call-outs in my mail\n:P\n\n^^^ see above.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1FDhy00epXXtgd@gremlin",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author strongly disagrees with the reviewer's approach, stating that the current feature is 'horrendously broken' and needs a clean backportable fix before proceeding.\n\nThe author acknowledges Lorenzo's concern about the patch introducing unrelated changes, specifically the addition of new vma checks, which may cause unexpected regressions. The author expresses their dislike for this pattern and implies that they will restructure the patch to address these concerns in a future version.\n\nAuthor asked reviewer Lorenzo (ARM) to propose a patch that adds the suggested cleanup, indicating they are open to incorporating the change but need more information.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "pushes back against reviewer's approach",
+            "emphasizes need for clean backportable fix",
+            "acknowledges concern",
+            "implies fix needed",
+            "openness to feedback",
+            "request for clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Please, I beg of you, let us propose clean backportable fixes to handle\nthe dumpster fire before we propose setting the entire dump on fire.\n\nI'm not against doing all of this, but this feature is horrendously\nbroken and every piece of tiering research that used it since ~6.14\nhas just had its data invalidated.\n\n---\n\nRight, I made no attempt at assessing the correctness the existing vma\nchecks - I just moved the existing code to a helper.\n\nI greatly dislike this pattern\n  1) Fix a bug\n  2) While we're here, fix some other subtle hard to explain thing that\n     may or may not change something but certainly is unrelated to the\n     fix and might actually regress something else unexpectedly.\n\nIn a single patch.\n\n---\n\nCan you at least propose a patch on top that adds the cleanup you\nsuggest? Much of the VMA stuff is lost on me because I haven't had\nthe time to sit down and consume the novel.\n\n~Gregory",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1ZUTgLQfLBxn80@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "Reviewer Lorenzo pointed out that the current check includes unnecessary cases like write-sealed memfd and MAP_PRIVATE file-backed mappings, and requested to either remove these cases or open-code for the specific hotfix case with a comment.\n\nReviewer Lorenzo expressed frustration that the original patch did not include a complete implementation, implying that it was incomplete and required further work from him.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "frustration",
+            "implied incompleteness"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Well firstly I'm explaining why what you think you are doing isn't\nnecessarily what you're doing.\n\nYour check as-written includes write-sealed memfd, MAP_PRIVATE file-backed\nmappings etc. and you need to figure out if that makes sense or not...\n\nAnd secondly do not talk about figh... I didn't know it was a hotfix ;)\n\nAnyway, I'd rather you didn't introduce a VMA helper like that here please.\n\nIt's not doing what it says it's doing and it might not even be doing what\nyou think it's doing.\n\nI'd:\n\n\ta. figure out whether it matters/you care/etc. about MAP_PRIVATE,\n\t   write-sealed memfd, etc.\n\n\tb. open-code for the hotfix with a comment.\n\n---\n\nWhat, literally writing the function for you wasn't enough? ;)\n\nI can follow up on it _myself_ if you like + you nag me to (hard to keep\ntrack of things...) good enough? ;)",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "aq1inYWiNWtZlyoo@gremlin",
+          "email": "ljs@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledged that they got defensive about a comment referencing their previous patch series and promised to revisit the code over the weekend.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged defensiveness",
+            "promised rework"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Sorry i got a bit triggered by \"If you check out my 40 patch series\" :P\n\ngive me the weekend, i'll see what i can clean up\n\n~Gregory",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1o3TYZR9JNkXXP@gourry-fedora-PF4VCD3F",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch refactors code for scanning read-only file mappings in tiering mode to improve readability, but its backportability is still a concern."
+    }
+  }
+}

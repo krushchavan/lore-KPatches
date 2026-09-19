@@ -9,6 +9,142 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch modifies the NUMA (Non-Uniform Memory Access) hinting mechanism to scan read-only file mappings when memory tiering is enabled, but only for promotion purposes. This change allows hot file folios on slow memory to be tracked by the tiering code, improving performance in certain scenarios. The patch addresses an issue where shared libraries and other read-only file-backed mappings were excluded from NUMA hinting, leading to placement bouncing and poor performance. By scanning these mappings, the patch enables more accurate tracking of runtime load and improves overall system responsiveness."
+    },
+    "2026-09-18": {
+      "report_file": "2026-09-18_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "The reviewer, David (Arm), pointed out that the function name `vma_is_ro_file` is misleading because a MAP_PRIVATE mapping can still have write permissions, even if it's read-only. He suggested moving this helper to be next to other vma helpers and giving it clear semantics.\n\nReviewer David suggested simplifying the condition for determining whether to scan read-only file mappings in tiering mode, recommending either shortening the current condition or using a helper function to make it more concise.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "misleading function name",
+            "requested changes",
+            "suggested improvement",
+            "recommended simplification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "MAP_PRIVATE can easily map a read-only file with write permissions. So the\nfunction name is a bit misleading.\n\nThis smells like a helper that should go next to other vma helpers and have\nclear semantics.\n\n---\n\nI'd vote for >80c here and but it into a singe line.\n\nOr just use a magical helper\n\nconst bool tiering = numab_mode & NUMA_BALANCING_MEMORY_TIERING;\n\nor sth like that.",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "0ed3ab3a-80b4-492f-867a-0584441722a9@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges reviewer's feedback that the patch could be improved for readability, but is concerned about backportability and balance between improvement and bugfix.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "balance",
+            "backportable"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "No argument here.  Would like to balance improvement vs backportable\nbugfix though.  I broke out the name to try to make it at least a bit\nmore readable.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1Cwh9hNw4wWEUP@gourry-fedora-PF4VCD3F",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David requested assistance from another developer, Lorenzo, indicating that the patch's changes are unclear or require further explanation.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "requested clarification",
+            "lacked understanding"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I understand, but I am not asking about much.\n\nMaybe Lorenzo can help us out.\n\n/me summons Lorenzo\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "c445a20c-ae83-4571-ae97-031ce7facc45@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "The reviewer pointed out several issues with the vma_is_ro_file() function, including its reliance on VMA_READ_BIT and potential edge cases with mprotect() and MAP_PRIVATE mappings. They suggested using a new API to check for read-only file-backed mappings and proposed an alternative implementation that checks for VMA_MAYSHARE_BIT and !VMA_MAYWRITE_BIT.\n\nThe reviewer noted that the patch's logic for determining whether to scan read-only file mappings in tiering mode is incorrect and requested a change to fix it.\n\nThe reviewer noted that the patch introduces a new condition for promotion-only scanning, but it is not clear if this change is necessary or correct, and requested clarification on why this change was made.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "alternative implementation",
+            "requested change",
+            "unclear change",
+            "requested clarification"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Firstly you should use the new VMA flags API :)\n\nBut also it seems odd to check VMA_READ_BIT. You can have it cleared but\nmmap()'ing without PROT_READ but has no material impact on mapping since\nwrite implies read for everything afaik (that can have an impact on GUP\nthough).\n\nAlso note that (well my series changes it hopefully landing for next cycle :)\nMAP_PRIVATE-/dev/zero which is anon would satisfy this. But anyway :)\n\nAnyway in general then I wonder if this shouldn't be vma->vm_file &&\n!vma_test(vma, VMA_WRITE_BIT), but then it makes me wonder about whether\nyou care if somebody can mprotect() this writable?\n\nIn which case it'd be vma->vm_file && !vma_test(vma, VMA_MAYWRITE_BIT).\n\nEven then things can be weird, as some drivers will clear VMA_MAYWRITE_BIT\nfor definitely-not-normal-files, though with the intent of disabling\nwriteability altogether.\n\nFor read-only files, as David notes, we do something _weird_:\n\nunsigned long do_mmap(struct file *file, unsigned long addr,\n\t\t\tunsigned long len, unsigned long prot,\n\t\t\tunsigned long flags, vma_flags_t vma_flags,\n\t\t\tunsigned long pgoff, unsigned long *populate,\n\t\t\tstruct list_head *uf)\n{\n\t...\n\tif (file) {\n\t\t...\n\t\tswitch (flags & MAP_TYPE) {\n\t\t\t...\n\t\tcase MAP_SHARED_VALIDATE:\n\t\t\t...\n\t\t\tif (!(file->f_mode & FMODE_WRITE))\n\t\t\t\tvma_flags_clear(&vma_flags, VMA_MAYWRITE_BIT,\n\t\t\t\t\t\tVMA_SHARED_BIT);\n\t\t\t...\n\t\t}\n\t\t...\n\t}\n\t...\n}\n\nSo they become !VMA_SHARED_BIT, !VMA_MAYWRITE_BIT. So it's good you don't\ncheck VMA_SHARED_BIT :)\n\nIf you map a read-only file MAP_PRIVATE as readable/writeable they will\nactually have VMA_WRITE_BIT, VMA_MAYWRITE_BIT set because the writes CoW\ninstead.\n\nAnyway, I'm guessing what you want here is:\n\n- Exclude MAP_PRIVATE mappings\n- Cannot in any universe write to the damn thing\n\nWhich seems like you'd want to test:\n\nIn which case the test should be something like:\n\n\treturn vma_test(vma, VMA_MAYSHARE_BIT) &&\n\t\t!vma_test(vma, VMA_MAYWRITE_BIT);\n\nBUT that isn't enough.\n\nBecause in actual fact (sigh) some drivers clear VMA_MAYWRITE_BIT (but they\nkeep VMA_SHARED_BIT) and write-sealing a memfd gives you VMA_SHARED &&\n!VMA_MAYWRITE_BIT (which is what vma_is_shared_maywrite() is for for\ninstance).\n\nSo if you _truly_ want to know if something has a _shared_ mapping of a\nread-only file It has to be like this:\n\n/**\n * vma_maps_shared_readonly_file() - Is @vma a shared mapping of a read-only\n * file?\n * @vma: The VMA to check.\n *\n * Upon mapping a read-only file with MAP_SHARED[_VALIDATE] mmap() will clear\n * VMA_SHARED_BIT and VMA_MAYWRITE_BIT.\n *\n * The VMA_MAYSHARE_BIT is retained to differentiate against mappings mapped\n * with MAP_PRIVATE.\n *\n * Some drivers clear VMA_MAYWRITE_BIT but by convention retain VMA_SHARED_BIT.\n * This is also true for write-sealed memfd's.\n *\n * Returns: true if the VMA is a shared mapping of a read-only file or false,\n * otherwise.\n */\nstatic inline bool vma_maps_shared_readonly_file(const struct vm_area_struct *vma)\n{\n\t/* Shared mappings of read-only files clear VMA_SHARED_BIT. */\n\tif (vma_test(vma, VMA_SHARED_BIT))\n\t\treturn false;\n\n\t/* But MAP_SHARED mappings retain VMA_MAYSHARE_BIT. */\n\tif (!vma_test(vma, VMA_MAYSHARE_BIT))\n\t\treturn false;\n\n\t/* Shared mappings of read-only files also clear VMA_MAYWRITE_BIT. */\n\tVM_WARN_ON_ONCE(vma_test(vma, VMA_MAYWRITE_BIT));\n\n\treturn true;\n}\n\nThe assert here is because nothing else clears VMA_SHARED_BIT like this, but to\nprotect from future changes that might somehow allow this could be:\n\n\treturn !vma_test(vma, VMA_MAYWRITE_BIT);\n\nNote that my 40 patch behemoth establishes some actual invariants on this kind\nof stuff and introduces some 'VMA checks via semantics' stuff (and eliminates\nVM_SPECIAL!) so if adding something like this I'd maybe base it on that.\n\nObviously if what you need semantically differs from this then do that\ninstead.\n\n---\n\nIt turns out I made it probably too much, or at least too many words :P\nSorry.\n\n---\n\nReminds me that I must schlo... write a script to find call-outs in my mail\n:P\n\n^^^ see above.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1FDhy00epXXtgd@gremlin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "The author acknowledges the current implementation of memory tiering is broken, agrees that a clean backportable fix is needed before proposing further changes, and implies that significant rework will be required to address the issue.\n\nAuthor acknowledged that their original patch did not assess the correctness of existing vma checks, instead just moved code to a helper function, and expressed dislike for the pattern of fixing unrelated issues in a single patch.\n\nThe author acknowledges that reviewer feedback was unclear, but requests a proposed patch for suggested cleanup before revisiting the issue.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledges existing problem",
+            "implies significant rework",
+            "acknowledged fix needed",
+            "dislike for pattern",
+            "requests clarification",
+            "asks for proposed patch"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Please, I beg of you, let us propose clean backportable fixes to handle\nthe dumpster fire before we propose setting the entire dump on fire.\n\nI'm not against doing all of this, but this feature is horrendously\nbroken and every piece of tiering research that used it since ~6.14\nhas just had its data invalidated.\n\n---\n\nRight, I made no attempt at assessing the correctness the existing vma\nchecks - I just moved the existing code to a helper.\n\nI greatly dislike this pattern\n  1) Fix a bug\n  2) While we're here, fix some other subtle hard to explain thing that\n     may or may not change something but certainly is unrelated to the\n     fix and might actually regress something else unexpectedly.\n\nIn a single patch.\n\n---\n\nCan you at least propose a patch on top that adds the cleanup you\nsuggest? Much of the VMA stuff is lost on me because I haven't had\nthe time to sit down and consume the novel.\n\n~Gregory",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1ZUTgLQfLBxn80@gourry-fedora-PF4VCD3F",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Lorenzo (ARM)",
+          "summary": "The reviewer pointed out that the current check in vma_is_ro_file() includes write-sealed memfd and MAP_PRIVATE file-backed mappings, which may not be intended behavior. They suggested removing the VMA helper function and instead open-coding the hotfix with a comment.\n\nThe reviewer expressed frustration and disappointment that the original patch author did not implement a suggested function on their own, implying that they should have been able to do so without needing further assistance.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "frustration",
+            "disappointment"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Well firstly I'm explaining why what you think you are doing isn't\nnecessarily what you're doing.\n\nYour check as-written includes write-sealed memfd, MAP_PRIVATE file-backed\nmappings etc. and you need to figure out if that makes sense or not...\n\nAnd secondly do not talk about figh... I didn't know it was a hotfix ;)\n\nAnyway, I'd rather you didn't introduce a VMA helper like that here please.\n\nIt's not doing what it says it's doing and it might not even be doing what\nyou think it's doing.\n\nI'd:\n\n\ta. figure out whether it matters/you care/etc. about MAP_PRIVATE,\n\t   write-sealed memfd, etc.\n\n\tb. open-code for the hotfix with a comment.\n\n---\n\nWhat, literally writing the function for you wasn't enough? ;)\n\nI can follow up on it _myself_ if you like + you nag me to (hard to keep\ntrack of things...) good enough? ;)",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "aq1inYWiNWtZlyoo@gremlin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledged that they got defensive about their previous work and promised to revisit and clean up the patch series over the weekend.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "defensiveness",
+            "promise to revisit"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Sorry i got a bit triggered by \"If you check out my 40 patch series\" :P\n\ngive me the weekend, i'll see what i can clean up\n\n~Gregory",
+          "reply_to": "Lorenzo (ARM)",
+          "message_date": "2026-09-18",
+          "message_id": "aq1o3TYZR9JNkXXP@gourry-fedora-PF4VCD3F",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the NUMA hinting code to scan read-only file mappings when memory tiering is enabled. Previously, these mappings were excluded from NUMA hinting to prevent placement bouncing and hide hot file folios on slow memory from the tiering code. The patch makes the scans promotion-only for these mappings, while retaining the existing restriction for ordinary NUMA placement. This change improves the accuracy of tier residency tracking in systems with large databases or other workloads that accumulate data on slower tiers."
     }
   }
 }

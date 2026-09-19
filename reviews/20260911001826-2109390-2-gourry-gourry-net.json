@@ -11,7 +11,7 @@
       "patch_summary": "This patch introduces support for promotion-only NUMA hinting scans in the Linux kernel. It adds a new flag MM_CP_PROT_NUMA_PROMO_ONLY to distinguish between placement and promotion-only scans, allowing the scanner to choose whether to promote pages or not. The change is made to the mm module, specifically in the functions change_prot_numa(), task_numa_work(), and vma_set_file(). The patch preserves existing behavior for certain fixes related to NUMA balancing and memory tiering systems."
     },
     "2026-09-17": {
-      "report_file": "2026-09-17_ollama_llama3.1-8b.html",
+      "report_file": "2026-09-18_ollama_llama3.1-8b.html",
       "developer": "Gregory Price",
       "reviews": [
         {
@@ -46,6 +46,89 @@
           "reply_to": "Peter Zijlstra",
           "message_date": "2026-09-17",
           "message_id": "aqwRX7Ula6ImRw3c@gourry-fedora-PF4VCD3F",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces a new feature to the Linux kernel's NUMA (Non-Uniform Memory Access) balancing system called 'promotion-only' hinting scans. The goal is to optimize page placement for memory tiering systems by allowing the scanner to distinguish between placement and promotion-only scans. A new flag, MM_CP_PROT_NUMA_PROMO_ONLY, is added to indicate that a protection walk should only promote pages rather than placing them. This change preserves existing behavior for certain fixes related to NUMA balancing. The patch modifies several kernel files, including mm.h, sched/fair.c, huge_memory.c, internal.h, mempolicy.c, and mprotect.c."
+    },
+    "2026-09-18": {
+      "report_file": "2026-09-18_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David suggested removing the is_private_single_threaded optimization, which only exists to repeatedly call vma_is_single_threaded_private(), and instead moving this check into folio_can_map_prot_numa() or passing cp_flags directly.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "optimization",
+            "suggestion"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "The is_private_single_threaded only exists to repeatedly call\nvma_is_single_threaded_private().\n\nMaybe we don't care about that optimization.\n\nSo maybe move the vma_is_single_threaded_private() call into\nfolio_can_map_prot_numa() and avoid one bool entirely ... and then maybe just\npass the cp_flags?\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "4d2853c9-edf4-4685-b186-7214ed6abd84@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David pointed out that the promotion-only flag is set incorrectly in two places: once based on sysctl_numa_balancing_mode and again when vma_is_ro_file() returns true, which will always override the previous setting.\n\nReviewer David (Arm) questioned why change_prot_numa() cannot query sysctl_numa_balancing_mode directly, suggesting it would simplify the code to move this inside the function and eliminate the boolean parameter.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "inconsistent flag settings",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "bool promo_only = !(numab_mode & NUMA_BALANCING_NORMAL);\n\n\nand in the later patch\n\nif (vma_is_ro_file(vma))\n\tpromo_only = true;\n\n?\n\nBut ...\n\n---\n\nStupid question: why can't/shouldn't change_prot_numa() query\nsysctl_numa_balancing_mode? Why do we have to query this outside of the function\nand forward it?\n\nI mean, change_prot_numa() gets the vma and can query\nsysctl_numa_balancing_mode. Why not move that into the function and avoid the\nboolean parameter?\n\nWe do have a single change_prot_numa() caller in the tree ...",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "9b5e1573-6fd8-48a5-a274-a6e7ff83d2fe@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Gregory Price (author)",
+          "summary": "Author acknowledges that they had previously planned to convert the code, but dropped it in favor of avoiding a CP bit; agrees to re-add the conversion patch to the series.\n\nThe author acknowledges that the patch's handling of promotion-only NUMA hinting scans is confusing, but explains that it is correct due to the introduction of a read-only file filter which broke TIERING mode. The author agrees that the current implementation is 'awful' and suggests that the real problem lies in the filters not accounting for both NORMAL and TIERING modes.\n\nAuthor acknowledges that the promotion-only protection walk choice should be calculated and stored, but prefers to calculate it once and use that state for the whole operation to avoid a 'split-state problem'. They plan to investigate further and possibly resolve this in patch #4.\n\nAuthor agreed to modify the patch by adding or eliminating a single_threaded_private argument, indicating that further revision is needed.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledges previous plan",
+            "agrees to re-add patch",
+            "acknowledges a complex issue",
+            "explains reasoning",
+            "acknowledges a technical concern",
+            "prefers a particular approach",
+            "acknowledged fix needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I originally had a 5th patch to convert it, but i dropped it while\nmaking multiple attempts to avoid a CP bit at all.\n\nI can add it back to the end of the series if you like.\n\n---\n\nYeah this is confusing, but it is correct.\n\n1) If we're in the code at all, balancing was on at some point.\n\n2) If !NORMAL - then TIERING must have been set - so always true\n   (promo_only says: only PROT_NONE low-tier folios)\n\n3) In (NORMAL | TIERING) mode.  promo_only = !NORMAL = false\n   (so in numab=3 - we PROT_NONE top-tier folios)\n\n4) But this causes socket-to-socket bouncing when (NORMAL) is set\n   so we retain the \"no R/O file\" filter by checking it and setting\n   the promo_only filter back it.\n\nIt is, decidedly, quite awful.\n\nBut the problem isn't the fix - the introduction of the R/O filter broke\nTIERING first.  The problem is that these filters never took both modes\n(NORMAL, TIERING) into account in the first place.  They optimized for\nNORMAL and broke TIERING.\n\n---\n\nWe need to calculate it anyway for patch #4 to track when the last full\nvma scan occurred in numab=3 mode.\n\nWe certainly can, but then we calculate it twice in the stack and it can\nchange out from under us.  I didn't want to have to think about that\nsplit-state problem, so I err'd on the side of calculate-once and do the\nwhole operation based on that state.\n\nI'll need to pull up some investigation notes, but I also remember there\nbeing a situation where checking it underneath this caused more scanning\nwork - didn't want to regress anyone. This might be resolved by patch #4.\n\n---\n\nYeah fair, i'll do that and just add (or eliminate) the\nsingle_threaded_private argument if possible.\n\n~Gregory",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-09-18",
+          "message_id": "aq08OIJ5mCnDVIfs@gourry-fedora-PF4VCD3F",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David suggested refactoring the existing code to improve its cleanliness and maintainability, implying that the current implementation is complex or hard to understand.\n\nReviewer suggested that forwarding whether a VMA was accessed might be cleaner, but noted it depends on the outcome of patch #4.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "complexity",
+            "maintainability",
+            "requested changes",
+            "conditional suggestion"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Given that that code is rather messy, I wonder if it can be cleaned up in a way\nthat would require us to avoid this.\n\n---\n\nMaybe forwarding whether the VMA was accessed could end up cleaner. But yeah, it\ndepends on how patch #4 will end up.",
+          "reply_to": "Gregory Price",
+          "message_date": "2026-09-18",
+          "message_id": "97dbf242-fe4c-43a2-81dd-80a747831a8a@kernel.org",
           "analysis_source": "llm"
         }
       ],

@@ -8,25 +8,76 @@
       "developer": "Joshua Hahn",
       "reviews": [
         {
-          "author": "Sashiko",
-          "summary": "Identified a potential issue with the patch, specifically that it unconditionally reports the batched size to the caller even if the excess was rejected by the stock and uncharged from the hierarchy. However, this is already the behavior for vanilla memcg, and Joshua plans to preserve all existing semantics without changing behaviors.",
-          "sentiment": "neutral",
+          "author": "Joshua Hahn (author)",
+          "summary": "Author acknowledged that the patch unconditionally reports the batched size to the caller even if excess was rejected by stock and uncharged from hierarchy, explained this is already existing behavior in vanilla memcg, and plans to fix it separately.",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "no clear signal"
+            "acknowledged a problem",
+            "plans to fix separately"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "Joshua Hahn",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
+          "raw_body": "Sashiko raised one bug for the series:\n\n @@ -192,11 +245,20 @@ bool page_counter_try_charge(struct page_counter *counter,\n  \t\t\t\tWRITE_ONCE(c->watermark, new);\n  \t\t}\n  \t}\n +\tif (charge > nr_pages)\n +\t\tpage_counter_refill_stock(counter, charge - nr_pages);\n +\tif (nr_charged)\n +\t\t*nr_charged = charge;\n  \treturn true;\n\n failed:\n\nAnd asked: Does this unconditionally report the batched size to the\ncaller even if the excess was rejected by the stock and uncharged from\nthe hierarchy?\n\n---\n\nThis is true, but this is already the behavior for vanilla memcg.\nIn this series I'm hoping to preserve all existing semantics without\nchanging behaviors, so I can fix this problem in a separate issue.\n\nSpecifically, in vanilla try_charge_memcg:\n\ndone_restock:\n\tif (batch > nr_pages)\n\t\trefill_stock(memcg, batch - nr_pages);\n\n...\n\t\t\tcurrent->memcg_nr_pages_over_high += batch;\n\nSo I've just preserved the exact semantics that we used to have before.\n\nThe problem isn't that big anyways though, it's a transient inflation\nin memcg_over_high and will be wiped on the next high handling run,\nand there is no effect on accounting or permanent inflations.\n\nSo I think this issue is pre-existing and a minor transient inflation\nfor memcg_over_high at best. If this looks problematic I can write an\northogonal fix separately.\n\nThanks anyways, Sashiko!\nJoshua",
+          "reply_to": "",
+          "message_date": "2026-09-17",
+          "message_id": "20260917175701.2343946-1-joshua.hahnjy@gmail.com",
+          "email": "joshua.hahnjy@gmail.com",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series aims to move the stock abstraction from mem_cgroup to page_counter, improving scalability and performance for future page_counters. The change involves decoupling the memsw and memory stocks in cgroup v1, which can lead to a different size of precharged cache for each. To preserve existing semantics, the patch preserves all draining, refilling, and uncharging behavior, including the uncharge path's refills and direct uncharges."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series moves the per-CPU cache of pre-charged pages, known as 'stock', from mem_cgroup to page_counter. This change is necessary to make future page_counters scalable and performant, particularly in scenarios where multiple new page_counters are introduced to a memcg. The existing seven-slot per-CPU design and drain policy are retained. For memcg v1 users, this decouples the memory and memsw stocks, potentially leading to different sizes of precharged cache for each. To prevent an invariant from being broken, the patch reports the larger value of memory and memsw usage_in_bytes for memsw reporting."
+    },
+    "2026-09-18": {
+      "report_file": "2026-09-18_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "Michal Koutný",
+          "summary": "Reviewer noted that the patch does not handle the case where a page_counter is being drained while its stock is being updated, which could lead to an underflow of the page_counter's count.\n\nReviewer noted that the stock abstraction move from memcg to page_counter may reintroduce a previously fixed issue related to stockage imprecision, which could trigger OOM (Out of Memory) conditions, and requested further investigation.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "drain while updating stock",
+            "underflow",
+            "imprecision",
+            "OOM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi.\n\nOn Thu, Sep 17, 2026 at 10:57:00AM -0700, Joshua Hahn <joshua.hahnjy@gmail.com> wrote:\n\n---\n\nIt reminds me [1] where stockage imprecision could even trigger OOM but\nit was reportedly only visible in LTP.\n\nHTH,\nMichal\n\n[1] https://lore.kernel.org/all/20250530151858.672391-1-mkoutny@suse.com/",
+          "reply_to": "Joshua Hahn",
+          "message_date": "2026-09-18",
+          "message_id": "aqzulM8S63363Tr1@localhost.localdomain",
+          "email": "mkoutny@suse.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joshua Hahn (author)",
+          "summary": "The author acknowledges that the asynchronous draining mechanism may lead to futile reclaim retries, but is considering it acceptable due to its lower overhead compared to synchronous reclamation. They plan to separate the code move from the draining improvements and will address this issue in a follow-up patch.\n\nAuthor responded to reviewer feedback with a brief acknowledgement, but did not address any specific technical concerns or indicate plans for revision.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledges potential issue",
+            "considers trade-offs",
+            "acknowledged the reviewer's thoughts",
+            "did not provide further explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "So I was thinking about this part quite a bit in the older versions of\nthis series where I changed the draining from being async to sync.\n\nIf I understand the issue you saw in LTP correctly, it's not one of\nactual memory OOMs but that there was stock that the memcg could use,\njust not in the current CPU that was trying to fulfill the charge,\nand also the draining for the remote CPUs did not happen in the time\nthat it took to run through 16 retry attempts.\n\nIOW seems to me we are synchronously waiting for asynchronous drains.\n\nTo me this did sound a little bit unfortunate since there really is\nmemory that the memcg could have used, just cached in the \"wrong\"\nplace (and for some reason that CPU is too busy to do the drain).\nOne of the versions that I worked on previously (v4, [2]) used an atomic\nfor the stock so that we just always do a synchronous drain via\ncmpxchg and we wouldn't have the problem above.\n\nObviously there are pros and cons. Synchronous means the reclaim path\nhas the ability to reclaim more memory NOW and prevent futile reclaim\nretries, but also it makes each flushing operation more expensive as\nthe cmpxchg operation is more expensive than acquiring a local trylock,\neven if it succeeds on the first try. \n\nIn my opinion just doing the synchronous reclamation makes a bit more\nsense to me since it gives a stronger guarantee that we are going to\nget the charges we need to fulfill the charge attempt NOW rather than\nspinning until some remote CPU gets scheduled to perform a local flush.\n\nBut this is just personal taste, I haven't really seen too much \nevidence that we are wasting too much time on the reclaims. So maybe\nasynchronous drains are OK here. I can do some more digging in our\nproduction data to see if we're ever just waiting for remote drains\nto finish.\n\nAnyways, I still intend on separating out the two efforts so that this\none is just a simple code move (and make stock more scalable) for\ncgroup v2 users (and I hope not-so-big impact for cgroup v1 users)\nand I can work on removing the 7-slot limit and improving the draining\nas a follow-up work.\n\n---\n\nThanks for your thoughts Michal. Have a great day!\nJoshua",
+          "reply_to": "Michal Koutný",
+          "message_date": "2026-09-18",
+          "message_id": "20260918184947.3681164-1-joshua.hahnjy@gmail.com",
+          "email": "joshua.hahnjy@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series moves the per-CPU cache of pre-charged pages, known as 'stock', from mem_cgroup to page_counter. This change is necessary to make future page_counters scalable and performant, particularly in scenarios where multiple new page_counters are introduced to a memcg. The existing seven-slot per-CPU design and drain policy are retained. For memcg v1 users, this decouples the memory and memsw stocks, potentially leading to different sizes of precharged cache for each. To prevent an invariant from being broken, the patch reports the larger value of memory and memsw usage_in_bytes for memsw reporting."
     }
   }
 }
