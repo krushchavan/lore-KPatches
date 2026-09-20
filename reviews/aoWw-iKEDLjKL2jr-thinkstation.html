@@ -238,130 +238,70 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] mm/huge_memory: transfer the pmd dirty bit to the folio on zap</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/aoWw_iKEDLjKL2jr@thinkstation/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-08-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a> &bull; <a href="#2026-08-19">2026-08-19</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-08-20</strong><div class="date-range-nav">Active on: <a href="#2026-08-20">2026-08-20</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses an issue where the pmd dirty bit is not being transferred to the folio when a huge page is zapped, leading to potential silent data loss in certain file systems like xfs. The problem arises because the TLB flush is deferred and can occur after the rmap has been dropped under the pmd lock, causing stale TLB entries to remain. To fix this, the patch aims to transfer the pmd dirty bit to the folio on zap, ensuring that data integrity is maintained even in the presence of concurrent writes.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0" id="2026-08-19">
+<div class="thread-node depth-0" id="2026-08-20">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Usama Arif</span>
-<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
+<span class="review-author">Lance Yang</span>
+<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-20">2026-08-20</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that the current implementation of tlb_flush_mmu_tlbonly() and tlb_remove_page_size() can lead to a stale TLB entry being accessed after its rmap entry is removed, resulting in a silently lost write. They suggested adding a new function pmd_zap_needs_tlb_flush() to check if a TLB flush is needed before dropping the rmap entry.</div>
+<div class="review-comment-text">Reviewer noted that pageout() cannot pass its refcount check due to PMD mapping holding an extra folio reference, which is dropped by mmu_gather only after TLB flush
+
+Reviewer noted that writeback can run folio_mkclean() concurrently with another CPU holding a stale TLB entry reference, causing a silent lost write and missing PG_dirty
+
+Reviewer noted that zap_huge_pmd() only handles one PMD under PTL and suggested flushing the TLB before calling folio_remove_rmap_pmd() to avoid stale TLB entries.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">I am currently at below to reduce tlb flushes, but still WIP
+<pre class="raw-body-text">Right. pageout() cannot pass its refcount check while PMD mapping still
+holds an extra folio ref, and mmu_gather drops that ref only after TLB
+flush.
 
+---
 
-diff --git a/include/asm-generic/tlb.h b/include/asm-generic/tlb.h
-index bdcc2778ac64f..60bdd6287b5a9 100644
---- a/include/asm-generic/tlb.h
-+++ b/include/asm-generic/tlb.h
-@@ -301,6 +301,12 @@ bool __tlb_remove_folio_pages(struct mmu_gather *tlb, struct page *page,
-  * function, except we define it before the &#x27;struct mmu_gather&#x27;.
-  */
- #define tlb_delay_rmap(tlb) (((tlb)-&gt;delayed_rmap = 1), true)
-+/*
-+ * Like tlb_delay_rmap() but without the side effect, for callers that must
-+ * flush rather than delay: can another CPU still reach this mapping through a
-+ * stale TLB entry once its rmap entry is gone? Not during fullmm teardown.
-+ */
-+#define tlb_rmap_needs_flush(tlb) (!(tlb)-&gt;fullmm)
- extern void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma);
- #endif
+Yep. Writeback can run folio_mkclean() while that ref is still held,
+though, and with rmap already gone it misses the PMD ...
 
-@@ -315,6 +321,7 @@ extern void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma);
-  */
- #ifndef tlb_delay_rmap
- #define tlb_delay_rmap(tlb) (false)
-+#define tlb_rmap_needs_flush(tlb) (false)
- static inline void tlb_flush_rmaps(struct mmu_gather *tlb, struct vm_area_struct *vma) { }
- #endif
+---
 
+zap_huge_pmd() only handles one PMD under PTL anyway ... how about just
+flushing before folio_remove_rmap_pmd()?
+
+---8&lt;---
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index afbb5974bd225..76d8d5cf92ee0 100644
+index afbb5974bd22..6fb34924ef66 100644
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
-@@ -2493,6 +2493,33 @@ static bool has_deposited_pgtable(struct vm_area_struct *vma, pmd_t pmdval,
-        return folio &amp;&amp; folio_test_anon(folio);
- }
+@@ -2531,6 +2531,14 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 	is_present = pmd_present(orig_pmd);
+ 	folio = normal_or_softleaf_folio_pmd(vma, addr, orig_pmd, is_present);
+ 	has_deposit = has_deposited_pgtable(vma, orig_pmd, folio);
++	/*
++	 * folio_mkclean() relies on the rmap to find writable mappings.
++	 * Flush stale TLB entries before removing it below.
++	 */
++	if (folio &amp;&amp; is_present &amp;&amp; !folio_test_anon(folio) &amp;&amp;
++	    pmd_dirty(orig_pmd))
++		tlb_flush_mmu_tlbonly(tlb);
++
+ 	if (folio)
+ 		zap_huge_pmd_folio(mm, vma, orig_pmd, folio, is_present);
+ 	if (has_deposit)
+---
 
-
-+static bool pmd_zap_needs_tlb_flush(struct mmu_gather *tlb, pmd_t pmdval,
-+                                   struct folio *folio, bool is_present)
-+{
-+       struct address_space *mapping;
-+
-+       if (!is_present || !pmd_dirty(pmdval) || folio_test_anon(folio))
-+               return false;
-+       if (!tlb_rmap_needs_flush(tlb))
-+               return false;
-+
-+       mapping = folio_mapping(folio);
-+       return mapping &amp;&amp; mapping_can_writeback(mapping);
-+}
-+
- /**
-  * zap_huge_pmd - Zap a huge THP which is of PMD size.
-  * @tlb: The MMU gather TLB state associated with the operation.
-@@ -2531,8 +2558,15 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
-        is_present = pmd_present(orig_pmd);
-        folio = normal_or_softleaf_folio_pmd(vma, addr, orig_pmd, is_present);
-        has_deposit = has_deposited_pgtable(vma, orig_pmd, folio);
--       if (folio)
-+       if (folio) {
-+               /* Flush before zap_huge_pmd_folio() drops the rmap entry. */
-+               if (pmd_zap_needs_tlb_flush(tlb, orig_pmd, folio, is_present)) {
-+                       tlb_flush_mmu_tlbonly(tlb);
-+                       /* Re-arm: tlb_remove_page_size() needs tlb-&gt;end set. */
-+                       tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
-+               }
-                zap_huge_pmd_folio(mm, vma, orig_pmd, folio, is_present);
-+       }
-        if (has_deposit)
-                zap_deposited_table(mm, pmd);</pre>
+Cheers, Lance</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Lance Yang</div>
-<a href="https://lore.kernel.org/r/1d0271fc-9f60-4b7f-8b89-e82a4f7034d5@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20260819161728.70270-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, concern about concurrent execution, request for fix</div>
 </div>
 </div>
 <div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Pedro Falcato</span>
-<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Pedro Falcato questioned the assumption that page_mkwrite is called in the same path as do_set_pmd(), citing write amplification concerns and pointing to a comment in wp_huge_pmd() indicating that COW or write-notify should be handled on the pte level.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Where do you see page_mkwrite being called in the same path as do_set_pmd()?
-Per my understanding of the code, this Should Not Happen, and it really Should
-Not Happen for many, many reasons (write amplification being the main one).
-
-Namely, see the comment in wp_huge_pmd():
-	/* COW or write-notify handled on pte level: split pmd. */
-
-if file huge pages get mapped writable, that&#x27;s a bug.
- 
-
--- 
-Pedro</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/aoXYh9EPF6QnlvIK@pedro-suse.lan" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, technical disagreement</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Lance Yang</span>
@@ -659,108 +599,6 @@ Cheers, Lance</pre>
 <div class="reply-to-label">&#8627; replying to Pedro Falcato</div>
 <a href="https://lore.kernel.org/r/20260820061337.24669-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, clarification, correction</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Hugh Dickins</span>
-<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-19">2026-08-19</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="review-tag-badge">Acked-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer noted that modifying a 2MiB+ hole in a shmem file through an mmap can result in silent data loss due to the pmd dirty bit not being updated, and suggested fixing this by adding a pmd equivalent of tlb_delay_rmap()
-
-Gave Acked-by</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">It isn&#x27;t entirely clear from the report, but this is all about modifying
-a 2MiB+ *hole* in a shmem file through an mmap thereof, with first fault
-a read fault not a write fault.  I suppose only a few proceed in that way
-(though truncating an empty file to some size and then mmap&#x27;ing that size
-is very normal).
-
-Or everybody who tried to report this bug, wrote their report into a
-2MiB hole in a shmem file through an mmap thereof.
-
-Other than holes, all shmem folios are dirty throughout (and re-marked
-dirty as soon as brought back from swap): so for most, it doesn&#x27;t matter
-what the pmd says.
-
-This raised a dim memory, took a while to locate what I was remembering:
-e1f1b1572e8d (&quot;mm/huge_memory.c: fix data loss when splitting a file pmd&quot;)
-from 2018.
-
-Not quite the same; but what a pity that one didn&#x27;t prompt any of us
-to look further and find what Usama now has.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/5bd5c5fe-0d55-9fec-aadf-477891428887@google.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
-<div class="thread-node depth-0" id="2026-08-20">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Lance Yang</span>
-<a class="date-chip" href="../2026-08-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-08-20">2026-08-20</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer noted that pageout() cannot pass its refcount check due to PMD mapping holding an extra folio reference, which is dropped by mmu_gather only after TLB flush
-
-Reviewer noted that writeback can run folio_mkclean() concurrently with another CPU holding a stale TLB entry reference, causing a silent lost write and missing PG_dirty
-
-Reviewer noted that zap_huge_pmd() only handles one PMD under PTL and suggested flushing the TLB before calling folio_remove_rmap_pmd() to avoid stale TLB entries.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Right. pageout() cannot pass its refcount check while PMD mapping still
-holds an extra folio ref, and mmu_gather drops that ref only after TLB
-flush.
-
----
-
-Yep. Writeback can run folio_mkclean() while that ref is still held,
-though, and with rmap already gone it misses the PMD ...
-
----
-
-zap_huge_pmd() only handles one PMD under PTL anyway ... how about just
-flushing before folio_remove_rmap_pmd()?
-
----8&lt;---
-diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index afbb5974bd22..6fb34924ef66 100644
---- a/mm/huge_memory.c
-+++ b/mm/huge_memory.c
-@@ -2531,6 +2531,14 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
- 	is_present = pmd_present(orig_pmd);
- 	folio = normal_or_softleaf_folio_pmd(vma, addr, orig_pmd, is_present);
- 	has_deposit = has_deposited_pgtable(vma, orig_pmd, folio);
-+	/*
-+	 * folio_mkclean() relies on the rmap to find writable mappings.
-+	 * Flush stale TLB entries before removing it below.
-+	 */
-+	if (folio &amp;&amp; is_present &amp;&amp; !folio_test_anon(folio) &amp;&amp;
-+	    pmd_dirty(orig_pmd))
-+		tlb_flush_mmu_tlbonly(tlb);
-+
- 	if (folio)
- 		zap_huge_pmd_folio(mm, vma, orig_pmd, folio, is_present);
- 	if (has_deposit)
----
-
-Cheers, Lance</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/20260819161728.70270-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, concern about concurrent execution, request for fix</div>
 </div>
 </div>
 </div>
