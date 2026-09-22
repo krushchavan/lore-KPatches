@@ -2,7 +2,7 @@
   "date": "2026-09-21",
   "report_file": "2026-09-21_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-09-22 06:00 UTC",
+  "last_updated": "2026-09-22 06:06 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -10,5 +10,166 @@
     ]
   ],
   "generation_time_seconds": 0.0,
-  "developer_reports": []
+  "developer_reports": [
+    {
+      "name": "Alexandre Ghiti",
+      "primary_email": "alexghiti@rivosinc.com",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH] mm: madvise: drop MADV_PAGEOUT folios at swap writeback completion",
+          "message_id": "20260921152449.629486-1-alex@ghiti.fr",
+          "url": "https://lore.kernel.org/all/20260921152449.629486-1-alex@ghiti.fr/",
+          "date": "2026-09-21T15:24:58Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260921152449.629486-1-alex@ghiti.fr",
+              "url": "https://lore.kernel.org/all/20260921152449.629486-1-alex@ghiti.fr/",
+              "subject": "[PATCH] mm: madvise: drop MADV_PAGEOUT folios at swap writeback completion",
+              "date": "2026-09-21T15:24:58Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch improves the handling of MADV_PAGEOUT folios on asynchronous swap devices by marking them as dropbehind at isolation time instead of waiting for writeback completion. This allows the memory to be freed earlier, reducing latency and improving performance. The patch also updates various kernel modules to handle the new behavior correctly.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "David (Arm)",
+              "summary": "Reviewer David pointed out that the patch's behavior for MADV_PAGEOUT folios is similar to regular reclamation, where memory is added to the swap cache and only freed on a subsequent scan, and asked why this isn't sufficient.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "But we have the same behavior when just reclaiming memory ordinarily? It's added\nto the swapcache and only the next scan actually frees up the memory.\n\nWouldn't we memory we reclaim ... just gone, like in the sync case?\n\n-- \nCheers,\n\nDavid",
+              "reply_to": "Alexandre Ghiti",
+              "message_date": "2026-09-21",
+              "message_id": "70cae945-3a4a-40db-96ac-5ce66a3fa186@kernel.org",
+              "analysis_source": "llm",
+              "email": "david@kernel.org"
+            },
+            {
+              "author": "Barry Song",
+              "summary": "Reviewer noted that the patch does not handle the case where a folio is already under writeback, and suggested adding a check to ensure that the folio is not being written back before marking it as dropbehind.\n\nReviewer Barry Song noted that the current implementation of MADV_PAGEOUT for asynchronous I/O, which delays folio release until a later scan, can lead to cold/hot inversion due to NVMe's fast writeback completion during isolation. He pointed out that this issue is similar to one addressed by Ridong's patch for active/inactive LRU reclaim path and suggested considering skipping the later scan and reclaiming folios immediately once I/O completes.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes",
+                "suggested alternative approach"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)\n<david@kernel.org> wrote:\n\n---\n\nFor synchronous I/O, such as zswap and zram, the memory is released\nimmediately after sync I/O is done.\n\nFor asynchronous I/O, such as NVMe, the swapcache is currently\nexpected to be rotated back to the tail of the LRU and wait for\nanother scan. Alexandre once mentioned that when he tried handling\nasync I/O the same way as sync I/O—releasing the memory once the I/O\ncompleted—he saw some regression. So, delaying the release until a\nlater scan may allow swapcache hits before the folios are eventually\nreclaimed.\n\nBut we actually have a problem here: this rotation, which puts\nwriteback folios at the tail of the LRU, is not reliable at all.\n\n`folio_rotate_reclaimable()` would only work reliably if the endio\nhappens after the folio has been put back on the LRU head, rather than\nwhile it is still isolated.\n\nBut nowadays NVMe is very fast. If we isolate N pages and perform\nshrink on them, M pages may finish writeback during the isolation,\nwhile the remaining N-M pages are still under writeback. M can easily\nbe more than 50% of N.\n\nAs a result, we can end up with the following cold/hot inversion:\n\nLRU head\n----- M pages whose writeback completed during isolation\n----- other pages\n----- N-M pages that are successfully rotated to the LRU tail\nLRU tail\n\nNow we can see that the M pages were expected to be reclaimed, but\nthey are not only left unreclaimed, but are effectively promoted to\nthe LRU head.\n\nFor MGLRU, commit 359a5e1416ca (\"mm: multi-gen LRU: retry folios\nwritten back while isolated\") added the following code to reclaim\nthose M pages that finish writeback during isolation by retrying\n`shrink_folio_list()` on them:\n\n                /* retry folios that may have missed\nfolio_rotate_reclaimable() */\n                if (!skip_retry && !folio_test_active(folio) &&\n!folio_mapped(folio) &&\n                    !folio_test_dirty(folio) && !folio_test_writeback(folio)) {\n                        list_move(&folio->lru, &clean);\n                        continue;\n                }\n\nThis somehow resolves the cold/hot inversion, but leaves the M and\nN-M pages with inconsistent behavior: some are actually reclaimed,\nwhile others remain at the tail of the LRU.\n\nFor the active/inactive LRU and `MADV_PAGEOUT`, we don't have a\nmechanism to restore the missed reclaim opportunity. Ridong's patch[1]\naddresses this cold/hot inversion in the active/inactive LRU reclaim\npath. To my knowledge, there has never been a patch to address the\nsame cold/hot inversion in `MADV_PAGEOUT`.\n\nBTW, if `MADV_PAGEOUT` is an explicit hint from userspace to reclaim\nthe memory, would it make sense to skip the later scan and reclaim the\nfolios immediately once the I/O completes?\n\n[1] https://lore.kernel.org/linux-mm/20260920132519.3369946-1-ridong.chen@linux.dev/\n\nBest Regards\nBarry",
+              "reply_to": "David (Arm)",
+              "message_date": "2026-09-22",
+              "message_id": "CAGsJ_4y8-wD0yMV8GCtCz5MfNrOKqUaTd+UgH=8MoP_nuvPnGg@mail.gmail.com",
+              "analysis_source": "llm",
+              "email": "baohua@kernel.org"
+            }
+          ],
+          "list_id": "linux-fsdevel@vger.kernel.org"
+        },
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v6 0/3] mm: zswap: free cold writeback folios promptly",
+          "message_id": "20260921151306.625134-1-alex@ghiti.fr",
+          "url": "https://lore.kernel.org/all/20260921151306.625134-1-alex@ghiti.fr/",
+          "date": "2026-09-21T15:37:53Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 6,
+          "series_patch_count": 3,
+          "version_history": [
+            {
+              "version": 6,
+              "message_id": "20260921151306.625134-1-alex@ghiti.fr",
+              "url": "https://lore.kernel.org/all/20260921151306.625134-1-alex@ghiti.fr/",
+              "subject": "[PATCH v6 0/3] mm: zswap: free cold writeback folios promptly",
+              "date": "2026-09-21T15:37:53Z"
+            }
+          ],
+          "series_items": [
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v6 1/3] mm: swap: move LRU insertion out of the swap cache allocator",
+              "message_id": "20260921151306.625134-2-alex@ghiti.fr",
+              "url": "https://lore.kernel.org/all/20260921151306.625134-2-alex@ghiti.fr/",
+              "date": "2026-09-21T15:14:18Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 6,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch moves the insertion of a new folio into the LRU out of the swap cache allocator, allowing callers to act on the folio before it becomes visible to reclaim. This is necessary for two use cases: moving refault evaluation out of the allocation and zswap writeback dropbehind. The helper function is renamed from `swap_cache_alloc_folio` to `__swap_cache_alloc_folio`, and its callers are responsible for adding the folio to the LRU after allocation.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-fsdevel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v6 2/3] mm: swap: drop dropbehind swap cache folios on writeback completion",
+              "message_id": "20260921151306.625134-3-alex@ghiti.fr",
+              "url": "https://lore.kernel.org/all/20260921151306.625134-3-alex@ghiti.fr/",
+              "date": "2026-09-21T15:15:23Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 6,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch modifies the Linux kernel to drop swap cache folios from their cache once writeback completes, rather than leaving them for reclaim later. This is done by adding a new function `swap_writeback_dropbehind_folio` that drops the folio directly from `folio_end_writeback`. The change ensures that the folio is not left in the swap cache with no way to reclaim it, and prevents blocking on the folio lock in interrupt context. The patch also updates several other functions to handle dropbehind for swap cache folios.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-fsdevel@vger.kernel.org"
+            },
+            {
+              "activity_type": "patch_submitted",
+              "subject": "[PATCH v6 3/3] mm: zswap: drop cold writeback folios via swap dropbehind",
+              "message_id": "20260921151306.625134-4-alex@ghiti.fr",
+              "url": "https://lore.kernel.org/all/20260921151306.625134-4-alex@ghiti.fr/",
+              "date": "2026-09-21T15:16:36Z",
+              "in_reply_to": null,
+              "ack_type": null,
+              "is_ongoing": false,
+              "submitted_date": null,
+              "patch_version": 6,
+              "series_patch_count": null,
+              "version_history": [],
+              "series_items": [],
+              "patch_summary": "This patch improves the zswap writeback process by dropping cold writeback folios via swap dropbehind. It addresses a problem where folios are left on the LRU for reclaim, wasting resources and keeping cold memory resident longer than necessary. The patch allocates the folio off the LRU, marks it PG_dropbehind to free it from the swap cache once writeback completes, and clears the PG_active flag after allocation to prevent issues with page freeing. This approach is a workaround until a fix for evaluating refaults on writeback buffers can be implemented.",
+              "analysis_source": "llm-chunked-no-replies",
+              "review_comments": [],
+              "list_id": "linux-fsdevel@vger.kernel.org"
+            }
+          ],
+          "patch_summary": "This patch set extends the existing dropbehind mechanism to swap cache folios, allowing zswap to opt into it and free cold writeback folios promptly. Currently, when zswap writes an entry back, it allocates a folio and leaves it on the LRU for page reclaim to find and free later, wasting a reclaim scan and keeping cold memory resident longer than necessary. The patch set moves LRU insertion out of the swap cache allocator, drops dropbehind swap cache folios on writeback completion, and has zswap allocate its writeback folio off the LRU and mark it dropbehind to take advantage of this mechanism.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [],
+          "list_id": "linux-fsdevel@vger.kernel.org"
+        }
+      ],
+      "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    }
+  ]
 }
