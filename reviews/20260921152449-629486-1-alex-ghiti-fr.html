@@ -246,14 +246,20 @@
 <div class="review-comment-header">
 <span class="review-author">David (Arm)</span>
 <a class="date-chip" href="../2026-09-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-21">2026-09-21</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer David pointed out that the patch&#x27;s behavior for MADV_PAGEOUT folios is similar to regular reclamation, where memory is added to the swap cache and only freed on a subsequent scan, and asked why this isn&#x27;t sufficient.</div>
+<div class="review-comment-text">Reviewer David (Arm) pointed out that the patch&#x27;s behavior for MADV_PAGEOUT is inconsistent with synchronous I/O, where memory is released immediately after sync I/O completion. He argued that delaying the release until a later scan may improve swapcache hits before folios are reclaimed, but questioned whether this is relevant in practice and suggested that evicting pages as soon as possible would be more beneficial for freeing up memory.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+<pre class="raw-body-text">On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; writeback completes, so the memory is not actually freed until a later
+&gt; reclaim scan removes the by then clean swap cache folio.
+But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
 to the swapcache and only the next scan actually frees up the memory.
 
 Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
@@ -261,31 +267,138 @@ Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
 -- 
 Cheers,
 
+David
+
+---
+
+On 9/21/26 23:56, Barry Song wrote:
+&gt; On Mon, Sep 21, 2026 at 11:37\u202fPM David Hildenbrand (Arm)
+&gt; &lt;david@kernel.org&gt; wrote:
+&gt;&gt;
+&gt;&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt;&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt;&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt;&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt;&gt;&gt; reclaim scan removes the by then clean swap cache folio.
+&gt;&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt;&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt;&gt;
+&gt;&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt; 
+&gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; immediately after sync I/O is done.
+&gt; 
+&gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; async I/O the same way as sync I/O\u2014releasing the memory once the I/O
+&gt; completed\u2014he saw some regression. So, delaying the release until a
+&gt; later scan may allow swapcache hits before the folios are eventually
+&gt; reclaimed.
+
+&quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+
+We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+the page tables. We made the workload the could, access the page immediately
+again suffer already.
+
+We should just evict them as soon as possible to free up memory.
+
+-- 
+Cheers,
+
+David
+
+---
+
+On 9/22/26 12:37, Barry Song wrote:
+&gt; On Tue, Sep 22, 2026 at 6:20\u202fPM David Hildenbrand (Arm)
+&gt; &lt;david@kernel.org&gt; wrote:
+&gt;&gt;
+&gt;&gt; On 9/21/26 23:56, Barry Song wrote:
+&gt;&gt;&gt; On Mon, Sep 21, 2026 at 11:37\u202fPM David Hildenbrand (Arm)
+&gt;&gt;&gt; &lt;david@kernel.org&gt; wrote:
+&gt;&gt;&gt;
+&gt;&gt;&gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt;&gt;&gt; immediately after sync I/O is done.
+&gt;&gt;&gt;
+&gt;&gt;&gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt;&gt;&gt; expected to be rotated back to the tail of the LRU and wait for
+&gt;&gt;&gt; another scan. Alexandre once mentioned that when he tried handling
+&gt;&gt;&gt; async I/O the same way as sync I/O\u2014releasing the memory once the I/O
+&gt;&gt;&gt; completed\u2014he saw some regression. So, delaying the release until a
+&gt;&gt;&gt; later scan may allow swapcache hits before the folios are eventually
+&gt;&gt;&gt; reclaimed.
+&gt;&gt;
+&gt;&gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt;&gt;
+&gt;&gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt;&gt; the page tables. We made the workload the could, access the page immediately
+&gt;&gt; again suffer already.
+&gt;&gt;
+&gt;&gt; We should just evict them as soon as possible to free up memory.
+&gt; 
+&gt; I suggested this to Alexandre, and he found that it could regress some
+&gt; workloads [1]. That is why Alexandre is only making the folios
+&gt; immediately reclaimable for `MADV_PAGEOUT`.
+
+I really hate to add special sauce for MADV_PAGEOUT. Also, I don&#x27;t quite like
+that we do something fundamentally different for sync vs. async.
+
+I assume, though, that async writeback that is very fast might just find the
+!folio_test_writeback() scenario just like the sync case. ... or if we
+reschedule after pageout()?
+
+I am wondering: if we can show that letting async swapped out pages stay in
+memory a bit longer improves performance, aren&#x27;t we swapping out the wrong pages
+in the first place, and not swapping them out would help the sync case as well?
+
+&gt; 
+&gt; See Alexandre&#x27;s description:
+&gt; 
+&gt; &quot;Future work
+&gt; -----------
+&gt; Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+&gt; prototyped dropbehind for all reclaimed swap folios and it regressed
+&gt; sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+&gt; immediately turns cheap in-cache refaults into disk reads and collapses
+&gt; swap readahead clustering. 
+
+Thanks, does this represent a workload pattern we care about?
+
+-- 
+Cheers,
+
 David</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
 <a href="https://lore.kernel.org/r/70cae945-3a4a-40db-96ac-5ce66a3fa186@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
+<div class="review-comment-signals">Signals: inconsistent behavior, requested changes</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-09-22">
+</div>
+<div class="thread-node depth-0" id="2026-09-22">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Barry Song</span>
-<a class="date-chip" href="../2026-09-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
+<a class="date-chip" href="../2026-09-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that the patch does not handle the case where a folio is already under writeback, and suggested adding a check to ensure that the folio is not being written back before marking it as dropbehind.
-
-Reviewer Barry Song noted that the current implementation of MADV_PAGEOUT for asynchronous I/O, which delays folio release until a later scan, can lead to cold/hot inversion due to NVMe&#x27;s fast writeback completion during isolation. He pointed out that this issue is similar to one addressed by Ridong&#x27;s patch for active/inactive LRU reclaim path and suggested considering skipping the later scan and reclaiming folios immediately once I/O completes.</div>
+<div class="review-comment-text">Barry Song noted that asynchronous swap devices can experience a cold/hot inversion when rotating writeback folios to the tail of the inactive list due to fast NVMe I/O, where some pages complete writeback during isolation while others remain under writeback. He suggested skipping the later scan and reclaiming the folios immediately once the I/O completes for MADV_PAGEOUT, which is an explicit hint from userspace to reclaim memory.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)
 &lt;david@kernel.org&gt; wrote:
-
----
+&gt;
+&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt; reclaim scan removes the by then clean swap cache folio.
+&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt;
+&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
 
 For synchronous I/O, such as zswap and zram, the memory is released
 immediately after sync I/O is done.
@@ -353,13 +466,1636 @@ folios immediately once the I/O completes?
 [1] https://lore.kernel.org/linux-mm/20260920132519.3369946-1-ridong.chen@linux.dev/
 
 Best Regards
+Barry
+
+---
+
+On Tue, Sep 22, 2026 at 6:20 PM David Hildenbrand (Arm)
+&lt;david@kernel.org&gt; wrote:
+&gt;
+&gt; On 9/21/26 23:56, Barry Song wrote:
+&gt; &gt; On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)
+&gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt;&gt;
+&gt; &gt;&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt;&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt;&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt;&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt;&gt;&gt; reclaim scan removes the by then clean swap cache folio.
+&gt; &gt;&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; &gt;&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt; &gt;&gt;
+&gt; &gt;&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt; &gt;
+&gt; &gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; &gt; immediately after sync I/O is done.
+&gt; &gt;
+&gt; &gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; &gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; &gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; &gt; async I/O the same way as sync I/O—releasing the memory once the I/O
+&gt; &gt; completed—he saw some regression. So, delaying the release until a
+&gt; &gt; later scan may allow swapcache hits before the folios are eventually
+&gt; &gt; reclaimed.
+&gt;
+&gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt;
+&gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt; the page tables. We made the workload the could, access the page immediately
+&gt; again suffer already.
+&gt;
+&gt; We should just evict them as soon as possible to free up memory.
+
+I suggested this to Alexandre, and he found that it could regress some
+workloads [1]. That is why Alexandre is only making the folios
+immediately reclaimable for `MADV_PAGEOUT`.
+
+See Alexandre&#x27;s description:
+
+&quot;Future work
+-----------
+Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+prototyped dropbehind for all reclaimed swap folios and it regressed
+sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+immediately turns cheap in-cache refaults into disk reads and collapses
+swap readahead clustering. Neither blk-wbt, mq-deadline nor a PG_workingset
+gate recovered it. MADV_PAGEOUT alone may still be worth it, since there
+userspace has explicitly declared the range cold, but I have not measured
+that case in isolation yet.&quot;
+
+[1] https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+
+Best Regards
+Barry
+
+---
+
+On Tue, Sep 22, 2026 at 6:47 PM Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt; wrote:
+&gt;
+&gt; On Tue, Sep 22, 2026 at 06:37:38PM +0800, Barry Song wrote:
+&gt; &gt; On Tue, Sep 22, 2026 at 6:20 PM David Hildenbrand (Arm)
+&gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt;
+&gt; &gt; &gt; On 9/21/26 23:56, Barry Song wrote:
+&gt; &gt; &gt; &gt; On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)
+&gt; &gt; &gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt; &gt;&gt;
+&gt; &gt; &gt; &gt;&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt; &gt; &gt;&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt; &gt; &gt;&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt; &gt; &gt;&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt; &gt; &gt;&gt;&gt; reclaim scan removes the by then clean swap cache folio.
+&gt; &gt; &gt; &gt;&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; &gt; &gt; &gt;&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt; &gt; &gt; &gt;&gt;
+&gt; &gt; &gt; &gt;&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; &gt; &gt; &gt; immediately after sync I/O is done.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; &gt; &gt; &gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; &gt; &gt; &gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; &gt; &gt; &gt; async I/O the same way as sync I/O—releasing the memory once the I/O
+&gt; &gt; &gt; &gt; completed—he saw some regression. So, delaying the release until a
+&gt; &gt; &gt; &gt; later scan may allow swapcache hits before the folios are eventually
+&gt; &gt; &gt; &gt; reclaimed.
+&gt; &gt; &gt;
+&gt; &gt; &gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt; &gt; &gt;
+&gt; &gt; &gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt; &gt; &gt; the page tables. We made the workload the could, access the page immediately
+&gt; &gt; &gt; again suffer already.
+&gt; &gt; &gt;
+&gt; &gt; &gt; We should just evict them as soon as possible to free up memory.
+&gt; &gt;
+&gt; &gt; I suggested this to Alexandre, and he found that it could regress some
+&gt; &gt; workloads [1]. That is why Alexandre is only making the folios
+&gt; &gt; immediately reclaimable for `MADV_PAGEOUT`.
+&gt; &gt;
+&gt; &gt; See Alexandre&#x27;s description:
+&gt; &gt;
+&gt; &gt; &quot;Future work
+&gt; &gt; -----------
+&gt; &gt; Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+&gt; &gt; prototyped dropbehind for all reclaimed swap folios and it regressed
+&gt; &gt; sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+&gt; &gt; immediately turns cheap in-cache refaults into disk reads and collapses
+&gt; &gt; swap readahead clustering. Neither blk-wbt, mq-deadline nor a PG_workingset
+&gt; &gt; gate recovered it. MADV_PAGEOUT alone may still be worth it, since there
+&gt; &gt; userspace has explicitly declared the range cold, but I have not measured
+&gt; &gt; that case in isolation yet.&quot;
+&gt; &gt;
+&gt; &gt; [1] https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+&gt; &gt;
+&gt; &gt; Best Regards
+&gt; &gt; Barry
+&gt;
+&gt; This patch as-is is just way way way WAY too complicated and fragile IMO.
+&gt;
+&gt; Whatever cases you have found, they need to be fixed somewhere
+&gt; fundamental. All of this feels like a hack.
+&gt;
+&gt; If you&#x27;re having to write a comment like:
+&gt;
+&gt; /*
+&gt;  * If X is Y, but not if B, and if Z is J but not if the moon&#x27;s bright at
+&gt;  * night, then maybe we will foo the bar, but only if the baz is blarghed,
+&gt;  * ...
+&gt;  */
+&gt;
+&gt; That usually means you&#x27;re doing something horribly wrong.
+&gt;
+&gt; And this patch has multiple comments like that.
+
+I&#x27;m not quite sure if you&#x27;ve read the context carefully :-) or why
+you&#x27;re angry with me.
+
+I did suggest that we should reclaim memory immediately after
+writeback completes, both for general memory reclaim and for
+`MADV_PAGEOUT`, while Alexandre was working on zswap dropbehind.
+
+Alexandre then found that this might not be a good idea for generic
+reclaim, but thought it might still be worth trying for `MADV_PAGEOUT`.
+That&#x27;s why this patch came about.
+
+The discussion between David and me is whether we should do this for
+`MADV_PAGEOUT` only, or also apply the same approach to generic
+reclaim. So far, we haven&#x27;t even gotten into the code details.
+
+And this is also the first day I&#x27;ve seen the code. I agree that I can
+work with Alexandre to improve the code through review, but please
+keep in mind that this is literally my first day looking at it,
+my respected Lorenzo. :-)
+
+Best Regards
+Barry
+
+---
+
+On Tue, Sep 22, 2026 at 7:16 PM Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt; wrote:
+&gt;
+&gt; On Tue, Sep 22, 2026 at 07:10:34PM +0800, Barry Song wrote:
+&gt; &gt; On Tue, Sep 22, 2026 at 6:47 PM Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt; wrote:
+&gt; &gt; &gt;
+&gt; &gt; &gt; On Tue, Sep 22, 2026 at 06:37:38PM +0800, Barry Song wrote:
+&gt; &gt; &gt; &gt; On Tue, Sep 22, 2026 at 6:20 PM David Hildenbrand (Arm)
+&gt; &gt; &gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; On 9/21/26 23:56, Barry Song wrote:
+&gt; &gt; &gt; &gt; &gt; &gt; On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)
+&gt; &gt; &gt; &gt; &gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt; &gt; &gt; &gt;&gt;
+&gt; &gt; &gt; &gt; &gt; &gt;&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt; &gt; &gt; &gt; &gt;&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt; &gt; &gt; &gt; &gt;&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt; &gt; &gt; &gt; &gt;&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt; &gt; &gt; &gt; &gt;&gt;&gt; reclaim scan removes the by then clean swap cache folio.
+&gt; &gt; &gt; &gt; &gt; &gt;&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; &gt; &gt; &gt; &gt; &gt;&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt; &gt; &gt; &gt; &gt; &gt;&gt;
+&gt; &gt; &gt; &gt; &gt; &gt;&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt; &gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; &gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; &gt; &gt; &gt; &gt; &gt; immediately after sync I/O is done.
+&gt; &gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; &gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; &gt; &gt; &gt; &gt; &gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; &gt; &gt; &gt; &gt; &gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; &gt; &gt; &gt; &gt; &gt; async I/O the same way as sync I/O—releasing the memory once the I/O
+&gt; &gt; &gt; &gt; &gt; &gt; completed—he saw some regression. So, delaying the release until a
+&gt; &gt; &gt; &gt; &gt; &gt; later scan may allow swapcache hits before the folios are eventually
+&gt; &gt; &gt; &gt; &gt; &gt; reclaimed.
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt; &gt; &gt; &gt; &gt; the page tables. We made the workload the could, access the page immediately
+&gt; &gt; &gt; &gt; &gt; again suffer already.
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; We should just evict them as soon as possible to free up memory.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; I suggested this to Alexandre, and he found that it could regress some
+&gt; &gt; &gt; &gt; workloads [1]. That is why Alexandre is only making the folios
+&gt; &gt; &gt; &gt; immediately reclaimable for `MADV_PAGEOUT`.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; See Alexandre&#x27;s description:
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &quot;Future work
+&gt; &gt; &gt; &gt; -----------
+&gt; &gt; &gt; &gt; Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+&gt; &gt; &gt; &gt; prototyped dropbehind for all reclaimed swap folios and it regressed
+&gt; &gt; &gt; &gt; sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+&gt; &gt; &gt; &gt; immediately turns cheap in-cache refaults into disk reads and collapses
+&gt; &gt; &gt; &gt; swap readahead clustering. Neither blk-wbt, mq-deadline nor a PG_workingset
+&gt; &gt; &gt; &gt; gate recovered it. MADV_PAGEOUT alone may still be worth it, since there
+&gt; &gt; &gt; &gt; userspace has explicitly declared the range cold, but I have not measured
+&gt; &gt; &gt; &gt; that case in isolation yet.&quot;
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; [1] https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; Best Regards
+&gt; &gt; &gt; &gt; Barry
+&gt; &gt; &gt;
+&gt; &gt; &gt; This patch as-is is just way way way WAY too complicated and fragile IMO.
+&gt; &gt; &gt;
+&gt; &gt; &gt; Whatever cases you have found, they need to be fixed somewhere
+&gt; &gt; &gt; fundamental. All of this feels like a hack.
+&gt; &gt; &gt;
+&gt; &gt; &gt; If you&#x27;re having to write a comment like:
+&gt; &gt; &gt;
+&gt; &gt; &gt; /*
+&gt; &gt; &gt;  * If X is Y, but not if B, and if Z is J but not if the moon&#x27;s bright at
+&gt; &gt; &gt;  * night, then maybe we will foo the bar, but only if the baz is blarghed,
+&gt; &gt; &gt;  * ...
+&gt; &gt; &gt;  */
+&gt; &gt; &gt;
+&gt; &gt; &gt; That usually means you&#x27;re doing something horribly wrong.
+&gt; &gt; &gt;
+&gt; &gt; &gt; And this patch has multiple comments like that.
+&gt; &gt;
+&gt; &gt; I&#x27;m not quite sure if you&#x27;ve read the context carefully :-) or why
+&gt; &gt; you&#x27;re angry with me.
+&gt; &gt;
+&gt; &gt; I did suggest that we should reclaim memory immediately after
+&gt; &gt; writeback completes, both for general memory reclaim and for
+&gt; &gt; `MADV_PAGEOUT`, while Alexandre was working on zswap dropbehind.
+&gt; &gt;
+&gt; &gt; Alexandre then found that this might not be a good idea for generic
+&gt; &gt; reclaim, but thought it might still be worth trying for `MADV_PAGEOUT`.
+&gt; &gt; That&#x27;s why this patch came about.
+&gt; &gt;
+&gt; &gt; The discussion between David and me is whether we should do this for
+&gt; &gt; `MADV_PAGEOUT` only, or also apply the same approach to generic
+&gt; &gt; reclaim. So far, we haven&#x27;t even gotten into the code details.
+&gt; &gt;
+&gt; &gt; And this is also the first day I&#x27;ve seen the code. I agree that I can
+&gt; &gt; work with Alexandre to improve the code through review, but please
+&gt; &gt; keep in mind that this is literally my first day looking at it,
+&gt; &gt; my respected Lorenzo. :-)
+&gt;
+&gt; I&#x27;m not angry with anybody, I&#x27;m saying the patch feels like a (fragile)
+&gt; hack and the issue needs addressing more fundamentally, echoing David&#x27;s
+&gt; suggestion.
+&gt;
+&gt; I also pointed out that when comments need to be extremely specific about
+&gt; exactly why you&#x27;re doing something, that usually means something is wrong.
+&gt;
+&gt; To expand on that - the reason why is that clearly the logic you are
+&gt; adjusting is assuming something.
+&gt;
+&gt; You are violating that assumption, which is why the comment is there.
+&gt;
+&gt; Generally that means the assumptions are wrong and something more
+&gt; fundamental needs to be changed.
+&gt;
+
+Thanks!
+
+I agree with your description. But I&#x27;m still a bit confused, as it
+feels like your reply may not be in the right context :-)
+
+Never mind, I understand you&#x27;re quite busy.
+
+---
+
+On Tue, Sep 22, 2026 at 7:26 PM David Hildenbrand (Arm)
+&lt;david@kernel.org&gt; wrote:
+&gt;
+&gt; On 9/22/26 12:37, Barry Song wrote:
+&gt; &gt; On Tue, Sep 22, 2026 at 6:20 PM David Hildenbrand (Arm)
+&gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt;&gt;
+&gt; &gt;&gt; On 9/21/26 23:56, Barry Song wrote:
+&gt; &gt;&gt;&gt; On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)
+&gt; &gt;&gt;&gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt;&gt;&gt;
+&gt; &gt;&gt;&gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; &gt;&gt;&gt; immediately after sync I/O is done.
+&gt; &gt;&gt;&gt;
+&gt; &gt;&gt;&gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; &gt;&gt;&gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; &gt;&gt;&gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; &gt;&gt;&gt; async I/O the same way as sync I/O—releasing the memory once the I/O
+&gt; &gt;&gt;&gt; completed—he saw some regression. So, delaying the release until a
+&gt; &gt;&gt;&gt; later scan may allow swapcache hits before the folios are eventually
+&gt; &gt;&gt;&gt; reclaimed.
+&gt; &gt;&gt;
+&gt; &gt;&gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt; &gt;&gt;
+&gt; &gt;&gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt; &gt;&gt; the page tables. We made the workload the could, access the page immediately
+&gt; &gt;&gt; again suffer already.
+&gt; &gt;&gt;
+&gt; &gt;&gt; We should just evict them as soon as possible to free up memory.
+&gt; &gt;
+&gt; &gt; I suggested this to Alexandre, and he found that it could regress some
+&gt; &gt; workloads [1]. That is why Alexandre is only making the folios
+&gt; &gt; immediately reclaimable for `MADV_PAGEOUT`.
+&gt;
+&gt; I really hate to add special sauce for MADV_PAGEOUT. Also, I don&#x27;t quite like
+&gt; that we do something fundamentally different for sync vs. async.
+&gt;
+&gt; I assume, though, that async writeback that is very fast might just find the
+&gt; !folio_test_writeback() scenario just like the sync case. ... or if we
+&gt; reschedule after pageout()?
+&gt;
+&gt; I am wondering: if we can show that letting async swapped out pages stay in
+&gt; memory a bit longer improves performance, aren&#x27;t we swapping out the wrong pages
+&gt; in the first place, and not swapping them out would help the sync case as well?
+
+I guess that&#x27;s because the LRU is not always accurate. There are cases
+where our prediction of future access patterns may be wrong, resulting
+in refaults?
+
+Even on Android, which uses zram with very fast synchronous swap-out,
+I can still hit the swapcache from time to time. So perhaps with a
+slower device, such as an HDD, keeping the swapcache around for longer
+could allow applications to hit it more often?
+
+&gt;
+&gt; &gt;
+&gt; &gt; See Alexandre&#x27;s description:
+&gt; &gt;
+&gt; &gt; &quot;Future work
+&gt; &gt; -----------
+&gt; &gt; Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+&gt; &gt; prototyped dropbehind for all reclaimed swap folios and it regressed
+&gt; &gt; sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+&gt; &gt; immediately turns cheap in-cache refaults into disk reads and collapses
+&gt; &gt; swap readahead clustering.
+&gt;
+&gt; Thanks, does this represent a workload pattern we care about?
+
+I don&#x27;t know. Maybe Alexandre can share more details about this
+benchmark. I&#x27;m also a little surprised by the 15% regression in
+Sysbench OLTP. My initial feeling was the same as yours: we should
+release the memory immediately after writeback completes, for both
+synchronous and asynchronous I/O.
+
+Kairui also mentioned to me that he once tried releasing memory
+immediately after folios were written back to HDD, and saw some
+serious performance regressions as well. Maybe Kairui can also share
+some thoughts on this.
+
+Best Regards
 Barry</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to David (Arm)</div>
 <a href="https://lore.kernel.org/r/CAGsJ_4y8-wD0yMV8GCtCz5MfNrOKqUaTd+UgH=8MoP_nuvPnGg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, suggested alternative approach</div>
+<div class="review-comment-signals">Signals: requested changes, suggested improvement</div>
 </div>
 </div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-09-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kairui Song noted that the current implementation of MADV_PAGEOUT folios being rotated to the tail of the LRU after writeback completion can lead to inconsistent behavior, specifically a &#x27;cold/hot inversion&#x27; where pages that finish writeback during isolation are promoted to the LRU head. He suggested treating MADV_PAGEOUT differently and proposed either adding a separate watermark for anon/file or introducing a new way to handle reclaim.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Sep 22, 2026 at 12:00 AM Barry Song &lt;baohua@kernel.org&gt; wrote:
+&gt;
+&gt; On Mon, Sep 21, 2026 at 11:37 PM David Hildenbrand (Arm)
+&gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt;
+&gt; &gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt; &gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt; &gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt; &gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt; &gt; reclaim scan removes the by then clean swap cache folio.
+&gt; &gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; &gt; to the swapcache and only the next scan actually frees up the memory.
+&gt; &gt;
+&gt; &gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt;
+&gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; immediately after sync I/O is done.
+&gt;
+&gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; async I/O the same way as sync I/O—releasing the memory once the I/O
+&gt; completed—he saw some regression. So, delaying the release until a
+&gt; later scan may allow swapcache hits before the folios are eventually
+&gt; reclaimed.
+&gt;
+&gt; But we actually have a problem here: this rotation, which puts
+&gt; writeback folios at the tail of the LRU, is not reliable at all.
+&gt;
+&gt; `folio_rotate_reclaimable()` would only work reliably if the endio
+&gt; happens after the folio has been put back on the LRU head, rather than
+&gt; while it is still isolated.
+
+I think we might better fix this instead? Or is this really a problem?
+If it has PG_reclaim, it should be putback to the tail instead of
+head, right?
+
+&gt; But nowadays NVMe is very fast. If we isolate N pages and perform
+&gt; shrink on them, M pages may finish writeback during the isolation,
+&gt; while the remaining N-M pages are still under writeback. M can easily
+&gt; be more than 50% of N.
+&gt;
+&gt; As a result, we can end up with the following cold/hot inversion:
+&gt;
+&gt; LRU head
+&gt; ----- M pages whose writeback completed during isolation
+&gt; ----- other pages
+&gt; ----- N-M pages that are successfully rotated to the LRU tail
+&gt; LRU tail
+&gt;
+&gt; Now we can see that the M pages were expected to be reclaimed, but
+&gt; they are not only left unreclaimed, but are effectively promoted to
+&gt; the LRU head.
+&gt;
+&gt; For MGLRU, commit 359a5e1416ca (&quot;mm: multi-gen LRU: retry folios
+&gt; written back while isolated&quot;) added the following code to reclaim
+&gt; those M pages that finish writeback during isolation by retrying
+&gt; `shrink_folio_list()` on them:
+&gt;
+&gt;                 /* retry folios that may have missed
+&gt; folio_rotate_reclaimable() */
+&gt;                 if (!skip_retry &amp;&amp; !folio_test_active(folio) &amp;&amp;
+&gt; !folio_mapped(folio) &amp;&amp;
+&gt;                     !folio_test_dirty(folio) &amp;&amp; !folio_test_writeback(folio)) {
+&gt;                         list_move(&amp;folio-&gt;lru, &amp;clean);
+&gt;                         continue;
+&gt;                 }
+&gt;
+&gt; This somehow resolves the cold/hot inversion, but leaves the M and
+&gt; N-M pages with inconsistent behavior: some are actually reclaimed,
+&gt; while others remain at the tail of the LRU.
+&gt;
+&gt; For the active/inactive LRU and `MADV_PAGEOUT`, we don&#x27;t have a
+&gt; mechanism to restore the missed reclaim opportunity. Ridong&#x27;s patch[1]
+&gt; addresses this cold/hot inversion in the active/inactive LRU reclaim
+&gt; path. To my knowledge, there has never been a patch to address the
+&gt; same cold/hot inversion in `MADV_PAGEOUT`.
+
+MADV_PAGEOUT is a bit different from the reclaim under pressure,
+reclaim underpressure can easily overshoot the amount of anon folios
+reclaimed, because however fast the writeback it, it can be faster by
+scanning the LRU and dropping clean file folios. So before LRU
+reclaimed enough clean file folios, we can&#x27;t stop the reclaim.
+
+I think the better fix is to have a separate watermark for anon / file
+or a new way to handle reclaim. Reclaiming an anon folio is hardly
+helpful in the short term when under heavy pressure and the device is
+not a synchronous device.
+
+The overshoot is a real issue, it&#x27;s very common to see many folios
+stuck in the swap cache after memory pressure. If we drop all of them,
+we will see significant regressions. Treating MADV_PAGEOUT differently
+here seems better.</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAMgjq7CpRg_5aMiRWFxWTYA2b1mtHu8YJAtvRRAy3SaZg45t-g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested alternative solution</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lorenzo (ARM)</span>
+<a class="date-chip" href="../2026-09-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer expressed frustration with the patch&#x27;s lack of justification and explanation for its changes. They specifically pointed out that the commit message does not provide sufficient context for understanding the &#x27;dropbehind&#x27; concept, which is being introduced in this patch. The reviewer also questioned the decision to credit nr_reclaimed when the write is submitted rather than when the folio is actually freed, suggesting that this change should be justified. Additionally, they expressed concerns about the complexity of the code and suggested refactoring before adding more functionality.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Mon, Sep 21, 2026 at 05:24:33PM +0200, Alexandre Ghiti wrote:
+&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; writeback completes, so the memory is not actually freed until a later
+&gt; reclaim scan removes the by then clean swap cache folio. Mark those
+&gt; folios dropbehind at isolation time instead and let folio_end_writeback()
+&gt; drop them from the swap cache as each write lands.
+
+Please split out very large paragraphs like this. It&#x27;s hard to read this.
+
+You aren&#x27;t giving any justification here you&#x27;re saying &#x27;X happens so don&#x27;t do X
+any more&#x27;.
+
+Why? That should come FIRST.
+
+&gt;
+&gt; A dropbehind folio is dropped by whoever completes its writeback, so the
+
+Ugh I really don&#x27;t love &#x27;dropbehind&#x27;. But I guess it&#x27;s a thing then?
+
+Can you explain what that is? This commit message isn&#x27;t really teling me much.
+
+&gt; reference the submitter holds has to be released before the write is
+&gt; submitted. As reclaim does before freeing a folio, flush the pending TLB
+&gt; batch first.
+
+Why do you do that? I don&#x27;t care if something does something, _why_?
+
+&gt;
+&gt; Note that for dropbehind folios nr_reclaimed is now credited when the
+&gt; write is submitted rather than when the folio is actually freed, since the
+&gt; reclaimer never sees the folio again.
+
+That sounds iffy...
+
+If this is a change that you are actively doing don&#x27;t say &#x27;note that&#x27; as if it&#x27;s
+a fact that can&#x27;t be avoided.
+
+You are _choosing_ to make a change, justify it then say you did it.
+
+&gt;
+&gt; Suggested-by: Barry Song &lt;baohua@kernel.org&gt;
+&gt; Signed-off-by: Alexandre Ghiti &lt;alex@ghiti.fr&gt;
+&gt; ---
+&gt; This applies on top of &quot;[PATCH v6 0/3] mm: zswap: free cold writeback folios
+&gt; promptly&quot;:
+&gt;
+&gt; https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+
+Hmm, but you&#x27;re targeting mm-unstable no?
+
+&gt;
+&gt;  mm/filemap.c |  7 +++++++
+&gt;  mm/madvise.c | 23 ++++++++++++++++++----
+&gt;  mm/page_io.c | 55 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+&gt;  mm/swap.h    |  2 ++
+&gt;  mm/vmscan.c  | 10 ++++++++++
+&gt;  mm/zswap.c   |  9 ++++-----
+
+Why is this a core mm change which also changes madvise but you&#x27;re changing
+zswap too? This feels like it needs to be broken out into commits.
+
+&gt;  6 files changed, 95 insertions(+), 11 deletions(-)
+&gt;
+&gt; diff --git a/mm/filemap.c b/mm/filemap.c
+&gt; index e1f1bbe943ce..14fa96fca8b8 100644
+&gt; --- a/mm/filemap.c
+&gt; +++ b/mm/filemap.c
+&gt; @@ -1630,6 +1630,13 @@ void folio_end_dropbehind(struct folio *folio)
+&gt;  	if (!folio_test_dropbehind(folio))
+&gt;  		return;
+&gt;
+&gt; +	/*
+&gt; +	 * PG_dropbehind could be set on an anonymous folio after
+&gt; +	 * folio_end_writeback() samples it (for example MADV_PAGEOUT).
+&gt; +	 */
+
+I don&#x27;t really feel this comment explains why you&#x27;re exiting here? It&#x27;s like you
+randomly state a fact as a comment.
+
+Something like &#x27;do not end dropbehind for anon because &lt; reason &gt;&#x27; no?
+
+&gt; +	if (folio_test_anon(folio))
+&gt; +		return;
+&gt; +
+&gt;  	/*
+&gt;  	 * Hitting !in_task() should not happen off RWF_DONTCACHE writeback,
+&gt;  	 * but can happen if normal writeback just happens to find dirty folios
+&gt; diff --git a/mm/madvise.c b/mm/madvise.c
+&gt; index eeee82cf2b3f..63164f95720b 100644
+&gt; --- a/mm/madvise.c
+&gt; +++ b/mm/madvise.c
+&gt; @@ -359,6 +359,17 @@ static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+&gt;  				     FPB_MERGE_YOUNG_DIRTY);
+&gt;  }
+&gt;
+&gt; +static void madvise_mark_dropbehind(struct folio *folio)
+&gt; +{
+&gt; +	/*
+&gt; +	 * A folio already under writeback is skipped: that writeback is not
+&gt; +	 * ours to hand over, so reclaim will put the folio back on the LRU
+&gt; +	 * while its completion could be dropping it at the same time.
+&gt; +	 */
+&gt; +	if (folio_test_anon(folio) &amp;&amp; !folio_test_writeback(folio))
+&gt; +		folio_set_dropbehind(folio);
+&gt; +}
+&gt; +
+&gt;  static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;  				unsigned long addr, unsigned long end,
+&gt;  				struct mm_walk *walk)
+&gt; @@ -439,10 +450,12 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;  			folio_set_workingset(folio);
+&gt;  		if (pageout) {
+&gt;  			if (folio_isolate_lru(folio)) {
+&gt; -				if (folio_test_unevictable(folio))
+&gt; +				if (folio_test_unevictable(folio)) {
+&gt;  					folio_putback_lru(folio);
+&gt; -				else
+&gt; +				} else {
+&gt; +					madvise_mark_dropbehind(folio);
+&gt;  					list_add(&amp;folio-&gt;lru, &amp;folio_list);
+&gt; +				}
+&gt;  			}
+&gt;  		} else
+&gt;  			folio_deactivate(folio);
+&gt; @@ -554,10 +567,12 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;  			folio_set_workingset(folio);
+&gt;  		if (pageout) {
+&gt;  			if (folio_isolate_lru(folio)) {
+&gt; -				if (folio_test_unevictable(folio))
+&gt; +				if (folio_test_unevictable(folio)) {
+&gt;  					folio_putback_lru(folio);
+&gt; -				else
+&gt; +				} else {
+&gt; +					madvise_mark_dropbehind(folio);
+&gt;  					list_add(&amp;folio-&gt;lru, &amp;folio_list);
+&gt; +				}
+&gt;  			}
+
+This existing code is utterly horrible can we maybe do some refactoring before
+adding yet more functionality here?
+
+I feel like the &#x27;pay down technical debt first&#x27; take I had in THP is pretty
+valid here also.
+
+But also, yeah you DEFINITELY need to separate out patches here.
+
+
+&gt;  		} else
+&gt;  			folio_deactivate(folio);
+&gt; diff --git a/mm/page_io.c b/mm/page_io.c
+&gt; index 52eae99de6e3..bf8238768cc9 100644
+&gt; --- a/mm/page_io.c
+&gt; +++ b/mm/page_io.c
+&gt; @@ -26,9 +26,12 @@
+&gt;  #include &lt;linux/delayacct.h&gt;
+&gt;  #include &lt;linux/zswap.h&gt;
+&gt;  #include &lt;linux/swap_ops.h&gt;
+&gt; +#include &quot;internal.h&quot;
+&gt;  #include &quot;swap.h&quot;
+&gt;  #include &quot;swap_table.h&quot;
+&gt;
+&gt; +#include &lt;trace/events/vmscan.h&gt;
+&gt; +
+&gt;  int generic_swapfile_activate(struct swap_info_struct *sis,
+&gt;  				struct file *swap_file,
+&gt;  				sector_t *span)
+&gt; @@ -248,8 +251,19 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+&gt;  	}
+&gt;  	rcu_read_unlock();
+&gt;
+&gt; +	if (folio_test_dropbehind(folio)) {
+&gt; +		/*
+&gt; +		 * pageout() traces and accounts at its tail, which we can&#x27;t do
+&gt; +		 * because dropbehind folios may already be freed by then.
+&gt; +		 */
+
+I&#x27;m really confused by this comment.
+
+You&#x27;re in swap_writeout() but you&#x27;re talking about pageout() and what they &#x27;may&#x27;
+be freed by then so you&#x27;re tracing/accounting in more than one place which
+sounds wrong?
+
+This  at least needs to be clarified.
+
+&gt; +		trace_mm_vmscan_write_folio(folio);
+&gt; +		lruvec_stat_mod_folio(folio, NR_VMSCAN_WRITE,
+&gt; +				      folio_nr_pages(folio));
+&gt; +		ret = SWAP_WRITE_DROPBEHIND;
+
+Not sure the comment explains why you&#x27;re chaging the ret here?
+
+&gt; +	}
+&gt; +
+&gt;  	__swap_writepage(ctx, folio);
+&gt; -	return 0;
+&gt; +	return ret;
+&gt;  out_unlock:
+&gt;  	folio_unlock(folio);
+&gt;  	return ret;
+&gt; @@ -692,8 +706,45 @@ EXPORT_SYMBOL_GPL(swap_fs_activate);
+&gt;
+&gt;  void swap_write_submit(struct swap_io_ctx *ctx)
+&gt;  {
+&gt; -	if (!ctx-&gt;sio)
+&gt; +	struct swap_iocb *sio = ctx-&gt;sio;
+&gt; +	bool dropbehind = false;
+&gt; +	int p;
+&gt; +
+&gt; +	if (!sio)
+&gt;  		return;
+&gt; +
+&gt; +	for (p = 0; p &lt; sio-&gt;nr_bvecs; p++) {
+&gt; +		if (folio_test_dropbehind(bvec_folio(&amp;sio-&gt;bvecs[p]))) {
+&gt; +			dropbehind = true;
+&gt; +			break;
+&gt; +		}
+&gt; +	}
+&gt; +
+&gt; +	if (dropbehind) {
+&gt; +		/*
+&gt; +		 * A dropbehind folio is freed by the completion, not by the
+&gt; +		 * reclaimer, and freeing needs every deferred unmap flushed,
+&gt; +		 * not just the writable ones try_to_unmap_flush_dirty() covers
+&gt; +		 * before the IO.  The reclaimer flushes before it frees, but
+&gt; +		 * that is too late for a batch swap_add_folio() already
+&gt; +		 * submitted mid-loop.  A no-op once that flush has happened.
+&gt; +		 */
+
+please use newlines to separate paragraphs :))
+
+This is really hard to read, it&#x27;s an LLM-like wall of text.
+
+There&#x27;s so much going on here.
+
+- A dropbehind folio is freed by completion not by reclaimer
+
+- Freeing needs every deferred unmap to be flushed (not only blah blah)
+
+- Reclaimer flushes before it frees but then it&#x27;s too late for blah blah
+
+- This is somehow a no-op once a flush has happened.
+
+Reading all that really makes me think that this solution isn&#x27;t the right one,
+instinctively? If you&#x27;re having to juggle many many delicate things all at once
+to justify some code that generally implies your design is wrong or at a wrong
+granularity.
+
+&gt; +		try_to_unmap_flush();
+&gt; +
+&gt; +		/*
+&gt; +		 * Now that the TLB is clean, drop the submitter&#x27;s reference:
+&gt; +		 * the swap cache then holds the only ones left, which is what
+&gt; +		 * __remove_mapping() expects when the completion drops the
+&gt; +		 * folio.  This has to happen before the write is submitted.
+&gt; +		 */
+&gt; +		for (p = 0; p &lt; sio-&gt;nr_bvecs; p++) {
+&gt; +			struct folio *folio = bvec_folio(&amp;sio-&gt;bvecs[p]);
+&gt; +
+&gt; +			if (folio_test_dropbehind(folio))
+&gt; +				folio_put(folio);
+&gt; +		}
+
+Is it ok to iterate through a bvec folio and start fiddling with refrences like
+this? What if your put frees the folio, is the bv-&gt;bv_page not now a dangling
+pointer?
+
+Also the comment for bvec_folio() makes me worry:
+
+ * A bvec can contain non-folio memory, so this should only be called by
+ * the creator of the bvec; drivers have no business looking at the owner
+ * of the memory.  It may not even be the right interface for the caller
+ * to use as a bvec can span multiple folios.  You may be better off using
+ * something like bio_for_each_folio_all() which iterates over all folios.
+
+Can each bvec span multiple folios? Why is bio_for_each_folio_all() not right
+here?
+
+&gt; +	}
+&gt; +
+&gt;  	count_vm_events(NRSWPOUT, 1);
+&gt;  	ctx-&gt;sis-&gt;ops-&gt;submit_write(ctx);
+&gt;  	ctx-&gt;sio = NULL;
+&gt; diff --git a/mm/swap.h b/mm/swap.h
+&gt; index 8679cb61268e..81114ad9e44a 100644
+&gt; --- a/mm/swap.h
+&gt; +++ b/mm/swap.h
+&gt; @@ -92,6 +92,8 @@ static inline int mem_cgroup_swappiness(struct mem_cgroup *memcg)
+&gt;  	return READ_ONCE(vm_swappiness);
+&gt;  }
+&gt;
+&gt; +#define SWAP_WRITE_DROPBEHIND	1
+&gt; +
+&gt;  #ifdef CONFIG_SWAP
+&gt;  #include &lt;linux/swapops.h&gt; /* for swp_offset */
+&gt;  #include &lt;linux/blk_types.h&gt; /* for bio_end_io_t */
+&gt; diff --git a/mm/vmscan.c b/mm/vmscan.c
+&gt; index a02f942418d3..5435fa5111b3 100644
+&gt; --- a/mm/vmscan.c
+&gt; +++ b/mm/vmscan.c
+&gt; @@ -613,6 +613,8 @@ typedef enum {
+&gt;  	PAGE_SUCCESS,
+&gt;  	/* folio is clean and locked */
+&gt;  	PAGE_CLEAN,
+&gt; +	/* folio will be freed after writeback, do not touch */
+&gt; +	PAGE_DROPBEHIND,
+
+Oh god, really? Do we have to add a whole new outcome possibility for CORE
+reclaim logic just for this?
+
+Ugh man.
+
+&gt;  } pageout_t;
+&gt;
+&gt;  /*
+&gt; @@ -659,6 +661,9 @@ static pageout_t pageout(struct swap_io_ctx *ctx, struct address_space *mapping,
+&gt;  	else
+&gt;  		res = swap_writeout(ctx, folio);
+&gt;
+&gt; +	if (res == SWAP_WRITE_DROPBEHIND)
+&gt; +		return PAGE_DROPBEHIND;
+&gt; +
+&gt;  	if (res &lt; 0)
+&gt;  		handle_write_error(mapping, folio, res);
+&gt;  	if (res == AOP_WRITEPAGE_ACTIVATE) {
+&gt; @@ -1437,6 +1442,9 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+&gt;  					nr_pages = 1;
+&gt;  				}
+&gt;  				goto activate_locked;
+&gt; +			case PAGE_DROPBEHIND:
+&gt; +				nr_reclaimed += nr_pages;
+&gt; +				continue;
+&gt;  			case PAGE_SUCCESS:
+&gt;  				if (nr_pages &gt; 1 &amp;&amp; !folio_test_large(folio)) {
+&gt;  					sc-&gt;nr_scanned -= (nr_pages - 1);
+&gt; @@ -2198,6 +2206,8 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
+&gt;  	while (!list_empty(folio_list)) {
+&gt;  		folio = lru_to_folio(folio_list);
+&gt;  		list_del(&amp;folio-&gt;lru);
+&gt; +		if (folio_test_anon(folio))
+&gt; +			folio_clear_dropbehind(folio);
+&gt;  		folio_putback_lru(folio);
+&gt;  	}
+&gt;  	trace_mm_vmscan_reclaim_pages(pgdat-&gt;node_id, sc.nr_scanned, nr_reclaimed, &amp;stat);
+&gt; diff --git a/mm/zswap.c b/mm/zswap.c
+&gt; index dc8425d6b21e..640936fe7464 100644
+&gt; --- a/mm/zswap.c
+&gt; +++ b/mm/zswap.c
+&gt; @@ -1051,17 +1051,16 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+&gt;  	folio_set_dropbehind(folio);
+&gt;
+&gt;  	/*
+&gt; -	 * Drop our reference before starting writeback so the swap cache holds
+&gt; -	 * the only one: the drop in folio_end_writeback() needs that for
+&gt; -	 * remove_mapping_set_shadow() to succeed, otherwise the folio is
+&gt; -	 * handed back to reclaim instead.
+&gt; +	 * Our reference is donated to swap_write_submit(), which drops it just
+&gt; +	 * before submitting so the swap cache holds the only one left: the drop
+&gt; +	 * in folio_end_writeback() needs that for remove_mapping_set_shadow()
+&gt; +	 * to succeed, otherwise the folio is handed back to reclaim instead.
+
+This feels really conplicated.
+
+My instinct with this change overall, though I&#x27;m not familiar with the
+dropbehind code, is that thi
+
+&gt;  	 *
+&gt;  	 * Nothing can free the folio in the meantime: we hold the folio lock
+&gt;  	 * until writeback starts, PG_writeback then blocks swap cache removal,
+&gt;  	 * and folio_end_writeback() takes its own reference before clearing
+&gt;  	 * PG_writeback and donates it to the drop.
+&gt;  	 */
+
+This comment is now a comment on...? Nothing?
+
+&gt; -	folio_put(folio);
+&gt;
+&gt;  	/* start writeback */
+&gt;  	__swap_writepage(&amp;ctx, folio);
+&gt; --
+&gt; 2.53.0-Meta
+&gt;
+
+--
+Cheers, Lorenzo
+
+---
+
+On Tue, Sep 22, 2026 at 06:37:38PM +0800, Barry Song wrote:
+&gt; On Tue, Sep 22, 2026 at 6:20\u202fPM David Hildenbrand (Arm)
+&gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt;
+&gt; &gt; On 9/21/26 23:56, Barry Song wrote:
+&gt; &gt; &gt; On Mon, Sep 21, 2026 at 11:37\u202fPM David Hildenbrand (Arm)
+&gt; &gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt; &gt;&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt; &gt;&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt; &gt;&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt; &gt;&gt;&gt; reclaim scan removes the by then clean swap cache folio.
+&gt; &gt; &gt;&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; &gt; &gt;&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt; &gt; &gt;
+&gt; &gt; &gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; &gt; &gt; immediately after sync I/O is done.
+&gt; &gt; &gt;
+&gt; &gt; &gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; &gt; &gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; &gt; &gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; &gt; &gt; async I/O the same way as sync I/O\u2014releasing the memory once the I/O
+&gt; &gt; &gt; completed\u2014he saw some regression. So, delaying the release until a
+&gt; &gt; &gt; later scan may allow swapcache hits before the folios are eventually
+&gt; &gt; &gt; reclaimed.
+&gt; &gt;
+&gt; &gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt; &gt;
+&gt; &gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt; &gt; the page tables. We made the workload the could, access the page immediately
+&gt; &gt; again suffer already.
+&gt; &gt;
+&gt; &gt; We should just evict them as soon as possible to free up memory.
+&gt;
+&gt; I suggested this to Alexandre, and he found that it could regress some
+&gt; workloads [1]. That is why Alexandre is only making the folios
+&gt; immediately reclaimable for `MADV_PAGEOUT`.
+&gt;
+&gt; See Alexandre&#x27;s description:
+&gt;
+&gt; &quot;Future work
+&gt; -----------
+&gt; Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+&gt; prototyped dropbehind for all reclaimed swap folios and it regressed
+&gt; sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+&gt; immediately turns cheap in-cache refaults into disk reads and collapses
+&gt; swap readahead clustering. Neither blk-wbt, mq-deadline nor a PG_workingset
+&gt; gate recovered it. MADV_PAGEOUT alone may still be worth it, since there
+&gt; userspace has explicitly declared the range cold, but I have not measured
+&gt; that case in isolation yet.&quot;
+&gt;
+&gt; [1] https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+&gt;
+&gt; Best Regards
+&gt; Barry
+
+This patch as-is is just way way way WAY too complicated and fragile IMO.
+
+Whatever cases you have found, they need to be fixed somewhere
+fundamental. All of this feels like a hack.
+
+If you&#x27;re having to write a comment like:
+
+/*
+ * If X is Y, but not if B, and if Z is J but not if the moon&#x27;s bright at
+ * night, then maybe we will foo the bar, but only if the baz is blarghed,
+ * ...
+ */
+
+That usually means you&#x27;re doing something horribly wrong.
+
+And this patch has multiple comments like that.
+
+--
+Cheers, Lorenzo
+
+---
+
+On Tue, Sep 22, 2026 at 07:10:34PM +0800, Barry Song wrote:
+&gt; On Tue, Sep 22, 2026 at 6:47\u202fPM Lorenzo Stoakes (ARM) &lt;ljs@kernel.org&gt; wrote:
+&gt; &gt;
+&gt; &gt; On Tue, Sep 22, 2026 at 06:37:38PM +0800, Barry Song wrote:
+&gt; &gt; &gt; On Tue, Sep 22, 2026 at 6:20\u202fPM David Hildenbrand (Arm)
+&gt; &gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; On 9/21/26 23:56, Barry Song wrote:
+&gt; &gt; &gt; &gt; &gt; On Mon, Sep 21, 2026 at 11:37\u202fPM David Hildenbrand (Arm)
+&gt; &gt; &gt; &gt; &gt; &lt;david@kernel.org&gt; wrote:
+&gt; &gt; &gt; &gt; &gt;&gt;
+&gt; &gt; &gt; &gt; &gt;&gt; On 9/21/26 17:24, Alexandre Ghiti wrote:
+&gt; &gt; &gt; &gt; &gt;&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt; &gt; &gt; &gt; &gt;&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt; &gt; &gt; &gt; &gt;&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt; &gt; &gt; &gt; &gt;&gt;&gt; reclaim scan removes the by then clean swap cache folio.
+&gt; &gt; &gt; &gt; &gt;&gt; But we have the same behavior when just reclaiming memory ordinarily? It&#x27;s added
+&gt; &gt; &gt; &gt; &gt;&gt; to the swapcache and only the next scan actually frees up the memory.
+&gt; &gt; &gt; &gt; &gt;&gt;
+&gt; &gt; &gt; &gt; &gt;&gt; Wouldn&#x27;t we memory we reclaim ... just gone, like in the sync case?
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; For synchronous I/O, such as zswap and zram, the memory is released
+&gt; &gt; &gt; &gt; &gt; immediately after sync I/O is done.
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; For asynchronous I/O, such as NVMe, the swapcache is currently
+&gt; &gt; &gt; &gt; &gt; expected to be rotated back to the tail of the LRU and wait for
+&gt; &gt; &gt; &gt; &gt; another scan. Alexandre once mentioned that when he tried handling
+&gt; &gt; &gt; &gt; &gt; async I/O the same way as sync I/O\u2014releasing the memory once the I/O
+&gt; &gt; &gt; &gt; &gt; completed\u2014he saw some regression. So, delaying the release until a
+&gt; &gt; &gt; &gt; &gt; later scan may allow swapcache hits before the folios are eventually
+&gt; &gt; &gt; &gt; &gt; reclaimed.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &quot;may&quot;, do we have any evidence that this actually is relevant in practice?
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; We asked to reclaim memory. We wrote the memory out to disk. We unmapped it from
+&gt; &gt; &gt; &gt; the page tables. We made the workload the could, access the page immediately
+&gt; &gt; &gt; &gt; again suffer already.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; We should just evict them as soon as possible to free up memory.
+&gt; &gt; &gt;
+&gt; &gt; &gt; I suggested this to Alexandre, and he found that it could regress some
+&gt; &gt; &gt; workloads [1]. That is why Alexandre is only making the folios
+&gt; &gt; &gt; immediately reclaimable for `MADV_PAGEOUT`.
+&gt; &gt; &gt;
+&gt; &gt; &gt; See Alexandre&#x27;s description:
+&gt; &gt; &gt;
+&gt; &gt; &gt; &quot;Future work
+&gt; &gt; &gt; -----------
+&gt; &gt; &gt; Barry suggested extending this to MADV_PAGEOUT and general reclaim. I
+&gt; &gt; &gt; prototyped dropbehind for all reclaimed swap folios and it regressed
+&gt; &gt; &gt; sysbench OLTP throughput by ~15% on NVMe swap: dropping the swap cache
+&gt; &gt; &gt; immediately turns cheap in-cache refaults into disk reads and collapses
+&gt; &gt; &gt; swap readahead clustering. Neither blk-wbt, mq-deadline nor a PG_workingset
+&gt; &gt; &gt; gate recovered it. MADV_PAGEOUT alone may still be worth it, since there
+&gt; &gt; &gt; userspace has explicitly declared the range cold, but I have not measured
+&gt; &gt; &gt; that case in isolation yet.&quot;
+&gt; &gt; &gt;
+&gt; &gt; &gt; [1] https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+&gt; &gt; &gt;
+&gt; &gt; &gt; Best Regards
+&gt; &gt; &gt; Barry
+&gt; &gt;
+&gt; &gt; This patch as-is is just way way way WAY too complicated and fragile IMO.
+&gt; &gt;
+&gt; &gt; Whatever cases you have found, they need to be fixed somewhere
+&gt; &gt; fundamental. All of this feels like a hack.
+&gt; &gt;
+&gt; &gt; If you&#x27;re having to write a comment like:
+&gt; &gt;
+&gt; &gt; /*
+&gt; &gt;  * If X is Y, but not if B, and if Z is J but not if the moon&#x27;s bright at
+&gt; &gt;  * night, then maybe we will foo the bar, but only if the baz is blarghed,
+&gt; &gt;  * ...
+&gt; &gt;  */
+&gt; &gt;
+&gt; &gt; That usually means you&#x27;re doing something horribly wrong.
+&gt; &gt;
+&gt; &gt; And this patch has multiple comments like that.
+&gt;
+&gt; I&#x27;m not quite sure if you&#x27;ve read the context carefully :-) or why
+&gt; you&#x27;re angry with me.
+&gt;
+&gt; I did suggest that we should reclaim memory immediately after
+&gt; writeback completes, both for general memory reclaim and for
+&gt; `MADV_PAGEOUT`, while Alexandre was working on zswap dropbehind.
+&gt;
+&gt; Alexandre then found that this might not be a good idea for generic
+&gt; reclaim, but thought it might still be worth trying for `MADV_PAGEOUT`.
+&gt; That&#x27;s why this patch came about.
+&gt;
+&gt; The discussion between David and me is whether we should do this for
+&gt; `MADV_PAGEOUT` only, or also apply the same approach to generic
+&gt; reclaim. So far, we haven&#x27;t even gotten into the code details.
+&gt;
+&gt; And this is also the first day I&#x27;ve seen the code. I agree that I can
+&gt; work with Alexandre to improve the code through review, but please
+&gt; keep in mind that this is literally my first day looking at it,
+&gt; my respected Lorenzo. :-)
+
+I&#x27;m not angry with anybody, I&#x27;m saying the patch feels like a (fragile)
+hack and the issue needs addressing more fundamentally, echoing David&#x27;s
+suggestion.
+
+I also pointed out that when comments need to be extremely specific about
+exactly why you&#x27;re doing something, that usually means something is wrong.
+
+To expand on that - the reason why is that clearly the logic you are
+adjusting is assuming something.
+
+You are violating that assumption, which is why the comment is there.
+
+Generally that means the assumptions are wrong and something more
+fundamental needs to be changed.
+
+&gt;
+&gt; Best Regards
+&gt; Barry
+
+--
+Cheers, Lorenzo</pre>
+</details>
+<a href="https://lore.kernel.org/r/arJYmwKnEu-djZlK@gremlin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lack of justification, complexity of code</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Alexandre Ghiti (author)</span>
+<a class="date-chip" href="../2026-09-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed reviewer feedback on patch [PATCH] mm: madvise: drop MADV_PAGEOUT folios at swap writeback completion, acknowledging the need to justify changes and provide explanations for technical decisions. The author agreed to restructure the commit message, add justifications, and improve comments in the code. A fix is planned for the next revision.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Lorenzo,
+
+On 9/22/26 12:44, Lorenzo Stoakes (ARM) wrote:
+&gt; On Mon, Sep 21, 2026 at 05:24:33PM +0200, Alexandre Ghiti wrote:
+&gt;&gt; On an asynchronous swap device MADV_PAGEOUT only marks the folio
+&gt;&gt; PG_reclaim and rotates it to the tail of the inactive list once its
+&gt;&gt; writeback completes, so the memory is not actually freed until a later
+&gt;&gt; reclaim scan removes the by then clean swap cache folio. Mark those
+&gt;&gt; folios dropbehind at isolation time instead and let folio_end_writeback()
+&gt;&gt; drop them from the swap cache as each write lands.
+&gt; Please split out very large paragraphs like this. It&#x27;s hard to read this.
+&gt;
+&gt; You aren&#x27;t giving any justification here you&#x27;re saying &#x27;X happens so don&#x27;t do X
+&gt; any more&#x27;.
+&gt;
+&gt; Why? That should come FIRST.
+
+
+You are right. I believe leaving those folios in memory creates useless 
+memory pressure and then should be freed as soon as possible.
+
+
+&gt;
+&gt;&gt; A dropbehind folio is dropped by whoever completes its writeback, so the
+&gt; Ugh I really don&#x27;t love &#x27;dropbehind&#x27;. But I guess it&#x27;s a thing then?
+&gt;
+&gt; Can you explain what that is? This commit message isn&#x27;t really teling me much.
+
+
+I&#x27;ll do in the next revision. And indeed I have been playing with 
+dropbehind quite a bit lately and I believe (and benchmarked) it 
+prevents useless reclaim (see the zswap writeback dropbehind patchset).
+
+
+&gt;
+&gt;&gt; reference the submitter holds has to be released before the write is
+&gt;&gt; submitted. As reclaim does before freeing a folio, flush the pending TLB
+&gt;&gt; batch first.
+&gt; Why do you do that? I don&#x27;t care if something does something, _why_?
+
+
+To prevent stale TLB entries to persist while the folio has been freed 
+by the callback. I&#x27;ll add that in the next revision, thanks.
+
+
+&gt;
+&gt;&gt; Note that for dropbehind folios nr_reclaimed is now credited when the
+&gt;&gt; write is submitted rather than when the folio is actually freed, since the
+&gt;&gt; reclaimer never sees the folio again.
+&gt; That sounds iffy...
+&gt;
+&gt; If this is a change that you are actively doing don&#x27;t say &#x27;note that&#x27; as if it&#x27;s
+&gt; a fact that can&#x27;t be avoided.
+&gt;
+&gt; You are _choosing_ to make a change, justify it then say you did it.
+
+
+Yes, this is questionable indeed, hence the note so that I can have 
+feedback. Even if it is too early to state the folios were reclaimed, I 
+believe it must be done somehow, I&#x27;ll add that in the next version.
+
+
+&gt;
+&gt;&gt; Suggested-by: Barry Song &lt;baohua@kernel.org&gt;
+&gt;&gt; Signed-off-by: Alexandre Ghiti &lt;alex@ghiti.fr&gt;
+&gt;&gt; ---
+&gt;&gt; This applies on top of &quot;[PATCH v6 0/3] mm: zswap: free cold writeback folios
+&gt;&gt; promptly&quot;:
+&gt;&gt;
+&gt;&gt; https://lore.kernel.org/linux-mm/20260921151306.625134-1-alex@ghiti.fr/
+&gt; Hmm, but you&#x27;re targeting mm-unstable no?
+
+
+Yes, I was not sure how to proceed here: should I RFC instead? Or is it ok?
+
+
+&gt;
+&gt;&gt;   mm/filemap.c |  7 +++++++
+&gt;&gt;   mm/madvise.c | 23 ++++++++++++++++++----
+&gt;&gt;   mm/page_io.c | 55 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+&gt;&gt;   mm/swap.h    |  2 ++
+&gt;&gt;   mm/vmscan.c  | 10 ++++++++++
+&gt;&gt;   mm/zswap.c   |  9 ++++-----
+&gt; Why is this a core mm change which also changes madvise but you&#x27;re changing
+&gt; zswap too? This feels like it needs to be broken out into commits.
+
+
+Because I make modifications in the core mm that is then not needed 
+anymore in zswap (the release of the reference). But I can split that 
+into another patch, I&#x27;ll do. Thanks
+
+
+&gt;
+&gt;&gt;   6 files changed, 95 insertions(+), 11 deletions(-)
+&gt;&gt;
+&gt;&gt; diff --git a/mm/filemap.c b/mm/filemap.c
+&gt;&gt; index e1f1bbe943ce..14fa96fca8b8 100644
+&gt;&gt; --- a/mm/filemap.c
+&gt;&gt; +++ b/mm/filemap.c
+&gt;&gt; @@ -1630,6 +1630,13 @@ void folio_end_dropbehind(struct folio *folio)
+&gt;&gt;   	if (!folio_test_dropbehind(folio))
+&gt;&gt;   		return;
+&gt;&gt;
+&gt;&gt; +	/*
+&gt;&gt; +	 * PG_dropbehind could be set on an anonymous folio after
+&gt;&gt; +	 * folio_end_writeback() samples it (for example MADV_PAGEOUT).
+&gt;&gt; +	 */
+&gt; I don&#x27;t really feel this comment explains why you&#x27;re exiting here? It&#x27;s like you
+&gt; randomly state a fact as a comment.
+&gt;
+&gt; Something like &#x27;do not end dropbehind for anon because &lt; reason &gt;&#x27; no?
+
+
+We need to test anon here because PG_dropbehind could be set in parallel 
+by MADV_PAGEOUT and that would make the anon folio reach 
+filemap_end_dropbehind(), which is wrong. I&#x27;ll improve the comment. Thanks
+
+
+&gt;
+&gt;&gt; +	if (folio_test_anon(folio))
+&gt;&gt; +		return;
+&gt;&gt; +
+&gt;&gt;   	/*
+&gt;&gt;   	 * Hitting !in_task() should not happen off RWF_DONTCACHE writeback,
+&gt;&gt;   	 * but can happen if normal writeback just happens to find dirty folios
+&gt;&gt; diff --git a/mm/madvise.c b/mm/madvise.c
+&gt;&gt; index eeee82cf2b3f..63164f95720b 100644
+&gt;&gt; --- a/mm/madvise.c
+&gt;&gt; +++ b/mm/madvise.c
+&gt;&gt; @@ -359,6 +359,17 @@ static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+&gt;&gt;   				     FPB_MERGE_YOUNG_DIRTY);
+&gt;&gt;   }
+&gt;&gt;
+&gt;&gt; +static void madvise_mark_dropbehind(struct folio *folio)
+&gt;&gt; +{
+&gt;&gt; +	/*
+&gt;&gt; +	 * A folio already under writeback is skipped: that writeback is not
+&gt;&gt; +	 * ours to hand over, so reclaim will put the folio back on the LRU
+&gt;&gt; +	 * while its completion could be dropping it at the same time.
+&gt;&gt; +	 */
+&gt;&gt; +	if (folio_test_anon(folio) &amp;&amp; !folio_test_writeback(folio))
+&gt;&gt; +		folio_set_dropbehind(folio);
+&gt;&gt; +}
+&gt;&gt; +
+&gt;&gt;   static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;&gt;   				unsigned long addr, unsigned long end,
+&gt;&gt;   				struct mm_walk *walk)
+&gt;&gt; @@ -439,10 +450,12 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;&gt;   			folio_set_workingset(folio);
+&gt;&gt;   		if (pageout) {
+&gt;&gt;   			if (folio_isolate_lru(folio)) {
+&gt;&gt; -				if (folio_test_unevictable(folio))
+&gt;&gt; +				if (folio_test_unevictable(folio)) {
+&gt;&gt;   					folio_putback_lru(folio);
+&gt;&gt; -				else
+&gt;&gt; +				} else {
+&gt;&gt; +					madvise_mark_dropbehind(folio);
+&gt;&gt;   					list_add(&amp;folio-&gt;lru, &amp;folio_list);
+&gt;&gt; +				}
+&gt;&gt;   			}
+&gt;&gt;   		} else
+&gt;&gt;   			folio_deactivate(folio);
+&gt;&gt; @@ -554,10 +567,12 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt;&gt;   			folio_set_workingset(folio);
+&gt;&gt;   		if (pageout) {
+&gt;&gt;   			if (folio_isolate_lru(folio)) {
+&gt;&gt; -				if (folio_test_unevictable(folio))
+&gt;&gt; +				if (folio_test_unevictable(folio)) {
+&gt;&gt;   					folio_putback_lru(folio);
+&gt;&gt; -				else
+&gt;&gt; +				} else {
+&gt;&gt; +					madvise_mark_dropbehind(folio);
+&gt;&gt;   					list_add(&amp;folio-&gt;lru, &amp;folio_list);
+&gt;&gt; +				}
+&gt;&gt;   			}
+&gt; This existing code is utterly horrible can we maybe do some refactoring before
+&gt; adding yet more functionality here?
+
+
+I can&#x27;t speak for him but I think Gregory Price has prepared a patchset 
+that indeed refactors this code, I&#x27;ll check with him.
+
+
+&gt;
+&gt; I feel like the &#x27;pay down technical debt first&#x27; take I had in THP is pretty
+&gt; valid here also.
+&gt;
+&gt; But also, yeah you DEFINITELY need to separate out patches here.
+
+
+Ok, I&#x27;ll improve that in v2.
+
+
+&gt;
+&gt;
+&gt;&gt;   		} else
+&gt;&gt;   			folio_deactivate(folio);
+&gt;&gt; diff --git a/mm/page_io.c b/mm/page_io.c
+&gt;&gt; index 52eae99de6e3..bf8238768cc9 100644
+&gt;&gt; --- a/mm/page_io.c
+&gt;&gt; +++ b/mm/page_io.c
+&gt;&gt; @@ -26,9 +26,12 @@
+&gt;&gt;   #include &lt;linux/delayacct.h&gt;
+&gt;&gt;   #include &lt;linux/zswap.h&gt;
+&gt;&gt;   #include &lt;linux/swap_ops.h&gt;
+&gt;&gt; +#include &quot;internal.h&quot;
+&gt;&gt;   #include &quot;swap.h&quot;
+&gt;&gt;   #include &quot;swap_table.h&quot;
+&gt;&gt;
+&gt;&gt; +#include &lt;trace/events/vmscan.h&gt;
+&gt;&gt; +
+&gt;&gt;   int generic_swapfile_activate(struct swap_info_struct *sis,
+&gt;&gt;   				struct file *swap_file,
+&gt;&gt;   				sector_t *span)
+&gt;&gt; @@ -248,8 +251,19 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+&gt;&gt;   	}
+&gt;&gt;   	rcu_read_unlock();
+&gt;&gt;
+&gt;&gt; +	if (folio_test_dropbehind(folio)) {
+&gt;&gt; +		/*
+&gt;&gt; +		 * pageout() traces and accounts at its tail, which we can&#x27;t do
+&gt;&gt; +		 * because dropbehind folios may already be freed by then.
+&gt;&gt; +		 */
+&gt; I&#x27;m really confused by this comment.
+&gt;
+&gt; You&#x27;re in swap_writeout() but you&#x27;re talking about pageout() and what they &#x27;may&#x27;
+&gt; be freed by then so you&#x27;re tracing/accounting in more than one place which
+&gt; sounds wrong?
+&gt;
+&gt; This  at least needs to be clarified.
+
+
+I see, it&#x27;s not obvious: trace_mm_vmscan_write_folio(folio) is usually called in pageout() after calling swap_writeout(). But with dropbehind, the folio could be freed when swap_writeout() returns and then we can&#x27;t use the folio anymore. I&#x27;ll be more explicit in v2, thanks.
+
+
+&gt;
+&gt;&gt; +		trace_mm_vmscan_write_folio(folio);
+&gt;&gt; +		lruvec_stat_mod_folio(folio, NR_VMSCAN_WRITE,
+&gt;&gt; +				      folio_nr_pages(folio));
+&gt;&gt; +		ret = SWAP_WRITE_DROPBEHIND;
+&gt; Not sure the comment explains why you&#x27;re chaging the ret here?
+
+
+The folio could be freed and must not be touched after the IO was 
+submitted. I&#x27;ll make it more explicit.
+
+
+&gt;
+&gt;&gt; +	}
+&gt;&gt; +
+&gt;&gt;   	__swap_writepage(ctx, folio);
+&gt;&gt; -	return 0;
+&gt;&gt; +	return ret;
+&gt;&gt;   out_unlock:
+&gt;&gt;   	folio_unlock(folio);
+&gt;&gt;   	return ret;
+&gt;&gt; @@ -692,8 +706,45 @@ EXPORT_SYMBOL_GPL(swap_fs_activate);
+&gt;&gt;
+&gt;&gt;   void swap_write_submit(struct swap_io_ctx *ctx)
+&gt;&gt;   {
+&gt;&gt; -	if (!ctx-&gt;sio)
+&gt;&gt; +	struct swap_iocb *sio = ctx-&gt;sio;
+&gt;&gt; +	bool dropbehind = false;
+&gt;&gt; +	int p;
+&gt;&gt; +
+&gt;&gt; +	if (!sio)
+&gt;&gt;   		return;
+&gt;&gt; +
+&gt;&gt; +	for (p = 0; p &lt; sio-&gt;nr_bvecs; p++) {
+&gt;&gt; +		if (folio_test_dropbehind(bvec_folio(&amp;sio-&gt;bvecs[p]))) {
+&gt;&gt; +			dropbehind = true;
+&gt;&gt; +			break;
+&gt;&gt; +		}
+&gt;&gt; +	}
+&gt;&gt; +
+&gt;&gt; +	if (dropbehind) {
+&gt;&gt; +		/*
+&gt;&gt; +		 * A dropbehind folio is freed by the completion, not by the
+&gt;&gt; +		 * reclaimer, and freeing needs every deferred unmap flushed,
+&gt;&gt; +		 * not just the writable ones try_to_unmap_flush_dirty() covers
+&gt;&gt; +		 * before the IO.  The reclaimer flushes before it frees, but
+&gt;&gt; +		 * that is too late for a batch swap_add_folio() already
+&gt;&gt; +		 * submitted mid-loop.  A no-op once that flush has happened.
+&gt;&gt; +		 */
+&gt; please use newlines to separate paragraphs :))
+&gt;
+&gt; This is really hard to read, it&#x27;s an LLM-like wall of text.
+&gt;
+&gt; There&#x27;s so much going on here.
+&gt;
+&gt; - A dropbehind folio is freed by completion not by reclaimer
+&gt;
+&gt; - Freeing needs every deferred unmap to be flushed (not only blah blah)
+&gt;
+&gt; - Reclaimer flushes before it frees but then it&#x27;s too late for blah blah
+&gt;
+&gt; - This is somehow a no-op once a flush has happened.
+&gt;
+&gt; Reading all that really makes me think that this solution isn&#x27;t the right one,
+&gt; instinctively? If you&#x27;re having to juggle many many delicate things all at once
+&gt; to justify some code that generally implies your design is wrong or at a wrong
+&gt; granularity.
+
+
+I don&#x27;t think it&#x27;s that delicate, the comment may be too complicated 
+though: we simply need to make sure to flush tlb entries here before the 
+folio is freed to avoid stale entries. I tried to explain why 
+try_to_unmap_flush_dirty() in shrink_folio_list() is not enough...etc. 
+I&#x27;ll keep it short and I think it should be enough (?).
+
+
+&gt;
+&gt;&gt; +		try_to_unmap_flush();
+&gt;&gt; +
+&gt;&gt; +		/*
+&gt;&gt; +		 * Now that the TLB is clean, drop the submitter&#x27;s reference:
+&gt;&gt; +		 * the swap cache then holds the only ones left, which is what
+&gt;&gt; +		 * __remove_mapping() expects when the completion drops the
+&gt;&gt; +		 * folio.  This has to happen before the write is submitted.
+&gt;&gt; +		 */
+&gt;&gt; +		for (p = 0; p &lt; sio-&gt;nr_bvecs; p++) {
+&gt;&gt; +			struct folio *folio = bvec_folio(&amp;sio-&gt;bvecs[p]);
+&gt;&gt; +
+&gt;&gt; +			if (folio_test_dropbehind(folio))
+&gt;&gt; +				folio_put(folio);
+&gt;&gt; +		}
+&gt; Is it ok to iterate through a bvec folio and start fiddling with refrences like
+&gt; this? What if your put frees the folio, is the bv-&gt;bv_page not now a dangling
+&gt; pointer?
+
+
+Here, at least the swap cache holds references on the folio, to me it 
+cannot be freed, I&#x27;ll check again though.
+
+
+&gt;
+&gt; Also the comment for bvec_folio() makes me worry:
+&gt;
+&gt;   * A bvec can contain non-folio memory, so this should only be called by
+&gt;   * the creator of the bvec; drivers have no business looking at the owner
+&gt;   * of the memory.  It may not even be the right interface for the caller
+&gt;   * to use as a bvec can span multiple folios.  You may be better off using
+&gt;   * something like bio_for_each_folio_all() which iterates over all folios.
+&gt;
+&gt; Can each bvec span multiple folios? Why is bio_for_each_folio_all() not right
+&gt; here?
+
+
+I don&#x27;t have answers for that now, I&#x27;ll check. Thanks
+
+
+&gt;
+&gt;&gt; +	}
+&gt;&gt; +
+&gt;&gt;   	count_vm_events(NRSWPOUT, 1);
+&gt;&gt;   	ctx-&gt;sis-&gt;ops-&gt;submit_write(ctx);
+&gt;&gt;   	ctx-&gt;sio = NULL;
+&gt;&gt; diff --git a/mm/swap.h b/mm/swap.h
+&gt;&gt; index 8679cb61268e..81114ad9e44a 100644
+&gt;&gt; --- a/mm/swap.h
+&gt;&gt; +++ b/mm/swap.h
+&gt;&gt; @@ -92,6 +92,8 @@ static inline int mem_cgroup_swappiness(struct mem_cgroup *memcg)
+&gt;&gt;   	return READ_ONCE(vm_swappiness);
+&gt;&gt;   }
+&gt;&gt;
+&gt;&gt; +#define SWAP_WRITE_DROPBEHIND	1
+&gt;&gt; +
+&gt;&gt;   #ifdef CONFIG_SWAP
+&gt;&gt;   #include &lt;linux/swapops.h&gt; /* for swp_offset */
+&gt;&gt;   #include &lt;linux/blk_types.h&gt; /* for bio_end_io_t */
+&gt;&gt; diff --git a/mm/vmscan.c b/mm/vmscan.c
+&gt;&gt; index a02f942418d3..5435fa5111b3 100644
+&gt;&gt; --- a/mm/vmscan.c
+&gt;&gt; +++ b/mm/vmscan.c
+&gt;&gt; @@ -613,6 +613,8 @@ typedef enum {
+&gt;&gt;   	PAGE_SUCCESS,
+&gt;&gt;   	/* folio is clean and locked */
+&gt;&gt;   	PAGE_CLEAN,
+&gt;&gt; +	/* folio will be freed after writeback, do not touch */
+&gt;&gt; +	PAGE_DROPBEHIND,
+&gt; Oh god, really? Do we have to add a whole new outcome possibility for CORE
+&gt; reclaim logic just for this?
+&gt;
+&gt; Ugh man.
+
+
+Dirty as hell, I agree! But this is the only way I found so that the 
+folio, which may have been freed in the meantime, is not touched anymore.
+
+
+&gt;
+&gt;&gt;   } pageout_t;
+&gt;&gt;
+&gt;&gt;   /*
+&gt;&gt; @@ -659,6 +661,9 @@ static pageout_t pageout(struct swap_io_ctx *ctx, struct address_space *mapping,
+&gt;&gt;   	else
+&gt;&gt;   		res = swap_writeout(ctx, folio);
+&gt;&gt;
+&gt;&gt; +	if (res == SWAP_WRITE_DROPBEHIND)
+&gt;&gt; +		return PAGE_DROPBEHIND;
+&gt;&gt; +
+&gt;&gt;   	if (res &lt; 0)
+&gt;&gt;   		handle_write_error(mapping, folio, res);
+&gt;&gt;   	if (res == AOP_WRITEPAGE_ACTIVATE) {
+&gt;&gt; @@ -1437,6 +1442,9 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
+&gt;&gt;   					nr_pages = 1;
+&gt;&gt;   				}
+&gt;&gt;   				goto activate_locked;
+&gt;&gt; +			case PAGE_DROPBEHIND:
+&gt;&gt; +				nr_reclaimed += nr_pages;
+&gt;&gt; +				continue;
+&gt;&gt;   			case PAGE_SUCCESS:
+&gt;&gt;   				if (nr_pages &gt; 1 &amp;&amp; !folio_test_large(folio)) {
+&gt;&gt;   					sc-&gt;nr_scanned -= (nr_pages - 1);
+&gt;&gt; @@ -2198,6 +2206,8 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
+&gt;&gt;   	while (!list_empty(folio_list)) {
+&gt;&gt;   		folio = lru_to_folio(folio_list);
+&gt;&gt;   		list_del(&amp;folio-&gt;lru);
+&gt;&gt; +		if (folio_test_anon(folio))
+&gt;&gt; +			folio_clear_dropbehind(folio);
+&gt;&gt;   		folio_putback_lru(folio);
+&gt;&gt;   	}
+&gt;&gt;   	trace_mm_vmscan_reclaim_pages(pgdat-&gt;node_id, sc.nr_scanned, nr_reclaimed, &amp;stat);
+&gt;&gt; diff --git a/mm/zswap.c b/mm/zswap.c
+&gt;&gt; index dc8425d6b21e..640936fe7464 100644
+&gt;&gt; --- a/mm/zswap.c
+&gt;&gt; +++ b/mm/zswap.c
+&gt;&gt; @@ -1051,17 +1051,16 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+&gt;&gt;   	folio_set_dropbehind(folio);
+&gt;&gt;
+&gt;&gt;   	/*
+&gt;&gt; -	 * Drop our reference before starting writeback so the swap cache holds
+&gt;&gt; -	 * the only one: the drop in folio_end_writeback() needs that for
+&gt;&gt; -	 * remove_mapping_set_shadow() to succeed, otherwise the folio is
+&gt;&gt; -	 * handed back to reclaim instead.
+&gt;&gt; +	 * Our reference is donated to swap_write_submit(), which drops it just
+&gt;&gt; +	 * before submitting so the swap cache holds the only one left: the drop
+&gt;&gt; +	 * in folio_end_writeback() needs that for remove_mapping_set_shadow()
+&gt;&gt; +	 * to succeed, otherwise the folio is handed back to reclaim instead.
+&gt; This feels really conplicated.
+&gt;
+&gt; My instinct with this change overall, though I&#x27;m not familiar with the
+&gt; dropbehind code, is that thi
+
+
+I&#x27;m sure this works as explained, but I can&#x27;t argue with you it&#x27;s not 
+complicated, if you have any idea to make that clearer, I&#x27;m happy to try.
+
+
+&gt;
+&gt;&gt;   	 *
+&gt;&gt;   	 * Nothing can free the folio in the meantime: we hold the folio lock
+&gt;&gt;   	 * until writeback starts, PG_writeback then blocks swap cache removal,
+&gt;&gt;   	 * and folio_end_writeback() takes its own reference before clearing
+&gt;&gt;   	 * PG_writeback and donates it to the drop.
+&gt;&gt;   	 */
+&gt; This comment is now a comment on...? Nothing?
+
+
+I still think it is an important comment so I&#x27;ll &quot;attach&quot; it to 
+__swap_writepage() below. Thanks
+
+Thanks for the thorough review!
+
+Alex
+
+
+&gt;
+&gt;&gt; -	folio_put(folio);
+&gt;&gt;
+&gt;&gt;   	/* start writeback */
+&gt;&gt;   	__swap_writepage(&amp;ctx, folio);
+&gt;&gt; --
+&gt;&gt; 2.53.0-Meta
+&gt;&gt;
+&gt; --
+&gt; Cheers, Lorenzo</pre>
+</details>
+<a href="https://lore.kernel.org/r/6f377965-c743-4d9f-81a7-3aa3294d61d3@ghiti.fr" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged need for justification, agreed to restructure</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory Price</span>
+<a class="date-chip" href="../2026-09-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Gregory Price expressed strong disagreement (CONTENTIOUS) with the patch, citing that the existing code is &#x27;utterly horrible&#x27; and requesting refactoring before adding new functionality. He also suggested separating patches and mentioned a similar issue with THP.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Sep 22, 2026 at 11:44:20AM +0100, Lorenzo Stoakes (ARM) wrote:
+&gt; &gt; @@ -554,10 +567,12 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+&gt; &gt;  			folio_set_workingset(folio);
+&gt; &gt;  		if (pageout) {
+&gt; &gt;  			if (folio_isolate_lru(folio)) {
+&gt; &gt; -				if (folio_test_unevictable(folio))
+&gt; &gt; +				if (folio_test_unevictable(folio)) {
+&gt; &gt;  					folio_putback_lru(folio);
+&gt; &gt; -				else
+&gt; &gt; +				} else {
+&gt; &gt; +					madvise_mark_dropbehind(folio);
+&gt; &gt;  					list_add(&amp;folio-&gt;lru, &amp;folio_list);
+&gt; &gt; +				}
+&gt; &gt;  			}
+&gt; 
+&gt; This existing code is utterly horrible can we maybe do some refactoring before
+&gt; adding yet more functionality here?
+&gt; 
+&gt; I feel like the &#x27;pay down technical debt first&#x27; take I had in THP is pretty
+&gt; valid here also.
+&gt; 
+&gt; But also, yeah you DEFINITELY need to separate out patches here.
+&gt; 
+
+I will post my refactor today, sorry for the delay.</pre>
+</details>
+<a href="https://lore.kernel.org/r/arKdGMrUixIb4spc@gourry-fedora-PF4VCD3F" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: strong disagreement, requested changes</div>
 </div>
 </div>
 </div>
