@@ -239,7 +239,7 @@
     <h1>[PATCH v2 0/3] mm: split underused anonymous mTHP folios</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260916224437.1164512-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-09-21</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-23</strong><div class="date-range-nav">Active on: <a href="#2026-09-23">2026-09-23</a> &bull; <a href="#2026-09-22">2026-09-22</a> &bull; <a href="#2026-09-21">2026-09-21</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses memory regressions caused by enabling 2M THP=always on arm64 with 64k base pages. The patches split underused anonymous mTHP folios, which are not currently reclaimed under memory pressure. Patch 1 makes the thp_underused() function size-aware to accommodate larger folio sizes. Patch 2 optimizes existing behavior by keeping folios that can never be found underused off the deferred split queue. Patch 3 queues anonymous mTHP folios from map_anon_folio_pte_nopf(), mirroring what is already done for PMD folios. The patches aim to provide a solution for deploying 2M THP=always on arm64 without causing memory regressions.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series proposes to split underused anonymous memory huge pages (mTHP folios) into smaller pages, but with a scaling approach that only queues folios of order &gt;=2 for splitting when the maximum number of page table entries (max_ptes_none) is not at its default value. This addresses concerns about performance and overhead, particularly in the Android small folios case, by avoiding unnecessary list_lru lock contention and minimizing the cost of splitting small folios. The patch series includes a benchmarking patch to measure the impact of this approach.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0">
 <div class="review-comment">
@@ -599,16 +599,16 @@ Joanne</pre>
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Barry Song</span>
-<a class="date-chip" href="../2026-09-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
+<a class="date-chip" href="../2026-09-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Barry Song noted that the patch may introduce a similar lock contention issue as the `lru_cache` case for mTHP order-2, referencing a report from Shivank that showed significant performance improvements after resolving this issue.
+<div class="review-comment-text">Barry Song pointed out that the deferred split list at fault time in the non-default max_ptes_none case could lead to similar lock contention issues as seen in the `lru_cache` case, which was previously addressed by Shivank&#x27;s report. He suggested looking into this issue and potentially improving performance.
 
-Barry Song questioned the assumption that systems will only use either 2MB mTHP or 512MB PMD-sized THP, expressing concern about potential conflicts on general-purpose systems.
+Barry Song questioned the assumption that using 2MB mTHP avoids conflicts with PMD-sized THPs, suggesting it&#x27;s unusual for a general-purpose system to enable both features.
 
-Reviewer Barry noted that the patch does not handle the case where a folio is already on the deferred split queue when it becomes underused, and requested that the patch be updated to handle this scenario.</div>
+Reviewer Barry expressed concerns about the scaling approach in the patch, specifically citing potential lock contention and limited upside vs cost of splitting small folios, and requested benchmark numbers to assess the issue.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Hi Joanne,
@@ -654,7 +654,85 @@ Barry</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Joanne Koong</div>
 <a href="https://lore.kernel.org/r/CAGsJ_4x_Q1Ku9r6zfC-K-o87juQ9JNQ8=OSNp+UZzW3MPtZXbQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: lock contention, performance regression, questioning an assumption</div>
+<div class="review-comment-signals">Signals: potential locking issue, performance improvement, questioning an assumption</div>
+</div>
+</div>
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-09-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David (Arm) expressed concerns about adding overhead to the majority of Linux installations, citing a default value of 511 for khugepaged_max_ptes_none that prevents underused PMD THP folios from being scanned.
+
+Reviewer David (Arm) expressed concern about the potential ugliness of implementing batching as a mitigation for list_lru lock contention, and suggested that it would be worth exploring further to see how it could be implemented.
+
+Reviewer David (Arm) expressed skepticism that Android users fine-tune the underused shrinker parameter, suggesting most use the default value of 511, and questioned whether Android even knows about this parameter.
+
+Reviewer David (Arm) expressed preference for scaling approach over default max_ptes_none, citing potential need for additional documentation and workarounds to address creep issue. He also suggested excluding certain small folio sizes from underused shrinker and hard-coding these exclusions in the kernel.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Exactly.
+
+I was primarily arguing that I don&#x27;t want this overhead for the majority of
+Linux installations out there that ship with
+
+$ cat /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none
+511
+
+IOW: we add them (PMD THP folios today!) to the deferred list for
+uuderused-scanning but never actually scan them because of:
+
+	if (khugepaged_max_ptes_none == HPAGE_PMD_NR - 1)
+		return false;
+
+Now, what you are saying is we might want less overhead for installations that
+modify max_ptes_none, like Meta&#x27;s fleet. See below.
+
+---
+
+Right, I raised that. Johannes thinks it could be fixed with batching. I was
+concerned that it would become rather ugly. We&#x27;d have to see how that could look.
+
+---
+
+I would assume everybody except some special users that fine-tune underused
+shrinker run with the default. I did some digging in the past regarding public
+documentation about how to set the parameter, and most of them just defaulted to
+511.
+
+I would be surprised if Android even knows about this parameter ;)
+
+---
+
+My opinion is (open for discussion :) ) that scaling is likely the better
+approach. With the following notes:
+
+(1) If we want to enable mTHP collapse with scaling as well, this needs very
+good documentation and also another thought on how to work around the problem of
+creep (e.g., refusing to collapse if creep would be possible according to the
+max_ptes_non setting and warning).
+
+(2) Systems where the underused shrinker is effectively inactive should not add
+folios to the deferred list. Including PMD THPs, which we unconditionally add today.
+
+(3) If we want to exclude certain small folio sizes from the underused shrinker
+(e.g., order-2? order-3?) it might be better to just hard-code that in the
+kernel instead of giving the admin a choice it cannot possibly make easily.
+
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/00d07f4a-f679-486f-9413-6917b5213854@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: overhead, default value, concerned</div>
 </div>
 </div>
 </div>

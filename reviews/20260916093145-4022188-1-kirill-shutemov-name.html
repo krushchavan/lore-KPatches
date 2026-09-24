@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 00/12] mm/collapse: separate a collapse from its callers</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260916093145.4022188-1-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-18</strong><div class="date-range-nav">Active on: <a href="#2026-09-18">2026-09-18</a> &bull; <a href="#2026-09-17">2026-09-17</a> &bull; <a href="#2026-09-16">2026-09-16</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-23</strong><div class="date-range-nav">Active on: <a href="#2026-09-23">2026-09-23</a> &bull; <a href="#2026-09-18">2026-09-18</a> &bull; <a href="#2026-09-17">2026-09-17</a> &bull; <a href="#2026-09-16">2026-09-16</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch set separates the collapse engine from its callers by introducing a clear interface and policy between them. The collapse engine, currently in khugepaged.c, is split into four distinct calls: collapse_control_init, collapse_policy_set, collapse_scan_pmd, and collapse_run_pmd. This separation allows for better modularity and maintainability of the code, as well as improved handling of lock states and policy decisions. The patch set also includes changes to madvise.c to gain a new operation and updates to various functions to follow the new interface.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-16">
@@ -249,7 +249,7 @@
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author is addressing a concern about the mmgrab() reference in madvise_collapse(), acknowledging it as redundant and promising to drop it by removing the mmgrab()/mmdrop() pair.</div>
+<div class="review-comment-text">The author addressed concerns about locking in the collapse path, specifically that madvise_collapse() holds an mmgrab() reference unnecessarily and that collapse_single_pmd() bumps khugepaged_pages_collapsed for its caller. The author agreed to restructure these parts of the code, dropping the redundant mmgrab() call and renaming a bitmap in khugepaged.c.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
@@ -295,477 +295,11 @@ index e13d233b9967..75c876acf527 100644
  
  	return thps == ((hend - hstart) &gt;&gt; HPAGE_PMD_SHIFT) ? 0
 -- 
-2.54.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-2-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged redundancy, promised fix</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Andrew Morton</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Andrew Morton noted that the changes in v3 do not address his previous concerns about lock ordering, specifically that collapse_huge_page() acquires the per-vswap spinlock while holding the folio lock, creating a potential deadlock with reclaim paths. He requested that the lock be dropped before calling try_to_unmap().</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Here&#x27;s how v3 altered mm.git:
+2.54.0
 
+---
 
- mm/collapse.h   |   21 ++++----
- mm/khugepaged.c |  118 ++++++++++++++++++++++++++--------------------
- mm/madvise.c    |    6 +-
- 3 files changed, 82 insertions(+), 63 deletions(-)
-
---- a/mm/collapse.h~b
-+++ a/mm/collapse.h
-@@ -95,15 +95,13 @@ struct collapse_control {
- 	 *
- 	 * The file side takes a reference while it still has the VMA, since a
- 	 * file collapse works on the page cache and never sees one; the run is
--	 * what gives it back.  A scan that found the PMD folio already in the
--	 * cache leaves only the PTE table to retract.
-+	 * what gives it back.
- 	 */
- 	unsigned long scan_orders;
- 	int scan_referenced;
- 	int scan_unmapped;
- 	struct file *scan_file;
- 	pgoff_t scan_pgoff;
--	bool scan_retract_only;
- };
- 
- /* Which orders a VMA may collapse to, zero when it may not collapse at all */
-@@ -114,18 +112,21 @@ unsigned long collapse_possible_orders(s
-  * A caller states what it allows in cc-&gt;policy and then hands over one PTE
-  * table&#x27;s worth of a VMA at a time:
-  *
-- *     collapse_control_init(cc)         once, before the first table
-- *     collapse_scan_pmd(vma, addr, ...) per table
-- *     collapse_run_pmd(mm, addr, cc)    when a scan found work
-- *     collapse_control_release(cc)      once, when done with the control
-+ *     collapse_control_init(cc)              once, before the first table
-+ *     collapse_scan_pmd(vma, addr, ...)      per table
-+ *     collapse_run_pmd(mm, addr, result, cc) when a scan found work
-+ *     collapse_control_release(cc)           once, when done with the control
-  *
-  * The caller holds mmap_lock for reading over the scan and passes an address
-- * within @vma, aligned to the PTE table the scan is to judge.
-+ * within @vma, aligned to the PTE table to scan.
-  *
-  * The scan returns with that lock still held.  It only reads, and almost every
-  * table it is offered has nothing to collapse, so a caller walks a whole VMA
-  * under the one lock it took to get there.  SCAN_SUCCEED means there is
-- * something to collapse; anything else is why there is not.
-+ * something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE means the page cache
-+ * already holds the PMD folio and only the PTE table is left to retract.
-+ * Both are work for the run, which is handed what the scan returned; anything
-+ * else is why there is nothing to do.
-  *
-  * The run is called without the lock and returns without it, taking what it
-  * needs in between: what it does -- allocate, isolate, copy, flush -- is slow
-@@ -144,7 +145,7 @@ enum scan_result collapse_scan_pmd(struc
- 		unsigned long addr, struct collapse_control *cc,
- 		unsigned long orders);
- enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
--		struct collapse_control *cc);
-+		enum scan_result result, struct collapse_control *cc);
- enum scan_result collapse_vma_revalidate(struct mm_struct *mm,
- 		unsigned long address, bool expect_anon,
- 		struct vm_area_struct **vmap, struct collapse_control *cc,
---- a/mm/khugepaged.c~b
-+++ a/mm/khugepaged.c
-@@ -996,11 +996,11 @@ static int collapse_find_target_node(str
- #endif
- 
- /*
-- * If mmap_lock temporarily dropped, revalidate vma
-- * after taking the mmap_lock again.
-- * Returns enum scan_result value.
-+ * Find the VMA at @address again once mmap_lock has been given up and taken
-+ * back, and check it still allows a collapse of @order there.  The VMA has to
-+ * span the whole PMD whatever @order is; with @expect_anon it also has to be
-+ * anonymous and have an anon_vma.  *@vmap is the VMA found, if any.
-  */
--
- enum scan_result collapse_vma_revalidate(struct mm_struct *mm, unsigned long address,
- 		bool expect_anon, struct vm_area_struct **vmap,
- 		struct collapse_control *cc, unsigned int order)
-@@ -1222,8 +1222,8 @@ static enum scan_result alloc_charge_fol
-  * while allocating a THP, as that could trigger direct reclaim/compaction.
-  * Note that the VMA must be rechecked after grabbing the mmap_lock again.
-  */
--static enum scan_result collapse_huge_page(struct mm_struct *mm, unsigned long start_addr,
--		int referenced, int unmapped, struct collapse_control *cc,
-+static enum scan_result collapse_huge_page(struct mm_struct *mm,
-+		unsigned long start_addr, struct collapse_control *cc,
- 		unsigned int order)
- {
- 	const unsigned long pmd_addr = start_addr &amp; HPAGE_PMD_MASK;
-@@ -1262,14 +1262,14 @@ static enum scan_result collapse_huge_pa
- 		goto out_nolock;
- 	}
- 
--	if (unmapped) {
-+	if (cc-&gt;scan_unmapped) {
- 		/*
- 		 * __collapse_huge_page_swapin() will return with mmap_lock
- 		 * released when it fails. So we jump out_nolock directly in
- 		 * that case.  Continuing to collapse causes inconsistency.
- 		 */
- 		result = __collapse_huge_page_swapin(mm, vma, start_addr, pmd,
--						     referenced, order);
-+						     cc-&gt;scan_referenced, order);
- 		if (result != SCAN_SUCCEED)
- 			goto out_nolock;
- 	}
-@@ -1433,9 +1433,8 @@ static unsigned int max_order_from_offse
-  * If a collapse is permitted, we attempt to collapse the PTE range into a
-  * mTHP.
-  */
--static enum scan_result mthp_collapse(struct mm_struct *mm,
--		unsigned long address, int referenced, int unmapped,
--		struct collapse_control *cc, unsigned long enabled_orders)
-+static enum scan_result mthp_collapse(struct mm_struct *mm, unsigned long address,
-+		struct collapse_control *cc)
- {
- 	unsigned int nr_eligible_ptes, nr_ptes, max_ptes_none;
- 	enum scan_result last_result = SCAN_FAIL;
-@@ -1448,7 +1447,7 @@ static enum scan_result mthp_collapse(st
- 	while (offset &lt; HPAGE_PMD_NR) {
- 		nr_ptes = 1UL &lt;&lt; order;
- 
--		if (!test_bit(order, &amp;enabled_orders))
-+		if (!test_bit(order, &amp;cc-&gt;scan_orders))
- 			goto next_order;
- 
- 		max_ptes_none = collapse_max_ptes_none(cc, NULL, order);
-@@ -1456,19 +1455,18 @@ static enum scan_result mthp_collapse(st
- 						      offset + nr_ptes);
- 
- 		/*
--		 * Swap PTEs accepted during the scan are counted in @unmapped,
--		 * not in cc-&gt;eligible_ptes. Account them for the PMD-order
--		 * candidate.
-+		 * Swap PTEs accepted during the scan are counted in
-+		 * cc-&gt;scan_unmapped, not in cc-&gt;eligible_ptes. Account them for
-+		 * the PMD-order candidate.
- 		 */
- 		if (is_pmd_order(order))
--			nr_eligible_ptes += unmapped;
-+			nr_eligible_ptes += cc-&gt;scan_unmapped;
- 
- 		if (nr_eligible_ptes &gt;= nr_ptes - max_ptes_none) {
- 			enum scan_result ret;
- 
- 			collapse_address = address + offset * PAGE_SIZE;
--			ret = collapse_huge_page(mm, collapse_address, referenced,
--						 unmapped, cc, order);
-+			ret = collapse_huge_page(mm, collapse_address, cc, order);
- 
- 			switch (ret) {
- 			/* Cases where we continue to next collapse candidate */
-@@ -1510,7 +1508,7 @@ next_order:
- 		 * we must always move to the next offset.
- 		 */
- 		if (order &gt; COLLAPSE_MIN_MTHP_ORDER &amp;&amp;
--		    (enabled_orders &amp; GENMASK(order - 1, 0))) {
-+		    (cc-&gt;scan_orders &amp; GENMASK(order - 1, 0))) {
- 			order--;
- 			continue;
- 		}
-@@ -2721,21 +2719,45 @@ static enum scan_result collapse_scan_fi
- 	return result;
- }
- 
-+/* Set up a control before its first scan; cc-&gt;policy is the caller&#x27;s to fill */
- void collapse_control_init(struct collapse_control *cc)
- {
- 	cc-&gt;progress = 0;
- 	cc-&gt;scan_file = NULL;
- }
- 
--void collapse_control_release(struct collapse_control *cc)
-+/* A scan that took a file reference should have been run */
-+static void collapse_put_scan_file(struct collapse_control *cc)
- {
--	/* A scan that took a file reference should have been run */
- 	if (WARN_ON_ONCE(cc-&gt;scan_file)) {
- 		fput(cc-&gt;scan_file);
- 		cc-&gt;scan_file = NULL;
- 	}
- }
- 
-+/*
-+ * Done with a control.  A scan that found something has to have been run by
-+ * then: the file side takes a reference on the file while it still has the
-+ * VMA to take it from, and the run is what gives it back.
-+ */
-+void collapse_control_release(struct collapse_control *cc)
-+{
-+	collapse_put_scan_file(cc);
-+}
-+
-+/*
-+ * Scan the PTE table of @vma at @addr for a collapse candidate.  @addr is
-+ * aligned to the table; @orders is what the caller allows there.
-+ *
-+ * Called with mmap_lock held for reading and returns with it still held.  It
-+ * only reads, and almost every table it is offered has nothing to collapse,
-+ * so a caller walks a whole VMA under the one lock it took to get there.
-+ *
-+ * SCAN_SUCCEED means there is something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE
-+ * means the page cache already holds the PMD folio and only the PTE table is
-+ * left to retract.  Both are work for collapse_run_pmd(), which is handed
-+ * what the scan returned; anything else is why there is nothing to do.
-+ */
- enum scan_result collapse_scan_pmd(struct vm_area_struct *vma,
- 		unsigned long addr, struct collapse_control *cc,
- 		unsigned long orders)
-@@ -2745,31 +2767,19 @@ enum scan_result collapse_scan_pmd(struc
- 
- 	mmap_assert_locked(vma-&gt;vm_mm);
- 	/* Whatever the last scan found has to have been run by now */
--	if (WARN_ON_ONCE(cc-&gt;scan_file)) {
--		fput(cc-&gt;scan_file);
--		cc-&gt;scan_file = NULL;
--	}
-+	collapse_put_scan_file(cc);
- 
- 	if (vma_is_anonymous(vma))
- 		return collapse_scan_anon_pmd(vma, addr, cc, orders);
- 
- 	pgoff = linear_page_index(vma, addr);
- 	result = collapse_scan_file(vma-&gt;vm_mm, addr, vma-&gt;vm_file, pgoff, cc);
--	switch (result) {
--	case SCAN_SUCCEED:
--		cc-&gt;scan_retract_only = false;
--		break;
--	case SCAN_PTE_MAPPED_HUGEPAGE:
--		/*
--		 * The page cache already holds the PMD folio; what is left is
--		 * to retract the PTE table, which is the run&#x27;s job.
--		 */
--		cc-&gt;scan_retract_only = true;
--		result = SCAN_SUCCEED;
--		break;
--	default:
-+	/*
-+	 * SCAN_PTE_MAPPED_HUGEPAGE is work too: the page cache already holds
-+	 * the PMD folio, and retracting the PTE table is the run&#x27;s job.
-+	 */
-+	if (result != SCAN_SUCCEED &amp;&amp; result != SCAN_PTE_MAPPED_HUGEPAGE)
- 		return result;
--	}
- 
- 	/*
- 	 * A file collapse works on the page cache and never sees a VMA, so take
-@@ -2780,25 +2790,32 @@ enum scan_result collapse_scan_pmd(struc
- 	return result;
- }
- 
-+/*
-+ * Collapse the table a scan found work in.  @result is what the scan
-+ * returned.
-+ *
-+ * Called without mmap_lock and returns without it, taking what it needs in
-+ * between: what it does -- allocate, isolate, copy, flush -- is slow enough
-+ * that a writer would wait behind it.  The caller gives the lock up first,
-+ * and with it the VMA and anything derived under it.  The run revalidates for
-+ * itself rather than trusting what the scan saw.
-+ */
- enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
--		struct collapse_control *cc)
-+		enum scan_result result, struct collapse_control *cc)
- {
- 	struct file *file = cc-&gt;scan_file;
- 	bool triggered_wb = false;
--	enum scan_result result;
- 	pgoff_t pgoff;
- 
- 	if (!file)
--		return mthp_collapse(mm, addr, cc-&gt;scan_referenced,
--				     cc-&gt;scan_unmapped, cc, cc-&gt;scan_orders);
-+		return mthp_collapse(mm, addr, cc);
- 
- 	cc-&gt;scan_file = NULL;
- 	pgoff = cc-&gt;scan_pgoff;
- 
--	if (cc-&gt;scan_retract_only) {
--		result = SCAN_PTE_MAPPED_HUGEPAGE;
-+	/* The scan found the PMD folio in place: nothing to collapse */
-+	if (result == SCAN_PTE_MAPPED_HUGEPAGE)
- 		goto retract;
--	}
- retry:
- 	result = collapse_file(mm, addr, file, pgoff, cc);
- 
-@@ -2912,8 +2929,9 @@ static void collapse_scan_mm_slot(unsign
- 			khugepaged_scan.address += HPAGE_PMD_SIZE;
- 
- 			*result = collapse_scan_pmd(vma, addr, cc, orders);
--			/* Nothing to collapse here, and the lock is still ours */
--			if (*result != SCAN_SUCCEED) {
-+			/* Nothing to do here, and the lock is still ours */
-+			if (*result != SCAN_SUCCEED &amp;&amp;
-+			    *result != SCAN_PTE_MAPPED_HUGEPAGE) {
- 				if (cc-&gt;progress &gt;= progress_max)
- 					goto breakouterloop;
- 				continue;
-@@ -2926,7 +2944,7 @@ static void collapse_scan_mm_slot(unsign
- 			 * whatever the collapse leaves them.
- 			 */
- 			mmap_read_unlock(mm);
--			*result = collapse_run_pmd(mm, addr, cc);
-+			*result = collapse_run_pmd(mm, addr, *result, cc);
- 			if (*result == SCAN_SUCCEED)
- 				khugepaged_pages_collapsed++;
- 			goto breakouterloop_mmap_lock;
-@@ -2984,7 +3002,7 @@ static void khugepaged_do_scan(struct co
- 	lru_add_drain_all();
- 
- 	collapse_control_init(cc);
--	/* One policy for the whole pass, so every table is judged the same */
-+	/* One policy for the whole pass, so every table is treated the same */
- 	collapse_policy_khugepaged(&amp;cc-&gt;policy);
- 
- 	while (true) {
---- a/mm/madvise.c~b
-+++ a/mm/madvise.c
-@@ -1014,8 +1014,8 @@ static int madvise_collapse(struct madvi
- 		}
- 
- 		result = collapse_scan_pmd(vma, addr, cc, orders);
--		/* Nothing to collapse here, and the lock is still ours */
--		if (result != SCAN_SUCCEED)
-+		/* Nothing to do here, and the lock is still ours */
-+		if (result != SCAN_SUCCEED &amp;&amp; result != SCAN_PTE_MAPPED_HUGEPAGE)
- 			goto tally;
- 
- 		/* The collapse takes its own locks, so give this up */
-@@ -1023,7 +1023,7 @@ static int madvise_collapse(struct madvi
- 		mark_mmap_lock_dropped(madv_behavior);
- 		vma = NULL;
- 
--		result = collapse_run_pmd(mm, addr, cc);
-+		result = collapse_run_pmd(mm, addr, result, cc);
- tally:
- 		switch (result) {
- 		case SCAN_SUCCEED:
-_</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/20260916154826.a55591eec86b5514dab898ca@linux-foundation.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: lock ordering issue, potential deadlock</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Andrew Morton</span>
-<a class="date-chip" href="../2026-09-17_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-17">2026-09-17</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Andrew Morton questioned the usefulness of sending a &#x27;heres-what-changed&#x27; reply and suggested it may not be used by others, also mentioning that he prepares it for the author to double-check their changes.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">I guess so - that would let people see what changed immediately rather
-than having me send it later on.  What do others think?
-
-I don&#x27;t know how useful the heres-what-changed reply is for people. 
-I&#x27;ve seen little sign of anyone using it.
-
-One reason I prepare it is for the author to scan it to double-check
-that they meant to do all those things.  The exercise also make me pay
-more attention, check that diff matches the v4-&gt;v5 changelog&#x27;s claims.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/20260917151131.ececfd158627e58257ca7110@linux-foundation.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: questioning usefulness, suggested alternative purpose</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2" id="2026-09-17">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-17_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-17">2026-09-17</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author asks for clarification on whether appending a range-diff to the cover letter is helpful, indicating no specific technical issue or concern being addressed</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">BTW, is it helpful to append a range-diff to the cover letter on a new
-revision of a patchset? I can do it in the future if it is useful.
-
--- 
-  Kiryl Shutsemau / Kirill A. Shutemov</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Andrew Morton</div>
-<a href="https://lore.kernel.org/r/aqvcElQxmtysJwbA@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: clarifying question</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-3" id="2026-09-18">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Baolin Wang</span>
-<a class="date-chip" href="../2026-09-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-18">2026-09-18</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
-</div>
-<div class="review-comment-text">Gave Reviewed-by</div>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/0230e861-8364-4302-a607-c34809a4a809@linux.alibaba.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-</div>
-</div>
-<div class="thread-node depth-3">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Baolin Wang</span>
-<a class="date-chip" href="../2026-09-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-18">2026-09-18</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Baolin Wang approved the patch after testing it with shmem mTHP collapse and confirmed that removing the &#x27;lock_dropped&#x27; flag did not introduce any issues.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Thanks for removing the ugly &#x27;lock_dropped&#x27;, and I also did some testing 
-with my shmem mTHP collapse, and no issues found. So,
-
-Reviewed-by: Baolin Wang &lt;baolin.wang@linux.alibaba.com&gt;</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
-<a href="https://lore.kernel.org/r/31658d2e-6e97-4771-aca3-ddc60484f326@linux.alibaba.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: approval, testing</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author addressed a concern about khugepaged_pages_collapsed being incremented in collapse_single_pmd(), explaining that it belongs to the daemon and should not be touched by MADV_COLLAPSE. The counter is instead incremented when the daemon sees the result of every collapse it asks for.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
 
 collapse_single_pmd() bumps khugepaged_pages_collapsed for its caller, and
 tests cc-&gt;is_khugepaged to know whether it should: the counter belongs to
@@ -819,24 +353,11 @@ index 75c876acf527..4979a93e3648 100644
  			khugepaged_scan.address += HPAGE_PMD_SIZE;
  			if (lock_dropped)
 -- 
-2.54.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-3-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged a fix, explained reasoning</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author addressed a concern about the naming of the bitmap in collapse_control, explaining that it represents PTEs accepted as collapse sources rather than just present PTEs. The author agreed to update the comments and name accordingly, but stated there is no functional change.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+2.54.0
+
+---
+
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
 
 The name says less than the bit means.  A set bit means not only that the
 PTE is present, but also that it passed the other checks: uffd,
@@ -948,24 +469,11 @@ index 4979a93e3648..081f705cfca2 100644
  		 * Record which node the original page is from and save this
  		 * information to cc-&gt;node_load[].
 -- 
-2.54.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-4-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: no functional change, update comments</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing the concern that the collapse engine and its callers are not properly separated, which was causing issues in khugepaged.c. The author agrees to draw a clear line between the two by adding a new header file (mm/collapse.h) that defines the interface between the engine and its callers. This will help to avoid reaching into each other&#x27;s code freely.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+2.54.0
+
+---
+
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
 
 khugepaged.c holds both the users of collapse and the machinery that
 performs it.  The daemon&#x27;s scan loop, the sysfs tunables, MADV_COLLAPSE&#x27;s
@@ -1249,8 +757,60 @@ index 081f705cfca2..8889f75cf45f 100644
 -- 
 2.54.0</pre>
 </details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-5-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: agreed, added new header file</div>
+<a href="https://lore.kernel.org/r/20260916093145.4022188-2-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, agreed to restructure</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Andrew Morton</span>
+<a class="date-chip" href="../2026-09-17_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-17">2026-09-17</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Andrew Morton questioned the usefulness of sending a &#x27;heres-what-changed&#x27; reply and suggested it may not be used by others, also mentioning that he prepares it for the author to double-check their changes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I guess so - that would let people see what changed immediately rather
+than having me send it later on.  What do others think?
+
+I don&#x27;t know how useful the heres-what-changed reply is for people. 
+I&#x27;ve seen little sign of anyone using it.
+
+One reason I prepare it is for the author to scan it to double-check
+that they meant to do all those things.  The exercise also make me pay
+more attention, check that diff matches the v4-&gt;v5 changelog&#x27;s claims.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20260917151131.ececfd158627e58257ca7110@linux-foundation.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: questioning usefulness, suggested alternative purpose</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-09-17">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-17_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-17">2026-09-17</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author asks for clarification on whether appending a range-diff to the cover letter is helpful, indicating no specific technical issue or concern being addressed</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">BTW, is it helpful to append a range-diff to the cover letter on a new
+revision of a patchset? I can do it in the future if it is useful.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Andrew Morton</div>
+<a href="https://lore.kernel.org/r/aqvcElQxmtysJwbA@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarifying question</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 <div class="thread-node depth-0">
@@ -1258,10 +818,10 @@ index 081f705cfca2..8889f75cf45f 100644
 <div class="review-comment-header">
 <span class="review-author">Kiryl Shutsemau (author)</span>
 <a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Author addressed a concern that tests scattered through the collapse path decide what a collapse is allowed to do by asking whether khugepaged started it, and responded that this is incorrect: each decision was made by the caller before it asked for a collapse. The author added a struct collapse_policy for callers to fill with their own settings, which will be used instead of cc-&gt;is_khugepaged.</div>
+<div class="review-comment-text">The author addressed a concern that tests in the collapse path are deciding what a collapse is allowed to do by asking whether khugepaged started it, instead of reading from a struct collapse_policy filled by the caller. The author agreed to add this policy and explained how it will be used: khugepaged fills it once per scan pass, MADV_COLLAPSE fills it once per call, and every test becomes a read of a field.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
@@ -1603,24 +1163,11 @@ index 8889f75cf45f..cb08789b2d38 100644
  
  	lru_add_drain_all();
 -- 
-2.54.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-6-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged, agreed</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author addressed a concern about the collapse_possible() function being redundant and only forwarding to collapse_possible_orders(). They acknowledged that its three callers can test the mask themselves, confirming no functional change is needed.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+2.54.0
+
+---
+
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
 
 collapse_possible() only forwards to collapse_possible_orders() and turns
 its mask into a bool.  Its three callers can test the mask themselves.
@@ -1679,24 +1226,11 @@ index cb08789b2d38..62bafe509bb7 100644
  
  	hstart = ALIGN(start, HPAGE_PMD_SIZE);
 -- 
-2.54.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-7-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged redundancy, no functional change</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing a naming inconsistency in the collapse_control_init_scan() function, which resets values for each PTE table scan. The author agrees to rename it to collapse_scan_reset(), indicating that this change does not introduce any functional changes.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+2.54.0
+
+---
+
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
 
 collapse_control_init_scan() resets what one scan accumulates: the node
 load, the allocation nodemask and the eligible-PTE bitmap.  It runs before
@@ -1753,8 +1287,8 @@ index 62bafe509bb7..ff1756c1255d 100644
 -- 
 2.54.0</pre>
 </details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-8-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: no functional change, rename of a function</div>
+<a href="https://lore.kernel.org/r/20260916093145.4022188-6-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: addressed_concern, explained_change</div>
 </div>
 </div>
 <div class="thread-node depth-0">
@@ -1762,10 +1296,10 @@ index 62bafe509bb7..ff1756c1255d 100644
 <div class="review-comment-header">
 <span class="review-author">Kiryl Shutsemau (author)</span>
 <a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author addressed a concern about the complexity of the collapse path by splitting it into two separate functions: one for scanning and another for running the collapse. The scan function will read under mmap_lock, while the run function will drop the lock before proceeding. The changes also include updates to tracing and file handling.</div>
+<div class="review-comment-text">The author addressed a concern about the separation of collapse scan and run functions, explaining that each half should have its own function: collapse_scan_pmd() for scanning and collapse_run_pmd() for collapsing. The author also explained changes to tracing and file handling.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
@@ -2172,24 +1706,11 @@ index ff1756c1255d..b6fc2c78e3e2 100644
  
  	return thps == ((hend - hstart) &gt;&gt; HPAGE_PMD_SHIFT) ? 0
 -- 
-2.54.0</pre>
-</details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-9-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged a fix is needed, agreed with the approach</div>
-</div>
-</div>
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (author)</span>
-<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author addressed a concern about the locking contract in collapse_scan_pmd() and collapse_run_pmd(). They agreed to open-code the boundary between these two functions in their callers, khugepaged&#x27;s walk and madvise_collapse(), so that each scans under its own lock and drops it before running the collapse. The code changes are functional-equivalent but with improved locking semantics.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+2.54.0
+
+---
+
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
 
 collapse_scan_pmd() and collapse_run_pmd() each have a clear locking
 contract.  The scan is called with mmap_lock held for reading and returns
@@ -2389,10 +1910,624 @@ index b6fc2c78e3e2..9e6b2af6519e 100644
  	collapse_control_release(cc);
  	kfree(cc);
 -- 
-2.54.0</pre>
+2.54.0
+
+---
+
+On Wed, Sep 16, 2026 at 03:48:26PM -0700, Andrew Morton wrote:
+&gt; Here&#x27;s how v3 altered mm.git:
+
+BTW, is it helpful to append a range-diff to the cover letter on a new
+revision of a patchset? I can do it in the future if it is useful.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
 </details>
-<a href="https://lore.kernel.org/r/20260916093145.4022188-10-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: agreed to restructure, no functional change</div>
+<a href="https://lore.kernel.org/r/20260916093145.4022188-9-kirill@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Andrew Morton</span>
+<a class="date-chip" href="../2026-09-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-16">2026-09-16</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Andrew Morton noted that the patch did not clearly separate the collapse engine from its callers, specifically citing khugepaged.c as holding both and reaching into each other. He requested that a clear boundary be drawn between the two, with the lock state written down against each call.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Wed, 16 Sep 2026 10:31:27 +0100 Kiryl Shutsemau &lt;kirill@shutemov.name&gt; wrote:
+
+&gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; 
+&gt; [ This is the first of the cleanups I said I would front-load ]
+&gt; 
+&gt; There is no line between the collapse engine and the callers that ask for
+&gt; a collapse.  khugepaged.c holds both, and they reach into each other.
+&gt; 
+&gt;  - Sixteen tests through the collapse path read cc-&gt;is_khugepaged to work
+&gt;    out what they are allowed to do, when every one of those decisions was
+&gt;    made by the caller before it asked.
+&gt; 
+&gt;  - collapse_single_pmd() does both halves of a collapse behind one call and
+&gt;    drops mmap_lock somewhere in the middle.  Which of its paths dropped it
+&gt;    is not something a caller can see, so it hands back a bool and the
+&gt;    caller keeps track.
+&gt; 
+&gt;  - MADV_COLLAPSE&#x27;s implementation -- the walk over the user&#x27;s range, the
+&gt;    per-PMD loop, the errno translation -- sits in khugepaged.c, which is
+&gt;    the daemon&#x27;s file.
+&gt; 
+&gt; So: draw the line.  State what a caller allows in a policy, split the call
+&gt; in two with the lock as the boundary, and move the syscall to madvise.c.
+&gt;
+
+Thanks, I updated mm-unstable.
+
+&gt; Changes since v2
+&gt; ================
+&gt; 
+&gt;   https://lore.kernel.org/all/20260910120238.2529819-1-kirill@shutemov.name/
+&gt; 
+&gt;  - Patch 8: the file scan returns SCAN_PTE_MAPPED_HUGEPAGE as it is and
+&gt;    the run is handed what the scan returned, so it goes straight to
+&gt;    retracting the PTE table when it sees it.  The scan_retract_only flag
+&gt;    and the result round trip go, and the two copies of the file put become
+&gt;    one helper (Zi).  Patches 9-12 follow the new signature.
+&gt; 
+&gt;  - Patch 8: mthp_collapse() and collapse_huge_page() read the orders and
+&gt;    the referenced and swapped-out counts from collapse_control instead of
+&gt;    taking them as arguments (Baolin).
+&gt; 
+&gt;  - Patch 11: each interface function is documented where it is defined,
+&gt;    with the lock state on entry and exit.  The overview in collapse.h
+&gt;    stays (Zi).
+&gt; 
+&gt;  - Reviewed-by from Zi Yan on 8 and 9, and from Zi Yan and Baolin Wang
+&gt;    on 5 and 10.
+
+Here&#x27;s how v3 altered mm.git:
+
+
+ mm/collapse.h   |   21 ++++----
+ mm/khugepaged.c |  118 ++++++++++++++++++++++++++--------------------
+ mm/madvise.c    |    6 +-
+ 3 files changed, 82 insertions(+), 63 deletions(-)
+
+--- a/mm/collapse.h~b
++++ a/mm/collapse.h
+@@ -95,15 +95,13 @@ struct collapse_control {
+ 	 *
+ 	 * The file side takes a reference while it still has the VMA, since a
+ 	 * file collapse works on the page cache and never sees one; the run is
+-	 * what gives it back.  A scan that found the PMD folio already in the
+-	 * cache leaves only the PTE table to retract.
++	 * what gives it back.
+ 	 */
+ 	unsigned long scan_orders;
+ 	int scan_referenced;
+ 	int scan_unmapped;
+ 	struct file *scan_file;
+ 	pgoff_t scan_pgoff;
+-	bool scan_retract_only;
+ };
+ 
+ /* Which orders a VMA may collapse to, zero when it may not collapse at all */
+@@ -114,18 +112,21 @@ unsigned long collapse_possible_orders(s
+  * A caller states what it allows in cc-&gt;policy and then hands over one PTE
+  * table&#x27;s worth of a VMA at a time:
+  *
+- *     collapse_control_init(cc)         once, before the first table
+- *     collapse_scan_pmd(vma, addr, ...) per table
+- *     collapse_run_pmd(mm, addr, cc)    when a scan found work
+- *     collapse_control_release(cc)      once, when done with the control
++ *     collapse_control_init(cc)              once, before the first table
++ *     collapse_scan_pmd(vma, addr, ...)      per table
++ *     collapse_run_pmd(mm, addr, result, cc) when a scan found work
++ *     collapse_control_release(cc)           once, when done with the control
+  *
+  * The caller holds mmap_lock for reading over the scan and passes an address
+- * within @vma, aligned to the PTE table the scan is to judge.
++ * within @vma, aligned to the PTE table to scan.
+  *
+  * The scan returns with that lock still held.  It only reads, and almost every
+  * table it is offered has nothing to collapse, so a caller walks a whole VMA
+  * under the one lock it took to get there.  SCAN_SUCCEED means there is
+- * something to collapse; anything else is why there is not.
++ * something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE means the page cache
++ * already holds the PMD folio and only the PTE table is left to retract.
++ * Both are work for the run, which is handed what the scan returned; anything
++ * else is why there is nothing to do.
+  *
+  * The run is called without the lock and returns without it, taking what it
+  * needs in between: what it does -- allocate, isolate, copy, flush -- is slow
+@@ -144,7 +145,7 @@ enum scan_result collapse_scan_pmd(struc
+ 		unsigned long addr, struct collapse_control *cc,
+ 		unsigned long orders);
+ enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
+-		struct collapse_control *cc);
++		enum scan_result result, struct collapse_control *cc);
+ enum scan_result collapse_vma_revalidate(struct mm_struct *mm,
+ 		unsigned long address, bool expect_anon,
+ 		struct vm_area_struct **vmap, struct collapse_control *cc,
+--- a/mm/khugepaged.c~b
++++ a/mm/khugepaged.c
+@@ -996,11 +996,11 @@ static int collapse_find_target_node(str
+ #endif
+ 
+ /*
+- * If mmap_lock temporarily dropped, revalidate vma
+- * after taking the mmap_lock again.
+- * Returns enum scan_result value.
++ * Find the VMA at @address again once mmap_lock has been given up and taken
++ * back, and check it still allows a collapse of @order there.  The VMA has to
++ * span the whole PMD whatever @order is; with @expect_anon it also has to be
++ * anonymous and have an anon_vma.  *@vmap is the VMA found, if any.
+  */
+-
+ enum scan_result collapse_vma_revalidate(struct mm_struct *mm, unsigned long address,
+ 		bool expect_anon, struct vm_area_struct **vmap,
+ 		struct collapse_control *cc, unsigned int order)
+@@ -1222,8 +1222,8 @@ static enum scan_result alloc_charge_fol
+  * while allocating a THP, as that could trigger direct reclaim/compaction.
+  * Note that the VMA must be rechecked after grabbing the mmap_lock again.
+  */
+-static enum scan_result collapse_huge_page(struct mm_struct *mm, unsigned long start_addr,
+-		int referenced, int unmapped, struct collapse_control *cc,
++static enum scan_result collapse_huge_page(struct mm_struct *mm,
++		unsigned long start_addr, struct collapse_control *cc,
+ 		unsigned int order)
+ {
+ 	const unsigned long pmd_addr = start_addr &amp; HPAGE_PMD_MASK;
+@@ -1262,14 +1262,14 @@ static enum scan_result collapse_huge_pa
+ 		goto out_nolock;
+ 	}
+ 
+-	if (unmapped) {
++	if (cc-&gt;scan_unmapped) {
+ 		/*
+ 		 * __collapse_huge_page_swapin() will return with mmap_lock
+ 		 * released when it fails. So we jump out_nolock directly in
+ 		 * that case.  Continuing to collapse causes inconsistency.
+ 		 */
+ 		result = __collapse_huge_page_swapin(mm, vma, start_addr, pmd,
+-						     referenced, order);
++						     cc-&gt;scan_referenced, order);
+ 		if (result != SCAN_SUCCEED)
+ 			goto out_nolock;
+ 	}
+@@ -1433,9 +1433,8 @@ static unsigned int max_order_from_offse
+  * If a collapse is permitted, we attempt to collapse the PTE range into a
+  * mTHP.
+  */
+-static enum scan_result mthp_collapse(struct mm_struct *mm,
+-		unsigned long address, int referenced, int unmapped,
+-		struct collapse_control *cc, unsigned long enabled_orders)
++static enum scan_result mthp_collapse(struct mm_struct *mm, unsigned long address,
++		struct collapse_control *cc)
+ {
+ 	unsigned int nr_eligible_ptes, nr_ptes, max_ptes_none;
+ 	enum scan_result last_result = SCAN_FAIL;
+@@ -1448,7 +1447,7 @@ static enum scan_result mthp_collapse(st
+ 	while (offset &lt; HPAGE_PMD_NR) {
+ 		nr_ptes = 1UL &lt;&lt; order;
+ 
+-		if (!test_bit(order, &amp;enabled_orders))
++		if (!test_bit(order, &amp;cc-&gt;scan_orders))
+ 			goto next_order;
+ 
+ 		max_ptes_none = collapse_max_ptes_none(cc, NULL, order);
+@@ -1456,19 +1455,18 @@ static enum scan_result mthp_collapse(st
+ 						      offset + nr_ptes);
+ 
+ 		/*
+-		 * Swap PTEs accepted during the scan are counted in @unmapped,
+-		 * not in cc-&gt;eligible_ptes. Account them for the PMD-order
+-		 * candidate.
++		 * Swap PTEs accepted during the scan are counted in
++		 * cc-&gt;scan_unmapped, not in cc-&gt;eligible_ptes. Account them for
++		 * the PMD-order candidate.
+ 		 */
+ 		if (is_pmd_order(order))
+-			nr_eligible_ptes += unmapped;
++			nr_eligible_ptes += cc-&gt;scan_unmapped;
+ 
+ 		if (nr_eligible_ptes &gt;= nr_ptes - max_ptes_none) {
+ 			enum scan_result ret;
+ 
+ 			collapse_address = address + offset * PAGE_SIZE;
+-			ret = collapse_huge_page(mm, collapse_address, referenced,
+-						 unmapped, cc, order);
++			ret = collapse_huge_page(mm, collapse_address, cc, order);
+ 
+ 			switch (ret) {
+ 			/* Cases where we continue to next collapse candidate */
+@@ -1510,7 +1508,7 @@ next_order:
+ 		 * we must always move to the next offset.
+ 		 */
+ 		if (order &gt; COLLAPSE_MIN_MTHP_ORDER &amp;&amp;
+-		    (enabled_orders &amp; GENMASK(order - 1, 0))) {
++		    (cc-&gt;scan_orders &amp; GENMASK(order - 1, 0))) {
+ 			order--;
+ 			continue;
+ 		}
+@@ -2721,21 +2719,45 @@ static enum scan_result collapse_scan_fi
+ 	return result;
+ }
+ 
++/* Set up a control before its first scan; cc-&gt;policy is the caller&#x27;s to fill */
+ void collapse_control_init(struct collapse_control *cc)
+ {
+ 	cc-&gt;progress = 0;
+ 	cc-&gt;scan_file = NULL;
+ }
+ 
+-void collapse_control_release(struct collapse_control *cc)
++/* A scan that took a file reference should have been run */
++static void collapse_put_scan_file(struct collapse_control *cc)
+ {
+-	/* A scan that took a file reference should have been run */
+ 	if (WARN_ON_ONCE(cc-&gt;scan_file)) {
+ 		fput(cc-&gt;scan_file);
+ 		cc-&gt;scan_file = NULL;
+ 	}
+ }
+ 
++/*
++ * Done with a control.  A scan that found something has to have been run by
++ * then: the file side takes a reference on the file while it still has the
++ * VMA to take it from, and the run is what gives it back.
++ */
++void collapse_control_release(struct collapse_control *cc)
++{
++	collapse_put_scan_file(cc);
++}
++
++/*
++ * Scan the PTE table of @vma at @addr for a collapse candidate.  @addr is
++ * aligned to the table; @orders is what the caller allows there.
++ *
++ * Called with mmap_lock held for reading and returns with it still held.  It
++ * only reads, and almost every table it is offered has nothing to collapse,
++ * so a caller walks a whole VMA under the one lock it took to get there.
++ *
++ * SCAN_SUCCEED means there is something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE
++ * means the page cache already holds the PMD folio and only the PTE table is
++ * left to retract.  Both are work for collapse_run_pmd(), which is handed
++ * what the scan returned; anything else is why there is nothing to do.
++ */
+ enum scan_result collapse_scan_pmd(struct vm_area_struct *vma,
+ 		unsigned long addr, struct collapse_control *cc,
+ 		unsigned long orders)
+@@ -2745,31 +2767,19 @@ enum scan_result collapse_scan_pmd(struc
+ 
+ 	mmap_assert_locked(vma-&gt;vm_mm);
+ 	/* Whatever the last scan found has to have been run by now */
+-	if (WARN_ON_ONCE(cc-&gt;scan_file)) {
+-		fput(cc-&gt;scan_file);
+-		cc-&gt;scan_file = NULL;
+-	}
++	collapse_put_scan_file(cc);
+ 
+ 	if (vma_is_anonymous(vma))
+ 		return collapse_scan_anon_pmd(vma, addr, cc, orders);
+ 
+ 	pgoff = linear_page_index(vma, addr);
+ 	result = collapse_scan_file(vma-&gt;vm_mm, addr, vma-&gt;vm_file, pgoff, cc);
+-	switch (result) {
+-	case SCAN_SUCCEED:
+-		cc-&gt;scan_retract_only = false;
+-		break;
+-	case SCAN_PTE_MAPPED_HUGEPAGE:
+-		/*
+-		 * The page cache already holds the PMD folio; what is left is
+-		 * to retract the PTE table, which is the run&#x27;s job.
+-		 */
+-		cc-&gt;scan_retract_only = true;
+-		result = SCAN_SUCCEED;
+-		break;
+-	default:
++	/*
++	 * SCAN_PTE_MAPPED_HUGEPAGE is work too: the page cache already holds
++	 * the PMD folio, and retracting the PTE table is the run&#x27;s job.
++	 */
++	if (result != SCAN_SUCCEED &amp;&amp; result != SCAN_PTE_MAPPED_HUGEPAGE)
+ 		return result;
+-	}
+ 
+ 	/*
+ 	 * A file collapse works on the page cache and never sees a VMA, so take
+@@ -2780,25 +2790,32 @@ enum scan_result collapse_scan_pmd(struc
+ 	return result;
+ }
+ 
++/*
++ * Collapse the table a scan found work in.  @result is what the scan
++ * returned.
++ *
++ * Called without mmap_lock and returns without it, taking what it needs in
++ * between: what it does -- allocate, isolate, copy, flush -- is slow enough
++ * that a writer would wait behind it.  The caller gives the lock up first,
++ * and with it the VMA and anything derived under it.  The run revalidates for
++ * itself rather than trusting what the scan saw.
++ */
+ enum scan_result collapse_run_pmd(struct mm_struct *mm, unsigned long addr,
+-		struct collapse_control *cc)
++		enum scan_result result, struct collapse_control *cc)
+ {
+ 	struct file *file = cc-&gt;scan_file;
+ 	bool triggered_wb = false;
+-	enum scan_result result;
+ 	pgoff_t pgoff;
+ 
+ 	if (!file)
+-		return mthp_collapse(mm, addr, cc-&gt;scan_referenced,
+-				     cc-&gt;scan_unmapped, cc, cc-&gt;scan_orders);
++		return mthp_collapse(mm, addr, cc);
+ 
+ 	cc-&gt;scan_file = NULL;
+ 	pgoff = cc-&gt;scan_pgoff;
+ 
+-	if (cc-&gt;scan_retract_only) {
+-		result = SCAN_PTE_MAPPED_HUGEPAGE;
++	/* The scan found the PMD folio in place: nothing to collapse */
++	if (result == SCAN_PTE_MAPPED_HUGEPAGE)
+ 		goto retract;
+-	}
+ retry:
+ 	result = collapse_file(mm, addr, file, pgoff, cc);
+ 
+@@ -2912,8 +2929,9 @@ static void collapse_scan_mm_slot(unsign
+ 			khugepaged_scan.address += HPAGE_PMD_SIZE;
+ 
+ 			*result = collapse_scan_pmd(vma, addr, cc, orders);
+-			/* Nothing to collapse here, and the lock is still ours */
+-			if (*result != SCAN_SUCCEED) {
++			/* Nothing to do here, and the lock is still ours */
++			if (*result != SCAN_SUCCEED &amp;&amp;
++			    *result != SCAN_PTE_MAPPED_HUGEPAGE) {
+ 				if (cc-&gt;progress &gt;= progress_max)
+ 					goto breakouterloop;
+ 				continue;
+@@ -2926,7 +2944,7 @@ static void collapse_scan_mm_slot(unsign
+ 			 * whatever the collapse leaves them.
+ 			 */
+ 			mmap_read_unlock(mm);
+-			*result = collapse_run_pmd(mm, addr, cc);
++			*result = collapse_run_pmd(mm, addr, *result, cc);
+ 			if (*result == SCAN_SUCCEED)
+ 				khugepaged_pages_collapsed++;
+ 			goto breakouterloop_mmap_lock;
+@@ -2984,7 +3002,7 @@ static void khugepaged_do_scan(struct co
+ 	lru_add_drain_all();
+ 
+ 	collapse_control_init(cc);
+-	/* One policy for the whole pass, so every table is judged the same */
++	/* One policy for the whole pass, so every table is treated the same */
+ 	collapse_policy_khugepaged(&amp;cc-&gt;policy);
+ 
+ 	while (true) {
+--- a/mm/madvise.c~b
++++ a/mm/madvise.c
+@@ -1014,8 +1014,8 @@ static int madvise_collapse(struct madvi
+ 		}
+ 
+ 		result = collapse_scan_pmd(vma, addr, cc, orders);
+-		/* Nothing to collapse here, and the lock is still ours */
+-		if (result != SCAN_SUCCEED)
++		/* Nothing to do here, and the lock is still ours */
++		if (result != SCAN_SUCCEED &amp;&amp; result != SCAN_PTE_MAPPED_HUGEPAGE)
+ 			goto tally;
+ 
+ 		/* The collapse takes its own locks, so give this up */
+@@ -1023,7 +1023,7 @@ static int madvise_collapse(struct madvi
+ 		mark_mmap_lock_dropped(madv_behavior);
+ 		vma = NULL;
+ 
+-		result = collapse_run_pmd(mm, addr, cc);
++		result = collapse_run_pmd(mm, addr, result, cc);
+ tally:
+ 		switch (result) {
+ 		case SCAN_SUCCEED:
+_
+
+---
+
+On Thu, 17 Sep 2026 13:26:51 +0100 Kiryl Shutsemau &lt;kirill@shutemov.name&gt; wrote:
+
+&gt; On Wed, Sep 16, 2026 at 03:48:26PM -0700, Andrew Morton wrote:
+&gt; &gt; Here&#x27;s how v3 altered mm.git:
+&gt; 
+&gt; BTW, is it helpful to append a range-diff to the cover letter on a new
+&gt; revision of a patchset? I can do it in the future if it is useful.
+
+I guess so - that would let people see what changed immediately rather
+than having me send it later on.  What do others think?
+
+I don&#x27;t know how useful the heres-what-changed reply is for people. 
+I&#x27;ve seen little sign of anyone using it.
+
+One reason I prepare it is for the author to scan it to double-check
+that they meant to do all those things.  The exercise also make me pay
+more attention, check that diff matches the v4-&gt;v5 changelog&#x27;s claims.</pre>
+</details>
+<a href="https://lore.kernel.org/r/20260916154826.a55591eec86b5514dab898ca@linux-foundation.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-09-18">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Baolin Wang</span>
+<a class="date-chip" href="../2026-09-18_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-18">2026-09-18</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that the original patch did not properly separate the locking boundary between collapse_scan_pmd() and collapse_run_pmd(), which led to inconsistent lock behavior in khugepaged&#x27;s walk and madvise_collapse(). The reviewer suggested open-coding the lock drop in the two callers, khugepaged and madvise_collapse(), to maintain a clear locking contract.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 9/16/26 5:31 PM, Kiryl Shutsemau wrote:
+&gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; 
+&gt; A collapse is two jobs.  One reads a PTE table under mmap_lock and decides
+&gt; whether the range is worth collapsing.  The other allocates, isolates,
+&gt; copies and flushes, and wants the lock given up first.
+&gt; 
+&gt; collapse_single_pmd() did both, so the boundary between them was somewhere
+&gt; in the middle of a function.
+&gt; 
+&gt; Give each half its own function:
+&gt; 
+&gt;    - collapse_scan_pmd() scans one table and only reads.  The anonymous
+&gt;      scan that used to carry that name keeps its body as
+&gt;      collapse_scan_anon_pmd(), and collapse_scan_pmd() is now the entry
+&gt;      that picks the anonymous or the file side.
+&gt; 
+&gt;    - collapse_run_pmd() does the collapse the scan asked for, and is
+&gt;      handed what the scan returned.  SCAN_SUCCEED means there is
+&gt;      something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE means the page
+&gt;      cache already holds the PMD folio and only the PTE table is left to
+&gt;      retract.  Both are work for the run; anything else is why there is
+&gt;      nothing to do.
+&gt; 
+&gt; collapse_single_pmd() is now the two of them with the mmap_lock drop in
+&gt; between, so its callers see what they saw before.
+&gt; 
+&gt; What the scan found and the run needs travels in collapse_control.  For
+&gt; an anonymous table that is the orders and the referenced and swapped-out
+&gt; counts, which mthp_collapse() and collapse_huge_page() now read from
+&gt; there instead of taking as arguments.  For a file it is the file itself
+&gt; and the offset in it.
+&gt; 
+&gt; The file side moves with the anonymous one.  collapse_scan_file() used to
+&gt; run with mmap_lock already given up, and called collapse_file() itself
+&gt; when the page cache looked worth it.  It now runs under the lock like the
+&gt; anonymous scan and only reads; the run does the collapse.  A file
+&gt; collapse works on the page cache and never sees a VMA, so the scan takes
+&gt; the file reference while it still has one and the run gives it back.
+&gt; 
+&gt; That changes what a refused file table costs khugepaged.  Every file
+&gt; table it scanned used to end its pass over that mm, because the lock had
+&gt; been dropped to scan it; now only a table it goes on to collapse does.
+&gt; 
+&gt; Two things on the file side stop being rescanned.  When the page cache
+&gt; already holds the PMD folio, the scan says so and the run goes straight
+&gt; to retracting the PTE table.  A run that refuses dirty pages and may
+&gt; write them back retries collapse_file() alone.  The checks the scan makes
+&gt; ahead of it are ones collapse_file() repeats under the page cache lock.
+&gt; 
+&gt; Tracing changes with it.  mm_khugepaged_scan_pmd and
+&gt; mm_khugepaged_scan_file used to fire after the collapse, so for an
+&gt; accepted table their status field carried what the collapse made of it.
+&gt; They now fire before it and read SCAN_SUCCEED for an accepted table.  What
+&gt; the collapse then made of it is for mm_collapse_huge_page and
+&gt; mm_khugepaged_collapse_file to report.
+&gt; 
+&gt; Assisted-by: LLM
+&gt; Reviewed-by: Zi Yan &lt;ziy@nvidia.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt; ---
+
+LGTM.
+Reviewed-by: Baolin Wang &lt;baolin.wang@linux.alibaba.com&gt;
+
+---
+
+On 9/16/26 5:31 PM, Kiryl Shutsemau wrote:
+&gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; 
+&gt; collapse_scan_pmd() and collapse_run_pmd() each have a clear locking
+&gt; contract.  The scan is called with mmap_lock held for reading and returns
+&gt; with it still held.  The collapse is called without it.
+&gt; 
+&gt; collapse_single_pmd() kept that boundary inside itself.  It dropped the
+&gt; lock on some paths and not others, and reported which by way of a bool its
+&gt; callers had to carry along and then act on.
+&gt; 
+&gt; Open-code it in the two callers.  Each scans under the lock it already
+&gt; holds and, when the scan found work, gives the lock up before running the
+&gt; collapse.
+&gt; khugepaged&#x27;s lock_dropped and madvise_collapse()&#x27;s mmap_unlocked both go:
+&gt; the code dropping the lock is now the code that wanted to know.
+&gt; 
+&gt; khugepaged&#x27;s walk carries on to the next table while the scan keeps
+&gt; refusing, and ends once a collapse has taken the lock from under it.
+&gt; madvise_collapse() re-finds its VMA after a collapse, which it did before,
+&gt; and now uses a NULL vma to say that it has to.  It still reports the drop
+&gt; to its own caller, from the line that does it.
+&gt; 
+&gt; The lock is given up and taken again at the same points as before.  No
+&gt; functional change.
+&gt; 
+&gt; Assisted-by: LLM
+&gt; Reviewed-by: Zi Yan &lt;ziy@nvidia.com&gt;
+&gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt; ---
+
+Thanks for removing the ugly &#x27;lock_dropped&#x27;, and I also did some testing 
+with my shmem mTHP collapse, and no issues found. So,
+
+Reviewed-by: Baolin Wang &lt;baolin.wang@linux.alibaba.com&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/0230e861-8364-4302-a607-c34809a4a809@linux.alibaba.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lock ordering issue, inconsistent behavior</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-09-23">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-09-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+<a href="https://lore.kernel.org/r/3d8f4dac-649c-42e0-8b51-437cf6cc65c2@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-09-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David (Arm) suggested appending a range-diff to the cover letter for new revisions of patchsets, allowing readers to immediately see changes instead of waiting for an additional email.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 9/18/26 00:11, Andrew Morton wrote:
+&gt; On Thu, 17 Sep 2026 13:26:51 +0100 Kiryl Shutsemau &lt;kirill@shutemov.name&gt; wrote:
+&gt; 
+&gt;&gt; On Wed, Sep 16, 2026 at 03:48:26PM -0700, Andrew Morton wrote:
+&gt;&gt;&gt; Here&#x27;s how v3 altered mm.git:
+&gt;&gt;
+&gt;&gt; BTW, is it helpful to append a range-diff to the cover letter on a new
+&gt;&gt; revision of a patchset? I can do it in the future if it is useful.
+&gt; 
+&gt; I guess so - that would let people see what changed immediately rather
+&gt; than having me send it later on.  What do others think?
+
+Ideally we&#x27;d have that for all series, such that it wouldn&#x27;t be the authors
+responsibility. Because even if Kiryl does that, nobody else will really do that :)
+
+(I assume if people would use b4 we could build some automation fairly easily.
+But that&#x27;s wishful thinking)
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<a href="https://lore.kernel.org/r/3e814778-6646-4066-8f2a-6418755c53a4@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: request, suggestion</div>
 </div>
 </div>
 </div>
