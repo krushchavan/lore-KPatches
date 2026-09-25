@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 05/12] mm/collapse: state what a collapse may do in the policy</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260916093145.4022188-6-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-23</strong><div class="date-range-nav">Active on: <a href="#2026-09-23">2026-09-23</a> &bull; <a href="#2026-09-16">2026-09-16</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-24</strong><div class="date-range-nav">Active on: <a href="#2026-09-24">2026-09-24</a> &bull; <a href="#2026-09-23">2026-09-23</a> &bull; <a href="#2026-09-16">2026-09-16</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch introduces a new struct collapse_policy that allows the caller to specify what a collapse is allowed to do, such as setting limits on PTEs, deciding whether to take swapped-out or shared PTEs into a sub-PMD collapse, and controlling how dirty pages are handled. The policy is filled in by the caller once per scan pass for khugepaged and once per call for MADV_COLLAPSE. This change simplifies the code and eliminates unnecessary checks.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-23">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">David (Arm)</span>
-<a class="date-chip" href="../2026-09-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
+<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-23">2026-09-23</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
@@ -282,6 +282,85 @@ Why are we not calling this collapse_policy_madvise to match its description her
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/2add40dc-6541-41e3-8233-521cce7e0d33@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, confusion about variable name, confusing</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-24">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author acknowledges that the current implementation of struct collapse_policy has a wrong abstraction and agrees to restructure it in v2 by splitting the limits into two sets: one for PMD order and one for sub-PMD order.
+
+The author addresses David&#x27;s feedback by clarifying that certain fields in the collapse_policy struct are read-only on one side (file or anonymous) and agrees to add prefixes to distinguish between them.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">The comment undersells it.
+
+The flag stands in for every sub-PMD rule khugepaged applies and
+MADV_COLLAPSE does not: no swapped-out PTE, no shared PTE, and
+max_ptes_none scaled to the order.
+
+Before this patch all three helpers tested is_khugepaged and then
+is_pmd_order; the flag replaced the first test in each. Which makes it
+is_khugepaged under another name, so you are right that it is the wrong
+abstraction.
+
+Splitting the limits works. Two sets of counts, one per order class:
+
+	struct collapse_limits {
+		unsigned int max_ptes_none;
+		unsigned int max_ptes_swap;
+		unsigned int max_ptes_shared;
+	};
+
+	struct collapse_policy {
+		struct collapse_limits pmd;
+		struct collapse_limits sub_pmd;
+		...
+	};
+
+For swap and shared the sub-PMD value is a count: 0 for khugepaged, no
+limit for MADV_COLLAPSE.
+
+For none it is the knob value, and the helper keeps today&#x27;s rule: 511
+means all but one PTE of the window, anything else means none.
+
+	static unsigned int collapse_max_ptes_none(struct collapse_control *cc,
+			struct vm_area_struct *vma, unsigned int order)
+	{
+		unsigned int max_ptes_none;
+
+		if (vma &amp;&amp; userfaultfd_armed(vma))
+			return 0;
+		if (is_pmd_order(order))
+			return cc-&gt;policy.pmd.max_ptes_none;
+
+		/* Below PMD order: all but one PTE of the window, or none */
+		max_ptes_none = cc-&gt;policy.sub_pmd.max_ptes_none;
+		if (max_ptes_none == COLLAPSE_MAX_PTES_LIMIT)
+			return (1 &lt;&lt; order) - 1;
+		return 0;
+	}
+
+Only the warning for other knob values moves to where khugepaged fills
+its policy. MADV_COLLAPSE never reads sub_pmd: it collapses to PMD order
+only. Nothing is scaled, so the creep question is untouched.
+
+---
+
+install_pmd and writeback_dirty are read only on the file side,
+skip_lazyfree and require_referenced only on the anonymous side.
+
+I will prefix them.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to David (Arm)</div>
+<a href="https://lore.kernel.org/r/arUVpLSG3Xj560m5@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a fix is needed, agrees to restructure, clarification</div>
+</div>
+</div>
 </div>
 </div>
 </div>

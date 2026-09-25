@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3 00/12] mm/collapse: separate a collapse from its callers</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260916093145.4022188-1-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-23</strong><div class="date-range-nav">Active on: <a href="#2026-09-23">2026-09-23</a> &bull; <a href="#2026-09-18">2026-09-18</a> &bull; <a href="#2026-09-17">2026-09-17</a> &bull; <a href="#2026-09-16">2026-09-16</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-24</strong><div class="date-range-nav">Active on: <a href="#2026-09-24">2026-09-24</a> &bull; <a href="#2026-09-23">2026-09-23</a> &bull; <a href="#2026-09-18">2026-09-18</a> &bull; <a href="#2026-09-17">2026-09-17</a> &bull; <a href="#2026-09-16">2026-09-16</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch set separates the collapse engine from its callers by introducing a clear interface and policy between them. The collapse engine, currently in khugepaged.c, is split into four distinct calls: collapse_control_init, collapse_policy_set, collapse_scan_pmd, and collapse_run_pmd. This separation allows for better modularity and maintainability of the code, as well as improved handling of lock states and policy decisions. The patch set also includes changes to madvise.c to gain a new operation and updates to various functions to follow the new interface.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-16">
@@ -2528,6 +2528,556 @@ David</pre>
 </details>
 <a href="https://lore.kernel.org/r/3e814778-6646-4066-8f2a-6418755c53a4@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: request, suggestion</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-09-24">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed David Hildenbrand&#x27;s concerns about the naming and abstraction of certain variables in the collapse policy, agreeing to split max_ptes_swap and shared into PMD and non-PMD cases and prefixing anon-/file-specific policies. The author also acknowledged that strict_sub_pmd is the wrong abstraction and will restructure it.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Wed, Sep 23, 2026 at 02:24:04PM +0200, David Hildenbrand (Arm) wrote:
+&gt; &gt; +/* What a collapse is allowed to do, decided by the caller that asks for it */
+&gt; &gt; +struct collapse_policy {
+&gt; &gt; +	/* Limits, stated per PMD; HPAGE_PMD_NR means &quot;no limit&quot; */
+&gt; &gt; +	unsigned int max_ptes_none;
+&gt; &gt; +	unsigned int max_ptes_swap;
+&gt; &gt; +	unsigned int max_ptes_shared;
+&gt; &gt; +
+&gt; &gt; +	/* Take no swapped-out or shared PTE into a sub-PMD collapse */
+&gt; &gt; +	bool strict_sub_pmd;
+&gt; 
+&gt; Reading this variable name without the documentation I have no idea what it
+&gt; means. It looks like the wrong abstraction.
+&gt; 
+&gt; Maybe you instead want to split max_ptes_swap and shared to a PMD and non-PMD case?
+&gt; 
+&gt; I am also confused why you use &quot;strict_sub_pmd&quot; in the collapse_max_ptes_none()
+&gt; handler below? Something seems odd, as it doesn&#x27;t amtch the description here.
+
+The comment undersells it.
+
+The flag stands in for every sub-PMD rule khugepaged applies and
+MADV_COLLAPSE does not: no swapped-out PTE, no shared PTE, and
+max_ptes_none scaled to the order.
+
+Before this patch all three helpers tested is_khugepaged and then
+is_pmd_order; the flag replaced the first test in each. Which makes it
+is_khugepaged under another name, so you are right that it is the wrong
+abstraction.
+
+Splitting the limits works. Two sets of counts, one per order class:
+
+	struct collapse_limits {
+		unsigned int max_ptes_none;
+		unsigned int max_ptes_swap;
+		unsigned int max_ptes_shared;
+	};
+
+	struct collapse_policy {
+		struct collapse_limits pmd;
+		struct collapse_limits sub_pmd;
+		...
+	};
+
+For swap and shared the sub-PMD value is a count: 0 for khugepaged, no
+limit for MADV_COLLAPSE.
+
+For none it is the knob value, and the helper keeps today&#x27;s rule: 511
+means all but one PTE of the window, anything else means none.
+
+	static unsigned int collapse_max_ptes_none(struct collapse_control *cc,
+			struct vm_area_struct *vma, unsigned int order)
+	{
+		unsigned int max_ptes_none;
+
+		if (vma &amp;&amp; userfaultfd_armed(vma))
+			return 0;
+		if (is_pmd_order(order))
+			return cc-&gt;policy.pmd.max_ptes_none;
+
+		/* Below PMD order: all but one PTE of the window, or none */
+		max_ptes_none = cc-&gt;policy.sub_pmd.max_ptes_none;
+		if (max_ptes_none == COLLAPSE_MAX_PTES_LIMIT)
+			return (1 &lt;&lt; order) - 1;
+		return 0;
+	}
+
+Only the warning for other knob values moves to where khugepaged fills
+its policy. MADV_COLLAPSE never reads sub_pmd: it collapses to PMD order
+only. Nothing is scaled, so the creep question is untouched.
+
+&gt; &gt; +
+&gt; &gt; +	/* Leave clean lazyfree folios to reclaim rather than collapse them */
+&gt; &gt; +	bool skip_lazyfree;
+&gt; &gt; +
+&gt; &gt; +	/* Refuse a range with no sign of use */
+&gt; &gt; +	bool require_referenced;
+&gt; &gt; +
+&gt; &gt; +	/* Map the PMD over a file collapse instead of leaving it to a fault */
+&gt; &gt; +	bool install_pmd;
+&gt; 
+&gt; Confusing.
+&gt; 
+&gt; If some of these policies are anon-/ file-specific, the name should indicate
+&gt; that, so there is less head scratching.
+
+install_pmd and writeback_dirty are read only on the file side,
+skip_lazyfree and require_referenced only on the anonymous side.
+
+I will prefix them.
+
+&gt; &gt; +/* MADV_COLLAPSE was asked for explicitly, so it is not held to those */
+&gt; &gt; +static void collapse_policy_forced(struct collapse_policy *p)
+&gt; 
+&gt; Why are we not calling this collapse_policy_madvise to match its description here?
+
+Will do.
+
+&gt; &gt; @@ -2943,6 +2952,9 @@ static void khugepaged_do_scan(struct collapse_control *cc)
+&gt; &gt;  
+&gt; &gt;  	lru_add_drain_all();
+&gt; &gt;  
+&gt; &gt; +	/* One policy for the whole pass, so every table is treated the same */
+&gt; 
+&gt; just drop that comment.
+
+Ack.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Wed, Sep 23, 2026 at 03:04:05PM +0200, David Hildenbrand (Arm) wrote:
+&gt; On 9/16/26 11:31, Kiryl Shutsemau wrote:
+&gt; &gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; &gt; 
+&gt; &gt; A collapse is two jobs.  One reads a PTE table under mmap_lock and decides
+&gt; &gt; whether the range is worth collapsing.  The other allocates, isolates,
+&gt; &gt; copies and flushes, and wants the lock given up first.
+&gt; &gt; 
+&gt; &gt; collapse_single_pmd() did both, so the boundary between them was somewhere
+&gt; &gt; in the middle of a function.
+&gt; &gt; 
+&gt; &gt; Give each half its own function:
+&gt; &gt; 
+&gt; &gt;   - collapse_scan_pmd() scans one table and only reads.  The anonymous
+&gt; &gt;     scan that used to carry that name keeps its body as
+&gt; &gt;     collapse_scan_anon_pmd(), and collapse_scan_pmd() is now the entry
+&gt; &gt;     that picks the anonymous or the file side.
+&gt; &gt; 
+&gt; &gt;   - collapse_run_pmd() does the collapse the scan asked for, and is
+&gt; &gt;     handed what the scan returned.  SCAN_SUCCEED means there is
+&gt; &gt;     something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE means the page
+&gt; &gt;     cache already holds the PMD folio and only the PTE table is left to
+&gt; &gt;     retract.  Both are work for the run; anything else is why there is
+&gt; &gt;     nothing to do.
+&gt; 
+&gt; Makes sense.
+&gt; 
+&gt; The naming is a bit suboptimal and inconsistent.
+&gt; 
+&gt; collapse_single_pmd
+&gt; -&gt; collapse_scan_pmd()
+&gt; -&gt; collapse_run_pmd()
+&gt; 
+&gt; Maybe it would be clearer:
+&gt; 
+&gt; collapse_pmd() [&quot;single&quot; is rather useless]
+&gt; -&gt; collapse_scan_pmd()
+&gt; -&gt; collapse_scanned_pmd()
+
+Yes, the naming is awkward.
+
+The problem is that collapse_ is the prefix of everything in the
+interface, so it cannot double as the verb: collapse_pmd() says what the
+function is about, not what it does, and collapse_scanned_pmd() has no
+verb at all.
+
+Each name needs one after the prefix, hence scan and run. I don&#x27;t
+particularly like it, but it seems better than scan and scanned, no?
+
+collapse_single_pmd() itself goes away in the next patch. You asked
+there why; I will answer there.
+
+&gt; &gt; What the scan found and the run needs travels in collapse_control.  For
+&gt; &gt; an anonymous table that is the orders and the referenced and swapped-out
+&gt; &gt; counts, which mthp_collapse() and collapse_huge_page() now read from
+&gt; &gt; there instead of taking as arguments.  For a file it is the file itself
+&gt; &gt; and the offset in it.
+&gt; &gt; 
+&gt; &gt; The file side moves with the anonymous one.  collapse_scan_file() used to
+&gt; &gt; run with mmap_lock already given up, and called collapse_file() itself
+&gt; &gt; when the page cache looked worth it.  It now runs under the lock like the
+&gt; &gt; anonymous scan and only reads; the run does the collapse.
+&gt; 
+&gt; So we add more locking to the file path to merge both paths cleanly? Or did I
+&gt; misunderstand that paragraph?
+
+The lock is held over the scan now, but it is taken fewer times. The
+current code drops mmap_lock before the file scan, before it knows if
+there is anything to collapse. Most scans find nothing, and each of them
+pays the cost of unlock and relock for nothing.
+
+Dropping the lock only after a scan found work mirrors the anonymous
+side, with the same batching shape.
+
+&gt; What do you mean with &quot;and only reads&quot;?
+
+That it no longer calls collapse_file(). The scan looks at the page
+cache and says whether there is work; collapse_file() is the run&#x27;s job.
+
+I will drop the wording. It does not help.
+
+&gt; &gt;  A file
+&gt; &gt; collapse works on the page cache and never sees a VMA, so the scan takes
+&gt; &gt; the file reference while it still has one and the run gives it back.
+&gt; &gt; 
+&gt; &gt; That changes what a refused file table costs khugepaged.  Every file
+&gt; &gt; table it scanned used to end its pass over that mm, because the lock had
+&gt; &gt; been dropped to scan it; now only a table it goes on to collapse does.
+&gt; 
+&gt; The last sentence makes no sense. At least to me :)
+
+It is also wrong, so I will rewrite it.
+
+Before this patch collapse_single_pmd() set lock_dropped for every file
+table, refused or not, and collapse_scan_mm_slot() bailed out on it.
+
+The mm slot stays, so the next call comes back to the same mm at the
+saved address, but every file table cost an unlock, a trip through
+khugepaged_do_scan(), a relock and a VMA lookup.
+
+Now only a table that gets collapsed pays that.
+
+&gt; &gt; Two things on the file side stop being rescanned.  When the page cache
+&gt; &gt; already holds the PMD folio, the scan says so and the run goes straight
+&gt; &gt; to retracting the PTE table.  A run that refuses dirty pages and may
+&gt; &gt; write them back retries collapse_file() alone.  The checks the scan makes
+&gt; &gt; ahead of it are ones collapse_file() repeats under the page cache lock.
+&gt; 
+&gt; Is there any way we could move these changes into separate patches? These
+&gt; changes are bit squeezed into the last part of this description. And having to
+&gt; much happening at once makes this rather hard to grasp.
+
+Ack.
+
+&gt; &gt; Tracing changes with it.  mm_khugepaged_scan_pmd and
+&gt; &gt; mm_khugepaged_scan_file used to fire after the collapse, so for an
+&gt; &gt; accepted table their status field carried what the collapse made of it.
+&gt; &gt; They now fire before it and read SCAN_SUCCEED for an accepted table.  What
+&gt; &gt; the collapse then made of it is for mm_collapse_huge_page and
+&gt; &gt; mm_khugepaged_collapse_file to report.
+&gt; &gt; 
+&gt; &gt; Assisted-by: LLM
+&gt; &gt; Reviewed-by: Zi Yan &lt;ziy@nvidia.com&gt;
+&gt; &gt; Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt; &gt; ---
+&gt; &gt;  mm/collapse.h   |  14 ++++
+&gt; &gt;  mm/khugepaged.c | 166 +++++++++++++++++++++++++++++++++---------------
+&gt; &gt;  2 files changed, 130 insertions(+), 50 deletions(-)
+&gt; 
+&gt; [...]
+&gt; 
+&gt; &gt; -/*
+&gt; &gt; - * Try to collapse a single PMD starting at a PMD aligned addr, and return
+&gt; &gt; - * the results.
+&gt; &gt; - */
+&gt; &gt; -static enum scan_result collapse_single_pmd(unsigned long addr,
+&gt; &gt; -		struct vm_area_struct *vma, bool *lock_dropped,
+&gt; &gt; -		struct collapse_control *cc)
+&gt; &gt; +static void collapse_control_init(struct collapse_control *cc)
+&gt; &gt; +{
+&gt; &gt; +	cc-&gt;progress = 0;
+&gt; &gt; +	cc-&gt;scan_file = NULL;
+&gt; &gt; +}
+&gt; &gt; +
+&gt; &gt; +/* A scan that took a file reference should have been run */
+&gt; &gt; +static void collapse_put_scan_file(struct collapse_control *cc)
+&gt; &gt; +{
+&gt; &gt; +	if (WARN_ON_ONCE(cc-&gt;scan_file)) {
+&gt; &gt; +		fput(cc-&gt;scan_file);
+&gt; &gt; +		cc-&gt;scan_file = NULL;
+&gt; &gt; +	}
+&gt; 
+&gt; See below regarding _release: having _put functions that are not supposed to put
+&gt; anything except with BUG is akward.
+&gt; 
+&gt; &gt; +}
+&gt; &gt; +
+&gt; &gt; +static void collapse_control_release(struct collapse_control *cc)
+&gt; &gt; +{
+&gt; &gt; +	collapse_put_scan_file(cc);
+&gt; &gt; +}
+&gt; 
+&gt; Do we really have to introduce collapse_control_release() just to perform some
+&gt; safety checks for BUGs? I&#x27;d rather keep the collapse interface minimal and not
+&gt; introduce _release semantics when there is actually nothing to be released?
+&gt; 
+&gt; Or will you add more into _release in later patches in this series?
+
+Not in this series.
+
+The engine I have on top of it gives both a job.
+
+I will drop it from this series and add it with the engine. The shape
+might change by the time the engine is posted.
+
+The check at the top of collapse_scan_pmd() stays, open-coded: a scan
+that found work on a file table holds a reference, and the next scan is
+where one that was never run gets caught.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Wed, Sep 23, 2026 at 03:08:55PM +0200, David Hildenbrand (Arm) wrote:
+&gt; On 9/16/26 11:31, Kiryl Shutsemau wrote:
+&gt; &gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; &gt; 
+&gt; &gt; collapse_scan_pmd() and collapse_run_pmd() each have a clear locking
+&gt; &gt; contract.  The scan is called with mmap_lock held for reading and returns
+&gt; &gt; with it still held.  The collapse is called without it.
+&gt; &gt; 
+&gt; &gt; collapse_single_pmd() kept that boundary inside itself.  It dropped the
+&gt; &gt; lock on some paths and not others, and reported which by way of a bool its
+&gt; &gt; callers had to carry along and then act on.
+&gt; &gt; 
+&gt; &gt; Open-code it in the two callers.  Each scans under the lock it already
+&gt; &gt; holds and, when the scan found work, gives the lock up before running the
+&gt; &gt; collapse.
+&gt; &gt; khugepaged&#x27;s lock_dropped and madvise_collapse()&#x27;s mmap_unlocked both go:
+&gt; &gt; the code dropping the lock is now the code that wanted to know.
+&gt; &gt; 
+&gt; &gt; khugepaged&#x27;s walk carries on to the next table while the scan keeps
+&gt; &gt; refusing, and ends once a collapse has taken the lock from under it.
+&gt; &gt; madvise_collapse() re-finds its VMA after a collapse, which it did before,
+&gt; &gt; and now uses a NULL vma to say that it has to.  It still reports the drop
+&gt; &gt; to its own caller, from the line that does it.
+&gt; &gt; 
+&gt; &gt; The lock is given up and taken again at the same points as before.  No
+&gt; &gt; functional change.
+&gt; &gt; 
+&gt; 
+&gt; I&#x27;m not sure I see the benefit. The code in the previous collapse_single_pmd()
+&gt; callers certainly gets more messy?
+&gt; 
+&gt; Is there some other patches in this series that depend on it or what&#x27;s the
+&gt; motivation?
+
+The locking. Scan and run have different locking expectations.
+
+I tried to explain it multiple times. Probably not well enough.
+Let me reiterate.
+
+The scan reads a PTE table under mmap_lock, fails often, and does not
+drop the lock to move on to the next table.
+
+The collapse allocates, may sleep in writeback and takes mmap_lock for
+write itself, so the lock inherited from the scan is no good to it.
+
+collapse_single_pmd() hid that boundary inside one call. It dropped the
+lock somewhere in the middle, on some paths and not others, and
+lock_dropped was the only way for the caller to find out.
+
+With the two calls each has one rule: the scan runs in the caller&#x27;s
+locking context and never touches the lock, the run is called unlocked
+and takes what it needs.
+
+There is nothing left to report, so lock_dropped and mmap_unlocked go.
+It is the same move as Nico&#x27;s da98790891a4 (&quot;require collapse_huge_page
+to enter/exit with the lock dropped&quot;), one level up.
+
+It also makes moving the scan to per-VMA locking trivial: the caller
+owns the lock and the engine never sees it. I said as much in reply to
+your note on v2:
+
+  https://lore.kernel.org/all/aqQf9hSy0iNjnL6t@thinkstation/
+
+Patch 12 depends on it, since madvise.c gets the two calls and their
+lock rules rather than a bool.
+
+On messier: what the callers gained is an mmap_read_unlock() where they
+decide to run, and what they lost is a bool telling them whether
+somebody else had dropped their lock. Each caller now takes and drops
+its own lock and knows it, and the engine never touches a lock it did
+not take.
+
+That is more lines at the call site and a simpler locking rules.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Wed, Sep 23, 2026 at 03:19:36PM +0200, David Hildenbrand (Arm) wrote:
+ [...]
+&gt; 
+&gt; &gt; +		/* One mask for the whole VMA */
+&gt; &gt; +		orders = collapse_possible_orders(vma, vma-&gt;vm_flags,
+&gt; &gt; +						  cc-&gt;policy.tva_type);
+&gt; 
+&gt; cc-&gt;policy.tva_type is always sattic here, no?
+
+Yes, TVA_KHUGEPAGED.
+
+&gt; &gt; @@ -3252,9 +3254,11 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+&gt; &gt;  			}
+&gt; &gt;  			vma = found;
+&gt; &gt;  			hend = min(hend, vma-&gt;vm_end &amp; HPAGE_PMD_MASK);
+&gt; &gt; +			orders = collapse_possible_orders(vma, vma-&gt;vm_flags,
+&gt; &gt; +							  cc-&gt;policy.tva_type);
+&gt; 
+&gt; 
+&gt; That&#x27;s always TVA_FORCED_COLLAPSE, no?
+
+Yep.
+
+&gt; It&#x27;s a shame we cannot get rid of cc-&gt;policy.tva_type because we need it for
+&gt; hugepage_vma_revalidate to calculate orders. Which sucks a bit.
+
+It stays for the engine, not the callers.
+
+The fixup I will fold in v4 is below.
+
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 2a10a30055c6..8fad934befe2 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -2905,7 +2905,7 @@ static void collapse_scan_mm_slot(unsigned int progress_max,
+ 		}
+ 		/* One mask for the whole VMA */
+ 		orders = collapse_possible_orders(vma, vma-&gt;vm_flags,
+-						  cc-&gt;policy.tva_type);
++						  TVA_KHUGEPAGED);
+ 		if (!orders) {
+ 			cc-&gt;progress++;
+ 			continue;
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 33bcd390ce43..3087640ddaad 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -1010,7 +1010,7 @@ static int madvise_collapse(struct madvise_behavior *madv_behavior)
+ 			vma = found;
+ 			hend = min(hend, vma-&gt;vm_end &amp; HPAGE_PMD_MASK);
+ 			orders = collapse_possible_orders(vma, vma-&gt;vm_flags,
+-							  cc-&gt;policy.tva_type);
++							  TVA_FORCED_COLLAPSE);
+ 		}
+ 
+ 		result = collapse_scan_pmd(vma, addr, cc, orders);
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov
+
+---
+
+On Wed, Sep 23, 2026 at 03:34:11PM +0200, David Hildenbrand (Arm) wrote:
+&gt; On 9/16/26 11:31, Kiryl Shutsemau wrote:
+&gt; &gt; From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+&gt; &gt; 
+&gt; &gt; A collapse takes four calls:
+&gt; &gt; 
+&gt; &gt;   - collapse_control_init() - set up the control a caller carries;
+&gt; &gt;   - collapse_scan_pmd() - scan one PTE table, under mmap_lock;
+&gt; &gt;   - collapse_run_pmd() - collapse what the scan found, no mmap_lock;
+&gt; 
+&gt; As discussed, having a single collapse_pmd() function might be cleaner if that&#x27;s
+&gt; easily possible.
+
+Answered on patch 9: the two calls are the point.
+
+&gt; &gt;   - collapse_control_release() - done with the control.
+&gt; 
+&gt; And as discussed, I hope we can just get rid of a release function that&#x27;s not
+&gt; actually supposed to release anything right now (unless I was missing an update
+&gt; in one of the patches).
+
+Will remove in v4.
+
+&gt; &gt; All four are static in khugepaged.c, as are collapse_possible_orders(),
+&gt; &gt; which says what a VMA allows, and the revalidate a caller needs once a
+&gt; &gt; collapse has given the mmap_lock up.  No other file can ask for a collapse
+&gt; &gt; without them.
+&gt; &gt; 
+&gt; &gt; Declare them in collapse.h, with a comment stating the order they are
+&gt; &gt; called in and who holds the lock over each step.  Each function says
+&gt; &gt; what it needs and what it does where it is defined.
+&gt; &gt; 
+&gt; &gt; hugepage_vma_revalidate() becomes collapse_vma_revalidate(): it is part of
+&gt; &gt; what a collapse offers now, not a helper of the daemon.
+&gt; 
+&gt; Is it just me or is collapse_vma_revalidate() an odd part of this interface?
+&gt; 
+&gt; You&#x27;d expect a matching function that performs the initial validation on a given
+&gt; vma.
+&gt; 
+&gt; Maybe we should have a
+&gt; 
+&gt; 	orders = collapse_vma_validate(vma)
+&gt; 
+&gt; that really just wraps collapse_possible_orders(), an expose that instead to the
+&gt; collapse users?
+&gt; 
+&gt; So they&#x27;d use collapse_vma_validate() to then call collapse_vma_revalidate()
+&gt; after temporarily dropping the mmap lock?
+
+collapse_vma_revalidate() re-checks what the scan ran under: a VMA at
+the address, anonymous if the scan went that way, covering the PMD
+range, allowing this order.
+
+A collapse_vma_validate() could bundle what the callers check before a
+scan, for the sake of symmetry. Feels like overkill to me.
+
+&gt; &gt; -static enum scan_result hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
+&gt; &gt; +enum scan_result collapse_vma_revalidate(struct mm_struct *mm, unsigned long address,
+&gt; &gt;  		bool expect_anon, struct vm_area_struct **vmap,
+&gt; &gt;  		struct collapse_control *cc, unsigned int order)
+&gt; &gt;  {
+&gt; &gt; @@ -1264,7 +1264,7 @@ static enum scan_result collapse_huge_page(struct mm_struct *mm,
+&gt; &gt;  	}
+&gt; &gt;  
+&gt; &gt;  	mmap_read_lock(mm);
+&gt; &gt; -	result = hugepage_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+&gt; &gt; +	result = collapse_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+&gt; &gt;  					 &amp;vma, cc, order);
+&gt; &gt;  	if (result != SCAN_SUCCEED) {
+&gt; &gt;  		mmap_read_unlock(mm);
+&gt; &gt; @@ -1299,7 +1299,7 @@ static enum scan_result collapse_huge_page(struct mm_struct *mm,
+&gt; &gt;  	 * mmap_lock.
+&gt; &gt;  	 */
+&gt; &gt;  	mmap_write_lock(mm);
+&gt; &gt; -	result = hugepage_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+&gt; &gt; +	result = collapse_vma_revalidate(mm, pmd_addr, /*expect_anon=*/ true,
+&gt; &gt;  					 &amp;vma, cc, order);
+&gt; &gt;  	if (result != SCAN_SUCCEED)
+&gt; &gt;  		goto out_up_write;
+&gt; &gt; @@ -2741,7 +2741,8 @@ static enum scan_result collapse_scan_file(struct mm_struct *mm,
+&gt; &gt;  	return result;
+&gt; &gt;  }
+&gt; &gt;  
+&gt; &gt; -static void collapse_control_init(struct collapse_control *cc)
+&gt; &gt; +/* Set up a control before its first scan; cc-&gt;policy is the caller&#x27;s to fill */
+&gt; 
+&gt; 
+&gt; Kerneldoc please. Applies to the other ones exposed as part of the same
+&gt; interface as well.
+
+Will do, for all of them. The overview in collapse.h stays; it is what
+ties the calls together and says who holds the lock between them.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<a href="https://lore.kernel.org/r/arUVpLSG3Xj560m5@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a need for improvement, agreed to make changes</div>
 </div>
 </div>
 </div>
