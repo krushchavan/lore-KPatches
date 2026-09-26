@@ -245,24 +245,698 @@
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Chris Li</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
+<a class="date-chip" href="../2026-09-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-22">2026-09-22</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Chris Li noted that the patch contains excessive uses of swap_is_vswap(), which fragments the code path and makes it harder to reason about, particularly around locks, and considers this the biggest drawback of the series.
-
-Reviewer Chris Li noted that a vswap device does not follow the traditional swap on/off behavior, and instead suggested that it should go through swap on to enable swapping.</div>
+<div class="review-comment-text">Reviewer Chris Li noted that the vswap device is capped at REFCOUNT_MAX pages, just under 8 TiB with 4 KiB pages, and every swapped page takes a reference on its cgroup&#x27;s memcg-&gt;private_id_ref, a 32-bit refcount_t. He pointed out that this could lead to a cgroup saturating the refcount and leaking the memcg until reboot.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">There are too many swap_is_vswap() in this series. It fragments the
+<pre class="raw-body-text">On Fri, Sep 18, 2026 at 1:03 PM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt;
+&gt; Create a virtual swap device (just under 8 TiB with 4 KiB pages), along
+&gt; with the dynamic cluster infrastructure that the rest of the vswap layer is
+&gt; built on. swap_cluster_info_dynamic keeps per-cluster info in an xarray, so
+&gt; a device can be sized without a static cluster_info[] array. For now, vswap
+&gt; requires a 64-bit architecture.
+&gt;
+&gt; swap_table_lookup() resolves a swap entry&#x27;s cluster and reads its slot,
+&gt; both under RCU. A vswap cluster is allocated on demand and freed by
+&gt; kfree_rcu(), so an unpinned entry cannot have its cluster resolved
+&gt; beforehand, and the lookup can return NULL. Callers holding a pinned
+&gt; entry keep resolving it themselves: the pin holds ci-&gt;count above zero,
+&gt; so the cluster cannot be destroyed. mm/workingset.c includes swap_table.h
+&gt; with CONFIG_SWAP off, so the helpers swap_table_lookup() calls gain
+&gt; !CONFIG_SWAP stubs.
+&gt;
+&gt; The dynamic-cluster allocator is wired in, but nothing reaches it yet.
+&gt; vswap_si is kept off the swap device lists, and no allocation path can
+&gt; select it. Backends (zswap, zero, physical disk) and the vswap-aware
+&gt; swap-out / swap-in / writeback paths arrive in subsequent patches.
+&gt;
+&gt; Routing is controlled by the &quot;vswap=&quot; kernel parameter, defaulting to
+&gt; CONFIG_VSWAP_DEFAULT_ON. When off, no device exists, every vswap path is
+&gt; skipped, and swap behavior is unchanged. When on, vswap_init() creates
+&gt; the device and enables a static key only after it is fully published, so
+&gt; callers never observe a half-built device. The device lives for the
+&gt; lifetime of the kernel and cannot be swapon&#x27;d or swapoff&#x27;d.
+&gt;
+&gt; The device is capped at REFCOUNT_MAX pages, just under 8 TiB with 4 KiB
+&gt; pages. Every swapped page takes a reference on its cgroup&#x27;s
+&gt; memcg-&gt;private_id_ref, a 32-bit refcount_t, so a cgroup that swaps past
+&gt; that saturates it and leaks the memcg until reboot. The limit is not
+&gt; specific to vswap, a physical swapfile that large hits it too, but vswap
+&gt; is the first device that can reach it without provisioning the storage.
+&gt;
+&gt; Suggested-by: Kairui Song &lt;kasong@tencent.com&gt;
+&gt; Signed-off-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
+&gt; ---
+&gt;  .../admin-guide/kernel-parameters.txt         |   7 +
+&gt;  MAINTAINERS                                   |   1 +
+&gt;  include/linux/swap.h                          |   9 +
+&gt;  mm/Kconfig                                    |  20 ++
+&gt;  mm/page_io.c                                  |  14 +
+&gt;  mm/swap.h                                     |  77 ++++-
+&gt;  mm/swap_state.c                               |  40 +--
+&gt;  mm/swap_table.h                               |  27 ++
+&gt;  mm/swapfile.c                                 | 275 ++++++++++++++++--
+&gt;  mm/vswap.h                                    |  34 +++
+&gt;  mm/zswap.c                                    |   6 +
+&gt;  11 files changed, 468 insertions(+), 42 deletions(-)
+&gt;  create mode 100644 mm/vswap.h
+&gt;
+&gt; diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+&gt; index 68647ff4bdd2..646e689d9e80 100644
+&gt; --- a/Documentation/admin-guide/kernel-parameters.txt
+&gt; +++ b/Documentation/admin-guide/kernel-parameters.txt
+&gt; @@ -8431,6 +8431,13 @@ Kernel parameters
+&gt;                         force           - force vulnerability detection even on
+&gt;                                           unaffected processors
+&gt;
+&gt; +       vswap=          [MM,EARLY]
+&gt; +                       Route swapouts through the virtual swap layer, which
+&gt; +                       allows zswap and zero-filled pages to be used without
+&gt; +                       a physical swap device. 64-bit only.
+&gt; +                       Format: { on | off }
+&gt; +                       Default: on if CONFIG_VSWAP_DEFAULT_ON=y, else off.
+&gt; +
+&gt;         vsyscall=       [X86-64,EARLY]
+&gt;                         Controls the behavior of vsyscalls (i.e. calls to
+&gt;                         fixed addresses of 0xffffffffff600x00 from legacy
+&gt; diff --git a/MAINTAINERS b/MAINTAINERS
+&gt; index e4412c3d8d45..e49a3d4e332b 100644
+&gt; --- a/MAINTAINERS
+&gt; +++ b/MAINTAINERS
+&gt; @@ -17411,6 +17411,7 @@ F:      mm/swap.h
+&gt;  F:     mm/swap_table.h
+&gt;  F:     mm/swap_state.c
+&gt;  F:     mm/swapfile.c
+&gt; +F:     mm/vswap.h
+&gt;
+&gt;  MEMORY MANAGEMENT - THP (TRANSPARENT HUGE PAGE)
+&gt;  M:     Andrew Morton &lt;akpm@linux-foundation.org&gt;
+&gt; diff --git a/include/linux/swap.h b/include/linux/swap.h
+&gt; index 61005501888c..0b341301d8fa 100644
+&gt; --- a/include/linux/swap.h
+&gt; +++ b/include/linux/swap.h
+&gt; @@ -201,6 +201,7 @@ enum {
+&gt;         SWP_STABLE_WRITES = (1 &lt;&lt; 11),  /* no overwrite PG_writeback pages */
+&gt;         SWP_SYNCHRONOUS_IO = (1 &lt;&lt; 12), /* synchronous IO is efficient */
+&gt;         SWP_HIBERNATION = (1 &lt;&lt; 13),    /* pinned for hibernation */
+&gt; +       SWP_VSWAP       = (1 &lt;&lt; 14),    /* virtual swap device */
+&gt;                                         /* add others here before... */
+&gt;  };
+&gt;
+&gt; @@ -270,8 +271,14 @@ struct swap_info_struct {
+&gt;         struct list_head discard_clusters; /* discard clusters list */
+&gt;         struct plist_node avail_list;   /* entry in swap_avail_head */
+&gt;         const struct swap_ops *ops;
+&gt; +       struct xarray cluster_info_pool; /* Xarray for vswap dynamic cluster info */
+&gt;  };
+&gt;
+&gt; +static inline bool swap_is_vswap(struct swap_info_struct *si)
+&gt; +{
+&gt; +       return si-&gt;flags &amp; SWP_VSWAP;
+&gt; +}
+&gt; +
+&gt;  /**
+&gt;   * folio_swap_entry - Return the swap entry at a page index within a folio.
+&gt;   * @folio: The folio.
+&gt; @@ -427,6 +434,8 @@ void swap_free_hibernation_slot(swp_entry_t entry);
+&gt;
+&gt;  static inline void put_swap_device(struct swap_info_struct *si)
+&gt;  {
+&gt; +       if (swap_is_vswap(si))
+&gt; +               return;
+&gt;         percpu_ref_put(&amp;si-&gt;users);
+&gt;  }
+&gt;
+&gt; diff --git a/mm/Kconfig b/mm/Kconfig
+&gt; index 30170a936f1f..beef56e870ce 100644
+&gt; --- a/mm/Kconfig
+&gt; +++ b/mm/Kconfig
+&gt; @@ -19,6 +19,26 @@ menuconfig SWAP
+&gt;           used to provide more virtual memory than the actual RAM present
+&gt;           in your computer.  If unsure say Y.
+&gt;
+&gt; +config VSWAP_DEFAULT_ON
+&gt; +       bool &quot;Route swapouts through virtual swap by default&quot;
+&gt; +       depends on SWAP &amp;&amp; 64BIT
+&gt; +       default n
+&gt; +       help
+&gt; +         Virtual swap allows zswap and zero-filled pages to be used
+&gt; +         without swapping on a physical device first, and lets a page
+&gt; +         move between zswap and a swapfile without invalidating the page
+&gt; +         table entries that refer to it.
+&gt; +
+&gt; +         Swap entries are handed out by a virtual swap device instead of
+&gt; +         naming a slot on a real one, so the backing can be chosen and
+&gt; +         changed after the entry exists.
+&gt; +
+&gt; +         Say Y to make &quot;vswap=on&quot; the default, routing swapouts through
+&gt; +         the virtual swap layer from boot.
+&gt; +
+&gt; +         Say N (default) to leave vswap off unless &quot;vswap=on&quot; is passed
+&gt; +         on the kernel command line.
+&gt; +
+&gt;  config ZSWAP
+&gt;         bool &quot;Compressed cache for swap pages&quot;
+&gt;         depends on SWAP
+&gt; diff --git a/mm/page_io.c b/mm/page_io.c
+&gt; index 1da4ff484f09..5cd77bd1b12c 100644
+&gt; --- a/mm/page_io.c
+&gt; +++ b/mm/page_io.c
+&gt; @@ -28,6 +28,7 @@
+&gt;  #include &lt;linux/swap_ops.h&gt;
+&gt;  #include &quot;swap.h&quot;
+&gt;  #include &quot;swap_table.h&quot;
+&gt; +#include &quot;vswap.h&quot;
+&gt;
+&gt;  int generic_swapfile_activate(struct swap_info_struct *sis,
+&gt;                                 struct file *swap_file,
+&gt; @@ -248,6 +249,14 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+&gt;         }
+&gt;         rcu_read_unlock();
+&gt;
+&gt; +       /*
+&gt; +        * A vswap folio has no physical slot to write to, so keep it dirty.
+&gt; +        */
+&gt; +       if (is_vswap_entry(folio-&gt;swap)) {
+&gt; +               folio_mark_dirty(folio);
+&gt; +               return AOP_WRITEPAGE_ACTIVATE;
+&gt; +       }
+&gt; +
+&gt;         __swap_writeout(ctx, folio);
+&gt;         return 0;
+&gt;  out_unlock:
+&gt; @@ -482,6 +491,11 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio)
+&gt;         if (zswap_load(folio) != -ENOENT)
+&gt;                 goto finish;
+&gt;
+&gt; +       if (unlikely(swap_is_vswap(sis))) {
+
+There are too many swap_is_vswap() in this series. It fragments the
 code path, making things harder to reason about. Esepcially around
 locks. I count 22 in this patch alone.
 
 I consider this the biggest drawback of this series. This
 fragmentation of the code path.
 
----
+&gt; +               folio_unlock(folio);
+&gt; +               goto finish;
+&gt; +       }
+&gt; +
+&gt;         /* We have to read from slower devices. Increase zswap protection. */
+&gt;         zswap_folio_swapin(folio);
+&gt;         swap_add_folio(ctx, folio, READ);
+&gt; diff --git a/mm/swap.h b/mm/swap.h
+&gt; index b3b54c28929a..528a27afb335 100644
+&gt; --- a/mm/swap.h
+&gt; +++ b/mm/swap.h
+&gt; @@ -67,6 +67,12 @@ struct swap_cluster_info {
+&gt;         struct list_head list;
+&gt;  };
+&gt;
+&gt; +struct swap_cluster_info_dynamic {
+&gt; +       struct swap_cluster_info ci;
+&gt; +       unsigned int index;             /* for cluster_index() */
+&gt; +       struct rcu_head rcu;
+&gt; +};
+&gt; +
+&gt;  /* All on-list cluster must have a non-zero flag. */
+&gt;  enum swap_cluster_flags {
+&gt;         CLUSTER_FLAG_NONE = 0, /* For temporary off-list cluster */
+&gt; @@ -77,6 +83,7 @@ enum swap_cluster_flags {
+&gt;         CLUSTER_FLAG_USABLE = CLUSTER_FLAG_FRAG,
+&gt;         CLUSTER_FLAG_FULL,
+&gt;         CLUSTER_FLAG_DISCARD,
+&gt; +       CLUSTER_FLAG_DEAD,      /* Vswap dynamic cluster pending kfree_rcu */
+&gt;         CLUSTER_FLAG_MAX,
+&gt;  };
+&gt;
+&gt; @@ -119,12 +126,33 @@ static inline struct swap_info_struct *__swap_entry_to_info(swp_entry_t entry)
+&gt;         return __swap_type_to_info(swp_type(entry));
+&gt;  }
+&gt;
+&gt; +/**
+&gt; + * __swap_offset_to_cluster - look up the cluster holding a swap offset
+&gt; + * @si: the swap device
+&gt; + * @offset: the swap entry offset
+&gt; + *
+&gt; + * Context: A vswap cluster is freed by kfree_rcu(). Callers must hold the
+&gt; + * RCU read lock, or know the cluster is pinned by an in-use entry.
+&gt; + *
+&gt; + * Return: the cluster, or NULL if @si is a vswap device with no cluster
+&gt; + * allocated at @offset.
+&gt; + */
+&gt;  static inline struct swap_cluster_info *__swap_offset_to_cluster(
+&gt;                 struct swap_info_struct *si, pgoff_t offset)
+&gt;  {
+&gt; +       unsigned int cluster_idx = offset / SWAPFILE_CLUSTER;
+&gt; +
+&gt;         VM_WARN_ON_ONCE(percpu_ref_is_zero(&amp;si-&gt;users)); /* race with swapoff */
+&gt;         VM_WARN_ON_ONCE(offset &gt;= roundup(si-&gt;max, SWAPFILE_CLUSTER));
+&gt; -       return &amp;si-&gt;cluster_info[offset / SWAPFILE_CLUSTER];
+&gt; +
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               struct swap_cluster_info_dynamic *ci_dyn;
+&gt; +
+&gt; +               ci_dyn = xa_load(&amp;si-&gt;cluster_info_pool, cluster_idx);
+&gt; +               return ci_dyn ? &amp;ci_dyn-&gt;ci : NULL;
+&gt; +       }
+&gt; +
+&gt; +       return &amp;si-&gt;cluster_info[cluster_idx];
+&gt;  }
+&gt;
+&gt;  static inline struct swap_cluster_info *__swap_entry_to_cluster(swp_entry_t entry)
+&gt; @@ -133,10 +161,36 @@ static inline struct swap_cluster_info *__swap_entry_to_cluster(swp_entry_t entr
+&gt;                                         swp_offset(entry));
+&gt;  }
+&gt;
+&gt; +static inline struct swap_cluster_info *__vswap_cluster_lock(
+&gt; +               struct swap_info_struct *si, unsigned long offset, bool irq)
+&gt; +{
+&gt; +       struct swap_cluster_info *ci;
+&gt; +
+&gt; +       rcu_read_lock();
+&gt; +       ci = __swap_offset_to_cluster(si, offset);
+&gt; +       if (ci) {
+&gt; +               if (irq)
+&gt; +                       spin_lock_irq(&amp;ci-&gt;lock);
+&gt; +               else
+&gt; +                       spin_lock(&amp;ci-&gt;lock);
+&gt; +
+&gt; +               /* The cluster can be torn down while we wait for the lock. */
+&gt; +               if (ci-&gt;flags == CLUSTER_FLAG_DEAD) {
+&gt; +                       if (irq)
+&gt; +                               spin_unlock_irq(&amp;ci-&gt;lock);
+&gt; +                       else
+&gt; +                               spin_unlock(&amp;ci-&gt;lock);
+&gt; +                       ci = NULL;
+&gt; +               }
+&gt; +       }
+&gt; +       rcu_read_unlock();
+&gt; +       return ci;
+&gt; +}
+&gt; +
+&gt;  static __always_inline struct swap_cluster_info *__swap_cluster_lock(
+&gt;                 struct swap_info_struct *si, unsigned long offset, bool irq)
+&gt;  {
+&gt; -       struct swap_cluster_info *ci = __swap_offset_to_cluster(si, offset);
+&gt; +       struct swap_cluster_info *ci;
+&gt;
+&gt;         /*
+&gt;          * Nothing modifies swap cache in an IRQ context. All access to
+&gt; @@ -149,6 +203,11 @@ static __always_inline struct swap_cluster_info *__swap_cluster_lock(
+&gt;          */
+&gt;         VM_WARN_ON_ONCE(!in_task());
+&gt;         VM_WARN_ON_ONCE(percpu_ref_is_zero(&amp;si-&gt;users)); /* race with swapoff */
+&gt; +
+&gt; +       if (swap_is_vswap(si))
+&gt; +               return __vswap_cluster_lock(si, offset, irq);
+&gt; +
+&gt; +       ci = __swap_offset_to_cluster(si, offset);
+&gt;         if (irq)
+&gt;                 spin_lock_irq(&amp;ci-&gt;lock);
+&gt;         else
+&gt; @@ -159,10 +218,12 @@ static __always_inline struct swap_cluster_info *__swap_cluster_lock(
+&gt;  /**
+&gt;   * swap_cluster_lock - Lock and return the swap cluster of given offset.
+&gt;   * @si: swap device the cluster belongs to.
+&gt; - * @offset: the swap entry offset, pointing to a valid slot.
+&gt; + * @offset: the swap entry offset.
+&gt;   *
+&gt;   * Context: The caller must ensure the offset is in the valid range and
+&gt;   * protect the swap device with reference count or locks.
+&gt; + * Return: the locked cluster, or NULL if it is gone. Only a vswap device
+&gt; + * can return NULL, as its clusters are allocated and freed on demand.
+&gt;   */
+&gt;  static inline struct swap_cluster_info *swap_cluster_lock(
+&gt;                 struct swap_info_struct *si, unsigned long offset)
+&gt; @@ -363,6 +424,16 @@ static inline struct swap_info_struct *__swap_entry_to_info(swp_entry_t entry)
+&gt;         return NULL;
+&gt;  }
+&gt;
+&gt; +static inline struct swap_cluster_info *__swap_entry_to_cluster(swp_entry_t entry)
+&gt; +{
+&gt; +       return NULL;
+&gt; +}
+&gt; +
+&gt; +static inline unsigned int swp_cluster_offset(swp_entry_t entry)
+&gt; +{
+&gt; +       return 0;
+&gt; +}
+&gt; +
+&gt;  static inline int folio_alloc_swap(struct folio *folio)
+&gt;  {
+&gt;         return -EINVAL;
+&gt; diff --git a/mm/swap_state.c b/mm/swap_state.c
+&gt; index cef44aadee61..424a0040b4b8 100644
+&gt; --- a/mm/swap_state.c
+&gt; +++ b/mm/swap_state.c
+&gt; @@ -96,8 +96,7 @@ struct folio *swap_cache_get_folio(swp_entry_t entry)
+&gt;         struct folio *folio;
+&gt;
+&gt;         for (;;) {
+&gt; -               swp_tb = swap_table_get(__swap_entry_to_cluster(entry),
+&gt; -                                       swp_cluster_offset(entry));
+&gt; +               swp_tb = swap_table_lookup(entry);
+&gt;                 if (!swp_tb_is_folio(swp_tb))
+&gt;                         return NULL;
+&gt;                 folio = swp_tb_to_folio(swp_tb);
+&gt; @@ -119,8 +118,7 @@ bool swap_cache_has_folio(swp_entry_t entry)
+&gt;  {
+&gt;         unsigned long swp_tb;
+&gt;
+&gt; -       swp_tb = swap_table_get(__swap_entry_to_cluster(entry),
+&gt; -                               swp_cluster_offset(entry));
+&gt; +       swp_tb = swap_table_lookup(entry);
+&gt;         return swp_tb_is_folio(swp_tb);
+&gt;  }
+&gt;
+&gt; @@ -136,8 +134,7 @@ void *swap_cache_get_shadow(swp_entry_t entry)
+&gt;  {
+&gt;         unsigned long swp_tb;
+&gt;
+&gt; -       swp_tb = swap_table_get(__swap_entry_to_cluster(entry),
+&gt; -                               swp_cluster_offset(entry));
+&gt; +       swp_tb = swap_table_lookup(entry);
+&gt;         if (swp_tb_is_shadow(swp_tb))
+&gt;                 return swp_tb_to_shadow(swp_tb);
+&gt;         return NULL;
+&gt; @@ -414,14 +411,16 @@ void __swap_cache_replace_folio(struct swap_cluster_info *ci,
+&gt;   * -ENOENT / -EEXIST: Target swap entry is unavailable or cached, the caller
+&gt;   *                    should abort or try to use the cached folio instead
+&gt;   */
+&gt; -static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt; -                                       swp_entry_t targ_entry, gfp_t gfp,
+&gt; +static struct folio *__swap_cache_alloc(swp_entry_t targ_entry, gfp_t gfp,
+&gt;                                         unsigned int order, struct vm_fault *vmf,
+&gt;                                         struct mempolicy *mpol, pgoff_t ilx)
+&gt;  {
+&gt;         int err;
+&gt;         swp_entry_t entry;
+&gt;         struct folio *folio;
+&gt; +       struct swap_cluster_info *ci;
+&gt; +       struct swap_info_struct *si = __swap_entry_to_info(targ_entry);
+&gt; +       unsigned long offset = swp_offset(targ_entry);
+&gt;         void *shadow = NULL;
+&gt;         unsigned short memcg_id;
+&gt;         unsigned long address, nr_pages = 1UL &lt;&lt; order;
+&gt; @@ -431,9 +430,12 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt;         entry.val = round_down(targ_entry.val, nr_pages);
+&gt;
+&gt;         /* Check if the slot and range are available, skip allocation if not */
+&gt; -       spin_lock(&amp;ci-&gt;lock);
+&gt; -       err = __swap_cache_add_check(ci, targ_entry, nr_pages, NULL, NULL);
+&gt; -       spin_unlock(&amp;ci-&gt;lock);
+&gt; +       err = -ENOENT;
+&gt; +       ci = swap_cluster_lock(si, offset);
+&gt; +       if (ci) {
+&gt; +               err = __swap_cache_add_check(ci, targ_entry, nr_pages, NULL, NULL);
+&gt; +               swap_cluster_unlock(ci);
+&gt; +       }
+&gt;         if (unlikely(err))
+&gt;                 return ERR_PTR(err);
+&gt;
+&gt; @@ -454,10 +456,13 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt;                 return ERR_PTR(-ENOMEM);
+&gt;
+&gt;         /* Double check the range is still not in conflict */
+&gt; -       spin_lock(&amp;ci-&gt;lock);
+&gt; -       err = __swap_cache_add_check(ci, targ_entry, nr_pages, &amp;shadow, &amp;memcg_id);
+&gt; +       err = -ENOENT;
+&gt; +       ci = swap_cluster_lock(si, offset);
+&gt; +       if (ci)
+&gt; +               err = __swap_cache_add_check(ci, targ_entry, nr_pages, &amp;shadow, &amp;memcg_id);
+&gt;         if (unlikely(err)) {
+&gt; -               spin_unlock(&amp;ci-&gt;lock);
+&gt; +               if (ci)
+&gt; +                       swap_cluster_unlock(ci);
+&gt;                 folio_put(folio);
+&gt;                 return ERR_PTR(err);
+&gt;         }
+&gt; @@ -465,10 +470,11 @@ static struct folio *__swap_cache_alloc(struct swap_cluster_info *ci,
+&gt;         __folio_set_locked(folio);
+&gt;         __folio_set_swapbacked(folio);
+&gt;         __swap_cache_do_add_folio(ci, folio, entry);
+&gt; -       spin_unlock(&amp;ci-&gt;lock);
+&gt; +       swap_cluster_unlock(ci);
+&gt;
+&gt;         if (mem_cgroup_swapin_charge_folio(folio, memcg_id,
+&gt;                                            vmf ? vmf-&gt;vma-&gt;vm_mm : NULL, gfp)) {
+&gt; +               /* The folio pins the cluster */
+&gt;                 spin_lock(&amp;ci-&gt;lock);
+&gt;                 __swap_cache_do_del_folio(ci, folio, entry, shadow);
+&gt;                 spin_unlock(&amp;ci-&gt;lock);
+&gt; @@ -525,9 +531,7 @@ struct folio *swap_cache_alloc_folio(swp_entry_t targ_entry, gfp_t gfp,
+&gt;  {
+&gt;         int order, err;
+&gt;         struct folio *ret;
+&gt; -       struct swap_cluster_info *ci;
+&gt;
+&gt; -       ci = __swap_entry_to_cluster(targ_entry);
+&gt;         order = highest_order(orders);
+&gt;
+&gt;         /* orders must be non-zero, and must not exceed cluster size. */
+&gt; @@ -535,7 +539,7 @@ struct folio *swap_cache_alloc_folio(swp_entry_t targ_entry, gfp_t gfp,
+&gt;                 return ERR_PTR(-EINVAL);
+&gt;
+&gt;         do {
+&gt; -               ret = __swap_cache_alloc(ci, targ_entry, gfp, order,
+&gt; +               ret = __swap_cache_alloc(targ_entry, gfp, order,
+&gt;                                          vmf, mpol, ilx);
+&gt;                 if (!IS_ERR(ret))
+&gt;                         break;
+&gt; diff --git a/mm/swap_table.h b/mm/swap_table.h
+&gt; index e6613e62f8d0..3d64d1629882 100644
+&gt; --- a/mm/swap_table.h
+&gt; +++ b/mm/swap_table.h
+&gt; @@ -6,6 +6,8 @@
+&gt;  #include &lt;linux/atomic.h&gt;
+&gt;  #include &quot;swap.h&quot;
+&gt;
+&gt; +extern struct swap_info_struct *vswap_si;
+&gt; +
+&gt;  /* A typical flat array in each cluster as swap table */
+&gt;  struct swap_table {
+&gt;         atomic_long_t entries[SWAPFILE_CLUSTER];
+&gt; @@ -264,6 +266,31 @@ static inline unsigned long swap_table_get(struct swap_cluster_info *ci,
+&gt;         return swp_tb;
+&gt;  }
+&gt;
+&gt; +/*
+&gt; + * Resolve @entry&#x27;s cluster and read its slot, both under RCU. A vswap
+&gt; + * cluster is allocated on demand and freed by kfree_rcu(), so a caller
+&gt; + * starting from an entry cannot resolve it beforehand.
+&gt; + */
+&gt; +static inline unsigned long swap_table_lookup(swp_entry_t entry)
+&gt; +{
+&gt; +       struct swap_cluster_info *ci;
+&gt; +       atomic_long_t *table;
+&gt; +       unsigned long swp_tb;
+&gt; +
+&gt; +       rcu_read_lock();
+&gt; +       ci = __swap_entry_to_cluster(entry);
+&gt; +       if (!ci) {
+&gt; +               rcu_read_unlock();
+&gt; +               return null_to_swp_tb();
+&gt; +       }
+&gt; +       table = rcu_dereference(ci-&gt;table);
+&gt; +       swp_tb = table ? atomic_long_read(&amp;table[swp_cluster_offset(entry)])
+&gt; +                      : null_to_swp_tb();
+&gt; +       rcu_read_unlock();
+&gt; +
+&gt; +       return swp_tb;
+&gt; +}
+&gt; +
+&gt;  static inline void __swap_table_set_zero(struct swap_cluster_info *ci,
+&gt;                                          unsigned int ci_off)
+&gt;  {
+&gt; diff --git a/mm/swapfile.c b/mm/swapfile.c
+&gt; index c1c5fbb3c909..edd7bddf7ff9 100644
+&gt; --- a/mm/swapfile.c
+&gt; +++ b/mm/swapfile.c
+&gt; @@ -36,6 +36,7 @@
+&gt;  #include &lt;linux/poll.h&gt;
+&gt;  #include &lt;linux/oom.h&gt;
+&gt;  #include &lt;linux/swapfile.h&gt;
+&gt; +#include &lt;linux/swap_ops.h&gt;
+&gt;  #include &lt;linux/export.h&gt;
+&gt;  #include &lt;linux/sort.h&gt;
+&gt;  #include &lt;linux/completion.h&gt;
+&gt; @@ -46,6 +47,7 @@
+&gt;  #include &lt;asm/tlbflush.h&gt;
+&gt;  #include &lt;linux/leafops.h&gt;
+&gt;  #include &quot;swap_table.h&quot;
+&gt; +#include &quot;vswap.h&quot;
+&gt;  #include &quot;internal.h&quot;
+&gt;  #include &quot;swap.h&quot;
+&gt;
+&gt; @@ -399,6 +401,8 @@ static inline bool cluster_is_usable(struct swap_cluster_info *ci, int order)
+&gt;  static inline unsigned int cluster_index(struct swap_info_struct *si,
+&gt;                                          struct swap_cluster_info *ci)
+&gt;  {
+&gt; +       if (swap_is_vswap(si))
+&gt; +               return container_of(ci, struct swap_cluster_info_dynamic, ci)-&gt;index;
+&gt;         return ci - si-&gt;cluster_info;
+&gt;  }
+&gt;
+&gt; @@ -594,10 +598,15 @@ static void move_cluster(struct swap_info_struct *si,
+&gt;         lockdep_assert_held(&amp;ci-&gt;lock);
+&gt;
+&gt;         spin_lock(&amp;si-&gt;lock);
+&gt; -       if (ci-&gt;flags == CLUSTER_FLAG_NONE)
+&gt; +       if (!list) {
+&gt; +               /* Going away. An isolated cluster is already off its list. */
+&gt; +               if (ci-&gt;flags != CLUSTER_FLAG_NONE)
+&gt; +                       list_del(&amp;ci-&gt;list);
+&gt; +       } else if (ci-&gt;flags == CLUSTER_FLAG_NONE) {
+&gt;                 list_add_tail(&amp;ci-&gt;list, list);
+&gt; -       else
+&gt; +       } else {
+&gt;                 list_move_tail(&amp;ci-&gt;list, list);
+&gt; +       }
+&gt;         spin_unlock(&amp;si-&gt;lock);
+&gt;         ci-&gt;flags = new_flags;
+&gt;  }
+&gt; @@ -615,6 +624,18 @@ static void __free_cluster(struct swap_info_struct *si, struct swap_cluster_info
+&gt;  {
+&gt;         swap_cluster_assert_empty(ci, 0, SWAPFILE_CLUSTER, false);
+&gt;         swap_cluster_free_table(ci);
+&gt; +
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               struct swap_cluster_info_dynamic *ci_dyn;
+&gt; +
+&gt; +               /* vswap clusters are destroyed, not returned to free_clusters. */
+&gt; +               ci_dyn = container_of(ci, struct swap_cluster_info_dynamic, ci);
+&gt; +               xa_erase(&amp;si-&gt;cluster_info_pool, ci_dyn-&gt;index);
+&gt; +               move_cluster(si, ci, NULL, CLUSTER_FLAG_DEAD);
+&gt; +               kfree_rcu(ci_dyn, rcu);
+&gt; +               return;
+&gt; +       }
+&gt; +
+&gt;         move_cluster(si, ci, &amp;si-&gt;free_clusters, CLUSTER_FLAG_FREE);
+&gt;         ci-&gt;order = 0;
+&gt;  }
+&gt; @@ -851,6 +872,8 @@ static bool cluster_reclaim_range(struct swap_info_struct *si,
+&gt;         unsigned long offset = start, end = start + nr_pages;
+&gt;         unsigned long swp_tb;
+&gt;
+&gt; +       VM_WARN_ON_ONCE(swap_is_vswap(si));
+&gt; +
+&gt;         spin_unlock(&amp;ci-&gt;lock);
+&gt;         do {
+&gt;                 swp_tb = swap_table_get(ci, offset % SWAPFILE_CLUSTER);
+&gt; @@ -1042,6 +1065,44 @@ static unsigned int alloc_swap_scan_list(struct swap_info_struct *si,
+&gt;         return found;
+&gt;  }
+&gt;
+&gt; +static unsigned int vswap_alloc_cluster(struct swap_info_struct *si,
+&gt; +                                       struct folio *folio)
+&gt; +{
+&gt; +       struct swap_cluster_info_dynamic *ci_dyn;
+&gt; +       struct swap_cluster_info *ci;
+&gt; +       unsigned long offset;
+&gt; +
+&gt; +       VM_WARN_ON(!swap_is_vswap(si));
+&gt; +
+&gt; +       ci_dyn = kzalloc_obj(*ci_dyn, GFP_ATOMIC | __GFP_NOWARN);
+&gt; +       if (!ci_dyn)
+&gt; +               return SWAP_ENTRY_INVALID;
+&gt; +
+&gt; +       spin_lock_init(&amp;ci_dyn-&gt;ci.lock);
+&gt; +       INIT_LIST_HEAD(&amp;ci_dyn-&gt;ci.list);
+&gt; +
+&gt; +       if (swap_cluster_alloc_table(&amp;ci_dyn-&gt;ci, GFP_ATOMIC | __GFP_NOWARN)) {
+&gt; +               kfree(ci_dyn);
+&gt; +               return SWAP_ENTRY_INVALID;
+&gt; +       }
+&gt; +
+&gt; +       /* Lock before publishing: xa_alloc makes the cluster findable by offset. */
+&gt; +       ci = &amp;ci_dyn-&gt;ci;
+&gt; +       spin_lock(&amp;ci-&gt;lock);
+&gt; +
+&gt; +       if (xa_alloc(&amp;si-&gt;cluster_info_pool, &amp;ci_dyn-&gt;index, ci_dyn,
+&gt; +                    XA_LIMIT(1, DIV_ROUND_UP(si-&gt;max, SWAPFILE_CLUSTER) - 1),
+&gt; +                    GFP_ATOMIC | __GFP_NOWARN)) {
+&gt; +               spin_unlock(&amp;ci-&gt;lock);
+&gt; +               swap_cluster_free_table(&amp;ci_dyn-&gt;ci);
+&gt; +               kfree(ci_dyn);
+&gt; +               return SWAP_ENTRY_INVALID;
+&gt; +       }
+&gt; +
+&gt; +       offset = cluster_offset(si, ci);
+&gt; +       return alloc_swap_scan_cluster(si, ci, folio, offset);
+&gt; +}
+&gt; +
+&gt;  static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
+&gt;  {
+&gt;         long to_scan = 1;
+&gt; @@ -1064,7 +1125,9 @@ static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
+&gt;                                 spin_unlock(&amp;ci-&gt;lock);
+&gt;                                 nr_reclaim = __try_to_reclaim_swap(si, offset,
+&gt;                                                                    TTRS_ANYWAY);
+&gt; -                               spin_lock(&amp;ci-&gt;lock);
+&gt; +                               ci = swap_cluster_lock(si, offset);
+&gt; +                               if (!ci)
+&gt; +                                       goto next;
+&gt;                                 if (nr_reclaim) {
+&gt;                                         offset += abs(nr_reclaim);
+&gt;                                         continue;
+&gt; @@ -1078,6 +1141,7 @@ static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
+&gt;                         relocate_cluster(si, ci);
+&gt;
+&gt;                 swap_cluster_unlock(ci);
+&gt; +next:
+&gt;                 if (to_scan &lt;= 0)
+&gt;                         break;
+&gt;
+&gt; @@ -1154,6 +1218,12 @@ static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
+&gt;                         goto done;
+&gt;         }
+&gt;
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               found = vswap_alloc_cluster(si, folio);
+&gt; +               if (found)
+&gt; +                       goto done;
+&gt; +       }
+&gt; +
+&gt;         if (!(si-&gt;flags &amp; SWP_PAGE_DISCARD)) {
+&gt;                 found = alloc_swap_scan_list(si, &amp;si-&gt;free_clusters, folio, false);
+&gt;                 if (found)
+&gt; @@ -1290,8 +1360,10 @@ static bool swap_usage_add(struct swap_info_struct *si, unsigned int nr_entries)
+&gt;         /*
+&gt;          * If device is full, and SWAP_USAGE_OFFLIST_BIT is not set,
+&gt;          * remove it from the plist.
+&gt; +        *
+&gt; +        * Vswap is never on the avail list, so skip it.
+&gt;          */
+&gt; -       if (unlikely(val == si-&gt;pages)) {
+&gt; +       if (unlikely(val == si-&gt;pages) &amp;&amp; !swap_is_vswap(si)) {
+&gt;                 del_from_avail_list(si, false);
+&gt;                 return true;
+&gt;         }
+&gt; @@ -1306,8 +1378,10 @@ static void swap_usage_sub(struct swap_info_struct *si, unsigned int nr_entries)
+&gt;         /*
+&gt;          * If device is not full, and SWAP_USAGE_OFFLIST_BIT is set,
+&gt;          * add it to the plist.
+&gt; +        *
+&gt; +        * Vswap is never on the avail list, so skip it.
+&gt;          */
+&gt; -       if (unlikely(val &amp; SWAP_USAGE_OFFLIST_BIT))
+&gt; +       if (unlikely(val &amp; SWAP_USAGE_OFFLIST_BIT) &amp;&amp; !swap_is_vswap(si))
+&gt;                 add_to_avail_list(si, false);
+&gt;  }
+&gt;
+&gt; @@ -1352,6 +1426,10 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
+&gt;
+&gt;  static bool get_swap_device_info(struct swap_info_struct *si)
+&gt;  {
+&gt; +       /* The vswap device is always alive, so it needs no refcount. */
+&gt; +       if (swap_is_vswap(si))
+&gt; +               return true;
 
 This is questionable. A vswap device does not go through swap on.
 
@@ -270,53 +944,447 @@ This changes the behavior where swap devices always go through swap on/off.
 
 I wish the swap device went through swap on to be able to start swapping.
 
-Chris</pre>
+Chris
+
+
+
+&gt; +
+&gt;         if (!percpu_ref_tryget_live(&amp;si-&gt;users))
+&gt;                 return false;
+&gt;         /*
+&gt; @@ -1387,11 +1465,11 @@ static bool swap_alloc_fast(struct folio *folio)
+&gt;                 return false;
+&gt;
+&gt;         ci = swap_cluster_lock(si, offset);
+&gt; -       if (cluster_is_usable(ci, order)) {
+&gt; +       if (ci &amp;&amp; cluster_is_usable(ci, order)) {
+&gt;                 if (cluster_is_empty(ci))
+&gt;                         offset = cluster_offset(si, ci);
+&gt;                 alloc_swap_scan_cluster(si, ci, folio, offset);
+&gt; -       } else {
+&gt; +       } else if (ci) {
+&gt;                 swap_cluster_unlock(ci);
+&gt;         }
+&gt;
+&gt; @@ -1513,6 +1591,7 @@ int swap_retry_table_alloc(swp_entry_t entry, gfp_t gfp)
+&gt;         if (IS_ERR_OR_NULL(si))
+&gt;                 return 0;
+&gt;
+&gt; +       /* The source PTE pins the entry, so its cluster is alive. */
+&gt;         ci = __swap_offset_to_cluster(si, offset);
+&gt;         ret = swap_extend_table_alloc(si, ci, swp_cluster_offset(entry), gfp);
+&gt;
+&gt; @@ -1923,7 +2002,7 @@ struct swap_info_struct *get_swap_device(swp_entry_t entry)
+&gt;         return NULL;
+&gt;  put_out:
+&gt;         pr_err_ratelimited(&quot;%s: %s%08lx\n&quot;, __func__, Bad_offset, entry.val);
+&gt; -       percpu_ref_put(&amp;si-&gt;users);
+&gt; +       put_swap_device(si);
+&gt;         return ERR_PTR(-EIO);
+&gt;  }
+&gt;
+&gt; @@ -2002,7 +2081,7 @@ bool swap_entry_swapped(struct swap_info_struct *si, swp_entry_t entry)
+&gt;         unsigned long swp_tb;
+&gt;
+&gt;         ci = swap_cluster_lock(si, offset);
+&gt; -       swp_tb = swap_table_get(ci, offset % SWAPFILE_CLUSTER);
+&gt; +       swp_tb = __swap_table_get(ci, swp_cluster_offset(entry));
+&gt;         swap_cluster_unlock(ci);
+&gt;
+&gt;         return swp_tb_get_count(swp_tb) &gt; 0;
+&gt; @@ -2055,6 +2134,7 @@ static bool folio_maybe_swapped(struct folio *folio)
+&gt;         VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
+&gt;         VM_WARN_ON_ONCE_FOLIO(!folio_test_swapcache(folio), folio);
+&gt;
+&gt; +       /* Folio is locked and in swap cache, so ci-&gt;count &gt; 0: cluster is alive. */
+&gt;         ci = __swap_entry_to_cluster(entry);
+&gt;         ci_off = swp_cluster_offset(entry);
+&gt;         ci_end = ci_off + folio_nr_pages(folio);
+&gt; @@ -2249,6 +2329,9 @@ static int __find_hibernation_swap_type(dev_t device, sector_t offset)
+&gt;
+&gt;                 if (!(sis-&gt;flags &amp; SWP_WRITEOK))
+&gt;                         continue;
+&gt; +               /* vswap has no bdev, so it is never a hibernation target. */
+&gt; +               if (swap_is_vswap(sis))
+&gt; +                       continue;
+&gt;
+&gt;                 if (device == sis-&gt;bdev-&gt;bd_dev) {
+&gt;                         struct swap_extent *se = first_se(sis);
+&gt; @@ -2375,6 +2458,9 @@ int find_first_swap(dev_t *device)
+&gt;
+&gt;                 if (!(sis-&gt;flags &amp; SWP_WRITEOK))
+&gt;                         continue;
+&gt; +               /* vswap has no bdev, so it is never a hibernation target. */
+&gt; +               if (swap_is_vswap(sis))
+&gt; +                       continue;
+&gt;                 *device = sis-&gt;bdev-&gt;bd_dev;
+&gt;                 spin_unlock(&amp;swap_lock);
+&gt;                 return type;
+&gt; @@ -2591,8 +2677,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+&gt;                                                 &amp;vmf);
+&gt;                 }
+&gt;                 if (!folio) {
+&gt; -                       swp_tb = swap_table_get(__swap_entry_to_cluster(entry),
+&gt; -                                               swp_cluster_offset(entry));
+&gt; +                       swp_tb = swap_table_lookup(entry);
+&gt;                         if (swp_tb_get_count(swp_tb) &lt;= 0)
+&gt;                                 continue;
+&gt;                         return -ENOMEM;
+&gt; @@ -3022,15 +3107,24 @@ static int setup_swap_extents(struct swap_info_struct *sis,
+&gt;
+&gt;  static void _enable_swap_info(struct swap_info_struct *si)
+&gt;  {
+&gt; -       atomic_long_add(si-&gt;pages, &amp;nr_swap_pages);
+&gt; -       total_swap_pages += si-&gt;pages;
+&gt; +       if (!swap_is_vswap(si)) {
+&gt; +               atomic_long_add(si-&gt;pages, &amp;nr_swap_pages);
+&gt; +               total_swap_pages += si-&gt;pages;
+&gt; +       }
+&gt;
+&gt;         assert_spin_locked(&amp;swap_lock);
+&gt;
+&gt; -       plist_add(&amp;si-&gt;list, &amp;swap_active_head);
+&gt; +       /*
+&gt; +        * Vswap has no backing file and no swapoff support, so keep it
+&gt; +        * off swap_active_head (used by swapoff filename lookup and
+&gt; +        * swap_sync_discard) and swap_avail_head (physical allocator).
+&gt; +        */
+&gt; +       if (!swap_is_vswap(si)) {
+&gt; +               plist_add(&amp;si-&gt;list, &amp;swap_active_head);
+&gt;
+&gt; -       /* Add back to available list */
+&gt; -       add_to_avail_list(si, true);
+&gt; +               /* Add back to available list */
+&gt; +               add_to_avail_list(si, true);
+&gt; +       }
+&gt;  }
+&gt;
+&gt;  /*
+&gt; @@ -3074,12 +3168,31 @@ static void wait_for_allocation(struct swap_info_struct *si)
+&gt;         }
+&gt;  }
+&gt;
+&gt; -static void free_swap_cluster_info(struct swap_cluster_info *cluster_info,
+&gt; +static void free_swap_cluster_info(struct swap_info_struct *si,
+&gt; +                                  struct swap_cluster_info *cluster_info,
+&gt;                                    unsigned long maxpages)
+&gt;  {
+&gt; +       struct swap_cluster_info_dynamic *ci_dyn;
+&gt;         struct swap_cluster_info *ci;
+&gt; +       unsigned long idx;
+&gt;         int i, nr_clusters = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
+&gt;
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               xa_for_each(&amp;si-&gt;cluster_info_pool, idx, ci_dyn) {
+&gt; +                       ci = &amp;ci_dyn-&gt;ci;
+&gt; +                       spin_lock(&amp;ci-&gt;lock);
+&gt; +                       if (cluster_table_is_alloced(ci)) {
+&gt; +                               swap_cluster_assert_empty(ci, 0,
+&gt; +                                                         SWAPFILE_CLUSTER, true);
+&gt; +                               swap_cluster_free_table(ci);
+&gt; +                       }
+&gt; +                       spin_unlock(&amp;ci-&gt;lock);
+&gt; +                       kfree(ci_dyn);
+&gt; +               }
+&gt; +               xa_destroy(&amp;si-&gt;cluster_info_pool);
+&gt; +               return;
+&gt; +       }
+&gt; +
+&gt;         if (!cluster_info)
+&gt;                 return;
+&gt;         for (i = 0; i &lt; nr_clusters; i++) {
+&gt; @@ -3226,7 +3339,7 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+&gt;         mutex_unlock(&amp;swapon_mutex);
+&gt;         kfree(p-&gt;global_cluster);
+&gt;         p-&gt;global_cluster = NULL;
+&gt; -       free_swap_cluster_info(cluster_info, maxpages);
+&gt; +       free_swap_cluster_info(p, cluster_info, maxpages);
+&gt;
+&gt;         inode = mapping-&gt;host;
+&gt;
+&gt; @@ -3573,10 +3686,39 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+&gt;                                     unsigned long maxpages)
+&gt;  {
+&gt;         unsigned long nr_clusters = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
+&gt; -       struct swap_cluster_info *cluster_info;
+&gt; +       struct swap_cluster_info *cluster_info = NULL;
+&gt; +       struct swap_cluster_info_dynamic *ci_dyn = NULL;
+&gt;         int err = -ENOMEM;
+&gt;         unsigned long i;
+&gt;
+&gt; +       /* A vswap device uses an xarray pool instead of a static array. */
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               nr_clusters = 0;
+&gt; +               xa_init_flags(&amp;si-&gt;cluster_info_pool, XA_FLAGS_ALLOC);
+&gt; +
+&gt; +               /*
+&gt; +                * Pre-allocate cluster 0 and mark slot 0 (header page)
+&gt; +                * as bad so the allocator never hands out page offset 0.
+&gt; +                */
+&gt; +               ci_dyn = kzalloc_obj(*ci_dyn, GFP_KERNEL);
+&gt; +               if (!ci_dyn)
+&gt; +                       goto err;
+&gt; +               spin_lock_init(&amp;ci_dyn-&gt;ci.lock);
+&gt; +               INIT_LIST_HEAD(&amp;ci_dyn-&gt;ci.list);
+&gt; +
+&gt; +               err = xa_insert(&amp;si-&gt;cluster_info_pool, 0, ci_dyn, GFP_KERNEL);
+&gt; +               if (err) {
+&gt; +                       kfree(ci_dyn);
+&gt; +                       goto err;
+&gt; +               }
+&gt; +
+&gt; +               err = swap_cluster_setup_bad_slot(si, &amp;ci_dyn-&gt;ci, 0, false);
+&gt; +               if (err)
+&gt; +                       goto err;
+&gt; +
+&gt; +               goto setup_cluster_info;
+&gt; +       }
+&gt; +
+&gt;         cluster_info = kvzalloc_objs(*cluster_info, nr_clusters);
+&gt;         if (!cluster_info)
+&gt;                 goto err;
+&gt; @@ -3620,6 +3762,7 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+&gt;                         goto err;
+&gt;         }
+&gt;
+&gt; +setup_cluster_info:
+&gt;         INIT_LIST_HEAD(&amp;si-&gt;free_clusters);
+&gt;         INIT_LIST_HEAD(&amp;si-&gt;full_clusters);
+&gt;         INIT_LIST_HEAD(&amp;si-&gt;discard_clusters);
+&gt; @@ -3641,10 +3784,16 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+&gt;                 }
+&gt;         }
+&gt;
+&gt; +       /* Slot 0 is bad, so cluster 0 never empties. The rest of it is usable. */
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               ci_dyn-&gt;ci.flags = CLUSTER_FLAG_NONFULL;
+&gt; +               list_add_tail(&amp;ci_dyn-&gt;ci.list, &amp;si-&gt;nonfull_clusters[0]);
+&gt; +       }
+&gt; +
+&gt;         si-&gt;cluster_info = cluster_info;
+&gt;         return 0;
+&gt;  err:
+&gt; -       free_swap_cluster_info(cluster_info, maxpages);
+&gt; +       free_swap_cluster_info(si, cluster_info, maxpages);
+&gt;         return err;
+&gt;  }
+&gt;
+&gt; @@ -3866,7 +4015,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+&gt;         si-&gt;global_cluster = NULL;
+&gt;         inode = NULL;
+&gt;         destroy_swap_extents(si, swap_file);
+&gt; -       free_swap_cluster_info(si-&gt;cluster_info, si-&gt;max);
+&gt; +       free_swap_cluster_info(si, si-&gt;cluster_info, si-&gt;max);
+&gt;         si-&gt;cluster_info = NULL;
+&gt;         /*
+&gt;          * Clear the SWP_USED flag after all resources are freed so
+&gt; @@ -3997,3 +4146,87 @@ static int __init swapfile_init(void)
+&gt;         return 0;
+&gt;  }
+&gt;  subsys_initcall(swapfile_init);
+&gt; +
+&gt; +struct swap_info_struct *vswap_si;
+&gt; +DEFINE_STATIC_KEY_FALSE(vswap_key);
+&gt; +
+&gt; +static bool vswap_enabled_early __initdata = IS_ENABLED(CONFIG_VSWAP_DEFAULT_ON);
+&gt; +
+&gt; +static int __init early_vswap(char *buf)
+&gt; +{
+&gt; +       return kstrtobool(buf, &amp;vswap_enabled_early);
+&gt; +}
+&gt; +early_param(&quot;vswap&quot;, early_vswap);
+&gt; +
+&gt; +/* vswap does no IO on its own. */
+&gt; +static const struct swap_ops vswap_ops = { };
+&gt; +
+&gt; +static int __init vswap_init(void)
+&gt; +{
+&gt; +       struct swap_info_struct *si;
+&gt; +       unsigned long maxpages;
+&gt; +       int err;
+&gt; +
+&gt; +       if (!IS_ENABLED(CONFIG_64BIT)) {
+&gt; +               if (vswap_enabled_early)
+&gt; +                       pr_warn(&quot;vswap: requires 64-bit architecture; vswap disabled, swapout falls back to direct physical swap\n&quot;);
+&gt; +               return 0;
+&gt; +       }
+&gt; +
+&gt; +       if (!vswap_enabled_early)
+&gt; +               return 0;
+&gt; +
+&gt; +       si = alloc_swap_info();
+&gt; +       if (IS_ERR(si)) {
+&gt; +               pr_warn(&quot;vswap: alloc_swap_info failed (%ld); vswap disabled, swapout falls back to direct physical swap\n&quot;,
+&gt; +                       PTR_ERR(si));
+&gt; +               return 0;
+&gt; +       }
+&gt; +
+&gt; +       /*
+&gt; +        * Each swapped page holds a reference on its cgroup&#x27;s
+&gt; +        * memcg-&gt;private_id_ref, a 32-bit refcount_t, so a cgroup that swaps
+&gt; +        * REFCOUNT_MAX pages saturates it and leaks the memcg until reboot.
+&gt; +        * Cap the device there; that also keeps page counts inside si-&gt;max&#x27;s
+&gt; +        * unsigned int. Lifting it needs the memcg refcount widened, which a
+&gt; +        * physical swapfile of this size needs too.
+&gt; +        */
+&gt; +       maxpages = min(swapfile_maximum_size,
+&gt; +                      ALIGN_DOWN((unsigned long)REFCOUNT_MAX, SWAPFILE_CLUSTER));
+&gt; +       /*
+&gt; +        * SWP_WRITEOK enables slot allocation. SWP_SOLIDSTATE selects
+&gt; +        * per-CPU cluster allocation; vswap has no si-&gt;global_cluster.
+&gt; +        */
+&gt; +       si-&gt;flags |= SWP_VSWAP | SWP_SOLIDSTATE | SWP_WRITEOK;
+&gt; +       si-&gt;ops = &amp;vswap_ops;
+&gt; +       si-&gt;bdev = NULL;
+&gt; +       si-&gt;max = maxpages;
+&gt; +       si-&gt;pages = maxpages - 1;
+&gt; +
+&gt; +       INIT_WORK(&amp;si-&gt;discard_work, swap_discard_work);
+&gt; +       INIT_WORK(&amp;si-&gt;reclaim_work, swap_reclaim_work);
+&gt; +
+&gt; +       err = setup_swap_clusters_info(si, NULL, maxpages);
+&gt; +       if (err)
+&gt; +               goto fail;
+&gt; +
+&gt; +       mutex_lock(&amp;swapon_mutex);
+&gt; +       enable_swap_info(si);
+&gt; +       mutex_unlock(&amp;swapon_mutex);
+&gt; +
+&gt; +       vswap_si = si;
+&gt; +       pr_info(&quot;vswap: created virtual swap device (%lu pages)\n&quot;, maxpages);
+&gt; +
+&gt; +       /* Last: everything above must be visible before routing starts. */
+&gt; +       static_branch_enable(&amp;vswap_key);
+&gt; +       return 0;
+&gt; +
+&gt; +fail:
+&gt; +       pr_warn(&quot;vswap: setup_swap_clusters_info failed (%d); vswap disabled, swapout falls back to direct physical swap\n&quot;,
+&gt; +               err);
+&gt; +       spin_lock(&amp;swap_lock);
+&gt; +       si-&gt;flags = 0;
+&gt; +       spin_unlock(&amp;swap_lock);
+&gt; +       return 0;
+&gt; +}
+&gt; +late_initcall(vswap_init);
+&gt; diff --git a/mm/vswap.h b/mm/vswap.h
+&gt; new file mode 100644
+&gt; index 000000000000..16395f357955
+&gt; --- /dev/null
+&gt; +++ b/mm/vswap.h
+&gt; @@ -0,0 +1,34 @@
+&gt; +/* SPDX-License-Identifier: GPL-2.0 */
+&gt; +/*
+&gt; + * Virtual swap space
+&gt; + *
+&gt; + * Copyright (C) 2026 Nhat Pham
+&gt; + */
+&gt; +#ifndef _MM_VSWAP_H
+&gt; +#define _MM_VSWAP_H
+&gt; +
+&gt; +#include &lt;linux/jump_label.h&gt;
+&gt; +#include &lt;linux/swap.h&gt;
+&gt; +#include &quot;swap.h&quot;
+&gt; +
+&gt; +#ifdef CONFIG_SWAP
+&gt; +
+&gt; +DECLARE_STATIC_KEY_FALSE(vswap_key);
+&gt; +
+&gt; +/*
+&gt; + * Only true once vswap_init() has published vswap_si, so callers never
+&gt; + * see the device half built.
+&gt; + */
+&gt; +static inline bool vswap_is_enabled(void)
+&gt; +{
+&gt; +       return static_branch_unlikely(&amp;vswap_key);
+&gt; +}
+&gt; +
+&gt; +static inline bool is_vswap_entry(swp_entry_t entry)
+&gt; +{
+&gt; +       return swap_is_vswap(__swap_entry_to_info(entry));
+&gt; +}
+&gt; +
+&gt; +#endif /* CONFIG_SWAP */
+&gt; +
+&gt; +#endif /* _MM_VSWAP_H */
+&gt; diff --git a/mm/zswap.c b/mm/zswap.c
+&gt; index 507f2d19fd2a..73728b510ff6 100644
+&gt; --- a/mm/zswap.c
+&gt; +++ b/mm/zswap.c
+&gt; @@ -1018,6 +1018,12 @@ static int zswap_writeback_entry(struct zswap_entry *entry,
+&gt;         if (IS_ERR_OR_NULL(si))
+&gt;                 return -ENOENT;
+&gt;
+&gt; +       /* Vswap entries have no physical backing to write to. */
+&gt; +       if (swap_is_vswap(si)) {
+&gt; +               put_swap_device(si);
+&gt; +               return -EINVAL;
+&gt; +       }
+&gt; +
+&gt;         mpol = get_task_policy(current);
+&gt;         folio = swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,
+&gt;                                        NO_INTERLEAVE_INDEX);
+&gt; --
+&gt; 2.53.0-Meta
+&gt;</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
 <a href="https://lore.kernel.org/r/CACePvbVaDNspMDSw_qAcapKAzXj3JGV-KMYmow7aePa0POHpSg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: excessive use of swap_is_vswap(), code path fragmentation, requested changes</div>
+<div class="review-comment-signals">Signals: cgroup, refcount</div>
 </div>
 </div>
-<div class="thread-node depth-0">
+<div class="thread-node depth-0" id="2026-09-24">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Chris Li</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<a class="date-chip" href="../2026-09-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Chris Li expressed opposition to making the virtual swap device a special device, citing that it&#x27;s similar in concept to xswap, which is a normal swap device implemented via swap_ops.
-
-Reviewer Chris Li noted that the design of the virtual swap device infrastructure has both pros and cons, but did not specify any technical issues or concerns.
-
-Reviewer Chris Li questioned the handling of uncompressible pages in vswap, suggesting that xswap should store them instead of rejecting them, and noted that zswap also stores some uncompressible pages.
-
-Reviewer Chris Li suggested removing the swap_is_xswap() check and noted that xswap has different requirements compared to zswap, as it does not have a writeback enable interface.
-
-Reviewer Chris Li noted that the issue of swap table lookup under RCU being slow is a problem area not specific to vswap, but rather a general issue in the core swap layer, and plans exist to improve it.
-
-Reviewer Chris Li suggested using Baoquan&#x27;s writeback series as a base for the patch, citing it as closer to their own vision and a more suitable starting point.
-
-Reviewer Chris Li suggested taking a swap_ops approach to eliminate the need for swap_is_vswap() and offered collaboration, but the patch author did not follow this suggestion; he also recommended following Baoquan&#x27;s xswap writeback patch series instead.
-
-Reviewer Chris Li expressed concerns that the vswap implementation will break existing /etc/fstab configurations, including support for UUIDs, and may start using swap space without explicit user enablement, which changes the previous behavior and mental model of users. He suggested adopting a design philosophy where swap devices are treated as VFS-like file systems, allowing for future flash-friendly swap file systems.
-
-Reviewer Chris Li expressed strong disagreement with the patch series due to its perceived lack of cleanliness, specifically disliking special cases and trying to minimize their use.</div>
+<div class="review-comment-text">Reviewer Chris Li expressed concerns about code fragmentation due to excessive use of swap_is_vswap() checks, which makes the code harder to reason about and creates lock ordering issues. He suggested that vswap should be treated as a special device with its own requirements, rather than being implemented via swap_ops like ext4 is on top of VFS.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Ack, that is why I am against making it a special device. That is the
+<pre class="raw-body-text">On Thu, Sep 24, 2026 at 6:20 AM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt;
+&gt; On Wed, Sep 23, 2026 at 2:18 AM Chris Li &lt;chrisl@kernel.org&gt; wrote:
+&gt; &gt;
+&gt; &gt;
+&gt; &gt; There are too many swap_is_vswap() in this series. It fragments the
+&gt; &gt; code path, making things harder to reason about. Esepcially around
+&gt; &gt; locks. I count 22 in this patch alone.
+&gt; &gt;
+&gt; &gt; I consider this the biggest drawback of this series. This
+&gt; &gt; fragmentation of the code path.
+&gt;
+&gt; This will mirror my response at [1], but I&#x27;m responding here for the
+&gt; record and for your convenience.
+
+Thank you. Really appriciate that.
+
+&gt; It is needed because vswap *is* a special device, with its own
+&gt; requirements. If you don&#x27;t special case-it, you&#x27;d get undesirable
+&gt; behaviors.
+
+Ack, that is why I am against making it a special device. That is the
 whole idea behind xswap. It is just normal swap device implemented via
 swap_ops just like ext4 is a file system implemnet on top of VFS.
 
----
+&gt; Let&#x27;s take Baoquan&#x27;s patch series as an example.  It treats the xswap
+&gt; device as just another swap device, without any special consideration
+&gt; for it. Which creates several problem:
 
 That is a careful design choice. Keep in mind that design choice
 usually has pros and cons.
 
 I will follow your feedback here.
 
----
+&gt; 1. At allocation time, cgroups that disable zswap might get an xswap
+&gt; slot, because you don&#x27;t do any check that the device you allocating
+&gt; the swap slots for is xswap. At swap_writeout() time, it is *stuck* -
+&gt; we already do the unmapping step, so we cannot reclaim the page.
+&gt;
+&gt; Ironically a physical swapfile backend could have bailed us out here,
+&gt; but it&#x27;s not in that patch series yet :)
 
 I am not sure I follow. Are you referring to the uncompressible pages
 that xswap would have to reject?
@@ -327,13 +1395,21 @@ the reclaim LRU. Zswap also stores some uncompressible pages. The last
 time I checked, it was unfortunately not able to serve my case but
 perfect for yours.
 
----
+&gt; Vswap both has swapfile backend, AND allows you to bypass it if the
+&gt; cgroup disables zswap. Both involves a bit of swap_is_vswap() check,
+&gt; but I think it&#x27;s worth it :)
 
 If xswap needs the lower tier it can allocate for one. I don&#x27;t think
 xswap should need to have swap_is_xswap() there. Also xswap does not
 have all the baggage of zswap.writeback enable interface.
 
----
+
+&gt;
+&gt; 2. Per-CPU allocation caching: since all devices share the same cache,
+&gt; xswap will invalidate the caching of other devices, and vice versa. It
+&gt; would be fine if the these devices are interchangeable, but as noted
+&gt; above, it&#x27;s not, especially without physical swapfile as the backend
+&gt; option. So you&#x27;re forced to taken the slow path more often.
 
 This will be addressed by the swap tiers series if it is not delayed.
 This should be addressed in the core swap layer not vswap. Kairui also
@@ -341,13 +1417,24 @@ has some ideas to improve that. Yes, it is a problem area, but it is
 not specific to xswap. We are well aware of it and have plans to
 improve it.
 
----
+&gt;
+&gt; Vswap gets around this by adding its own per-cpu allocation caching,
+&gt;
+&gt; So by being too lazy and not carefully distinguish the swap devices,
+&gt; not only does xswap not work for the writeback use case, it cannot
+&gt; even work in deployments where some workloads (cgroup) select zswap,
+&gt; whereas others select disk swap. It can only work if you intend to
+&gt; have a single class of device - either virtual/xswap or disk swap -
+&gt; but not both.
 
 Baoquan&#x27;s writeback series is out. It is by no means perfect. But it
 is much closer to what I have in mind. That is a much better base to
 work on.
-
----
+&gt;
+&gt; Maybe instead of just grepping for swap_is_vswap() and throw your hand
+&gt; at the complexity, read the code and try to understand why it&#x27;s
+&gt; necessary first, then propose simplifications if you have good ideas
+&gt; in minds.
 
 Yes, I already read your code I decide that most of the
 swap_is_vswap() should not be needed if taking a proper swap_ops
@@ -366,7 +1453,16 @@ less.&quot;
 Anyway, Baoquan&#x27;s xswap writeback patch series is out. I suggest
 following and improving that series instead.
 
----
+&gt; &gt; This is questionable. A vswap device does not go through swap on.
+&gt; &gt;
+&gt; &gt; This changes the behavior where swap devices always go through swap on/off.
+&gt; &gt;
+&gt; &gt; I wish the swap device went through swap on to be able to start swapping.
+&gt; &gt;
+
+&gt;
+&gt; What usecase would necessitate the need for swapon/swapoff interface?
+&gt; Other than just trying to shoehorn it to an existing interface?
 
 I like universal interfaces. Your vswap will break the /etc/fstab. The
 current suggestion for xswap using sysfs will break that as well.
@@ -386,32 +1482,133 @@ different file system to create them.
 This aligns neatly with swap ops and makes room for future
 flash-friendly swap file systems for example.
 
----
+&gt; I&#x27;ve expressed why I dislike the interface in [1]. Other than the
+&gt; sizing aspect, which we are already discussing in another thread,
+&gt; priority also makes zero sense. You are literally exposing an
+&gt; interface with only one correct answer - what&#x27;s the point?
+&gt;
+&gt; Justify your interface choice with real userspace use case, not just by
+&gt; conforming to the status quo.
 
 That is why I feel your patch series are really unclean. I dislike
 special cases, I try to avoid them as much as possible.
 
+Chris
+
+&gt;
+&gt; [1]: https://lore.kernel.org/all/CAKEwX=PEEkYiNRaVhCuM4E6mxB9huPKfkDa4m62VMTzedg1oYw@mail.gmail.com/
+
+---
+
+On Thu, Sep 24, 2026 at 8:13 AM Rik van Riel &lt;riel@surriel.com&gt; wrote:
+&gt;
+&gt; On Tue, 2026-09-22 at 23:18 -1000, Chris Li wrote:
+&gt; &gt; On Fri, Sep 18, 2026 at 1:03 PM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt; &gt; &gt;
+&gt; &gt; &gt;
+&gt; &gt; &gt; @@ -482,6 +491,11 @@ void swap_read_folio(struct swap_io_ctx *ctx,
+&gt; &gt; &gt; struct folio *folio)
+&gt; &gt; &gt;         if (zswap_load(folio) != -ENOENT)
+&gt; &gt; &gt;                 goto finish;
+&gt; &gt; &gt;
+&gt; &gt; &gt; +       if (unlikely(swap_is_vswap(sis))) {
+&gt; &gt;
+&gt; &gt; There are too many swap_is_vswap() in this series. It fragments the
+&gt; &gt; code path, making things harder to reason about. Esepcially around
+&gt; &gt; locks. I count 22 in this patch alone.
+&gt; &gt;
+&gt; &gt; I consider this the biggest drawback of this series. This
+&gt; &gt; fragmentation of the code path.
+&gt;
+&gt; Could we avoid that by simply always having everything
+&gt; go through the vswap abstraction layer?
+
+Yes, but it will pay the price for going through the unnecessary
+redirection layer always. It incurs performance and meta data
+overhead. That was one of my previous objections to the earlier vswap
+version. Sorry I enjoy micro optimization too much, that is both my
+strength and weakness.
+
+&gt;
+&gt; When everything in vswap, we don&#x27;t need to test for it.
+&gt;
+I&#x27;ve been there and done that, the result was pretty bad in those
+earlier series.
+
+&gt; Handling the details of what&#x27;s behind the vswap would
+&gt; be handled one layer down.
+&gt;
+&gt; Chris, do you think that would be cleaner?
+
+If it can wrap below the swap_ops, it is just priviate inernal dedail
+of implementing its own indirections. That would be much cleaner. That
+is what I am trying to pitch to Nhat in prevoius email but does not
+have following actions.
+
+Chris
+
+&gt;
+&gt; What am I missing?
+&gt;
+&gt; --
+&gt; All Rights Reversed.
+
+---
+
+On Thu, Sep 24, 2026 at 3:15 PM Rik van Riel &lt;riel@surriel.com&gt; wrote:
+&gt;
+&gt; On Thu, 2026-09-24 at 14:43 -1000, Chris Li wrote:
+&gt; &gt; On Thu, Sep 24, 2026 at 6:20 AM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt; &gt; &gt;
+&gt; &gt;
+&gt; &gt; &gt; It is needed because vswap *is* a special device, with its own
+&gt; &gt; &gt; requirements. If you don&#x27;t special case-it, you&#x27;d get undesirable
+&gt; &gt; &gt; behaviors.
+&gt; &gt;
+&gt; &gt; Ack, that is why I am against making it a special device. That is the
+&gt; &gt; whole idea behind xswap. It is just normal swap device implemented
+&gt; &gt; via
+&gt; &gt; swap_ops just like ext4 is a file system implemnet on top of VFS.
+&gt;
+&gt; The filesystem layer is relatively clean because
+&gt; it has a VFS.
+&gt;
+&gt; Are you saying it is time we have a similar
+&gt; abstraction layer on the swap side?
+
+Yes, you understand me well. The swap side VFS already started as
+swap_ops. I give a LSF/MM talk on it as well. It is already cleaning
+up some ZRAM special cases in the block layer. That is what xswap is
+building on top of.
+
 Chris</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
 <a href="https://lore.kernel.org/r/CACePvbVQsHXt4=+qfKz-KTar9CG+3OiAfLd1EZgnRE-1gyoKOQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: opposition, requested changes, no specific technical issue raised</div>
+<div class="review-comment-signals">Signals: code fragmentation, lock ordering issues</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-09-24">
+</div>
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Nhat Pham (author)</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<a class="date-chip" href="../2026-09-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author is addressing concerns about treating vswap as a special device due to its unique requirements and behaviors. They argue that not special casing it would lead to undesirable outcomes, such as stuck allocations and per-CPU caching issues. The author suggests that the current implementation is necessary to handle the complexities of vswap and proposes that reviewers should understand the code before proposing simplifications.
-
-The author is addressing a concern about the swapon/swapoff interface, specifically questioning its necessity and usefulness. They express their dislike for the interface and ask the reviewer to provide a real-world use case that justifies its existence.</div>
+<div class="review-comment-text">Author addressed Chris Li&#x27;s concern about swap_is_vswap() being used too frequently in the patch series, explaining that vswap is a special device requiring its own special case handling to avoid undesirable behaviors. The author provided examples from Baoquan&#x27;s xswap patch series and argued that treating vswap as just another swap device would lead to problems such as stuck pages and incorrect allocation caching. Chris Li responded by acknowledging the need for careful design choices, but also expressing concerns about making vswap a special device.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">This will mirror my response at [1], but I&#x27;m responding here for the
+<pre class="raw-body-text">On Wed, Sep 23, 2026 at 2:18 AM Chris Li &lt;chrisl@kernel.org&gt; wrote:
+&gt;
+&gt;
+&gt; There are too many swap_is_vswap() in this series. It fragments the
+&gt; code path, making things harder to reason about. Esepcially around
+&gt; locks. I count 22 in this patch alone.
+&gt;
+&gt; I consider this the biggest drawback of this series. This
+&gt; fragmentation of the code path.
+
+This will mirror my response at [1], but I&#x27;m responding here for the
 record and for your convenience.
 
 It is needed because vswap *is* a special device, with its own
@@ -454,7 +1651,14 @@ at the complexity, read the code and try to understand why it&#x27;s
 necessary first, then propose simplifications if you have good ideas
 in minds.
 
----
+&gt;
+&gt; This is questionable. A vswap device does not go through swap on.
+&gt;
+&gt; This changes the behavior where swap devices always go through swap on/off.
+&gt;
+&gt; I wish the swap device went through swap on to be able to start swapping.
+&gt;
+&gt; Chris
 
 What usecase would necessitate the need for swapon/swapoff interface?
 Other than just trying to shoehorn it to an existing interface?
@@ -467,26 +1671,295 @@ interface with only one correct answer - what&#x27;s the point?
 Justify your interface choice with real userspace use case, not just by
 conforming to the status quo.
 
-[1]: https://lore.kernel.org/all/CAKEwX=PEEkYiNRaVhCuM4E6mxB9huPKfkDa4m62VMTzedg1oYw@mail.gmail.com/</pre>
+[1]: https://lore.kernel.org/all/CAKEwX=PEEkYiNRaVhCuM4E6mxB9huPKfkDa4m62VMTzedg1oYw@mail.gmail.com/
+
+---
+
+On Thu, Sep 24, 2026 at 5:44 PM Chris Li &lt;chrisl@kernel.org&gt; wrote:
+&gt;
+&gt; On Thu, Sep 24, 2026 at 6:20 AM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt; &gt;
+&gt; &gt; On Wed, Sep 23, 2026 at 2:18 AM Chris Li &lt;chrisl@kernel.org&gt; wrote:
+&gt; &gt; &gt;
+&gt; &gt; &gt;
+&gt; &gt; &gt; There are too many swap_is_vswap() in this series. It fragments the
+&gt; &gt; &gt; code path, making things harder to reason about. Esepcially around
+&gt; &gt; &gt; locks. I count 22 in this patch alone.
+&gt; &gt; &gt;
+&gt; &gt; &gt; I consider this the biggest drawback of this series. This
+&gt; &gt; &gt; fragmentation of the code path.
+&gt; &gt;
+&gt; &gt; This will mirror my response at [1], but I&#x27;m responding here for the
+&gt; &gt; record and for your convenience.
+&gt;
+&gt; Thank you. Really appriciate that.
+&gt;
+&gt; &gt; It is needed because vswap *is* a special device, with its own
+&gt; &gt; requirements. If you don&#x27;t special case-it, you&#x27;d get undesirable
+&gt; &gt; behaviors.
+&gt;
+&gt; Ack, that is why I am against making it a special device. That is the
+&gt; whole idea behind xswap. It is just normal swap device implemented via
+&gt; swap_ops just like ext4 is a file system implemnet on top of VFS.
+&gt;
+&gt; &gt; Let&#x27;s take Baoquan&#x27;s patch series as an example.  It treats the xswap
+&gt; &gt; device as just another swap device, without any special consideration
+&gt; &gt; for it. Which creates several problem:
+&gt;
+&gt; That is a careful design choice. Keep in mind that design choice
+&gt; usually has pros and cons.
+&gt;
+&gt; I will follow your feedback here.
+&gt;
+&gt; &gt; 1. At allocation time, cgroups that disable zswap might get an xswap
+&gt; &gt; slot, because you don&#x27;t do any check that the device you allocating
+&gt; &gt; the swap slots for is xswap. At swap_writeout() time, it is *stuck* -
+&gt; &gt; we already do the unmapping step, so we cannot reclaim the page.
+&gt; &gt;
+&gt; &gt; Ironically a physical swapfile backend could have bailed us out here,
+&gt; &gt; but it&#x27;s not in that patch series yet :)
+&gt;
+&gt; I am not sure I follow. Are you referring to the uncompressible pages
+&gt; that xswap would have to reject?
+&gt;
+&gt; One way to address that is for xswap to just bite the bullet and store
+&gt; the uncompressible pages within xswap. That way it will stay out of
+&gt; the reclaim LRU. Zswap also stores some uncompressible pages. The last
+&gt; time I checked, it was unfortunately not able to serve my case but
+&gt; perfect for yours.
+
+Not even that. Say you have two kind of workloads in the same host:
+workload enables disk swap but disable zswap (zswap.max = 0), and
+workload that wants zswap. Let&#x27;s even ignore writeback for now.
+
+You add 2 &quot;swap devices&quot; to the system: xswap and NVME swapfile.
+
+At swap allocation time, xswap patch series does not check carefully
+which swap device is being used, so you might get an xswap slot for
+the cgroup that disables zswap. You&#x27;re stuck at swap_writeout() time.
+You can&#x27;t undo it anymore, and you don&#x27;t even support the physical
+swapfile backend to fallback.
+
+
+&gt;
+&gt; &gt; Vswap both has swapfile backend, AND allows you to bypass it if the
+&gt; &gt; cgroup disables zswap. Both involves a bit of swap_is_vswap() check,
+&gt; &gt; but I think it&#x27;s worth it :)
+&gt;
+&gt; If xswap needs the lower tier it can allocate for one. I don&#x27;t think
+&gt; xswap should need to have swap_is_xswap() there. Also xswap does not
+&gt; have all the baggage of zswap.writeback enable interface.
+
+But that&#x27;s my point. As of now, it does not. Unless you merge the
+other RFC series, which brings it to roughly the same size as what I&#x27;m
+doing here.
+
+&gt;
+&gt;
+&gt; &gt;
+&gt; &gt; 2. Per-CPU allocation caching: since all devices share the same cache,
+&gt; &gt; xswap will invalidate the caching of other devices, and vice versa. It
+&gt; &gt; would be fine if the these devices are interchangeable, but as noted
+&gt; &gt; above, it&#x27;s not, especially without physical swapfile as the backend
+&gt; &gt; option. So you&#x27;re forced to taken the slow path more often.
+&gt;
+&gt; This will be addressed by the swap tiers series if it is not delayed.
+&gt; This should be addressed in the core swap layer not vswap. Kairui also
+&gt; has some ideas to improve that. Yes, it is a problem area, but it is
+&gt; not specific to xswap. We are well aware of it and have plans to
+&gt; improve it.
+
+
+Which is 2 massive patch series away. Also, I don&#x27;t know how close we
+are to reaching a consensus on swap.tier. I defer that to memcg
+maintainers.
+
+&gt;
+&gt; &gt;
+&gt; &gt; Vswap gets around this by adding its own per-cpu allocation caching,
+&gt; &gt;
+&gt; &gt; So by being too lazy and not carefully distinguish the swap devices,
+&gt; &gt; not only does xswap not work for the writeback use case, it cannot
+&gt; &gt; even work in deployments where some workloads (cgroup) select zswap,
+&gt; &gt; whereas others select disk swap. It can only work if you intend to
+&gt; &gt; have a single class of device - either virtual/xswap or disk swap -
+&gt; &gt; but not both.
+&gt;
+&gt; Baoquan&#x27;s writeback series is out. It is by no means perfect. But it
+&gt; is much closer to what I have in mind. That is a much better base to
+&gt; work on.
+
+It&#x27;s *literally* the same design as me, from a metadata design. The
+only difference is:
+
+1. It moves the metadata from a new dynamic cluster struct and shoves
+it into the existing physical struct.
+
+Like, you can check patch 11 of this series. It&#x27;s practically the same
+thing, with the only difference being ou
+
+&gt; &gt;
+&gt; &gt; Maybe instead of just grepping for swap_is_vswap() and throw your hand
+&gt; &gt; at the complexity, read the code and try to understand why it&#x27;s
+&gt; &gt; necessary first, then propose simplifications if you have good ideas
+&gt; &gt; in minds.
+&gt;
+&gt; Yes, I already read your code I decide that most of the
+&gt; swap_is_vswap() should not be needed if taking a proper swap_ops
+&gt; approach. I wanted to offer you the chance to work closely with me to
+&gt; achieve that, but you did not follow that suggestion.
+&gt;
+&gt; Quote from my old email:
+&gt; https://lore.kernel.org/all/CACePvbX+3tO91BmRwaLqf3Xia32GCemt3W8tayErG81BYLgrzA@mail.gmail.com/
+&gt;
+&gt; &quot;I am happy to spend some time working with you to discuss the generic
+&gt; adopted version of vswap, if you are open to it. Or if you don&#x27;t want
+&gt; to waste time on it. I can have someone else or myself come up with
+&gt; the generic adopted version of vswap for you to review, which I prefer
+&gt; less.&quot;
+&gt;
+&gt; Anyway, Baoquan&#x27;s xswap writeback patch series is out. I suggest
+&gt; following and improving that series instead.
+&gt;
+&gt; &gt; &gt; This is questionable. A vswap device does not go through swap on.
+&gt; &gt; &gt;
+&gt; &gt; &gt; This changes the behavior where swap devices always go through swap on/off.
+&gt; &gt; &gt;
+&gt; &gt; &gt; I wish the swap device went through swap on to be able to start swapping.
+&gt; &gt; &gt;
+&gt;
+&gt; &gt;
+&gt; &gt; What usecase would necessitate the need for swapon/swapoff interface?
+&gt; &gt; Other than just trying to shoehorn it to an existing interface?
+&gt;
+&gt; I like universal interfaces. Your vswap will break the /etc/fstab. The
+&gt; current suggestion for xswap using sysfs will break that as well.
+&gt; I would like to keep the /etc/fstab interface working, including
+&gt; support for UUIDs for swap devices, etc.
+
+&quot;Universal interfaces&quot; is not a use case. None of the thing you list
+out here is a use case. It&#x27;s an interface, but you have not
+constructed a single use case to justify all of that.
+
+&gt; I am very concerned that vswap will start kicking in without me
+&gt; explicitly enabling it. That changes the previous user-visible
+&gt; behavior. It breaks my mental model. Please take this feedback
+&gt; seriously.
+
+I mean, there&#x27;s a knob for it. How can it start kicking in without
+your enablement?
+
+
+&gt;
+&gt; &gt; I&#x27;ve expressed why I dislike the interface in [1]. Other than the
+&gt; &gt; sizing aspect, which we are already discussing in another thread,
+&gt; &gt; priority also makes zero sense. You are literally exposing an
+&gt; &gt; interface with only one correct answer - what&#x27;s the point?
+&gt; &gt;
+&gt; &gt; Justify your interface choice with real userspace use case, not just by
+&gt; &gt; conforming to the status quo.
+&gt;
+&gt; That is why I feel your patch series are really unclean. I dislike
+&gt; special cases, I try to avoid them as much as possible.
+
+Again, your disliking something is not a use case.
+
+---
+
+On Fri, Sep 25, 2026 at 11:04 AM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt;
+&gt;
+&gt;
+&gt; 1. It moves the metadata from a new dynamic cluster struct and shoves
+&gt; it into the existing physical struct.
+&gt;
+&gt; Like, you can check patch 11 of this series. It&#x27;s practically the same
+&gt; thing, with the only difference being ou
+
+being our interface choice.
+
+Sorry that got cut off. I must have accidentally deleted it.
+
+---
+
+On Thu, Sep 24, 2026 at 6:17 PM Chris Li &lt;chrisl@kernel.org&gt; wrote:
+&gt;
+&gt; On Thu, Sep 24, 2026 at 8:13 AM Rik van Riel &lt;riel@surriel.com&gt; wrote:
+&gt;
+&gt; Yes, but it will pay the price for going through the unnecessary
+&gt; redirection layer always. It incurs performance and meta data
+&gt; overhead. That was one of my previous objections to the earlier vswap
+&gt; version. Sorry I enjoy micro optimization too much, that is both my
+&gt; strength and weakness.
+&gt;
+&gt; &gt;
+&gt; &gt; When everything in vswap, we don&#x27;t need to test for it.
+&gt; &gt;
+&gt; I&#x27;ve been there and done that, the result was pretty bad in those
+&gt; earlier series.
+&gt;
+&gt; &gt; Handling the details of what&#x27;s behind the vswap would
+&gt; &gt; be handled one layer down.
+&gt; &gt;
+&gt; &gt; Chris, do you think that would be cleaner?
+&gt;
+&gt; If it can wrap below the swap_ops, it is just priviate inernal dedail
+&gt; of implementing its own indirections. That would be much cleaner. That
+&gt; is what I am trying to pitch to Nhat in prevoius email but does not
+&gt; have following actions.
+
+Registering vswap&#x27;s operation as into swap_ops isn&#x27;t too hard. I
+frankly don&#x27;t see much wins to it for vswap itself, but it&#x27;s not hard
+to do if you like it.
+
+What I&#x27;m disagreeing is treating it as &quot;just another swap device&quot;. The
+implementation shares a lot of swap device&#x27;s machinery, so I have
+don&#x27;t mind adopting it, but you can&#x27;t treat it like a normal swap
+device, and expose it to userspace like one. You get issues with
+allocations internally, and externally you give userspace a vector to
+misconfigure with device priority.
+
+That&#x27;s why I&#x27;ve been insisting on what&#x27;s the use case that motivates
+these aspects of the interface that you&#x27;re interested in. A pretty
+design is not a real usecase, especially one that creates problems
+with userspace misconfigurations.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Chris Li</div>
 <a href="https://lore.kernel.org/r/CAKEwX=OP3Gb9sVOvch+p4j7quzgy-rUY=UTZau5ztMj7heJJoA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: author presents a technical explanation, author asks reviewer to consider complexity, questioning</div>
+<div class="review-comment-signals">Signals: acknowledged, explained</div>
 </div>
 </div>
-<div class="thread-node depth-1">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Rik Riel</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<a class="date-chip" href="../2026-09-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
+<span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Rik Riel suggested refactoring the code to have all vswap operations go through a single abstraction layer, which would simplify testing and handling of underlying details.</div>
+<div class="review-comment-text">Rik Riel expressed concern about the code path fragmentation caused by repeated use of swap_is_vswap() in the patch series, which he believes makes it harder to reason about locks and considers this the biggest drawback of the series.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Could we avoid that by simply always having everything
+<pre class="raw-body-text">On Tue, 2026-09-22 at 23:18 -1000, Chris Li wrote:
+&gt; On Fri, Sep 18, 2026 at 1:03 PM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt; &gt; 
+&gt; &gt; 
+&gt; &gt; @@ -482,6 +491,11 @@ void swap_read_folio(struct swap_io_ctx *ctx,
+&gt; &gt; struct folio *folio)
+&gt; &gt;         if (zswap_load(folio) != -ENOENT)
+&gt; &gt;                 goto finish;
+&gt; &gt; 
+&gt; &gt; +       if (unlikely(swap_is_vswap(sis))) {
+&gt; 
+&gt; There are too many swap_is_vswap() in this series. It fragments the
+&gt; code path, making things harder to reason about. Esepcially around
+&gt; locks. I count 22 in this patch alone.
+&gt; 
+&gt; I consider this the biggest drawback of this series. This
+&gt; fragmentation of the code path.
+
+Could we avoid that by simply always having everything
 go through the vswap abstraction layer?
 
 When everything in vswap, we don&#x27;t need to test for it.
@@ -499,120 +1972,70 @@ Chris, do you think that would be cleaner?
 What am I missing?
 
 -- 
-All Rights Reversed.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Chris Li</div>
-<a href="https://lore.kernel.org/r/7571f005bca65aa4ad5e7ec89e62801ad058b689.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Chris Li</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Chris Li expressed concern about performance overhead due to unnecessary redirection layer in the virtual swap device infrastructure, echoing a previous objection to an earlier vswap version.
-
-Reviewer Chris Li expressed strong disagreement with the patch series based on past experience with earlier versions of the code.
-
-Reviewer Chris Li suggested that the virtual swap device infrastructure could be simplified by implementing its own indirections, similar to how swap_ops works, and proposed this as a cleaner alternative.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Yes, but it will pay the price for going through the unnecessary
-redirection layer always. It incurs performance and meta data
-overhead. That was one of my previous objections to the earlier vswap
-version. Sorry I enjoy micro optimization too much, that is both my
-strength and weakness.
+All Rights Reversed.
 
 ---
 
-I&#x27;ve been there and done that, the result was pretty bad in those
-earlier series.
+On Thu, 2026-09-24 at 14:43 -1000, Chris Li wrote:
+&gt; On Thu, Sep 24, 2026 at 6:20 AM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt; &gt; 
+&gt; 
+&gt; &gt; It is needed because vswap *is* a special device, with its own
+&gt; &gt; requirements. If you don&#x27;t special case-it, you&#x27;d get undesirable
+&gt; &gt; behaviors.
+&gt; 
+&gt; Ack, that is why I am against making it a special device. That is the
+&gt; whole idea behind xswap. It is just normal swap device implemented
+&gt; via
+&gt; swap_ops just like ext4 is a file system implemnet on top of VFS.
 
----
-
-If it can wrap below the swap_ops, it is just priviate inernal dedail
-of implementing its own indirections. That would be much cleaner. That
-is what I am trying to pitch to Nhat in prevoius email but does not
-have following actions.
-
-Chris</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Rik Riel</div>
-<a href="https://lore.kernel.org/r/CACePvbV-tazW=LmsbUtAhHzR2d6JwFT5R1jYZ9_NTp1hxXH=bw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: performance, overhead, past experience</div>
-</div>
-</div>
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Chris Li</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Chris Li pointed out that this patch builds upon existing work from the swap side VFS, specifically mentioning his own LSF/MM talk and the xswap project, which is already cleaning up ZRAM special cases in the block layer.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Yes, you understand me well. The swap side VFS already started as
-swap_ops. I give a LSF/MM talk on it as well. It is already cleaning
-up some ZRAM special cases in the block layer. That is what xswap is
-building on top of.
-
-Chris</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Rik Riel</div>
-<a href="https://lore.kernel.org/r/CACePvbWMd+SVgriqB=ZU=kmAL80kc+iJ5x4TMc3=gn7py4Ly7g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledgment, context</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Rik Riel</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer Rik Riel questioned whether a similar abstraction layer to VFS should be introduced for swap, noting that filesystems have a built-in abstraction layer.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">The filesystem layer is relatively clean because
+The filesystem layer is relatively clean because
 it has a VFS.
 
 Are you saying it is time we have a similar
 abstraction layer on the swap side?
 
 -- 
-All Rights Reversed.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Chris Li</div>
-<a href="https://lore.kernel.org/r/12541da81f59db27af46096db8da5d425135a162.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: questioning, inquiry</div>
-</div>
-</div>
-<div class="thread-node depth-1">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Rik Riel</span>
-<a class="date-chip" href="../2026-09-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-24">2026-09-24</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Rik Riel questioned the necessity of an additional lookup in the vswap layer when the data is already in the swap cache or a slower back-end, suggesting that micro optimizations may not be worth the added complexity.
+All Rights Reversed.
 
-Reviewer Rik Riel requested a detailed discussion on the design of virtual swap device infrastructure, including data structures, operations at abstraction and swap layers, migration handling, and ideal design in case of disagreements.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">We really only have two cases here, don&#x27;t we?
+---
+
+On Thu, 2026-09-24 at 15:17 -1000, Chris Li wrote:
+&gt; On Thu, Sep 24, 2026 at 8:13 AM Rik van Riel &lt;riel@surriel.com&gt;
+&gt; wrote:
+&gt; &gt; 
+&gt; &gt; On Tue, 2026-09-22 at 23:18 -1000, Chris Li wrote:
+&gt; &gt; &gt; On Fri, Sep 18, 2026 at 1:03 PM Nhat Pham &lt;nphamcs@gmail.com&gt;
+&gt; &gt; &gt; wrote:
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; @@ -482,6 +491,11 @@ void swap_read_folio(struct swap_io_ctx
+&gt; &gt; &gt; &gt; *ctx,
+&gt; &gt; &gt; &gt; struct folio *folio)
+&gt; &gt; &gt; &gt;         if (zswap_load(folio) != -ENOENT)
+&gt; &gt; &gt; &gt;                 goto finish;
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; +       if (unlikely(swap_is_vswap(sis))) {
+&gt; &gt; &gt; 
+&gt; &gt; &gt; There are too many swap_is_vswap() in this series. It fragments
+&gt; &gt; &gt; the
+&gt; &gt; &gt; code path, making things harder to reason about. Esepcially
+&gt; &gt; &gt; around
+&gt; &gt; &gt; locks. I count 22 in this patch alone.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; I consider this the biggest drawback of this series. This
+&gt; &gt; &gt; fragmentation of the code path.
+&gt; &gt; 
+&gt; &gt; Could we avoid that by simply always having everything
+&gt; &gt; go through the vswap abstraction layer?
+&gt; 
+&gt; Yes, but it will pay the price for going through the unnecessary
+&gt; redirection layer always. It incurs performance and meta data
+&gt; overhead. That was one of my previous objections to the earlier vswap
+&gt; version. Sorry I enjoy micro optimization too much, that is both my
+&gt; strength and weakness.
+
+We really only have two cases here, don&#x27;t we?
 
 Either the data is in the swap cache, and
 the vswap layer can directly look up the
@@ -626,8 +2049,18 @@ If the micro optimization come at the cost
 of less flexibility, and harder to maintain
 code, are they really worth it?
 
----
-
+&gt; 
+&gt; &gt; Handling the details of what&#x27;s behind the vswap would
+&gt; &gt; be handled one layer down.
+&gt; &gt; 
+&gt; &gt; Chris, do you think that would be cleaner?
+&gt; 
+&gt; If it can wrap below the swap_ops, it is just priviate inernal dedail
+&gt; of implementing its own indirections. That would be much cleaner.
+&gt; That
+&gt; is what I am trying to pitch to Nhat in prevoius email but does not
+&gt; have following actions.
+&gt; 
 Can you sketch out the details of what you
 think that should look like?
 
@@ -650,11 +2083,8 @@ look like?
 -- 
 All Rights Reversed.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Chris Li</div>
-<a href="https://lore.kernel.org/r/a30eb60221cda2fe726a86c2c6f859f71fc7a46d.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, trade-off between optimization and maintainability, lack of clear direction</div>
-</div>
-</div>
+<a href="https://lore.kernel.org/r/7571f005bca65aa4ad5e7ec89e62801ad058b689.camel@surriel.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: code_path_fragmentation, lock_ordering</div>
 </div>
 </div>
 </div>
