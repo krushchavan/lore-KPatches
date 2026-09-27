@@ -3,34 +3,6 @@
   "subject": "[PATCH 0/3] zstd: probe the CPU for BMI2 support once, not per context",
   "url": "https://lore.kernel.org/all/20260826122558.2662013-1-usama.arif@linux.dev/",
   "dates": {
-    "2026-08-27": {
-      "report_file": "2026-08-27_ollama_llama3.1-8b.html",
-      "developer": "Usama Arif",
-      "reviews": [
-        {
-          "author": "Usama Arif (author)",
-          "summary": "Author acknowledged a potential issue with using cpu_feature_enabled(), but expressed uncertainty about its feasibility for standalone library imports and suggested an alternative patch as a better solution.\n\nThe author is addressing Eric Biggers' feedback on the patch to probe the CPU for BMI2 support once, not per context. The author agrees that using kernel CPU feature detection is a better approach and has modified the code to use cpu_feature_enabled() in the normal x86 compressor and decompressor objects. The existing raw CPUID fallback will be retained for preboot and other builds. A fix is planned.",
-          "sentiment": "neutral",
-          "sentiment_signals": [
-            "uncertainty",
-            "alternative",
-            "agreement",
-            "modification"
-          ],
-          "has_inline_review": false,
-          "tags_given": [],
-          "analysis_source": "llm",
-          "raw_body": "The only issue I saw with that was that zstd is a standalone library that\nis imported, so I am not sure how using cpu_feature_enabled() would work\nfor the maintainers. If the maintainers are happy with it, I think the\nbelow patch is much better.\n\n---\n\nFrom: Usama Arif <usama.arif@linux.dev>\nDate: Thu, 27 Aug 2026 05:34:41 -0700\nSubject: [PATCH] zstd: use kernel CPU feature detection on x86\n\nZstd currently probes CPUID while initializing each compression or\ndecompression context. This bypasses the x86 feature policy used by the\nrest of the kernel and repeats a serializing instruction sequence for\nevery context.\n\nUse cpu_feature_enabled() in the normal x86 compressor and decompressor\nobjects. Check ABM, BMI1, and BMI2 because the dispatched functions are\ncompiled with lzcnt, bmi, and bmi2. The checks are alternatives-patched\nat boot.\n\nThe effect is especially visible under virtualization, where CPUID\nnormally causes a VM exit. A 4 KiB crypto_acomp benchmark was run in\none-vCPU KVM guests. Comparing the unpatched baseline with this\nthree-patch series, the median reported ns/op values were:\n\n                         before    after\n  compression            16,777   13,635 ns/op  (-18.7%)\n  decompression           3,454    1,006 ns/op  (-70.9%)\n\nKeep the existing raw CPUID fallback for preboot and other builds which\ncannot use the normal x86 feature infrastructure. Also retain the early\nreturn when dynamic dispatch is disabled.\n\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n lib/zstd/Makefile               |  5 +++++\n lib/zstd/common/zstd_internal.h | 18 ++++++++++++++----\n 2 files changed, 19 insertions(+), 4 deletions(-)\n\ndiff --git a/lib/zstd/Makefile b/lib/zstd/Makefile\nindex be218b5e0ed59..db1d1439f5447 100644\n--- a/lib/zstd/Makefile\n+++ b/lib/zstd/Makefile\n@@ -42,3 +42,8 @@ zstd_common-y := \\\n \t\tcommon/error_private.o \\\n \t\tcommon/fse_decompress.o \\\n \t\tcommon/zstd_common.o \\\n+\n+ifeq ($(CONFIG_X86),y)\n+CFLAGS_compress/zstd_compress.o += -DZSTD_USE_KERNEL_CPU_FEATURES\n+CFLAGS_decompress/zstd_decompress.o += -DZSTD_USE_KERNEL_CPU_FEATURES\n+endif\ndiff --git a/lib/zstd/common/zstd_internal.h b/lib/zstd/common/zstd_internal.h\nindex 41f190b533209..f7d3bca650747 100644\n--- a/lib/zstd/common/zstd_internal.h\n+++ b/lib/zstd/common/zstd_internal.h\n@@ -31,6 +31,11 @@\n #include \"fse.h\"\n #include \"huf.h\"\n #include <linux/xxhash.h>                /* XXH_reset, update, digest */\n+\n+/* Use the kernel's CPU feature policy in normal x86 kernel builds. */\n+#if defined(ZSTD_USE_KERNEL_CPU_FEATURES)\n+#include <asm/cpufeature.h>\n+#endif\n #define ZSTD_TRACE 0\n \n /* ---- static assert (debug) --- */\n@@ -311,12 +316,17 @@ size_t ZSTD_decodeSeqHeaders(ZSTD_DCtx* dctx, int* nbSeqPtr,\n  */\n MEM_STATIC int ZSTD_cpuSupportsBmi2(void)\n {\n-#if DYNAMIC_BMI2\n-    ZSTD_cpuid_t cpuid = ZSTD_cpuid();\n-    return ZSTD_cpuid_bmi1(cpuid) && ZSTD_cpuid_bmi2(cpuid);\n-#else\n+#if !DYNAMIC_BMI2\n     /* Nothing looks at the flag in this configuration. */\n     return 0;\n+#elif defined(ZSTD_USE_KERNEL_CPU_FEATURES)\n+    return cpu_feature_enabled(X86_FEATURE_ABM) &&\n+           cpu_feature_enabled(X86_FEATURE_BMI1) &&\n+           cpu_feature_enabled(X86_FEATURE_BMI2);\n+#else\n+    ZSTD_cpuid_t cpuid = ZSTD_cpuid();\n+    return ZSTD_cpuid_bmi1(cpuid) &&\n+           ZSTD_cpuid_bmi2(cpuid);\n #endif\n }\n \n-- \n2.53.0-Meta",
-          "reply_to": "Eric Biggers",
-          "message_date": "2026-08-27",
-          "message_id": "c8d71171-9b4c-418a-a48d-c18bb20da52f@linux.dev",
-          "email": "usama.arif@linux.dev",
-          "is_maintainer": false
-        }
-      ],
-      "analysis_source": "llm-per-reviewer",
-      "patch_summary": "This patch series optimizes the Zstandard (zstd) compression library in the Linux kernel by reducing unnecessary CPUID probes for BMI2 support. The current implementation probes for BMI2 support every time a compression or decompression context is set up, which can lead to performance issues due to serializing CPUID instructions on x86. This patch series introduces caching and dynamic dispatching of BMI2 support, resulting in significant performance improvements (up to 71% reduction in decompression time) by reducing the number of CPUID probes."
-    },
     "2026-08-28": {
       "report_file": "2026-08-28_ollama_llama3.1-8b.html",
       "developer": "Usama Arif",
