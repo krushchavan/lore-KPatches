@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH 4/4] mm/zswap: move reclaim-driven writeback to a kworker</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260928081900.4187482-5-alex@ghiti.fr/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-29</strong><div class="date-range-nav">Active on: <a href="#2026-09-29">2026-09-29</a> &bull; <a href="#2026-09-28">2026-09-28</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-09-30</strong><div class="date-range-nav">Active on: <a href="#2026-09-30">2026-09-30</a> &bull; <a href="#2026-09-29">2026-09-29</a> &bull; <a href="#2026-09-28">2026-09-28</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch moves the reclaim-driven writeback of zswap to a kworker, which writes back data in chunks of SWAP_CLUSTER_MAX entries at a time while holding a reference on the memcg. This change is made to prevent stalls caused by uninterruptible sleeps when the owning cgroup&#x27;s IO budget is exceeded. The shrinker now reports nothing freed until the worker has run and completed the writeback.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-09-29">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Nhat Pham</span>
-<a class="date-chip" href="../2026-09-29_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-29">2026-09-29</a>
+<a class="date-chip" href="../2026-09-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-29">2026-09-29</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
@@ -304,6 +304,86 @@ Worth at least an callout in the changelog?</pre>
 <div class="reply-to-label">&#8627; replying to Alexandre Ghiti</div>
 <a href="https://lore.kernel.org/r/CAKEwX=PJjGe3kjYCHwxijaZ+W8HvOiNQTTS-Da1R02hPW=kCDA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: potential issue with memcg reference, requested changes, unclear effect</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-09-30">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Alexandre Ghiti</span>
+<a class="date-chip" href="../2026-09-30_ollama_llama3.1-8b.html" title="First appeared in report for 2026-09-30">2026-09-30</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the deferred writeback workers hold a reference to the memcg, and requested that queued workers be stopped before calling try_to_unmap() to prevent lock ordering violations.
+
+Reviewer noted that the current implementation may not scale as the number of workers increases, requesting further testing and discussion.
+
+Reviewer Alexandre Ghiti noted that the writeback bio is issued as root, incurring debt to the cgroup, and with this series throttling the bio at submission, reclaimers would stall on a single cgroup&#x27;s IO budget; he suggested deferring writeback for everyone.
+
+Reviewer Alexandre Ghiti noted that the shrinker&#x27;s behavior needs discussion to prevent zswap from draining &#x27;hot&#x27; pages, and suggested clarifying the justifications for all behavioral changes in the next version.
+
+Reviewer noted that while the deferred writeback workers hold a reference to the memcg, they do not drop theirs when they finish, potentially causing issues with reclaim paths.
+
+Reviewer noted that kworker may stall due to exhausting the memcg&#x27;s IO budget, potentially starving other memcgs, and suggested this as a valid reason for moving writeback to a kworker.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Nhat,
+
+On Tue, Sep 29, 2026 at 3:43 PM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+
+---
+
+It would not scale indeed, the worker does not accumulate in this
+version of the patch. That needs to be tested and discussed.
+
+---
+
+Today the writeback bio is issued as root, which incurs debt to the
+cgroup. The submitting task repays it on return to user or on any
+other IO of the cgroup until the debt is paid off.
+
+With this series the bio is throttled at submission instead, so
+whoever submits it sleeps until the cgroup has budget:
+- for direct reclaimers, that&#x27;s the application latency we observed
+- for kswapd reclaim, it would stall on a single cgroup&#x27;s IO budget
+
+So we need to defer for everyone.
+
+---
+
+In the large production workload I have worked on, when the shrinker
+is enabled, the zswap pool size decreases by ~97%. So I did not want
+to accumulate &quot;too much&quot; work to prevent zswap from draining &quot;hot&quot;
+pages, it acts like an additional throttling mechanism. But that needs
+discussion, hence the RFC.
+
+And you&#x27;re right, In the next version, I&#x27;ll clearly point out all the
+behavioral changes I made with their justifications.
+
+---
+
+Yes, this is another behavioural change that I will explain in the next version.
+
+Indeed the work piles up in the shrinker control loop if writeback
+cannot catch up but note that it is bounded, which is what we want
+right?
+
+---
+
+You&#x27;re right, and the explanation is &quot;we cannot starve other memcgs if
+one worker stalls because it exhausted its memcg budget&quot;.
+
+Thanks Nhat!
+
+Alex</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/CAEmasaWgracciCPNB-39iZ6RRCbGfQYFNiWSHsfP0qaaxCXCKg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lock ordering violation, requested changes, scalability concern</div>
+</div>
+</div>
 </div>
 </div>
 </div>
