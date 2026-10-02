@@ -238,9 +238,294 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 10/13] mm/collapse: open-code collapse_single_pmd() in its two callers</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260928100630.21870-11-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-28</strong><div class="date-range-nav">Active on: <a href="#2026-09-28">2026-09-28</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch removes the collapse_single_pmd() function and instead open-codes its logic in two callers, khugepaged and madvise_collapse(). The function was previously handling lock management differently for each caller, which is now handled directly by each caller. This change simplifies the code and prepares it for moving madvise_collapse() out of khugepaged.c.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-09-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-01</strong><div class="date-range-nav">Active on: <a href="#2026-10-01">2026-10-01</a> &bull; <a href="#2026-09-28">2026-09-28</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch refactors the collapse_single_pmd() function by open-coding its behavior in its two callers, khugepaged and madvise_collapse(). The original function handled different lock behaviors for these callers, but since they already act on dropping the lock, it&#x27;s more straightforward to handle this directly in each caller. This simplifies the code and prepares for future changes, such as moving madvise_collapse() out of khugepaged.c.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-01">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-10-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-01">2026-10-01</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David questioned whether keeping the mmap lock locked is necessary, suggesting a single collapse_single_pmd() function that always returns with the mmap lock unlocked, even if it means dropping and re-acquiring the lock multiple times.
+
+The reviewer noted that the comment in the patch description about collapse_single_pmd() dropping the lock on some paths and not others is no longer accurate, as the function now always drops the lock before calling collapse_run_pmd(). The reviewer suggests reverting this change to maintain consistency with the original behavior.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Let me think this through. collapse_scan_file: it doesn&#x27;t actually need the MM at
+all. The only reason is to do tracing. Rather stupid, it just should not consume
+the MM at all anymore. Consequently it doesn&#x27;t even need the mmap lock. But the
+caller needs the mmap lock to figure out the file + range from the vma (the
+per-vma lock would also be sufficient for that).
+
+Also, I guess we can convert some of the scanning to use per-vma locks in the
+future, whereby we would actually want to scan with the per-vma lock held.
+
+I do wonder about one thing: should we really care so much about keeping the
+mmap lock locked? Meaning, why not provide a single collapse_single_pmd() that
+
+* Is always called without the mmap lock (as is)
+* Always returns with the mmap lock unlocked (change)
+
+Sure, we drop+re-acquire the mmap lock a couple of times and lookup the vma, but
+isn&#x27;t that actually being nice to the other parts of the system? In the future
+ it would simply get called with the per-vma lock and would return with it unlocked.
+
+In the good old days, looking up VMAs was expensive, but nowadays ... not sure
+if it still matters?
+
+khugepaged? Not sure if this matters. madvise? I suspect many real users operate
+on a single PMD only (e.g., tcmalloc, jemalloc). For the other ones, not sure if
+dropping the lock every PMD is really a problem?
+
+IOW, how bad would the following simplification be (prototype that needs more
+work and thought):
+
+---
+
+From: &quot;David Hildenbrand (Arm)&quot; &lt;david@kernel.org&gt;
+Date: Thu, 1 Oct 2026 11:22:26 +0200
+Subject: [PATCH] tmp
+
+Signed-off-by: David Hildenbrand (Arm) &lt;david@kernel.org&gt;
+---
+ mm/khugepaged.c | 105 ++++++++++++++++++------------------------------
+ 1 file changed, 39 insertions(+), 66 deletions(-)
+
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 87bbba6ce59a..3085e8b34ff7 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -2858,43 +2858,42 @@ static enum scan_result collapse_run_pmd(struct mm_struct *mm,
+ 
+ /*
+  * Try to collapse a single PMD starting at a PMD aligned addr, and return
+- * the results.
++ * the results. mmap_lock must be held for reading on entry and is always
++ * dropped on return.
+  */
+ static enum scan_result collapse_single_pmd(unsigned long addr,
+-		struct vm_area_struct *vma, bool *lock_dropped,
++		struct vm_area_struct *vma,
+ 		struct collapse_control *cc)
+ {
+ 	struct mm_struct *mm = vma-&gt;vm_mm;
+ 	enum scan_result result;
+ 
+ 	result = collapse_scan_pmd(vma, addr, cc);
+-	if (result != SCAN_SUCCEED &amp;&amp; result != SCAN_PTE_MAPPED_HUGEPAGE)
+-		return result;
+ 
+ 	/* The collapse takes its own locks, so give this up */
+ 	mmap_read_unlock(mm);
+-	*lock_dropped = true;
+ 
+-	return collapse_run_pmd(mm, addr, result, cc);
++	if (result == SCAN_SUCCEED || result == SCAN_PTE_MAPPED_HUGEPAGE)
++		result = collapse_run_pmd(mm, addr, result, cc);
++
++	return result;
+ }
+ 
+-static void collapse_scan_mm_slot(unsigned int progress_max,
+-		enum scan_result *result, struct collapse_control *cc)
++static enum scan_result collapse_scan_mm_slot(struct collapse_control *cc)
+ 	__releases(&amp;khugepaged_mm_lock)
+ 	__acquires(&amp;khugepaged_mm_lock)
+ {
+ 	struct vma_iterator vmi;
+ 	struct mm_slot *slot;
+ 	struct mm_struct *mm;
+-	struct vm_area_struct *vma;
++	struct vm_area_struct *vma = NULL;
+ 	unsigned int progress_prev = cc-&gt;progress;
++	enum scan_result result = SCAN_FAIL;
+ 
+ 	lockdep_assert_held(&amp;khugepaged_mm_lock);
+-	*result = SCAN_FAIL;
+ 
+-	if (khugepaged_scan.mm_slot) {
+-		slot = khugepaged_scan.mm_slot;
+-	} else {
++	slot = khugepaged_scan.mm_slot;
++	if (!slot) {
+ 		slot = list_first_entry(&amp;khugepaged_scan.mm_head,
+ 				     struct mm_slot, mm_node);
+ 		khugepaged_scan.address = 0;
+@@ -2903,17 +2902,12 @@ static void collapse_scan_mm_slot(unsigned int progress_max,
+ 	spin_unlock(&amp;khugepaged_mm_lock);
+ 
+ 	mm = slot-&gt;mm;
+-	/*
+-	 * Don&#x27;t wait for semaphore (to avoid long wait times).  Just move to
+-	 * the next mm on the list.
+-	 */
+-	vma = NULL;
++	/* Don&#x27;t wait for mmap_lock. Move to the next mm if it is contended. */
+ 	if (unlikely(!mmap_read_trylock(mm)))
+-		goto breakouterloop_mmap_lock;
++		goto out;
+ 
+-	cc-&gt;progress++;
+ 	if (unlikely(collapse_test_exit_or_disable(mm)))
+-		goto breakouterloop;
++		goto out_unlock;
+ 
+ 	vma_iter_init(&amp;vmi, mm, khugepaged_scan.address);
+ 	for_each_vma(vmi, vma) {
+@@ -2939,39 +2933,22 @@ static void collapse_scan_mm_slot(unsigned int progress_max,
+ 			khugepaged_scan.address = hstart;
+ 		VM_BUG_ON(khugepaged_scan.address &amp; ~HPAGE_PMD_MASK);
+ 
+-		while (khugepaged_scan.address &lt; hend) {
+-			bool lock_dropped = false;
++		if (khugepaged_scan.address &gt;= hend)
++			continue;
+ 
+-			cond_resched();
+-			if (unlikely(collapse_test_exit_or_disable(mm)))
+-				goto breakouterloop;
+-
+-			VM_WARN_ON_ONCE(khugepaged_scan.address &lt; hstart ||
+-				  khugepaged_scan.address + HPAGE_PMD_SIZE &gt;
+-				  hend);
+-
+-			*result = collapse_single_pmd(khugepaged_scan.address,
+-						      vma, &amp;lock_dropped, cc);
+-			if (*result == SCAN_SUCCEED)
+-				khugepaged_pages_collapsed++;
+-			/* move to next address */
+-			khugepaged_scan.address += HPAGE_PMD_SIZE;
+-			if (lock_dropped)
+-				/*
+-				 * We released mmap_lock so break loop.  Note
+-				 * that we drop mmap_lock before all hugepage
+-				 * allocations, so if allocation fails, we are
+-				 * guaranteed to break here and report the
+-				 * correct result back to caller.
+-				 */
+-				goto breakouterloop_mmap_lock;
+-			if (cc-&gt;progress &gt;= progress_max)
+-				goto breakouterloop;
+-		}
++		result = collapse_single_pmd(khugepaged_scan.address, vma, cc);
++		if (result == SCAN_SUCCEED)
++			khugepaged_pages_collapsed++;
++		/* Move to the next address and look up its VMA again. */
++		khugepaged_scan.address += HPAGE_PMD_SIZE;
++		goto out;
+ 	}
+-breakouterloop:
++out_unlock:
+ 	mmap_read_unlock(mm); /* exit_mmap will destroy ptes after this */
+-breakouterloop_mmap_lock:
++out:
++	/* PMD scans and skipped VMAs account for their own progress. */
++	if (cc-&gt;progress == progress_prev)
++		cc-&gt;progress++;
+ 
+ 	spin_lock(&amp;khugepaged_mm_lock);
+ 	VM_BUG_ON(khugepaged_scan.mm_slot != slot);
+@@ -2998,6 +2975,7 @@ static void collapse_scan_mm_slot(unsigned int progress_max,
+ 
+ 	trace_mm_khugepaged_scan(mm, cc-&gt;progress - progress_prev,
+ 				 khugepaged_scan.mm_slot == NULL);
++	return result;
+ }
+ 
+ static int khugepaged_has_work(void)
+@@ -3034,7 +3012,7 @@ static void khugepaged_do_scan(struct collapse_control *cc)
+ 			pass_through_head++;
+ 		if (khugepaged_has_work() &amp;&amp;
+ 		    pass_through_head &lt; 2)
+-			collapse_scan_mm_slot(progress_max, &amp;result, cc);
++			result = collapse_scan_mm_slot(cc);
+ 		else
+ 			cc-&gt;progress = progress_max;
+ 		spin_unlock(&amp;khugepaged_mm_lock);
+@@ -3232,7 +3210,6 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+ 	unsigned long hstart, hend, addr;
+ 	enum scan_result last_fail = SCAN_FAIL;
+ 	int thps = 0;
+-	bool mmap_unlocked = false;
+ 
+ 	BUG_ON(vma-&gt;vm_start &gt; start);
+ 	BUG_ON(vma-&gt;vm_end &lt; end);
+@@ -3255,24 +3232,23 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+ 	lru_add_drain_all();
+ 
+ 	for (addr = hstart; addr &lt; hend; addr += HPAGE_PMD_SIZE) {
+-		enum scan_result result = SCAN_FAIL;
++		enum scan_result result;
+ 
+-		if (mmap_unlocked) {
++		if (addr != hstart) {
+ 			cond_resched();
+ 			mmap_read_lock(mm);
+-			mmap_unlocked = false;
+-			*lock_dropped = true;
+ 			result = hugepage_vma_revalidate(mm, addr, false, &amp;vma,
+ 							 cc, HPAGE_PMD_ORDER);
+ 			if (result != SCAN_SUCCEED) {
+ 				last_fail = result;
+-				goto out_nolock;
++				goto out;
+ 			}
+ 
+ 			hend = min(hend, vma-&gt;vm_end &amp; HPAGE_PMD_MASK);
+ 		}
+ 
+-		result = collapse_single_pmd(addr, vma, &amp;mmap_unlocked, cc);
++		result = collapse_single_pmd(addr, vma, cc);
++		*lock_dropped = true;
+ 
+ 		switch (result) {
+ 		case SCAN_SUCCEED:
+@@ -3295,17 +3271,14 @@ int madvise_collapse(struct vm_area_struct *vma, unsigned long start,
+ 		default:
+ 			last_fail = result;
+ 			/* Other error, exit */
+-			goto out_maybelock;
++			goto out_lock;
+ 		}
+ 	}
+ 
+-out_maybelock:
++out_lock:
+ 	/* Caller expects us to hold mmap_lock on return */
+-	if (mmap_unlocked) {
+-		*lock_dropped = true;
+-		mmap_read_lock(mm);
+-	}
+-out_nolock:
++	mmap_read_lock(mm);
++out:
+ 	mmap_assert_locked(mm);
+ 	kfree(cc);
+ 
+-- 
+2.43.0
+
+
+Based on that, I&#x27;d rather want to see collapse_single_pmd() to just inline the file
+and anon paths, and see how we can further optimize the locking internally (e.g., perform
+the pagecache scanning without the mmap lock).
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/b2133cff-ce69-4a45-bf33-c44b774dee7b@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, suggested simplification, inconsistency</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
