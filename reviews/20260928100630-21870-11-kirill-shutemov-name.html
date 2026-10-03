@@ -238,14 +238,14 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v4 10/13] mm/collapse: open-code collapse_single_pmd() in its two callers</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20260928100630.21870-11-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-09-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-01</strong><div class="date-range-nav">Active on: <a href="#2026-10-01">2026-10-01</a> &bull; <a href="#2026-09-28">2026-09-28</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-09-28</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-02</strong><div class="date-range-nav">Active on: <a href="#2026-10-02">2026-10-02</a> &bull; <a href="#2026-10-01">2026-10-01</a> &bull; <a href="#2026-09-28">2026-09-28</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch refactors the collapse_single_pmd() function by open-coding its behavior in its two callers, khugepaged and madvise_collapse(). The original function handled different lock behaviors for these callers, but since they already act on dropping the lock, it&#x27;s more straightforward to handle this directly in each caller. This simplifies the code and prepares for future changes, such as moving madvise_collapse() out of khugepaged.c.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-01">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">David (Arm)</span>
-<a class="date-chip" href="../2026-10-01_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-01">2026-10-01</a>
+<a class="date-chip" href="../2026-10-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-01">2026-10-01</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
@@ -523,6 +523,126 @@ David</pre>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/b2133cff-ce69-4a45-bf33-c44b774dee7b@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, suggested simplification, inconsistency</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-10-02">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-10-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-02">2026-10-02</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges David&#x27;s feedback about virtual address scanning not being the best way to collapse page cache, but considers it out of scope for this patchset
+
+Author explained that collapse_single_pmd() dropping the lock requires knowing which lock the caller took, and proposed adding a flag to indicate this, similar to the existing lock_dropped bool.
+
+The author agrees that khugepaged has worked since a specific commit to walk tables under one hold, giving the lock up only to collapse, and confirms this behavior will be kept in the patch series.
+
+Author responded to David&#x27;s feedback by explaining that their version of the patch has a lower overhead than the original, citing measurements on a production config and arguing that the additional cost is acceptable given the bounded nature of the scan.
+
+Author responded to David&#x27;s feedback by explaining that khugepaged&#x27;s scan rate is a critical concern for their use case, and they cannot afford to sacrifice it for the sake of having a single entry point into the engine.
+
+Author acknowledges the appeal of a single entry point but disagrees that it&#x27;s worth the cost, specifically citing negative impacts on locking and scan rate.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Right on both.
+
+As I mentioned before, virtual address scanning might not be the best
+way to collapse page cache.
+
+We might want to start from inodes on superblocks that have large folios
+enabled.
+
+But it is out of scope for the patchset.
+
+---
+
+That is the reason the caller owns the lock here.
+
+On top of this series I have khugepaged scanning under the per-VMA lock:
+the scan asserts whatever lock the caller holds, the caller does
+vma_end_read() before the run, and the run takes the locks it needs
+itself.
+
+Neither the scan nor the run changed for it.
+
+With collapse_single_pmd() dropping the lock, it has to know which lock
+the caller took. process_madvise() on another process&#x27;s mm cannot move
+to the VMA lock: untagged_addr_remote() asserts mmap_lock, so a remote
+MADV_COLLAPSE keeps it while a local one and khugepaged move on.
+
+The single call would need a flag saying which lock to drop. That is
+the lock_dropped bool again, pointing the other way.
+
+---
+
+Yes, we should.
+
+Walking the tables under one hold and giving the lock up only to
+collapse is how khugepaged has worked since ba76149f47d8 (&quot;thp:
+khugepaged&quot;).
+
+The bool is just how that signal got plumbed when MADV_COLLAPSE arrived
+in 50ad2f24b3b4, and it has already cost one bug, 5a62019807da
+(&quot;mm/khugepaged: fix issue with tracking lock&quot;).
+
+This series removes the bool and keeps the behaviour.
+
+---
+
+The rwsem and the VMA lookup are not the only cost.
+
+In your version every table is a visit to the mm: unlock,
+khugepaged_mm_lock, back through khugepaged_do_scan(),
+khugepaged_mm_lock again, a trylock and a VMA walk, for a scan that on
+memory already huge is one pmd read.
+
+I measured your prototype against patch 9 as posted, both on a production
+config, 8G of anonymous memory already collapsed, scan_sleep_millisecs 0,
+pages_to_scan 65536, PMD order only, five runs each, medians:
+
+                                     as posted    yours
+  khugepaged, nothing to collapse:
+    full passes over 8G in 20s         251,180    55,477
+    khugepaged CPU                        100%      100%
+    cost per refused table               19 ns     88 ns
+  MADV_COLLAPSE, already huge:
+    512M per call, p50                  3.8 us   17.4 us
+    2M per call, p50                    703 ns    703 ns
+  tables walked in full then refused
+    (max_ptes_none 0), passes in 20s       803       836
+
+On being nice to the rest of the system: the scan is already bounded.
+The read hold ends after pages_to_scan worth of progress. We already
+have properly sized scan batching in place.
+
+---
+
+khugepaged matters. We run it across the fleet, and its scan cost is
+what decides how aggressive we can afford to be with it. I am not
+giving up scan rate to keep one entry point into the engine.
+
+For a single PMD there is no difference either way. For a range, today a
+MADV_COLLAPSE over memory that is already huge walks it without letting
+go of the lock at all; in your version it relocks and revalidates for
+every table, and tells madvise_walk_vmas() to look the VMA up again.
+
+---
+
+I see the appeal of the single entry point for the collapse engine. I do.
+
+But it costs us on both the locking picture and the scan rate. That
+does not work for me.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to David (Arm)</div>
+<a href="https://lore.kernel.org/r/ar-nKHZ5hlbsXeFP@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged feedback, considered out of scope, no clear resolution signal</div>
+</div>
+</div>
 </div>
 </div>
 </div>

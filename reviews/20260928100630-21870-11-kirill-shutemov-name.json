@@ -11,7 +11,7 @@
       "patch_summary": "This patch removes the collapse_single_pmd() function and instead open-codes its logic in two callers, khugepaged and madvise_collapse(). The function was previously handling lock management differently for each caller, which is now handled directly by each caller. This change simplifies the code and prepares it for moving madvise_collapse() out of khugepaged.c."
     },
     "2026-10-01": {
-      "report_file": "2026-10-01_ollama_llama3.1-8b.html",
+      "report_file": "2026-10-02_ollama_llama3.1-8b.html",
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
@@ -32,6 +32,39 @@
           "reply_to": "Kiryl Shutsemau",
           "message_date": "2026-10-01",
           "message_id": "b2133cff-ce69-4a45-bf33-c44b774dee7b@kernel.org",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch refactors the collapse_single_pmd() function by open-coding its behavior in its two callers, khugepaged and madvise_collapse(). The original function handled different lock behaviors for these callers, but since they already act on dropping the lock, it's more straightforward to handle this directly in each caller. This simplifies the code and prepares for future changes, such as moving madvise_collapse() out of khugepaged.c."
+    },
+    "2026-10-02": {
+      "report_file": "2026-10-02_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledges David's feedback about virtual address scanning not being the best way to collapse page cache, but considers it out of scope for this patchset\n\nAuthor explained that collapse_single_pmd() dropping the lock requires knowing which lock the caller took, and proposed adding a flag to indicate this, similar to the existing lock_dropped bool.\n\nThe author agrees that khugepaged has worked since a specific commit to walk tables under one hold, giving the lock up only to collapse, and confirms this behavior will be kept in the patch series.\n\nAuthor responded to David's feedback by explaining that their version of the patch has a lower overhead than the original, citing measurements on a production config and arguing that the additional cost is acceptable given the bounded nature of the scan.\n\nAuthor responded to David's feedback by explaining that khugepaged's scan rate is a critical concern for their use case, and they cannot afford to sacrifice it for the sake of having a single entry point into the engine.\n\nAuthor acknowledges the appeal of a single entry point but disagrees that it's worth the cost, specifically citing negative impacts on locking and scan rate.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged feedback",
+            "considered out of scope",
+            "no clear resolution signal",
+            "author provided explanation",
+            "agreement",
+            "confirmation",
+            "measurement",
+            "bounded_scan",
+            "author provided technical explanation",
+            "costs locking",
+            "negative impact on scan rate"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Right on both.\n\nAs I mentioned before, virtual address scanning might not be the best\nway to collapse page cache.\n\nWe might want to start from inodes on superblocks that have large folios\nenabled.\n\nBut it is out of scope for the patchset.\n\n---\n\nThat is the reason the caller owns the lock here.\n\nOn top of this series I have khugepaged scanning under the per-VMA lock:\nthe scan asserts whatever lock the caller holds, the caller does\nvma_end_read() before the run, and the run takes the locks it needs\nitself.\n\nNeither the scan nor the run changed for it.\n\nWith collapse_single_pmd() dropping the lock, it has to know which lock\nthe caller took. process_madvise() on another process's mm cannot move\nto the VMA lock: untagged_addr_remote() asserts mmap_lock, so a remote\nMADV_COLLAPSE keeps it while a local one and khugepaged move on.\n\nThe single call would need a flag saying which lock to drop. That is\nthe lock_dropped bool again, pointing the other way.\n\n---\n\nYes, we should.\n\nWalking the tables under one hold and giving the lock up only to\ncollapse is how khugepaged has worked since ba76149f47d8 (\"thp:\nkhugepaged\").\n\nThe bool is just how that signal got plumbed when MADV_COLLAPSE arrived\nin 50ad2f24b3b4, and it has already cost one bug, 5a62019807da\n(\"mm/khugepaged: fix issue with tracking lock\").\n\nThis series removes the bool and keeps the behaviour.\n\n---\n\nThe rwsem and the VMA lookup are not the only cost.\n\nIn your version every table is a visit to the mm: unlock,\nkhugepaged_mm_lock, back through khugepaged_do_scan(),\nkhugepaged_mm_lock again, a trylock and a VMA walk, for a scan that on\nmemory already huge is one pmd read.\n\nI measured your prototype against patch 9 as posted, both on a production\nconfig, 8G of anonymous memory already collapsed, scan_sleep_millisecs 0,\npages_to_scan 65536, PMD order only, five runs each, medians:\n\n                                     as posted    yours\n  khugepaged, nothing to collapse:\n    full passes over 8G in 20s         251,180    55,477\n    khugepaged CPU                        100%      100%\n    cost per refused table               19 ns     88 ns\n  MADV_COLLAPSE, already huge:\n    512M per call, p50                  3.8 us   17.4 us\n    2M per call, p50                    703 ns    703 ns\n  tables walked in full then refused\n    (max_ptes_none 0), passes in 20s       803       836\n\nOn being nice to the rest of the system: the scan is already bounded.\nThe read hold ends after pages_to_scan worth of progress. We already\nhave properly sized scan batching in place.\n\n---\n\nkhugepaged matters. We run it across the fleet, and its scan cost is\nwhat decides how aggressive we can afford to be with it. I am not\ngiving up scan rate to keep one entry point into the engine.\n\nFor a single PMD there is no difference either way. For a range, today a\nMADV_COLLAPSE over memory that is already huge walks it without letting\ngo of the lock at all; in your version it relocks and revalidates for\nevery table, and tells madvise_walk_vmas() to look the VMA up again.\n\n---\n\nI see the appeal of the single entry point for the collapse engine. I do.\n\nBut it costs us on both the locking picture and the scan rate. That\ndoes not work for me.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-10-02",
+          "message_id": "ar-nKHZ5hlbsXeFP@thinkstation",
           "analysis_source": "llm"
         }
       ],
