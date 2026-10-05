@@ -231,6 +231,120 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series introduces PMD-level swap entries for anonymous THPs, allowing huge mappings to survive the swap round-trip and reducing page-table overhead. When a PMD-mapped anonymous THP is swapped out, it is split into PTE-level swap entries. The new PMD swap entry is a compact page-table encoding that can be restored directly on swap-in without waiting for khugepaged to collapse the range later. This approach reduces major faults and swap I/O rate, resulting in improved performance. The patch series is ordered so that every consumer can handle PMD swap entries before the swap-out producer starts installing them."
+    },
+    "2026-10-04": {
+      "report_file": "2026-10-04_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "Reviewer Lance Yang noted that setting swap soft-dirty on RISC-V also sets _PAGE_EXEC, causing the fault handler to skip the migration wait due to a pre-existing bug, and requested additional checks in pmd_leaf_soft_dirty_tests() to catch similar issues early.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hey Usama,\n\nStaring at the swap-entry bits across architectures, and RISC-V looks a\nbit off in that regard ...\n\nWith Svrsw60t59b and CONFIG_MEM_SOFT_DIRTY=y, setting swap soft-dirty also\nsets _PAGE_EXEC. A migration PMD then looks present ... so the fault\nhandler skips the migration wait :(\n\nAnd yeah, this is a pre-existing bug. I've sent a separate fix for it.\n\nhttps://lore.kernel.org/linux-mm/20261004030312.90163-1-lance.yang@linux.dev/\n\nBTW, could we also add more checks to pmd_leaf_soft_dirty_tests() so we\ncatch this kind of issue early? Setting a swap flag shouldn't make a\nnon-present PMD present, IIUC.\n\n---8<---\ndiff --git a/mm/debug_vm_pgtable.c b/mm/debug_vm_pgtable.c\nindex 863111c6d4eb..80686e2baaa1 100644\n--- a/mm/debug_vm_pgtable.c\n+++ b/mm/debug_vm_pgtable.c\n@@ -762,7 +762,9 @@ static void __init pmd_leaf_soft_dirty_tests(struct pgtable_debug_args *args)\n \tWARN_ON(!pmd_is_huge(pmd));\n \tWARN_ON(!pmd_is_valid_softleaf(pmd));\n\n-\tWARN_ON(!pmd_swp_soft_dirty(pmd_swp_mksoft_dirty(pmd)));\n+\tpmd = pmd_swp_mksoft_dirty(pmd);\n+\tWARN_ON(!pmd_swp_soft_dirty(pmd));\n+\tWARN_ON(pmd_present(pmd));\n \tWARN_ON(pmd_swp_soft_dirty(pmd_swp_clear_soft_dirty(pmd)));\n }\n #else  /* !CONFIG_TRANSPARENT_HUGEPAGE */\n--\n\n[...]\n\nCheers, Lance",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-10-04",
+          "message_id": "20261004030844.90483-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Reviewer Lance Yang pointed out that the patch does not handle the case where a PMD swap entry is split and some slots are still backed by zswap's per-page store, which would cause PMD-order swap-in consumers to fail.\n\nReviewer Lance Yang noted that the PMD swap entry should be cleared of UFFD markers in the same way as PTEs, to prevent potential issues when handling split PMD mappings.\n\nReviewer Lance Yang noted that when moving a PMD swap entry from an exclusive swap source to an empty hole destination, the UFFD-WP marker is not cleared before checking if the destination is RWP-registered, potentially leading to unexpected write protection and leaving userspace writers stuck. He suggested clearing the source UFFD-WP marker before the destination RWP check.\n\nReviewer Lance Yang noted that the patch does not handle the case where a PMD swap entry is split and some slots are still backed by zswap's per-page store, which can lead to incorrect behavior when trying to load the range page by page.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "split",
+            "zswap",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hey Usama,\n\nOn Fri, Oct 02, 2026 at 02:52:40AM -0700, Usama Arif wrote:\n[...]\n\n---\n\nShouldn't we clear the source UFFD marker here?\n\n\tmoved_pmd = pmd_swp_clear_uffd(moved_pmd);\n\njust like move_swap_pte(), no?\n\n---\n\nstatic int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,\n\t\t\t unsigned long dst_addr, unsigned long src_addr,\n\t\t\t pte_t *dst_pte, pte_t *src_pte,\n\t\t\t pte_t orig_dst_pte, pte_t orig_src_pte,\n\t\t\t pmd_t *dst_pmd, pmd_t dst_pmdval,\n\t\t\t spinlock_t *dst_ptl, spinlock_t *src_ptl,\n\t\t\t struct folio *src_folio,\n\t\t\t struct swap_info_struct *si, swp_entry_t entry)\n{\n...\n\torig_src_pte = ptep_get_and_clear(mm, src_addr, src_pte);\n...\n\torig_src_pte = pte_swp_clear_uffd(orig_src_pte);\n\t/* Re-arm RWP on the moved swap entry if dst_vma is RWP-registered. */\n\tif (userfaultfd_rwp(dst_vma))\n\t\torig_src_pte = pte_swp_mkuffd(orig_src_pte);\n\tset_pte_at(mm, dst_addr, dst_pte, orig_src_pte);\n...\n}\n\nSuppose the source is an exclusive swap PMD carrying a UFFD-WP marker, and\nthe destination is an empty hole registered for synchronous UFFD-WP without\nRWP. We haven't write-protected the destination, but a successful whole-PMD\nMOVE carries the source's UFFD-WP marker into it.\n\nOn swap-in, that marker is restored in the present PMD, leaving it\nwrite-protected. The write fault then reaches\nhandle_userfault(vmf, VM_UFFD_WP), even though we never write-protected\nthe destination ...\n\nThat would be quite a surprise for userspace, and could leave the writer\nstuck if the unexpected WP event goes unhandled :)\n\nvm_fault_t do_huge_pmd_swap_page(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n...\n\tbool exclusive, stable_writes, rwp_restore = false;\n\tbool write = vmf->flags & FAULT_FLAG_WRITE;\n...\n\tpmd = folio_mk_pmd(folio, vma->vm_page_prot);\n...\n\tif (pmd_swp_uffd(vmf->orig_pmd))\n\t\tpmd = pmd_mkuffd(pmd);\n\tif (pmd_swp_uffd(vmf->orig_pmd) && userfaultfd_rwp(vma)) {\n\t\tpmd = pmd_modify(pmd, PAGE_NONE);\n\t\trwp_restore = true;\n\t}\n...\n\tif (exclusive) {\n\t\tif (!rwp_restore && (vma->vm_flags & VM_WRITE) &&\n\t\t    !userfaultfd_huge_pmd_wp(vma, pmd) &&\n\t\t    !pmd_needs_soft_dirty_wp(vma, pmd)) {\n\t\t\tpmd = pmd_mkwrite(pmd, vma);\n\t\t\tif (write)\n\t\t\t\tpmd = pmd_mkdirty(pmd);\n\t\t}\n\t\trmap_flags |= RMAP_EXCLUSIVE;\n\t}\n...\n\tvmf->orig_pmd = pmd;\n...\n\tif (write && !pmd_write(pmd) && !rwp_restore) {\n\t\tvm_fault_t wp_ret = wp_huge_pmd(vmf);\n...\n\t}\n...\n}\n\nvm_fault_t wp_huge_pmd(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tconst bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;\n...\n\tif (vma_is_anonymous(vma)) {\n\t\tif (likely(!unshare) &&\n\t\t    userfaultfd_huge_pmd_wp(vma, vmf->orig_pmd)) {\n\t\t\tif (userfaultfd_wp_async(vmf->vma))\n\t\t\t\tgoto split;\n\t\t\treturn handle_userfault(vmf, VM_UFFD_WP);\n\t\t}\n\t\treturn do_huge_pmd_wp_page(vmf);\n\t}\n...\n}\n\nSo, clearing the source UFFD-WP marker before the destination RWP check\nwould match the PTE helper and keep the RWP re-arm :)\n\nAm I missing something?\n\n---\n\n[...]\n\nCheers, Lance",
+          "reply_to": "",
+          "message_date": "2026-10-04",
+          "message_id": "20261004081917.20111-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Reviewer Lance Yang noted that the patch does not handle the case where a PMD swap entry is split and one of its slots is still backed by zswap's per-page store, which would cause PMD-order swap-in consumers to fail.\n\nLance Yang noted that the current implementation of swapin_sync() returning a cached order-0 folio does not prevent zswap writeback from inserting its own small folio into the swap cache, leading to a race condition where the fault thread can lock the folio while writeback is still pending. He suggested unlocking and putting the folio on size mismatch, then jumping to split_fallback to keep the folio in the swap cache for do_swap_page().\n\nReviewer Lance Yang pointed out that the patch does not handle the case where a PMD swap entry is split and the individual slots are still backed by zswap's per-page store, which would cause a failure in PMD-order swap-in consumers.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "split",
+            "zswap",
+            "race condition",
+            "requested changes",
+            "handling of split PMD swap entries with zswap-backed slots"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hey Usama,\n\nNot an expert on swap, so the below may be naive ...\n\nOn Fri, Oct 02, 2026 at 02:52:42AM -0700, Usama Arif wrote:\n[...]\n\n---\n\nRequesting BIT(HPAGE_PMD_ORDER) doesn't prevent swapin_sync() from\nreturning a cached order-0 folio ...\n\nstruct folio *swapin_sync(swp_entry_t entry, gfp_t gfp, unsigned long orders,\n\t\t\t   struct vm_fault *vmf, struct mempolicy *mpol, pgoff_t ilx)\n{\n...\n\tdo {\n\t\tfolio = swap_cache_get_folio(entry);\n\t\tif (folio)\n\t\t\treturn folio;\n\t\tfolio = __swap_cache_alloc_folio(entry, gfp, orders, vmf, mpol, ilx);\n\t} while (PTR_ERR(folio) == -EEXIST);\n\n...\n}\n\nstatic int zswap_writeback_entry(struct zswap_entry *entry,\n\t\t\t\t swp_entry_t swpentry)\n{\n...\n\tfolio = __swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,\n\t\t\t\t\t NO_INTERLEAVE_INDEX);\n...\n\tif (IS_ERR(folio))\n\t\treturn PTR_ERR(folio);\n...\n\tif (!zswap_decompress(entry, folio)) {\n\t\tret = -EIO;\n\t\tgoto err;\n\t}\n\n\txa_erase(tree, offset);\n...\n\t/* folio is up to date */\n\tfolio_mark_uptodate(folio);\n\n\tfolio_set_dropbehind(folio);\n...\n\tfolio_put(folio);\n\n\t/* start writeback */\n\t__swap_writeout(&ctx, folio);\n\tswap_write_submit(&ctx);\n\n\treturn 0;\n...\n}\n\nvoid __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)\n{\n\tVM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);\n...\n\tfolio_start_writeback(folio);\n\tfolio_unlock(folio);\n\tswap_add_folio(ctx, folio, WRITE);\n}\n\nSay we hit the following race:\n\n1) swap_pmd_cache_lookup() finds the range empty, before zswap writeback\n   inserts its order-0 folio.\n\n2) zswap writeback puts that small folio in the swap cache at the first\n   slot, then erases the last zswap entry in the range.\n\n3) The fault thread checks zswap and gets false from zswap_is_present().\n   It then calls swapin_sync(), which returns that cached small folio.\n\n4) After __swap_writeout() unlocks the folio, the fault thread can lock\n   it while writeback is still pending. The folio isn't PMD-sized, so\n   we reach that cleanup ...\n\nzswap has already dropped its allocation reference, and writeback itself\ndoesn't hold one. So, without any other references, we're left with the\nswap-cache reference and our fault reference.\n\nThe folio is still !anon, so swap_cache_del_folio() removes the cache\nreference, then folio_put() drops ours. That can drop the last reference\nwhile I/O is still using the folio ... :(\n\nSo ... could we just unlock and put it on the size mismatch, then jump\nto split_fallback? That would keep the folio in the swap cache for\ndo_swap_page().\n\nSomething like:\n\n---8<---\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex 69721801cf9f..53c15bfdb0a1 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -2507,9 +2507,14 @@ vm_fault_t do_huge_pmd_swap_page(struct vm_fault *vmf)\n \t/*\n \t * Folio should be PMD-sized; if not (e.g. split in swap cache),\n \t * split the PMD swap entry and retry at PTE level.\n+\t * Keep the folio cached: zswap writeback may still be in flight and\n+\t * relies on the swap-cache reference to keep it alive.\n \t */\n-\tif (folio_nr_pages(folio) != HPAGE_PMD_NR)\n-\t\tgoto unlock_split_fallback;\n+\tif (folio_nr_pages(folio) != HPAGE_PMD_NR) {\n+\t\tfolio_unlock(folio);\n+\t\tfolio_put(folio);\n+\t\tgoto split_fallback;\n+\t}\n\n \t/*\n \t * A read that failed - a PMD-order zswap load that found per-page\n@@ -2647,6 +2652,7 @@ vm_fault_t do_huge_pmd_swap_page(struct vm_fault *vmf)\n\n unlock_split_fallback:\n \t/*\n+\t * Only PMD-sized folios reach this cleanup.\n \t * PTE fallback cannot add a single-page rmap to a PMD-sized folio that\n \t * has never been mapped: do_swap_page() would hand the whole folio to\n \t * folio_add_new_anon_rmap() while installing one PTE. Nor can it do\n--\n\nHopefully I didn't miss anything :D\n\n---\n\n[...]\n\nCheers, Lance",
+          "reply_to": "",
+          "message_date": "2026-10-04",
+          "message_id": "20261004101942.37331-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author acknowledges that they need to learn reviewer's approach, but does not address any specific technical feedback or concerns.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledges need for improvement",
+            "appreciates feedback"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "No worries! Really do appreciate all the reviews and the feedback! I will need to\nlearn your magic of reviewing so many different ongoing series at the same time.",
+          "reply_to": "Zi Yan",
+          "message_date": "2026-10-04",
+          "message_id": "0b188796-502f-4d1d-8b57-08e6540531ef@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series introduces PMD-level swap entries for anonymous THPs, allowing huge mappings to survive the swap round-trip and reducing page-table overhead. When a PMD-mapped anonymous THP is swapped out, it is split into PTE-level swap entries. The new PMD swap entry is a compact page-table encoding that can be restored directly on swap-in without waiting for khugepaged to collapse the range later. This approach reduces major faults and swap I/O rate, resulting in improved performance. The patch series is ordered so that every consumer can handle PMD swap entries before the swap-out producer starts installing them."
+    },
+    "2026-10-05": {
+      "report_file": "2026-10-04_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "LEROY Christophe",
+          "summary": "Reviewer reminded the author to CC linuxppc-dev@lists.ozlabs.org when addressing powerpc architecture",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Don't forget to CC <linuxppc-dev@lists.ozlabs.org> when addressing \r\npowerpc architecture.\r\n\r\nLe 02/10/2026 à 11:52, Usama Arif a écrit :",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-10-05",
+          "message_id": "4a4bf0ca-b21b-4b37-b2e3-9bd8ba343bd6@cs-soprasteria.com",
+          "email": "christophe.leroy2@cs-soprasteria.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series introduces PMD-level swap entries for anonymous THPs, allowing huge mappings to survive the swap round-trip and reducing page-table overhead. When a PMD-mapped anonymous THP is swapped out, it is split into PTE-level swap entries. The new PMD swap entry is a compact page-table encoding that can be restored directly on swap-in without waiting for khugepaged to collapse the range later. This approach reduces major faults and swap I/O rate, resulting in improved performance. The patch series is ordered so that every consumer can handle PMD swap entries before the swap-out producer starts installing them."
     }
   }
 }

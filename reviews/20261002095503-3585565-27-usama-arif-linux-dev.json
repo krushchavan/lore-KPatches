@@ -9,6 +9,36 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch adds support for moving PMD-level swap entries in UFFDIO_MOVE operations. It introduces a new function, move_swap_pmd(), which moves the entry under both PMD locks and propagates soft-dirty flags. The function also handles revalidation of cached folios and anchors the anon rmap to the destination VMA. Additionally, it rejects PMD swap entries at the destination with -EEXIST. This patch addresses a problem where aligned UFFDIO_MOVE operations over swapped-out THPs fail due to missing support for PMD-level swap entries."
+    },
+    "2026-10-04": {
+      "report_file": "2026-10-04_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "Reviewer Lance Yang noted that the move_swap_pmd() function does not properly handle the case where src_folio is NULL, and suggested adding a check for this condition to avoid potential crashes.\n\nReviewer Lance Yang noted that the source UFFD marker should be cleared in move_swap_pmd() to maintain consistency with move_swap_pte(), which also clears the source UFFD marker.\n\nreviewer noted that move_swap_pmd() does not clear the source UFFD-WP marker before checking if the destination is registered for synchronous UFFD-WP, which could lead to unexpected behavior on swap-in and leave writers stuck\n\nReviewer noted that move_swap_pmd() does not handle the case where src_folio is NULL, which can lead to a null pointer dereference when checking if it has been freed and reused for a different swap entry.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "potential crash",
+            "missing check",
+            "requested change",
+            "requested changes",
+            "null pointer dereference",
+            "handling edge cases"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hey Usama,\n\nOn Fri, Oct 02, 2026 at 02:52:40AM -0700, Usama Arif wrote:\n[...]\n\n---\n\nShouldn't we clear the source UFFD marker here?\n\n\tmoved_pmd = pmd_swp_clear_uffd(moved_pmd);\n\njust like move_swap_pte(), no?\n\n---\n\nstatic int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,\n\t\t\t unsigned long dst_addr, unsigned long src_addr,\n\t\t\t pte_t *dst_pte, pte_t *src_pte,\n\t\t\t pte_t orig_dst_pte, pte_t orig_src_pte,\n\t\t\t pmd_t *dst_pmd, pmd_t dst_pmdval,\n\t\t\t spinlock_t *dst_ptl, spinlock_t *src_ptl,\n\t\t\t struct folio *src_folio,\n\t\t\t struct swap_info_struct *si, swp_entry_t entry)\n{\n...\n\torig_src_pte = ptep_get_and_clear(mm, src_addr, src_pte);\n...\n\torig_src_pte = pte_swp_clear_uffd(orig_src_pte);\n\t/* Re-arm RWP on the moved swap entry if dst_vma is RWP-registered. */\n\tif (userfaultfd_rwp(dst_vma))\n\t\torig_src_pte = pte_swp_mkuffd(orig_src_pte);\n\tset_pte_at(mm, dst_addr, dst_pte, orig_src_pte);\n...\n}\n\nSuppose the source is an exclusive swap PMD carrying a UFFD-WP marker, and\nthe destination is an empty hole registered for synchronous UFFD-WP without\nRWP. We haven't write-protected the destination, but a successful whole-PMD\nMOVE carries the source's UFFD-WP marker into it.\n\nOn swap-in, that marker is restored in the present PMD, leaving it\nwrite-protected. The write fault then reaches\nhandle_userfault(vmf, VM_UFFD_WP), even though we never write-protected\nthe destination ...\n\nThat would be quite a surprise for userspace, and could leave the writer\nstuck if the unexpected WP event goes unhandled :)\n\nvm_fault_t do_huge_pmd_swap_page(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n...\n\tbool exclusive, stable_writes, rwp_restore = false;\n\tbool write = vmf->flags & FAULT_FLAG_WRITE;\n...\n\tpmd = folio_mk_pmd(folio, vma->vm_page_prot);\n...\n\tif (pmd_swp_uffd(vmf->orig_pmd))\n\t\tpmd = pmd_mkuffd(pmd);\n\tif (pmd_swp_uffd(vmf->orig_pmd) && userfaultfd_rwp(vma)) {\n\t\tpmd = pmd_modify(pmd, PAGE_NONE);\n\t\trwp_restore = true;\n\t}\n...\n\tif (exclusive) {\n\t\tif (!rwp_restore && (vma->vm_flags & VM_WRITE) &&\n\t\t    !userfaultfd_huge_pmd_wp(vma, pmd) &&\n\t\t    !pmd_needs_soft_dirty_wp(vma, pmd)) {\n\t\t\tpmd = pmd_mkwrite(pmd, vma);\n\t\t\tif (write)\n\t\t\t\tpmd = pmd_mkdirty(pmd);\n\t\t}\n\t\trmap_flags |= RMAP_EXCLUSIVE;\n\t}\n...\n\tvmf->orig_pmd = pmd;\n...\n\tif (write && !pmd_write(pmd) && !rwp_restore) {\n\t\tvm_fault_t wp_ret = wp_huge_pmd(vmf);\n...\n\t}\n...\n}\n\nvm_fault_t wp_huge_pmd(struct vm_fault *vmf)\n{\n\tstruct vm_area_struct *vma = vmf->vma;\n\tconst bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;\n...\n\tif (vma_is_anonymous(vma)) {\n\t\tif (likely(!unshare) &&\n\t\t    userfaultfd_huge_pmd_wp(vma, vmf->orig_pmd)) {\n\t\t\tif (userfaultfd_wp_async(vmf->vma))\n\t\t\t\tgoto split;\n\t\t\treturn handle_userfault(vmf, VM_UFFD_WP);\n\t\t}\n\t\treturn do_huge_pmd_wp_page(vmf);\n\t}\n...\n}\n\nSo, clearing the source UFFD-WP marker before the destination RWP check\nwould match the PTE helper and keep the RWP re-arm :)\n\nAm I missing something?\n\n---\n\n[...]\n\nCheers, Lance",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-10-04",
+          "message_id": "20261004081917.20111-1-lance.yang@linux.dev",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds support for moving PMD-level swap entries in UFFDIO_MOVE operations. It introduces a new function, move_swap_pmd(), which handles the movement of these entries under both PMD locks. The function propagates soft-dirty bits and arms the UFFD marker for an RWP-registered destination. It also revalidates the folio's association with the swap entry and updates the anon rmap metadata. The patch rejects a PMD swap entry at the destination with -EEXIST, as it is not a hole and does not resolve on its own. This patch addresses a problem where aligned UFFDIO_MOVE operations over swapped-out THPs fail due to the lack of support for PMD-level swap entries."
     }
   }
 }

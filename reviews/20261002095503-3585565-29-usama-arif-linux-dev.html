@@ -238,9 +238,168 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v8 28/30] mm: handle PMD swap entry faults on swap-in</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261002095503.3585565-29-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-02</strong><div class="date-range-nav">Active on: <a href="#2026-10-02">2026-10-02</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a problem where PMD (Page Map Directory) swap entries would fault indefinitely when trying to swap in a huge page. The patch introduces a new function, do_huge_pmd_swap_page(), which resolves the whole mapping at PMD granularity and handles various failure cases, such as cache splitting or allocation failures. It also ensures that the folio is properly dropped from the swap cache if it has never been mapped or is not up-to-date. The patch aims to prevent a transient PMD-order allocation failure from becoming a VM_FAULT_OOM error.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-10-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-04</strong><div class="date-range-nav">Active on: <a href="#2026-10-04">2026-10-04</a> &bull; <a href="#2026-10-02">2026-10-02</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a problem where PMD (Page Map Directory) swap entries would fault indefinitely when swapped out, causing a VM_FAULT_OOM error. The solution is to split the PMD entry into individual PTEs and return 0, allowing the retry to land in do_swap_page(). This approach ensures that transient allocation failures do not become permanent errors. Additionally, the patch handles various edge cases, such as dropping folios from the swap cache when necessary, refusing to map poisoned subpages, and calling wp_huge_pmd() for write faults on read-only PMDs.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-04">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Lance Yang</span>
+<a class="date-chip" href="../2026-10-04_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-04">2026-10-04</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Lance Yang expressed concern that the patch does not handle the case where a PMD swap entry is split due to cache insertion losing a race, and suggested that this edge case should be addressed.
+
+The reviewer pointed out a potential race condition in the swap cache handling, where zswap writeback may insert an order-0 folio into the cache while another thread is still accessing it. This can lead to the last reference to the folio being dropped prematurely, causing issues with I/O completion. The reviewer suggested unlocking and putting the folio on size mismatch, then jumping to split_fallback to keep the folio in the swap cache for do_swap_page().
+
+Reviewer noted that the patch does not handle the case where a PMD swap entry is split due to cache insertion losing a race, and requested additional locking to prevent this issue.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hey Usama,
+
+Not an expert on swap, so the below may be naive ...
+
+On Fri, Oct 02, 2026 at 02:52:42AM -0700, Usama Arif wrote:
+[...]
+
+---
+
+Requesting BIT(HPAGE_PMD_ORDER) doesn&#x27;t prevent swapin_sync() from
+returning a cached order-0 folio ...
+
+struct folio *swapin_sync(swp_entry_t entry, gfp_t gfp, unsigned long orders,
+			   struct vm_fault *vmf, struct mempolicy *mpol, pgoff_t ilx)
+{
+...
+	do {
+		folio = swap_cache_get_folio(entry);
+		if (folio)
+			return folio;
+		folio = __swap_cache_alloc_folio(entry, gfp, orders, vmf, mpol, ilx);
+	} while (PTR_ERR(folio) == -EEXIST);
+
+...
+}
+
+static int zswap_writeback_entry(struct zswap_entry *entry,
+				 swp_entry_t swpentry)
+{
+...
+	folio = __swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,
+					 NO_INTERLEAVE_INDEX);
+...
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+...
+	if (!zswap_decompress(entry, folio)) {
+		ret = -EIO;
+		goto err;
+	}
+
+	xa_erase(tree, offset);
+...
+	/* folio is up to date */
+	folio_mark_uptodate(folio);
+
+	folio_set_dropbehind(folio);
+...
+	folio_put(folio);
+
+	/* start writeback */
+	__swap_writeout(&amp;ctx, folio);
+	swap_write_submit(&amp;ctx);
+
+	return 0;
+...
+}
+
+void __swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
+{
+	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
+...
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+	swap_add_folio(ctx, folio, WRITE);
+}
+
+Say we hit the following race:
+
+1) swap_pmd_cache_lookup() finds the range empty, before zswap writeback
+   inserts its order-0 folio.
+
+2) zswap writeback puts that small folio in the swap cache at the first
+   slot, then erases the last zswap entry in the range.
+
+3) The fault thread checks zswap and gets false from zswap_is_present().
+   It then calls swapin_sync(), which returns that cached small folio.
+
+4) After __swap_writeout() unlocks the folio, the fault thread can lock
+   it while writeback is still pending. The folio isn&#x27;t PMD-sized, so
+   we reach that cleanup ...
+
+zswap has already dropped its allocation reference, and writeback itself
+doesn&#x27;t hold one. So, without any other references, we&#x27;re left with the
+swap-cache reference and our fault reference.
+
+The folio is still !anon, so swap_cache_del_folio() removes the cache
+reference, then folio_put() drops ours. That can drop the last reference
+while I/O is still using the folio ... :(
+
+So ... could we just unlock and put it on the size mismatch, then jump
+to split_fallback? That would keep the folio in the swap cache for
+do_swap_page().
+
+Something like:
+
+---8&lt;---
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 69721801cf9f..53c15bfdb0a1 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2507,9 +2507,14 @@ vm_fault_t do_huge_pmd_swap_page(struct vm_fault *vmf)
+ 	/*
+ 	 * Folio should be PMD-sized; if not (e.g. split in swap cache),
+ 	 * split the PMD swap entry and retry at PTE level.
++	 * Keep the folio cached: zswap writeback may still be in flight and
++	 * relies on the swap-cache reference to keep it alive.
+ 	 */
+-	if (folio_nr_pages(folio) != HPAGE_PMD_NR)
+-		goto unlock_split_fallback;
++	if (folio_nr_pages(folio) != HPAGE_PMD_NR) {
++		folio_unlock(folio);
++		folio_put(folio);
++		goto split_fallback;
++	}
+
+ 	/*
+ 	 * A read that failed - a PMD-order zswap load that found per-page
+@@ -2647,6 +2652,7 @@ vm_fault_t do_huge_pmd_swap_page(struct vm_fault *vmf)
+
+ unlock_split_fallback:
+ 	/*
++	 * Only PMD-sized folios reach this cleanup.
+ 	 * PTE fallback cannot add a single-page rmap to a PMD-sized folio that
+ 	 * has never been mapped: do_swap_page() would hand the whole folio to
+ 	 * folio_add_new_anon_rmap() while installing one PTE. Nor can it do
+--
+
+Hopefully I didn&#x27;t miss anything :D
+
+---
+
+[...]
+
+Cheers, Lance</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<a href="https://lore.kernel.org/r/20261004101942.37331-1-lance.yang@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: concern, suggestion, potential race condition</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
