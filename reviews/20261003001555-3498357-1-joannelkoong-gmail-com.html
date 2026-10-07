@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v1 0/3] mm/readahead: avoid per-folio memcg reclaim</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261003001555.3498357-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-05</strong><div class="date-range-nav">Active on: <a href="#2026-10-05">2026-10-05</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-10-05</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-06</strong><div class="date-range-nav">Active on: <a href="#2026-10-06">2026-10-06</a> &bull; <a href="#2026-10-05">2026-10-05</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a performance issue in Linux&#x27;s readahead mechanism by avoiding per-folio memory cgroup (memcg) reclaim. When multiple tasks fault in the same cgroup, the frequent per-folio charges trigger reclaim, leading to livelocks and high CPU usage. The patches modify readahead to charge all folios in its window at once when the memcg is at its limit, reducing the number of reclaim passes by 94-96% and eliminating livelocks on a test system with btrfs file systems and compress-force=zstd:3.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-05">
@@ -283,6 +283,113 @@ overall performance loss?
 <div class="reply-to-label">&#8627; replying to Joanne Koong</div>
 <a href="https://lore.kernel.org/r/gz7cxhldkfkinbzpx4goa6rhdqpzldpaenzhtfoxcztpzj5avw@hkzo4fbdbck3" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested additional checks, questioning the effectiveness of the patch, request for clarification</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-10-06">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-10-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-06">2026-10-06</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2, and clarified that this change is necessary for avoiding memcg reclaim
+
+Author Joanne Koong is addressing a concern about the high rate of reclaim triggered by mmap readaround in btrfs file systems due to large ra_pages settings, which causes most faults to land on already cached pages. She suggests computing the mmap readaround size differently, either with a fixed cap or dynamically adapting the window based on usage.
+
+The author is addressing concerns about the accuracy of mmap_miss counting, specifically that it overcounts hits and doesn&#x27;t account for wasted pages. They suggest changing the count to track pages read vs pages used instead, or alternatively getting information from reclaim. The author believes these improvements would be complementary to their original patch rather than a replacement.
+
+Author addressed a concern about the impact of removing read-around on sequential readers, suggesting that it would have a minimal effect on random-access workloads but potentially harm sequential readers.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Jan!
+
+Thanks for taking a look at this.
+
+On Mon, Oct 5, 2026 at 2:27 PM Jan Kara &lt;jack@suse.cz&gt; wrote:
+
+---
+
+I ran some traces on two production hosts and am roughly seeing:
+* of the readahead folios that reclaim dropped during runs, ~66-78%
+had never been mapped
+* running a 60 second sample: mmap read-around accounts for ~86% of
+readahead on both hosts. 77% of the folios it adds are never mapped.
+Around 10-15% are faulted on directly and the rest are mapped by
+fault-around. mmap_miss skipped read-around for only ~2-4% of major
+faults. For faults that triggered read-around, mmap_miss was below 10
+for 74%-96% of them.
+
+This looks specific to mmap-readaround though. On these same hosts,
+I&#x27;m seeing much better utilization by buffered read readaheads (only
+~30% never accessed).
+
+I think a big part of what&#x27;s causing this is that btrfs by default
+sets ra_pages to at least 4M (in open_ctree() in fs/btrfs/disk-io.c).
+In do_sync_mmap_readahead(), I see &quot;ra-&gt;size = ra-&gt;ra_pages;&quot;. So it
+looks like mmap uses this same value directly for how many pages to
+read-around (with 4M ra_pages, this is 1024 pages), even if the faults
+are random accesses. I think this also accounts for why mmap_miss is
+so low too, since with the readaround windows that large, most faults
+land on pages that are already in the page cache, and each of those
+minor faults count as up to 16 hits, while each major fault only adds
+one miss and happens a lot less frequently. With many processes
+mapping the same file, I think it makes the problem worse (eg each
+process has minor faults to map it to its page tables, but there was
+only 1 major fault to load it into the cache).
+(Adding the btrfs list to cc. Apologies for not doing this from the
+beginning. The full thread is at
+https://lore.kernel.org/linux-fsdevel/20261003001555.3498357-1-joannelkoong@gmail.com/).
+
+Instead of having the mmap readaround size coupled 1:1 with ra_pages,
+do you think it makes sense to compute it differently? Like either
+having some sort of fixed cap (readaround never bigger than
+VM_READAHEAD_PAGES) or dynamically adapting the window where it starts
+small and grows if/when readaround folios get used and shrinking when
+they don&#x27;t? I don&#x27;t think this would degrade sequential mmap access
+(eg async readahead would ramp the window back up to ra_pages in a few
+steps once the fault hits the PG_readahead marker) and I think it
+could be beneficial in general too, as less pages need to get read in
+speculatively that wouldn&#x27;t be used, which would also lead to less
+reclaim.
+
+---
+
+Do you think it&#x27;d be better to have mmap_miss count pages read vs
+pages used instead of counting misses and hits seen at fault time? I
+think the problem we&#x27;re running into here at Meta which mmap_miss is
+not detecting is that there&#x27;s lots of wasted pages that never reach a
+fault. It also seems to overcount hits, eg a single fault can subtract
+mmap_miss by up to 16 if there are nearby cached pages (which might
+have been cached by buffered reads, not mmap), even if those cached
+pages never actually get touched. And the same cached page can be
+counted as a hit several times, once for each process that minor
+faults it in. Or maybe there&#x27;s some simple way to get the info from
+reclaim instead? Where if reclaim is evicting a readahead page that
+was never accessed, that&#x27;s counted as a miss? imo that seems a lot
+more accurate as a signal though that also seems a lot more invasive,
+like needing a new page flag.
+
+As I understand it, both these improvements (detangling mmap
+readaround size from ra_pages and improving mmap_miss heuristics)
+would be complementary to this series rather than a replacement for
+the per-folio reclaim fix. Does this match your view?
+
+---
+
+I haven&#x27;t measured end-to-end performance for that on production loads
+but my suspicion is that losing read-around at the memcg limit
+wouldn&#x27;t affect random-access workloads like these much, while it
+would for sequential readers.
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Jan Kara</div>
+<a href="https://lore.kernel.org/r/CAJnrk1ZaYAy_81OVxZ74wF1EXF8j13giGdu_CD7Q3XLzX-XThQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged fix needed, agreed to restructure, questioning</div>
+</div>
+</div>
 </div>
 </div>
 <div class="thread-node depth-0">

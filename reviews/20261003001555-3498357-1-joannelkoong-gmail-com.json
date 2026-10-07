@@ -48,6 +48,38 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series addresses a performance issue in Linux's readahead mechanism by avoiding per-folio memory cgroup (memcg) reclaim. When multiple tasks fault in the same cgroup, the frequent per-folio charges trigger reclaim, leading to livelocks and high CPU usage. The patches modify readahead to charge all folios in its window at once when the memcg is at its limit, reducing the number of reclaim passes by 94-96% and eliminating livelocks on a test system with btrfs file systems and compress-force=zstd:3."
+    },
+    "2026-10-06": {
+      "report_file": "2026-10-06_ollama_llama3.1-8b.html",
+      "developer": "Joanne Koong",
+      "reviews": [
+        {
+          "author": "Joanne Koong (author)",
+          "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2, and clarified that this change is necessary for avoiding memcg reclaim\n\nAuthor Joanne Koong is addressing a concern about the high rate of reclaim triggered by mmap readaround in btrfs file systems due to large ra_pages settings, which causes most faults to land on already cached pages. She suggests computing the mmap readaround size differently, either with a fixed cap or dynamically adapting the window based on usage.\n\nThe author is addressing concerns about the accuracy of mmap_miss counting, specifically that it overcounts hits and doesn't account for wasted pages. They suggest changing the count to track pages read vs pages used instead, or alternatively getting information from reclaim. The author believes these improvements would be complementary to their original patch rather than a replacement.\n\nAuthor addressed a concern about the impact of removing read-around on sequential readers, suggesting that it would have a minimal effect on random-access workloads but potentially harm sequential readers.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged fix needed",
+            "agreed to restructure",
+            "questioning",
+            "exploring alternative solutions",
+            "clarification",
+            "exploration of alternative solutions",
+            "suggestion",
+            "speculation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Hi Jan!\n\nThanks for taking a look at this.\n\nOn Mon, Oct 5, 2026 at 2:27 PM Jan Kara <jack@suse.cz> wrote:\n\n---\n\nI ran some traces on two production hosts and am roughly seeing:\n* of the readahead folios that reclaim dropped during runs, ~66-78%\nhad never been mapped\n* running a 60 second sample: mmap read-around accounts for ~86% of\nreadahead on both hosts. 77% of the folios it adds are never mapped.\nAround 10-15% are faulted on directly and the rest are mapped by\nfault-around. mmap_miss skipped read-around for only ~2-4% of major\nfaults. For faults that triggered read-around, mmap_miss was below 10\nfor 74%-96% of them.\n\nThis looks specific to mmap-readaround though. On these same hosts,\nI'm seeing much better utilization by buffered read readaheads (only\n~30% never accessed).\n\nI think a big part of what's causing this is that btrfs by default\nsets ra_pages to at least 4M (in open_ctree() in fs/btrfs/disk-io.c).\nIn do_sync_mmap_readahead(), I see \"ra->size = ra->ra_pages;\". So it\nlooks like mmap uses this same value directly for how many pages to\nread-around (with 4M ra_pages, this is 1024 pages), even if the faults\nare random accesses. I think this also accounts for why mmap_miss is\nso low too, since with the readaround windows that large, most faults\nland on pages that are already in the page cache, and each of those\nminor faults count as up to 16 hits, while each major fault only adds\none miss and happens a lot less frequently. With many processes\nmapping the same file, I think it makes the problem worse (eg each\nprocess has minor faults to map it to its page tables, but there was\nonly 1 major fault to load it into the cache).\n(Adding the btrfs list to cc. Apologies for not doing this from the\nbeginning. The full thread is at\nhttps://lore.kernel.org/linux-fsdevel/20261003001555.3498357-1-joannelkoong@gmail.com/).\n\nInstead of having the mmap readaround size coupled 1:1 with ra_pages,\ndo you think it makes sense to compute it differently? Like either\nhaving some sort of fixed cap (readaround never bigger than\nVM_READAHEAD_PAGES) or dynamically adapting the window where it starts\nsmall and grows if/when readaround folios get used and shrinking when\nthey don't? I don't think this would degrade sequential mmap access\n(eg async readahead would ramp the window back up to ra_pages in a few\nsteps once the fault hits the PG_readahead marker) and I think it\ncould be beneficial in general too, as less pages need to get read in\nspeculatively that wouldn't be used, which would also lead to less\nreclaim.\n\n---\n\nDo you think it'd be better to have mmap_miss count pages read vs\npages used instead of counting misses and hits seen at fault time? I\nthink the problem we're running into here at Meta which mmap_miss is\nnot detecting is that there's lots of wasted pages that never reach a\nfault. It also seems to overcount hits, eg a single fault can subtract\nmmap_miss by up to 16 if there are nearby cached pages (which might\nhave been cached by buffered reads, not mmap), even if those cached\npages never actually get touched. And the same cached page can be\ncounted as a hit several times, once for each process that minor\nfaults it in. Or maybe there's some simple way to get the info from\nreclaim instead? Where if reclaim is evicting a readahead page that\nwas never accessed, that's counted as a miss? imo that seems a lot\nmore accurate as a signal though that also seems a lot more invasive,\nlike needing a new page flag.\n\nAs I understand it, both these improvements (detangling mmap\nreadaround size from ra_pages and improving mmap_miss heuristics)\nwould be complementary to this series rather than a replacement for\nthe per-folio reclaim fix. Does this match your view?\n\n---\n\nI haven't measured end-to-end performance for that on production loads\nbut my suspicion is that losing read-around at the memcg limit\nwouldn't affect random-access workloads like these much, while it\nwould for sequential readers.\n\nThanks,\nJoanne",
+          "reply_to": "Jan Kara",
+          "message_date": "2026-10-06",
+          "message_id": "CAJnrk1ZaYAy_81OVxZ74wF1EXF8j13giGdu_CD7Q3XLzX-XThQ@mail.gmail.com",
+          "email": "joannelkoong@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series addresses a performance issue in Linux's readahead mechanism by avoiding per-folio memory cgroup (memcg) reclaim. When multiple tasks fault in the same cgroup, the frequent per-folio charges trigger reclaim, leading to livelocks and high CPU usage. The patches modify readahead to charge all folios in its window at once when the memcg is at its limit, reducing the number of reclaim passes by 94-96% and eliminating livelocks on a test system with btrfs file systems and compress-force=zstd:3."
     }
   }
 }
