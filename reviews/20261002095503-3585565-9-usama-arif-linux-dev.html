@@ -238,9 +238,97 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v8 08/30] mm: recognize PMD swap entries in the softleaf layer</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261002095503.3585565-9-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-02</strong><div class="date-range-nav">Active on: <a href="#2026-10-02">2026-10-02</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the softleaf layer in the Linux kernel to recognize and handle PMD swap entries. It introduces a new function `pmd_is_swap_entry()` that checks if a PMD entry encodes a swap entry, and updates existing functions to correctly handle swap entries. The changes include removing unnecessary checks for migration and device-private entries, and adding a check for swap entries in the `softleaf_is_valid_pmd_entry()` function. This patch prepares the kernel for installing swap entries directly into the PMD layer.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-10-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-07</strong><div class="date-range-nav">Active on: <a href="#2026-10-07">2026-10-07</a> &bull; <a href="#2026-10-02">2026-10-02</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces support for PMD swap entries in the softleaf layer, allowing swap entries to be recognized and handled correctly. The changes involve modifying various functions to handle PMD swap entries, including adding a new function `pmd_is_swap_entry()` to check if a PMD entry encodes an actual swap entry.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-07">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Zi Yan</span>
+<a class="date-chip" href="../2026-10-07_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-07">2026-10-07</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Identified potential issue with softleaf_is_swap() causing false positives in softleaf_is_valid_pmd_entry(). Suggested adding the check only after PMD swap entries are possible. Otherwise, LGTM.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri Oct 2, 2026 at 5:52 AM EDT, Usama Arif wrote:
+&gt; Reclaim splits a PMD-mapped anonymous THP into PTE-level swap entries
+&gt; before unmapping it, so an ordinary swap entry has never had to appear in a
+&gt; PMD. Prepare for installing one there instead: the softleaf layer is where
+&gt; every consumer decodes non-present PMDs.
+&gt;
+&gt; Accept swap entries as valid PMD softleaves and add pmd_is_swap_entry().
+&gt; A swap entry carries no PFN, so make pmd_softleaf_to_folio() warn and
+&gt; return NULL rather than interpret a swap offset as a page frame number.
+&gt;
+&gt; Unlike migration and device-private entries, a PMD swap entry can also
+&gt; carry the swap-exclusive marker, which softleaf_from_pmd() has to strip
+&gt; before decoding. Strip all three overlays unconditionally while we are
+&gt; here: each clear is a plain bit clear, so testing first only buys a branch.
+&gt;
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; Acked-by: David Hildenbrand (Arm) &lt;david@kernel.org&gt;
+&gt; Reviewed-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+&gt; ---
+&gt;  include/linux/leafops.h | 40 ++++++++++++++++++++++++++++------------
+&gt;  include/linux/pgtable.h | 17 +++++++++++++++++
+&gt;  2 files changed, 45 insertions(+), 12 deletions(-)
+&gt;
+&gt; diff --git a/include/linux/leafops.h b/include/linux/leafops.h
+&gt; index 7c13c58a5e218..ce176c78cefd4 100644
+&gt; --- a/include/linux/leafops.h
+&gt; +++ b/include/linux/leafops.h
+&gt; @@ -98,10 +98,9 @@ static inline softleaf_t softleaf_from_pmd(pmd_t pmd)
+&gt;  	if (pmd_present(pmd) || pmd_none(pmd))
+&gt;  		return softleaf_mk_none();
+&gt;  
+&gt; -	if (pmd_swp_soft_dirty(pmd))
+&gt; -		pmd = pmd_swp_clear_soft_dirty(pmd);
+&gt; -	if (pmd_swp_uffd(pmd))
+&gt; -		pmd = pmd_swp_clear_uffd(pmd);
+&gt; +	pmd = pmd_swp_clear_soft_dirty(pmd);
+&gt; +	pmd = pmd_swp_clear_uffd(pmd);
+&gt; +	pmd = pmd_swp_clear_exclusive(pmd);
+
+I notice there is pte_swp_clear_flags() and wonder if we want
+pmd_swp_clear_flags() to match it.
+
+&gt;  	arch_entry = __pmd_to_swp_entry(pmd);
+&gt;  
+&gt;  	/* Temporary until swp_entry_t eliminated. */
+&gt; @@ -634,18 +633,29 @@ static inline bool pmd_is_migration_entry(pmd_t pmd)
+&gt;   */
+&gt;  static inline bool softleaf_is_valid_pmd_entry(softleaf_t entry)
+&gt;  {
+&gt; -	/* Only device private, migration entries valid for PMD. */
+&gt;  	return softleaf_is_device_private(entry) ||
+&gt; -		softleaf_is_migration(entry);
+&gt; +		softleaf_is_migration(entry) ||
+&gt; +		softleaf_is_swap(entry);
+
+Using softleaf_is_swap() here makes softleaf_is_valid_pmd_entry() return
+false positive when pmd swap entry is not possible at the moment. Adding
+it only after pmd swap entry is possible can close the gap. But the
+whole series should be applied together, so it should be fine.
+
+Otherwise, LGTM.
+
+Reviewed-by: Zi Yan &lt;ziy@nvidia.com&gt;
+
+-- 
+Best Regards,
+Yan, Zi
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Usama Arif</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
