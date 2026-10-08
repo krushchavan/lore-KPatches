@@ -2,7 +2,7 @@
   "date": "2026-10-07",
   "report_file": "2026-10-07_ollama_llama3.1-8b.html",
   "status": "in_progress",
-  "last_updated": "2026-10-08 06:11 UTC",
+  "last_updated": "2026-10-08 06:14 UTC",
   "llm_backends": [
     [
       "ollama",
@@ -487,6 +487,125 @@
       "primary_email": "inwardvessel@gmail.com",
       "patches_submitted": [],
       "patches_reviewed": [],
+      "patches_acked": [],
+      "discussions_posted": [],
+      "errors": []
+    },
+    {
+      "name": "Kiryl Shutsemau",
+      "primary_email": "kas@kernel.org",
+      "patches_submitted": [
+        {
+          "activity_type": "patch_submitted",
+          "subject": "[PATCH v2] mm: page_alloc: make defrag_mode retries follow the promoted order",
+          "message_id": "20261006091815.897133-1-kirill@shutemov.name",
+          "url": "https://lore.kernel.org/all/20261006091815.897133-1-kirill@shutemov.name/",
+          "date": "2026-10-06T09:18:22Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": true,
+          "submitted_date": "2026-10-06",
+          "patch_version": 2,
+          "series_patch_count": 1,
+          "version_history": [
+            {
+              "version": 1,
+              "message_id": "20260929174553.175333-1-kirill@shutemov.name",
+              "url": "https://lore.kernel.org/all/20260929174553.175333-1-kirill@shutemov.name/",
+              "subject": "[PATCH] mm: page_alloc: make defrag_mode retries follow the promoted order",
+              "date": "2026-09-29T17:46:03Z"
+            },
+            {
+              "version": 2,
+              "message_id": "20261006091815.897133-1-kirill@shutemov.name",
+              "url": "https://lore.kernel.org/all/20261006091815.897133-1-kirill@shutemov.name/",
+              "subject": "[PATCH v2] mm: page_alloc: make defrag_mode retries follow the promoted order",
+              "date": "2026-10-06T09:18:22Z"
+            }
+          ],
+          "series_items": [],
+          "patch_summary": "This patch modifies the behavior of page allocation in defrag_mode to make retries follow the promoted order, rather than the original request order. This change is intended to prevent indefinite retrying by requests that are not movable, which can lead to high memory pressure and OOM killing. The patch also updates the retry logic for direct reclaim and compaction to take into account the promoted order, and resets the retry counters when a fallback attempt is made. As a result of this change, the number of should_reclaim_retry() calls and peak memory pressure are significantly reduced, leading to improved system performance.",
+          "analysis_source": "llm-per-reviewer",
+          "review_comments": [
+            {
+              "author": "Andrew Morton",
+              "summary": "Reviewer Andrew Morton questioned whether the patch should be applied to stable and 7.3-rcX kernels due to its size, suggesting caution before applying such a large change.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "caution",
+                "suggestion"
+              ],
+              "has_inline_review": false,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Thanks.  That's a fairly large update.  v2 diff is below.\n\nAre we sure about cc:stable?  Or even 7.3-rcX?  It's a pretty big\nchange.\n\n\n mm/page_alloc.c |   62 +++++++++++++++++++++++++---------------------\n 1 file changed, 34 insertions(+), 28 deletions(-)\n\n--- a/mm/page_alloc.c~a\n+++ a/mm/page_alloc.c\n@@ -4139,8 +4139,9 @@ out:\n  * For those, promote the order of reclaim and compaction to help make\n  * blocks, instead of spinning in reclaim alone unproductively. Retry\n  * decisions based on the outcome of that work - reclaim progress and\n- * compaction results - must account for the promotion as well, see\n- * should_reclaim_retry() and should_compact_retry().\n+ * compaction results - must account for the promotion as well, so\n+ * __alloc_pages_slowpath() computes the promoted order once and passes\n+ * it alongside the request order.\n  */\n static inline unsigned int nofrag_promote_order(unsigned int order,\n \t\t\t\t\t\tunsigned int alloc_flags,\n@@ -4162,8 +4163,9 @@ static inline unsigned int nofrag_promot\n /* Try memory compaction for high-order allocations before reclaim */\n static struct page *\n __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,\n-\t\tunsigned int alloc_flags, const struct alloc_context *ac,\n-\t\tenum compact_priority prio, enum compact_result *compact_result)\n+\t\tunsigned int compact_order, unsigned int alloc_flags,\n+\t\tconst struct alloc_context *ac, enum compact_priority prio,\n+\t\tenum compact_result *compact_result)\n {\n \tstruct page *page = NULL;\n \tunsigned long pflags;\n@@ -4174,7 +4176,6 @@ __alloc_pages_direct_compact(gfp_t gfp_m\n \t\t.order = order,\n \t\t.page = NULL,\n \t};\n-\tunsigned int compact_order = nofrag_promote_order(order, alloc_flags, ac);\n \n \tif (!compact_order)\n \t\treturn NULL;\n@@ -4256,7 +4257,7 @@ __alloc_pages_direct_compact(gfp_t gfp_m\n \n static inline bool\n should_compact_retry(gfp_t gfp_mask, struct alloc_context *ac, int order,\n-\t\t     int alloc_flags,\n+\t\t     int compact_order, int alloc_flags,\n \t\t     enum compact_result compact_result,\n \t\t     enum compact_priority *compact_priority,\n \t\t     int *compaction_retries)\n@@ -4266,10 +4267,7 @@ should_compact_retry(gfp_t gfp_mask, str\n \tbool ret = false;\n \tint retries = *compaction_retries;\n \tenum compact_priority priority = *compact_priority;\n-\tunsigned int compact_order;\n \n-\t/* Check the compaction result at the order compaction ran at */\n-\tcompact_order = nofrag_promote_order(order, alloc_flags, ac);\n \tif (!compact_order)\n \t\treturn false;\n \n@@ -4304,7 +4302,7 @@ should_compact_retry(gfp_t gfp_mask, str\n \t\t * need much more detailed feedback from compaction to\n \t\t * make a better decision.\n \t\t */\n-\t\tif (compact_order > PAGE_ALLOC_COSTLY_ORDER)\n+\t\tif (order > PAGE_ALLOC_COSTLY_ORDER)\n \t\t\tmax_retries /= 4;\n \n \t\tif (++(*compaction_retries) <= max_retries) {\n@@ -4316,7 +4314,7 @@ should_compact_retry(gfp_t gfp_mask, str\n \t/*\n \t * Compaction failed. Retry with increasing priority.\n \t */\n-\tmin_priority = (compact_order > PAGE_ALLOC_COSTLY_ORDER) ?\n+\tmin_priority = (order > PAGE_ALLOC_COSTLY_ORDER) ?\n \t\t\tMIN_COMPACT_COSTLY_PRIORITY : MIN_COMPACT_PRIORITY;\n \n \tif (*compact_priority > min_priority) {\n@@ -4331,8 +4329,9 @@ out:\n #else\n static inline struct page *\n __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,\n-\t\tunsigned int alloc_flags, const struct alloc_context *ac,\n-\t\tenum compact_priority prio, enum compact_result *compact_result)\n+\t\tunsigned int compact_order, unsigned int alloc_flags,\n+\t\tconst struct alloc_context *ac, enum compact_priority prio,\n+\t\tenum compact_result *compact_result)\n {\n \t*compact_result = COMPACT_SKIPPED;\n \treturn NULL;\n@@ -4340,7 +4339,7 @@ __alloc_pages_direct_compact(gfp_t gfp_m\n \n static inline bool\n should_compact_retry(gfp_t gfp_mask, struct alloc_context *ac, int order,\n-\t\t     int alloc_flags,\n+\t\t     int compact_order, int alloc_flags,\n \t\t     enum compact_result compact_result,\n \t\t     enum compact_priority *compact_priority,\n \t\t     int *compaction_retries)\n@@ -4479,13 +4478,12 @@ __perform_reclaim(gfp_t gfp_mask, unsign\n /* The really slow allocator path where we enter direct reclaim */\n static inline struct page *\n __alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,\n-\t\tunsigned int alloc_flags, const struct alloc_context *ac,\n-\t\tunsigned long *did_some_progress)\n+\t\tunsigned int reclaim_order, unsigned int alloc_flags,\n+\t\tconst struct alloc_context *ac, unsigned long *did_some_progress)\n {\n \tstruct page *page = NULL;\n \tunsigned long pflags;\n \tbool drained = false;\n-\tunsigned int reclaim_order = nofrag_promote_order(order, alloc_flags, ac);\n \n \tpsi_memstall_enter(&pflags);\n \t*did_some_progress = __perform_reclaim(gfp_mask, reclaim_order, ac);\n@@ -4651,8 +4649,9 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_ma\n  */\n static inline bool\n should_reclaim_retry(gfp_t gfp_mask, unsigned order,\n-\t\t     struct alloc_context *ac, int alloc_flags,\n-\t\t     bool did_some_progress, int *no_progress_loops)\n+\t\t     unsigned int reclaim_order, struct alloc_context *ac,\n+\t\t     int alloc_flags, bool did_some_progress,\n+\t\t     int *no_progress_loops)\n {\n \tstruct zone *zone;\n \tstruct zoneref *z;\n@@ -4671,7 +4670,7 @@ should_reclaim_retry(gfp_t gfp_mask, uns\n \t * whether the request itself could succeed after reclaim.\n \t */\n \tif (did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER &&\n-\t    nofrag_promote_order(order, alloc_flags, ac) == order)\n+\t    reclaim_order == order)\n \t\t*no_progress_loops = 0;\n \telse\n \t\t(*no_progress_loops)++;\n@@ -4811,6 +4810,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, u\n \tconst bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;\n \tstruct page *page = NULL;\n \tunsigned int alloc_flags;\n+\tunsigned int reclaim_order;\n \tunsigned long did_some_progress;\n \tenum compact_priority compact_priority;\n \tenum compact_result compact_result;\n@@ -4955,17 +4955,22 @@ retry:\n \t/* If allocation has taken excessively long, warn about it */\n \tcheck_alloc_stall_warn(gfp_mask, ac->nodemask, order, alloc_start_time);\n \n+\t/* The order reclaim and compaction work at, see nofrag_promote_order() */\n+\treclaim_order = nofrag_promote_order(order, alloc_flags, ac);\n+\n \t/* Try direct reclaim and then allocating */\n \tif (!compact_first) {\n-\t\tpage = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags,\n-\t\t\t\t\t\t\tac, &did_some_progress);\n+\t\tpage = __alloc_pages_direct_reclaim(gfp_mask, order, reclaim_order,\n+\t\t\t\t\t\t    alloc_flags, ac,\n+\t\t\t\t\t\t    &did_some_progress);\n \t\tif (page)\n \t\t\tgoto got_pg;\n \t}\n \n \t/* Try direct compaction and then allocating */\n-\tpage = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,\n-\t\t\t\t\tcompact_priority, &compact_result);\n+\tpage = __alloc_pages_direct_compact(gfp_mask, order, reclaim_order,\n+\t\t\t\t\t    alloc_flags, ac, compact_priority,\n+\t\t\t\t\t    &compact_result);\n \tif (page)\n \t\tgoto got_pg;\n \n@@ -5017,8 +5022,9 @@ retry:\n \t    check_retry_zonelist(zonelist_iter_cookie))\n \t\tgoto restart;\n \n-\tif (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,\n-\t\t\t\t did_some_progress > 0, &no_progress_loops))\n+\tif (should_reclaim_retry(gfp_mask, order, reclaim_order, ac,\n+\t\t\t\t alloc_flags, did_some_progress > 0,\n+\t\t\t\t &no_progress_loops))\n \t\tgoto retry;\n \n \t/*\n@@ -5028,8 +5034,8 @@ retry:\n \t * of free memory (see __compaction_suitable)\n \t */\n \tif (did_some_progress > 0 && can_compact &&\n-\t    should_compact_retry(gfp_mask, ac, order, alloc_flags,\n-\t\t\t\t compact_result, &compact_priority,\n+\t    should_compact_retry(gfp_mask, ac, order, reclaim_order,\n+\t\t\t\t alloc_flags, compact_result, &compact_priority,\n \t\t\t\t &compaction_retries))\n \t\tgoto retry;\n \n_",
+              "reply_to": "Kiryl Shutsemau",
+              "message_date": "2026-10-06",
+              "message_id": "20261006164122.ea9a673b336b8ac74725c35c@linux-foundation.org",
+              "analysis_source": "llm",
+              "email": "akpm@linux-foundation.org"
+            },
+            {
+              "author": "Kiryl Shutsemau (author)",
+              "summary": "Author is addressing a concern about the patch's testing and review process, suggesting to keep cc:stable but only submit it to Linus for v7.4-rc1 after it has been battle-tested in the fleet.",
+              "sentiment": "NEUTRAL",
+              "sentiment_signals": [
+                "clarification",
+                "request for consideration"
+              ],
+              "has_inline_review": false,
+              "tags_given": [],
+              "raw_body": "I think defrag_mode is not widely used. Maybe only in Meta.\n\nWhat about keeping cc:stable, but only submit it to Linus for v7.4-rc1?\n\nBy the time we would have the patch battle-tested in the fleet.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+              "reply_to": "Andrew Morton",
+              "message_date": "2026-10-07",
+              "message_id": "asZCEttmL6VlMXKc@thinkstation",
+              "analysis_source": "llm",
+              "email": "kirill@shutemov.name"
+            },
+            {
+              "author": "Usama Arif",
+              "summary": "Reviewer Usama Arif suggested resetting the retry counters only when the work order was actually promoted, to prevent movable requests and high-order requests from getting additional retries.",
+              "sentiment": "NEEDS_WORK",
+              "sentiment_signals": [
+                "requested changes"
+              ],
+              "has_inline_review": true,
+              "tags_given": [
+                "Reviewed-by"
+              ],
+              "raw_body": "Should these counters be reset only when the work order was actually\npromoted?\n\nFor movable requests, and requests already at or above pageblock\norder, `reclaim_order == order`. Their retry budget was therefore\nspent on the request itself rather than on promoted pageblock\nproduction. Resetting the counters here can give those requests\nanother 17 no-progress reclaim attempts, plus additional\ncompaction-success retries, before OOM or allocation failure.\n\nHow about:\n\tif (reclaim_order != order) {\n\t\tno_progress_loops = 0;\n\t\tcompaction_retries = 0;\n\t}\n\ninstead?",
+              "reply_to": "Kiryl Shutsemau",
+              "message_date": "2026-10-07",
+              "message_id": "20261007155316.2010164-1-usama.arif@linux.dev",
+              "analysis_source": "llm",
+              "email": "usama.arif@linux.dev"
+            }
+          ],
+          "list_id": "stable@vger.kernel.org"
+        }
+      ],
+      "patches_reviewed": [
+        {
+          "activity_type": "patch_reviewed",
+          "subject": "Re: [PATCH v2] mm: page_alloc: make defrag_mode retries follow the promoted order",
+          "message_id": "asZCEttmL6VlMXKc@thinkstation",
+          "url": "https://lore.kernel.org/all/asZCEttmL6VlMXKc@thinkstation/",
+          "date": "2026-10-07T13:01:38Z",
+          "in_reply_to": null,
+          "ack_type": null,
+          "is_ongoing": false,
+          "submitted_date": null,
+          "patch_version": 1,
+          "series_patch_count": null,
+          "version_history": [],
+          "series_items": [],
+          "patch_summary": "",
+          "analysis_source": "llm",
+          "review_comments": [],
+          "list_id": "stable@vger.kernel.org"
+        }
+      ],
       "patches_acked": [],
       "discussions_posted": [],
       "errors": []
