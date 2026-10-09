@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v8 00/30] mm: PMD-level swap entries for anonymous THPs</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261002095503.3585565-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-07</strong><div class="date-range-nav">Active on: <a href="#2026-10-07">2026-10-07</a> &bull; <a href="#2026-10-05">2026-10-05</a> &bull; <a href="#2026-10-04">2026-10-04</a> &bull; <a href="#2026-10-02">2026-10-02</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-10-02</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-08</strong><div class="date-range-nav">Active on: <a href="#2026-10-08">2026-10-08</a> &bull; <a href="#2026-10-07">2026-10-07</a> &bull; <a href="#2026-10-05">2026-10-05</a> &bull; <a href="#2026-10-04">2026-10-04</a> &bull; <a href="#2026-10-02">2026-10-02</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces PMD-level swap entries for anonymous THPs, allowing huge mappings to survive the swap round-trip and reducing page-table overhead. When a PMD-mapped anonymous THP is swapped out, it is split into PTE-level swap entries. The new PMD swap entry is a compact page-table encoding that can be restored directly on swap-in without waiting for khugepaged to collapse the range later. This approach reduces major faults and swap I/O rate, resulting in improved performance. The patch series is ordered so that every consumer can handle PMD swap entries before the swap-out producer starts installing them.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-02">
@@ -3691,6 +3691,472 @@ Reviewed-by: Luiz Capitulino &lt;luizcap@redhat.com&gt;
 </details>
 <a href="https://lore.kernel.org/r/0dd22f82-058c-40ad-8f52-4d95020851a1@redhat.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: no explicit technical issues mentioned, reviewer found most of the patch to be good</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-10-08">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Luiz Capitulino</span>
+<a class="date-chip" href="../2026-10-08_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-08">2026-10-08</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Luiz Capitulino ran the MM kselftests, including pmd_swap, on x86-64 and s390 KVM guests, and all tests passed.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 10/2/26 5:52 AM, Usama Arif wrote:
+&gt; When reclaim swaps out a PMD-mapped anonymous THP today, the PMD is
+&gt; split into HPAGE_PMD_NR PTE-level swap entries via TTU_SPLIT_HUGE_PMD
+&gt; before unmap.  This series introduces a PMD-level swap entry so the
+&gt; huge mapping can survive the swap round-trip and do_huge_pmd_swap_page()
+&gt; can restore the PMD mapping directly on swap-in, without waiting for
+&gt; khugepaged to collapse the range later.
+&gt; 
+&gt; The PMD swap entry is a compact page-table encoding for HPAGE_PMD_NR
+&gt; consecutive swap slots.  swap_map accounting remains per-slot and is
+&gt; unchanged.  Importantly, a PMD swap entry does not promise that the swap
+&gt; cache always contains one PMD-sized folio.  While the cache is empty or
+&gt; contains one PMD-sized folio, PMD-level handling can proceed.  Once the
+&gt; cache has split/per-slot state, users either inspect the individual
+&gt; slots directly (mincore) or split the PMD swap entry and retry through
+&gt; the PTE path (fault, swapoff, MADV_WILLNEED, UFFDIO_MOVE).  MADV_FREE
+&gt; does not consult the cache at all: it frees a whole PMD swap entry in
+&gt; place and only splits when the advised range covers part of the PMD.
+&gt; Likewise, if any slot is still backed by zswap&#x27;s per-page
+&gt; store, PMD-order swap-in consumers split and let the PTE path load the
+&gt; range page by page; an all-on-disk range can still be read back as one
+&gt; PMD-sized folio.
+&gt; 
+&gt; The series is ordered so every consumer can handle PMD swap entries
+&gt; before the swap-out producer starts installing them.  The swap-out patch
+&gt; is the last functional change.
+&gt; 
+&gt; Performance:
+&gt; 
+&gt;    Measured with vm-scalability&#x27;s case-swap-w-seq benchmark [1].  Four
+&gt;    pinned workers repeatedly write a 6 GiB anonymous working set on a
+&gt;    4 vCPU / 4 GiB guest, forcing the set out to swap and back in.  Swap
+&gt;    is an 8 GiB NOCOW raw virtio device (cache=none, aio=native), zswap is
+&gt;    disabled, and THP enabled/defrag are both &quot;always&quot;.  The numbers below
+&gt;    are medians of five interleaved runs per kernel after one warm-up run:
+&gt; 
+&gt;    Metric                          Baseline     Patched      Change
+&gt;    Aggregate throughput            584.3 MiB/s  2408.9 MiB/s +312.2% (4.12x)
+&gt;    Elapsed time                    85.43 s      20.72 s      -75.7%
+&gt;    Major faults                    1,814,699    228,466      -87.4%
+&gt;    Swap I/O rate                   1.02 GiB/s   4.10 GiB/s   +303.9%
+&gt; 
+&gt;    This is a swap-intensive synthetic workload, so it mostly demonstrates
+&gt;    the reduction in swap-fault and page-table overhead from preserving
+&gt;    PMD mappings.  I don&#x27;t want to use sythetic workloads to show benefits
+&gt;    of the series. IMHO, the main advantage comes from long-running
+&gt;    workloads I expect the bigger win to come from fewer TLB misses,
+&gt;    less khugepaged work, and less kernel churn from larger folios, although
+&gt;    I have not found a benchmark that captures that well.  PMD swap entries
+&gt;    also move us closer to eliminating page-table deposits for anonymous THPs,
+&gt;    which would provide memory savings.
+&gt; 
+&gt; Sashiko reviews on intermediate patches:
+&gt; 
+&gt;    Because the swap-out producer is the last functional patch, the
+&gt;    consumer code added by the patches before it is unreachable at the
+&gt;    point it is introduced.  Every previous sashiko review has reported
+&gt;    that code as broken on the basis of a state it cannot yet be in; the
+&gt;    series is ordered this way deliberately.  See [2].
+&gt; 
+&gt; Notes on zswap:
+&gt; 
+&gt;    Native PMD-order zswap load/store is intentionally left for a follow-up.
+&gt;    Alexandre Ghiti is currently working on this.
+&gt;    This series can still preserve PMD swap entries while zswap is enabled:
+&gt;    zswap stores the THP as order-0 entries, and PMD-order swap-in
+&gt;    consumers split any range that has zswap entries before reading it.  If
+&gt;    zswap has written the whole range back to disk, or the swap cache still
+&gt;    contains one PMD-sized folio, PMD-level handling can proceed.
+&gt; 
+&gt; Testing:
+&gt; 
+&gt;    The 17 pmd_swap selftests pass on x86_64 with zswap both disabled and
+&gt;    enabled.  PMD_SWAP_DEVICE was the sole active swap device, so the
+&gt;    swapoff test ran in both configurations.  Note that with zswap enabled
+&gt;    the range may legitimately come back through the PTE fallback, so those
+&gt;    runs skip the PMD-restoration assertions and say so in the log; the
+&gt;    zswap-disabled run is the one that proves PMD restoration.
+&gt; 
+&gt;    hmm-tests was run with CONFIG_DEBUG_VM=y and panic_on_warn=1, both on
+&gt;    this series and on the base commit: identical results either way
+&gt;    (pass:35 fail:3 skip:40).  The three failures are O_TMPFILE on the
+&gt;    test VM&#x27;s 9p /tmp, not kernel behaviour, and the THP paths
+&gt;    (migrate_anon_huge_*, migrate_partial_unmap_fault,
+&gt;    benchmark_thp_migration) pass.
+
+I ran the MM kselftests, including pmd_swap with PMD_SWAP_DEVICE set, on
+x86-64 and s390 (both are KVM guests). Both passed. I may test more if
+I have the cycles once this reaches the MM tree (maybe running the
+kselftests on other archs or a stress test), but for now:
+
+Tested-by: Luiz Capitulino &lt;luizcap@redhat.com&gt;
+
+&gt; 
+&gt; [1] https://git.kernel.org/pub/scm/linux/kernel/git/wfg/vm-scalability.git/tree/case-swap-w-seq
+&gt; [2] https://lore.kernel.org/all/282ef982-3e48-4283-9155-73a33fc1c4e8@linux.dev/
+&gt; 
+&gt; v7 -&gt; v8: https://lore.kernel.org/all/20260914122950.3283997-1-usama.arif@linux.dev/
+&gt; - Cover letter: add the case-swap-w-seq performance results. (Andrew Morton)
+&gt; - Patches 2-8: reword the opening paragraph as &quot;Prepare for ...&quot; instead of
+&gt;    referring to a later patch. (David Hildenbrand)
+&gt; - Patch 4 (powerpc): move the PMD exclusive helpers next to the soft-dirty
+&gt;    PMD helpers and express them the same way, as pte_pmd()/pmd_pte()
+&gt;    wrappers over the PTE helpers. (David Hildenbrand)
+&gt; - Patch 6 (s390): drop the comment above the helpers, keep the explanation
+&gt;    in the RSTE swap layout above __SWP_OFFSET_MASK_RSTE, and move the
+&gt;    helpers into the existing CONFIG_ARCH_HAS_PMD_SOFTLEAVES block above
+&gt;    pmd_swp_soft_dirty(). (David Hildenbrand)
+&gt; - Patch 7 (x86): add static_assert(_PAGE_SWP_EXCLUSIVE != _PAGE_PSE) so a
+&gt;    32-bit build that ever selects ARCH_HAS_PMD_SOFTLEAVES fails to compile
+&gt;    rather than producing pmd_present() swap entries. (Kiryl Shutsemau)
+&gt; - Patch 10: rename the flag to to_migration_entries, use two-tab
+&gt;    continuation indentation, reword the split comment, turn the comment on
+&gt;    split_pmd_to_migration_entries() into kerneldoc, and fold the
+&gt;    try_to_migrate_one() call onto one line.  Also drop that helper&#x27;s
+&gt;    pmd_trans_huge() || pmd_is_valid_softleaf() test, which was both too loose
+&gt;    and silently skipped the split, in favour of a VM_WARN_ON_ONCE() at the top
+&gt;    of __split_huge_pmd_locked() asserting that to_migration_entries implies a
+&gt;    present or device-private PMD. (David Hildenbrand)
+&gt; - Patch 11: drop the VM_WARN_ON_ONCE()/force and its comment from the swap
+&gt;    decode arm - 10/29 now asserts the to_migration_entries contract at the top
+&gt;    of __split_huge_pmd_locked() instead - and build the replacement PTEs by
+&gt;    advancing pte_next_swp_offset() rather than rebuilding each entry, which
+&gt;    hoists the soft-dirty/uffd/exclusive tests out of the loop. (David
+&gt;    Hildenbrand).
+&gt; - Patch 12 (new): split the swap-side changes out of the fork patch, so the
+&gt;    swap-entry range duplication gets its own patch for the swap maintainers.
+&gt;    Keeps the single-slot names as inline wrappers so existing callers are
+&gt;    untouched. (David Hildenbrand)
+&gt; - Patch 13 (fork): report a failed swap dup as -EIO and let copy_pmd_range()
+&gt;    own the GFP_KERNEL retry, as the PTE path does, dropping the open-coded
+&gt;    retry loop; move the mm counter update into each entry-type arm. (David
+&gt;    Hildenbrand)
+&gt; - Patch 16 (smaps): smaps_account_swap() takes nr_pages rather than a byte
+&gt;    size, and the local is called swapcount. (David Hildenbrand)
+&gt; - No other functional change.  All twelve sashiko findings on v7 were
+&gt;    analysed and none are defects of this series.
+&gt; 
+&gt; v6 -&gt; v7: https://lore.kernel.org/all/20260818131202.494754-1-usama.arif@linux.dev/
+&gt; - Rebase onto akpm/mm-new at baa8de2f3448 and adapt to the new
+&gt;    get_swap_device() contract and linear_anon_page_index().  The series grows
+&gt;    from 12 to 29 patches.
+&gt; - Patch 1: code unchanged; reword the commit message and collect review tags.
+&gt; - Patches 2-9: split the six architecture helpers from generic detection and
+&gt;    add debug_vm_pgtable coverage.  Use the s390 RSTE exclusive bit, make the
+&gt;    x86 helper return bool, clear all PMD swap overlay bits before softleaf
+&gt;    decoding, and add the architecture maintainers to Cc.
+&gt; - Patches 10-11: add a preparatory no-functional-change cleanup of the
+&gt;    migration-splitting API and keep the PMD swap split separate.
+&gt; - Patch 12: reject a multi-slot duplication range that crosses a swap-cluster
+&gt;    boundary.
+&gt; - Patch 13: drop the zswap_load() change, now upstream as 1a904e0d3c43, and
+&gt;    check for zswap after swap-cache insertion while all slots are pinned.
+&gt; - Patch 14: scan every subpage for hardware poison, discard a failed or newly
+&gt;    allocated unmapped PMD-sized folio before PTE fallback, and recheck the PMD
+&gt;    before splitting it.
+&gt; - Patches 15-23: split the non-present PMD walkers by subsystem.  Add the
+&gt;    guard-advice patch so MADV_GUARD_INSTALL/REMOVE leaves PMD swap entries
+&gt;    whole; the other split patches preserve v6 behaviour.
+&gt; - Patch 24: honour the current THP policy, discard a failed PMD-sized folio,
+&gt;    and recheck the PMD before PTE fallback.
+&gt; - Patch 25: do not split after cached-folio revalidation loses a race; retry
+&gt;    so a restored present THP remains whole.
+&gt; - Patches 26-27: separate the independent PTE-batching hardware-poison fix,
+&gt;    scan subpages directly, and discard failed or never-mapped PMD-sized folios
+&gt;    before PTE retry instead of making the whole range fail with SIGBUS.
+&gt; - Patch 28: keep the normal swap-out path unchanged, but make failed producer
+&gt;    preconditions warn and return -EBUSY rather than BUG or return -EINVAL.
+&gt; - Patch 29: grow the selftests from 16 to 17, adding
+&gt;    swapin_sync/cache-residency coverage and more robust feature, fallback,
+&gt;    privilege, data-integrity, and swap-device-priority handling.
+&gt; 
+&gt; v5 -&gt; v6: https://lore.kernel.org/all/20260722152043.2273289-1-usama.arif@linux.dev/
+&gt; - Add patch 1 to rename pmd_to_softleaf_folio() to
+&gt;    pmd_softleaf_to_folio().  No functional change. (Dev Jain)
+&gt; - Patch 2: warn when pmd_softleaf_to_folio() is given a non-PFN
+&gt;    softleaf rather than silently returning NULL. (Dev Jain)
+&gt; - Patch 4: bound the fork extend-table fallback to one retry, re-read
+&gt;    the PMD under its lock, normalize unrecoverable copy_huge_pmd() errors
+&gt;    to -ENOMEM so copy_pmd_range() cannot clear and leak the source swap
+&gt;    PMD, and drop a redundant thp_migration_supported() gate.
+&gt; - Patch 5: check multi-page swap-cache insertions for zswap-backed slots
+&gt;    in __swap_cache_add_check() under the cluster lock, both before
+&gt;    allocation and before insertion, and reject mixed zswap/disk state
+&gt;    with -EBUSY. (Yosry Ahmed, Nhat Pham)
+&gt; - Patch 6: on a failed non-uptodate PMD-order read, remove the large
+&gt;    folio from swap cache before splitting so order-0
+&gt;    fallback retries individual slots rather than poisoning the whole
+&gt;    2 MiB range; retain hardware-poisoned folios for per-subpage handling.
+&gt; - Patch 7: make HMM snapshot mode report a PMD swap entry as non-resident,
+&gt;    matching PTE swap entries, rather than HMM_PFN_ERROR.  Drop redundant
+&gt;    thp_migration_supported() gates and simplify non-present PMD handling.
+&gt; - Patch 8: factor PMD MADV_WILLNEED prefetch into
+&gt;    swapin_pmd_swap_entry(), split and retry through PTEs after any
+&gt;    PMD-order swapin failure, and replace the racy folio_test_locked()
+&gt;    plus folio_lock() sequence with folio_trylock().
+&gt; - Patch 9: guard PMD-swap UFFDIO_MOVE code with CONFIG_THP_SWAP, clarify
+&gt;    RWP marker propagation, and reject a PMD swap entry at the destination
+&gt;    with -EEXIST so UFFDIO_MOVE cannot loop forever on -EAGAIN.
+&gt; - Patch 10: honor current THP/VMA policy before PMD-order swap-in, recheck
+&gt;    that the PMD is still the original swap entry before splitting for PTE
+&gt;    fallback, and provide the CONFIG_TRANSPARENT_HUGEPAGE wp_huge_pmd()
+&gt;    declaration/stub needed by THP=n builds.
+&gt; - Patch 11: make an invalid set_pmd_swap_entry() walk context warn and
+&gt;    return -EINVAL instead of falsely reporting success and corrupting the
+&gt;    MM_ANONPAGES/MM_SWAPENTS accounting, and add an exact PMD-size folio
+&gt;    precondition check. (Luiz Capitulino)
+&gt; - Patch 12: use /proc/swaps for prerequisite detection, check
+&gt;    MADV_HUGEPAGE, and distinguish an environment that cannot allocate a
+&gt;    PMD THP (SKIP) from a swap-out validation failure (FAIL).  Add
+&gt;    partial-mprotect and partial-munmap split coverage.  Strengthen
+&gt;    munmap/MADV_FREE VmSwap accounting, pagemap slot-offset checks, and
+&gt;    mprotect/mremap swapped-state checks; force mremap to move, check
+&gt;    munmap()&#x27;s return, and mark the UFFDIO_MOVE destination MADV_HUGEPAGE
+&gt;    before asserting PMD restoration.  Move common setup and cleanup into
+&gt;    one fixture, merge the swapoff fixture, remove the redundant cycles
+&gt;    test, and make the data pattern differ between base pages so the split
+&gt;    tests can detect incorrect slot ordering.  Order fork-COW so the parent
+&gt;    writes while the child still holds the untouched shared swap entry.
+&gt;    (Luiz Capitulino)
+&gt; - Clarify commit messages throughout.  Retain TTU_SPLIT_HUGE_PMD after
+&gt;    prototyping its removal: removing it here requires an extra rmap walk
+&gt;    and broadens the series beyond PMD swap entries. (Matthew Wilcox)
+&gt; - Rebase onto akpm/mm-new from 15 August (4b65683fd25f).
+&gt; 
+&gt; v4 -&gt; v5: https://lore.kernel.org/all/20260713133613.2707815-1-usama.arif@linux.dev/
+&gt; - Commit message improvements for almost all patches (Yosry for zswap patch)
+&gt; - Patch 1: make pmd_to_softleaf_folio() reject softleaf entries that do
+&gt;    not encode a PFN, so a PMD swap offset is never interpreted as one.
+&gt;    PMD swap entries remain valid softleaf entries for classification.
+&gt;    (sashiko)
+&gt; - Patch 2: use the existing pmd_swp_uffd() helper and force freeze=false
+&gt;    for PMD swap entries, which have no struct page for the migration-entry
+&gt;    freeze path. (sashiko)
+&gt; - Patch 3: document that the caller&#x27;s page-table or swap-cache reference
+&gt;    pins every source slot while a partial PMD-sized duplication is rolled
+&gt;    back.  Keep the pre-existing PTE fork retry behavior outside this
+&gt;    series. (sashiko)
+&gt; - Patch 5: split to the PTE path rather than mapping a PMD-sized folio
+&gt;    containing a hardware-poisoned subpage, and restore PAGE_NONE when
+&gt;    swapoff restores a UFFD marker in an RWP VMA. (sashiko)
+&gt; - Patch 6: account SwapPss for a PMD swap entry one slot at a time because
+&gt;    the slots can have different swap reference counts.
+&gt; - Patch 7: if PMD-order MADV_WILLNEED encounters newly populated per-page
+&gt;    zswap state, revalidate and remove the failed clean PMD-sized cache
+&gt;    folio before retrying through PTEs.
+&gt; - Patch 8: mark a moved PMD swap entry for UFFD when the UFFDIO_MOVE
+&gt;    destination VMA is RWP-registered. (sashiko)
+&gt; - Patch 9: restore PAGE_NONE for UFFD RWP swap-in, preserve the original
+&gt;    write-fault state through swap-slot release and COW handling, remove
+&gt;    the unnecessary LRU drain, and prevent PTE batching from mapping a
+&gt;    poisoned subpage. (sashiko)
+&gt; - Patch 10: add and document thp_swpout_pmd, which counts PMD mappings
+&gt;    replaced by PMD-level swap entries rather than swapped folios.
+&gt; - Patch 11: register pmd_swap with the default mm selftest runner, preserve
+&gt;    errno across UFFDIO_MOVE cleanup, check swapoff residency before the
+&gt;    first memory access, add a parent-side write and verification to the
+&gt;    fork+COW test, and add RWP regression coverage for swap-in, UFFDIO_MOVE,
+&gt;    and swapoff. (sashiko)
+&gt; - Keep do_huge_pmd_swap_page() in patch 9.  Patches 6 and 7 only add
+&gt;    consumers; patch 10 remains the first producer, so no PMD swap entry
+&gt;    can reach those paths before the fault handler is present. (sashiko)
+&gt; - Rebase onto latest akpm/mm-new from 22 July (5e0603ba185a)
+&gt; 
+&gt; v3 -&gt; v4: https://lore.kernel.org/all/20260703173903.3789516-1-usama.arif@linux.dev/
+&gt; - Patch 1: guard the new arch-specific pmd_swp_mkexclusive /
+&gt;    pmd_swp_exclusive / pmd_swp_clear_exclusive helpers on arm64,
+&gt;    loongarch, powerpc, riscv, s390, and x86 with
+&gt;    CONFIG_ARCH_HAS_PMD_SOFTLEAVES, matching the pattern already
+&gt;    used for pmd_swp_soft_dirty.  Also fixes the redefinition-vs-
+&gt;    generic-fallback build errors kernel test robot reported on
+&gt;    i386-allnoconfig-bpf and riscv-allnoconfig-bpf, and rewraps
+&gt;    the patch 1 commit message paragraphs to ~75 columns.
+&gt;    (sashiko, kernel test robot, Usama Arif)
+&gt; - Patch 2: switch the trailing folio_remove_rmap_pmd() gate in
+&gt;    __split_huge_pmd_locked() from *pmd to old_pmd, old_pmd retains
+&gt;    the original present-or-non-present classification for every
+&gt;    branch above. (sashiko)
+&gt; - Patch 3: teach swap_retry_table_alloc() (and the underlying
+&gt;    swap_extend_table_alloc()) to accept an nr parameter and scan
+&gt;    every slot in [ci_off, ci_off + nr) before committing an
+&gt;    extend-table allocation.  (sashiko)
+&gt; - Patch 4: rename zswap_range_has_entry() to zswap_is_present() so
+&gt;    the same helper serves both single-slot (nr=1) and range queries,
+&gt;    and switch the implementation from XA_STATE + xas_find() to
+&gt;    xa_find(), which handles RCU locking and internal-retry markers
+&gt;    itself.  Rename the callers in patches 5, 7, 9. (Yosry)
+&gt; - Patch 9: refuse to map a swap-cache folio in do_huge_pmd_swap_page()
+&gt;    when folio_contain_hwpoisoned_page() reports a poisoned subpage;
+&gt;    split the PMD swap entry so do_swap_page() can return
+&gt;    VM_FAULT_HWPOISON per subpage instead of the PMD handler mapping
+&gt;    the corrupted memory as one THP.  Mirrors the PageHWPoison check
+&gt;    the PTE swap-in path already performs. (sashiko)
+&gt; - Patch 9: note explicitly in the commit message that PMD-order
+&gt;    swap-in deliberately skips the order-0 readahead paths, order-0
+&gt;    readahead would populate per-page swap-cache state and force the
+&gt;    PMD swap entry to split before the fault could finish. (Kairui)
+&gt; - Patch 10: move mm_prepare_for_swap_entries() into
+&gt;    set_pmd_swap_entry() between folio_dup_swap() and set_pmd_at()
+&gt;    so this mm is on init_mm.mmlist before any swap PMD referencing
+&gt;    slots with a non-zero swap_map becomes visible.  Matches the PTE
+&gt;    swap-out ordering. (sashiko)
+&gt; - rebase onto latest akpm/mm-new (61cccb8363fcc282d4ae0555b8739dd227f5ad0b)
+&gt; 
+&gt; 
+&gt; v2 -&gt; v3: https://lore.kernel.org/all/20260602142537.198755-1-usama.arif@linux.dev/
+&gt; - Clarified the PMD swap entry rule: it is a compact encoding for
+&gt;    HPAGE_PMD_NR swap slots, not a guarantee that swap cache always has
+&gt;    one PMD-sized folio. (Lance Yang)
+&gt; - Swapoff, fault, MADV_WILLNEED, and UFFDIO_MOVE now classify the
+&gt;    whole PMD swap-cache range and split/retry through the PTE path for
+&gt;    split/per-slot cache state. (Lance Yang)
+&gt; - mincore handles PMD swap entries without assuming one lookup covers
+&gt;    a split swap-cache range. (Lance Yang)
+&gt; - UFFDIO_MOVE rechecks all HPAGE_PMD_NR slots before moving an empty
+&gt;    PMD swap-cache range, avoiding stale rmap metadata for per-slot
+&gt;    cached folios.
+&gt; - Added a standalone zswap prerequisite patch from Alexandre that
+&gt;    distinguishes all-on-disk large-folio ranges from ranges with
+&gt;    per-page zswap entries.
+&gt; - Replaced the global zswap-ever-enabled policy with per-range zswap
+&gt;    checks: PMD swap entries can still be installed while zswap is
+&gt;    enabled, and PMD-order swap-in consumers split when the range has
+&gt;    per-page zswap state.
+&gt; - Added a mincore selftest and updated MADV_WILLNEED coverage so the
+&gt;    test checks that the PMD swap entry remains in place until first
+&gt;    touch.  Total pmd_swap coverage is now 14 tests.
+&gt; 
+&gt; 
+&gt; v1 -&gt; v2: https://lore.kernel.org/all/20260427100553.2754667-1-usama.arif@linux.dev/
+&gt; - Patch 1: convert two additional softleaf_to_pmd() callers that
+&gt;    landed in mm-unstable since v1 (mm/debug_vm_pgtable.c,
+&gt;    mm/migrate_device.c) (Dev)
+&gt; - Patch 2: rename helper ensure_on_mmlist() to
+&gt;    mm_prepare_for_swap_entries() to better describe its purpose
+&gt;    (David)
+&gt; - Patch 3: drop VM_WARN_ON_ONCE(!pmd_is_migration_entry) as
+&gt;    Dev posted it as a separate patch.
+&gt; - Patch 5 (new): move softleaf_to_folio() inside the device-private
+&gt;    branch in migrate_vma_collect_pmd(); same class of fix as patch 4
+&gt;    but for the migrate-device PMD walker.
+&gt; - Patch 6 (new): rename CONFIG_ARCH_ENABLE_THP_MIGRATION to
+&gt;    CONFIG_ARCH_HAS_PMD_SOFTLEAVES so the gate that now drives
+&gt;    swap-entry support too is named for what it actually controls
+&gt;    (PMD softleaf entries), not just migration. (Dev)
+&gt; - Patch 7: add the missing pmd_swp_exclusive / mkexclusive /
+&gt;    clear_exclusive helpers for powerpc.
+&gt; - Patches 10 and 14: use upstream swapin_sync() (bundles
+&gt;    swap_cache_alloc_folio + swap_read_folio + the -EEXIST race
+&gt;    retry) instead of the bespoke swapin_alloc_pmd_folio() helper
+&gt;    from v1; do_swap_page and shmem_swapin_folio use the same
+&gt;    helper (Kairui)
+&gt; - Patch 10: construct a stack vm_fault for the swapoff swap-in so
+&gt;    the allocator can resolve a mempolicy, mirroring how the PTE
+&gt;    swapoff path (unuse_pte_range) already does it.
+&gt; - Patch 11: extend coverage to check_pmd_state() in khugepaged so a
+&gt;    swapped-out PMD-mapped THP is treated as SCAN_PMD_MAPPED (matches
+&gt;    the existing migration-entry handling). Route PMD swap entries in the
+&gt;    pmd_trans_huge_lock() branch of mincore_pte_range() through
+&gt;    mincore_pmd_swap() so a swapped-out PMD-mapped THP isn&#x27;t reported as
+&gt;    resident.
+&gt; - Patch 12 (new): handle PMD swap entries in MADV_WILLNEED via
+&gt;    swapin_sync(BIT(HPAGE_PMD_ORDER)); a naive order-0 read-ahead
+&gt;    would force the subsequent fault to split.
+&gt; - Patch 13: refuse UFFDIO_MOVE with -EBUSY if the swap-cache folio
+&gt;    was split between swap-out and the move, matching
+&gt;    move_pages_pte()&#x27;s rejection of large folios; otherwise only one
+&gt;    of the 512 anon-rmaps would be re-anchored to dst_vma.
+&gt; - Patch 16: alloc_fill_swap_thp() now uses the existing
+&gt;    mmap_pmd_aligned() helper so tests don&#x27;t flake/skip based on VA
+&gt;    placement; new MADV_WILLNEED test that watches the PMD-order
+&gt;    mTHP swpin counter; swapoff test restructured to use the
+&gt;    kselftest_harness ASSERT cleanup blocks (no double swapoff, no
+&gt;    verify-after-munmap).
+&gt; - Collected Acks and Reviews
+&gt; 
+&gt; Usama Arif (30):
+&gt;    mm: rename pmd_to_softleaf_folio() to pmd_softleaf_to_folio()
+&gt;    arm64: mm: add PMD swap-exclusive helpers
+&gt;    loongarch: mm: add PMD swap-exclusive helpers
+&gt;    powerpc: mm: add PMD swap-exclusive helpers
+&gt;    riscv: mm: add PMD swap-exclusive helpers
+&gt;    s390: mm: add PMD swap-exclusive helpers
+&gt;    x86: mm: add PMD swap-exclusive helpers
+&gt;    mm: recognize PMD swap entries in the softleaf layer
+&gt;    mm/debug_vm_pgtable: test PMD swap-exclusive helpers
+&gt;    mm: make PMD migration-entry splitting explicit
+&gt;    mm: split PMD swap entries into PTE swap entries
+&gt;    mm/swap: allow duplicating a range of swap entries
+&gt;    mm: handle PMD swap entries in fork path
+&gt;    mm: zswap: reject high-order swap cache allocations backed by zswap
+&gt;    mm: swap in PMD swap entries as whole THPs during swapoff
+&gt;    fs/proc: account PMD swap entries in smaps
+&gt;    mm: handle soft-dirty and uffd-wp on PMD swap entries
+&gt;    mm/hmm: fault PMD swap entries on demand
+&gt;    mm: free PMD swap entries in zap_huge_pmd()
+&gt;    mm/madvise: free PMD swap entries with MADV_FREE
+&gt;    mm/madvise: skip PMD swap entries for MADV_COLD and MADV_PAGEOUT
+&gt;    mm/madvise: keep PMD swap entries whole for MADV_GUARD_INSTALL/REMOVE
+&gt;    mm/mincore: report PMD swap-cache residency
+&gt;    mm/khugepaged: treat PMD swap entries as mapped THPs
+&gt;    mm: handle PMD swap entries in MADV_WILLNEED
+&gt;    mm: handle PMD swap entries in UFFDIO_MOVE
+&gt;    mm: don&#x27;t PTE-batch a swap-in over a hardware-poisoned subpage
+&gt;    mm: handle PMD swap entry faults on swap-in
+&gt;    mm: install PMD swap entries on swap-out
+&gt;    selftests/mm: add PMD swap entry tests
+&gt; 
+&gt;   Documentation/admin-guide/mm/transhuge.rst   |   5 +
+&gt;   arch/arm64/include/asm/pgtable.h             |   6 +
+&gt;   arch/loongarch/include/asm/pgtable.h         |  19 +
+&gt;   arch/powerpc/include/asm/book3s/64/pgtable.h |   6 +
+&gt;   arch/riscv/include/asm/pgtable.h             |  15 +
+&gt;   arch/s390/include/asm/pgtable.h              |  20 +-
+&gt;   arch/x86/include/asm/pgtable.h               |  20 +
+&gt;   fs/proc/task_mmu.c                           |  45 +-
+&gt;   include/linux/huge_mm.h                      |  40 +-
+&gt;   include/linux/leafops.h                      |  44 +-
+&gt;   include/linux/pgtable.h                      |  17 +
+&gt;   include/linux/swap.h                         |  12 +-
+&gt;   include/linux/vm_event_item.h                |   1 +
+&gt;   include/linux/zswap.h                        |   6 +
+&gt;   mm/debug_vm_pgtable.c                        |  40 +
+&gt;   mm/hmm.c                                     |  11 +-
+&gt;   mm/huge_memory.c                             | 714 +++++++++++--
+&gt;   mm/internal.h                                |  58 ++
+&gt;   mm/khugepaged.c                              |   6 +
+&gt;   mm/madvise.c                                 | 169 +++-
+&gt;   mm/memory.c                                  |  65 +-
+&gt;   mm/migrate_device.c                          |   7 +-
+&gt;   mm/mincore.c                                 |  47 +-
+&gt;   mm/mprotect.c                                |   2 +-
+&gt;   mm/rmap.c                                    |  27 +-
+&gt;   mm/swap.h                                    |  30 +-
+&gt;   mm/swap_state.c                              |  83 +-
+&gt;   mm/swapfile.c                                | 245 ++++-
+&gt;   mm/userfaultfd.c                             |  14 +
+&gt;   mm/vmscan.c                                  |   9 +-
+&gt;   mm/vmstat.c                                  |   1 +
+&gt;   mm/zswap.c                                   |  12 +-
+&gt;   tools/testing/selftests/mm/Makefile          |   2 +
+&gt;   tools/testing/selftests/mm/ksft_pmd_swap.sh  |   4 +
+&gt;   tools/testing/selftests/mm/pmd_swap.c        | 989 +++++++++++++++++++
+&gt;   tools/testing/selftests/mm/run_vmtests.sh    |   4 +
+&gt;   tools/testing/selftests/mm/vm_util.c         |  24 +
+&gt;   tools/testing/selftests/mm/vm_util.h         |   2 +
+&gt;   38 files changed, 2630 insertions(+), 191 deletions(-)
+&gt;   create mode 100755 tools/testing/selftests/mm/ksft_pmd_swap.sh
+&gt;   create mode 100644 tools/testing/selftests/mm/pmd_swap.c
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/52773d68-2ea2-4393-9adb-b71ddc00c6d6@redhat.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 </div>
 </div>
 </div>
