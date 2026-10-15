@@ -1,0 +1,195 @@
+{
+  "thread_id": "20261014171145.3292736-1-kas@kernel.org",
+  "subject": "[PATCH v5 0/9] mm/collapse: separate a collapse from its callers",
+  "url": "https://lore.kernel.org/all/20261014171145.3292736-1-kas@kernel.org/",
+  "dates": {
+    "2026-10-14": {
+      "report_file": "2026-10-14_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Andrew Morton",
+          "summary": "Andrew Morton noted that the patch changes the function names from collapse_scan_anon_pmd and mthp_collapse to collapse_scan_anon and collapse_anon, but the callers in khugepaged.c still use the old function names. He requested that the callers be updated to match the new function names.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Here are the v3->v4 changes for the nine remaining patches:\n\n\n mm/collapse.h   |   16 ++++++++++------\n mm/khugepaged.c |   28 ++++++++++++++--------------\n 2 files changed, 24 insertions(+), 20 deletions(-)\n\n--- a/mm/collapse.h~b\n+++ a/mm/collapse.h\n@@ -100,16 +100,20 @@ struct collapse_control {\n \tDECLARE_BITMAP(eligible_ptes, MAX_PTRS_PER_PTE);\n \n \t/*\n-\t * What a scan found and the run after it needs.  Live only between the\n-\t * two, and read by nobody else.\n-\t *\n-\t * The file side takes a reference while it still has the VMA, since a\n-\t * file collapse works on the page cache and never sees one; the run is\n-\t * what gives it back.\n+\t * What a scan found and the collapse after it needs.  Live only between\n+\t * the two, and read by nobody else.\n \t */\n+\n+\t/* Anonymous only: orders to try, referenced and swap PTE counts */\n \tunsigned long scan_orders;\n \tint scan_referenced;\n \tint scan_unmapped;\n+\n+\t/*\n+\t * File only.  A file collapse works on the page cache and never sees a\n+\t * VMA, so the scan takes a reference to the file while it still has\n+\t * one, and the collapse gives it back.\n+\t */\n \tstruct file *scan_file;\n \tpgoff_t scan_pgoff;\n };\n--- a/mm/khugepaged.c~b\n+++ a/mm/khugepaged.c\n@@ -646,7 +646,7 @@ static enum scan_result __collapse_huge_\n \t\t\tgoto out;\n \t\t}\n \n-\t\t/* See collapse_scan_pmd(). */\n+\t\t/* See collapse_scan_anon(). */\n \t\tif (folio_maybe_mapped_shared(folio)) {\n \t\t\t/*\n \t\t\t * TODO: Support shared pages without leading to further\n@@ -1099,7 +1099,7 @@ static enum scan_result check_pmd_still_\n \n /*\n  * Bring missing pages in from swap, to complete THP collapse.\n- * Only done if collapse_scan_pmd() believes it is worthwhile.\n+ * Only done if collapse_scan_anon() believes it is worthwhile.\n  *\n  * For mTHP orders the function bails on the first swap entry, because\n  * faulting pages back in during collapse could re-populate PTEs that\n@@ -1460,8 +1460,8 @@ static unsigned int max_order_from_offse\n }\n \n /*\n- * mthp_collapse() consumes the bitmap that is generated during\n- * collapse_scan_pmd() to determine what regions and mTHP orders fit best.\n+ * collapse_anon() consumes the bitmap that is generated during\n+ * collapse_scan_anon() to determine what regions and mTHP orders fit best.\n  *\n  * Each bit in cc->eligible_ptes marks a PTE the scan accepted as a collapse\n  * source. We start at the PMD order and check if it is eligible for collapse;\n@@ -1476,8 +1476,8 @@ static unsigned int max_order_from_offse\n  * If a collapse is permitted, we attempt to collapse the PTE range into a\n  * mTHP.\n  */\n-static enum scan_result mthp_collapse(struct mm_struct *mm, unsigned long address,\n-\t\tstruct collapse_control *cc)\n+static enum scan_result collapse_anon(struct mm_struct *mm,\n+\t\tunsigned long address, struct collapse_control *cc)\n {\n \tunsigned int nr_eligible_ptes, nr_ptes, max_ptes_none;\n \tenum scan_result last_result = SCAN_FAIL;\n@@ -1576,7 +1576,7 @@ done:\n \treturn last_result;\n }\n \n-static enum scan_result collapse_scan_anon_pmd(struct vm_area_struct *vma,\n+static enum scan_result collapse_scan_anon(struct vm_area_struct *vma,\n \t\tunsigned long start_addr, struct collapse_control *cc)\n {\n \tconst unsigned int max_ptes_shared = collapse_max_ptes_shared(cc, HPAGE_PMD_ORDER);\n@@ -1612,7 +1612,7 @@ static enum scan_result collapse_scan_an\n \t/*\n \t * If PMD is the only enabled order, enforce max_ptes_none, otherwise\n \t * scan all pages to populate the bitmap for mTHP collapse. The bitmap\n-\t * is then checked again in mthp_collapse() for each attempted order.\n+\t * is then checked again in collapse_anon() for each attempted order.\n \t */\n \tif (enabled_orders != BIT(HPAGE_PMD_ORDER))\n \t\tmax_ptes_none = COLLAPSE_MAX_PTES_LIMIT;\n@@ -2785,20 +2785,20 @@ static enum scan_result collapse_scan_pm\n \tpgoff_t pgoff;\n \n \tmmap_assert_locked(vma->vm_mm);\n-\t/* Whatever the last scan found has to have been run by now */\n+\t/* A scan that found work has to have been followed by collapse_pmd() */\n \tif (WARN_ON_ONCE(cc->scan_file)) {\n \t\tfput(cc->scan_file);\n \t\tcc->scan_file = NULL;\n \t}\n \n \tif (vma_is_anonymous(vma))\n-\t\treturn collapse_scan_anon_pmd(vma, addr, cc);\n+\t\treturn collapse_scan_anon(vma, addr, cc);\n \n \tpgoff = linear_page_index(vma, addr);\n \tresult = collapse_scan_file(vma->vm_mm, addr, vma->vm_file, pgoff, cc);\n \t/*\n \t * SCAN_PTE_MAPPED_HUGEPAGE is work too: the page cache already holds\n-\t * the PMD folio, and retracting the PTE table is the run's job.\n+\t * the PMD folio, and collapse_pmd() still has to retract the PTE table.\n \t */\n \tif (result != SCAN_SUCCEED && result != SCAN_PTE_MAPPED_HUGEPAGE)\n \t\treturn result;\n@@ -2812,7 +2812,7 @@ static enum scan_result collapse_scan_pm\n \treturn result;\n }\n \n-static enum scan_result collapse_run_pmd(struct mm_struct *mm,\n+static enum scan_result collapse_pmd(struct mm_struct *mm,\n \t\tunsigned long addr, enum scan_result result,\n \t\tstruct collapse_control *cc)\n {\n@@ -2821,7 +2821,7 @@ static enum scan_result collapse_run_pmd\n \tpgoff_t pgoff;\n \n \tif (!file)\n-\t\treturn mthp_collapse(mm, addr, cc);\n+\t\treturn collapse_anon(mm, addr, cc);\n \n \tcc->scan_file = NULL;\n \tpgoff = cc->scan_pgoff;\n@@ -2882,7 +2882,7 @@ static enum scan_result collapse_single_\n \tmmap_read_unlock(mm);\n \t*lock_dropped = true;\n \n-\treturn collapse_run_pmd(mm, addr, result, cc);\n+\treturn collapse_pmd(mm, addr, result, cc);\n }\n \n static void collapse_scan_mm_slot(unsigned int progress_max,\n_",
+          "reply_to": "Kiryl (Meta)",
+          "message_date": "2026-10-14",
+          "message_id": "20261014141616.6d79df8fc8c6ef7d41df5afc@linux-foundation.org",
+          "email": "akpm@linux-foundation.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch set separates the collapse engine from its callers, making it more modular and easier to understand. The caller specifies a policy that determines what actions are allowed, rather than relying on who called the function. This change is made by introducing new functions for scanning PTE tables and collapsing them, with the mmap_lock drop moved between these two operations. The patch set includes 9 patches in total, with some of them being standalone and others building upon each other."
+    },
+    "2026-10-15": {
+      "report_file": "2026-10-14_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015043404.57470-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015043638.57643-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015043856.57881-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015044103.58141-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015044412.58610-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015044530.58786-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015044632.58880-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015053920.64675-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        },
+        {
+          "author": "Lance Yang",
+          "summary": "Gave Reviewed-by",
+          "sentiment": "positive",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "heuristic",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "2026-10-15",
+          "message_id": "20261015054358.65376-1-lance.yang@linux.dev",
+          "email": "lance.yang@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch set separates the collapse engine from its callers, making it more modular and easier to understand. The caller specifies a policy that determines what actions are allowed, rather than relying on who called the function. This change is made by introducing new functions for scanning PTE tables and collapsing them, with the mmap_lock drop moved between these two operations. The patch set includes 9 patches in total, with some of them being standalone and others building upon each other."
+    }
+  }
+}

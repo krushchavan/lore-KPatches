@@ -238,9 +238,98 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH for-7.5 3/5] memcg: use high_work for remote charges</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261010210957.1350874-4-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-10</strong><div class="date-range-nav">Active on: <a href="#2026-10-10">2026-10-10</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the memcg (memory cgroup) handling of high memory usage to use a worker thread for remote charges, which are charges that go to a cgroup outside the current task&#x27;s cgroup and its ancestors. This change is necessary because the high handler currently uses the current task&#x27;s mm, which cannot handle these overages. The patch adds a check using mm_match_cgroup() before checking the high limits, and if it does not match, it uses the worker thread instead of recording task overage or doing synchronous reclaim and throttling. This change ensures that remote charges are handled correctly and efficiently.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-10-10</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-14</strong><div class="date-range-nav">Active on: <a href="#2026-10-14">2026-10-14</a> &bull; <a href="#2026-10-10">2026-10-10</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the memcg (memory cgroup) handling of high memory charges to use the high_work mechanism for remote charges, ensuring that these charges are properly handled even when they don&#x27;t belong to the current task&#x27;s cgroup or its ancestors.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-10-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-14">2026-10-14</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Acknowledged the patch and noted that it makes sense to use high_work for remote charges. However, Michal also mentioned that there are other places in the charge path where current-&gt;memcg == memcg is assumed.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Sat 10-10-26 14:09:55, Shakeel Butt wrote:
+&gt; Some charges go to a cgroup outside the current mm&#x27;s cgroup and its
+&gt; ancestors. The high handler uses current-&gt;mm, so it cannot handle these
+&gt; overages. Filesystem notifications and remote page faults can take
+&gt; this path.
+
+Hmm, you made me look at other places in the charge path where we are
+assuming current-&gt;memcg == memcg. We have reclaim recursion and oom
+checks. The former makes sense, for the latter it is likely not
+harmful.
+
+&gt; Use mm_match_cgroup() before checking the high limits. If it does not
+&gt; match, use high_work instead of recording task overage or doing
+&gt; synchronous reclaim and throttling. Charges to the same cgroup or an
+&gt; ancestor keep their current handling. Tasks without an mm also use the
+&gt; worker.
+&gt; 
+&gt; Like kernel threads, remote chargers skip memory.swap.high throttling
+&gt; and its high-event reporting, and a fast allocator can outrun the worker.
+&gt; The memory.max and memory.swap.max checks stay the same.
+
+Makes sense.
+
+&gt; Suggested-by: Tejun Heo &lt;tj@kernel.org&gt;
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+Thanks!
+
+&gt; ---
+&gt;  mm/memcontrol.c | 6 ++++--
+&gt;  1 file changed, 4 insertions(+), 2 deletions(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 8116fce6ab96..3456960cbe68 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2705,7 +2705,8 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  			       gfp_t gfp_mask)
+&gt;  {
+&gt;  	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+&gt; -	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD);
+&gt; +	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD) ||
+&gt; +		!current-&gt;mm || !mm_match_cgroup(current-&gt;mm, memcg);
+&gt;  
+&gt;  	/*
+&gt;  	 * If the hierarchy is above the normal consumption range, schedule
+&gt; @@ -2728,6 +2729,7 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		 * Don&#x27;t make an unrelated interrupted task handle this charge.
+&gt;  		 * Kernel threads may be working for other tasks, so let a worker
+&gt;  		 * reclaim instead.
+&gt; +		 * Remote charges need reclaim from their charged hierarchy.
+&gt;  		 */
+&gt;  		if (use_worker) {
+&gt;  			if (mem_high) {
+&gt; @@ -2756,7 +2758,7 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		}
+&gt;  	} while ((memcg = parent_mem_cgroup(memcg)));
+&gt;  
+&gt; -	/* Interrupts and kernel threads stop here. */
+&gt; +	/* Interrupts, kernel threads, and remote chargers stop here. */
+&gt;  	if (use_worker)
+&gt;  		return;
+&gt;  
+&gt; -- 
+&gt; 2.53.0-Meta
+
+-- 
+Michal Hocko
+SUSE Labs
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<div class="review-comment-signals">Signals: ACKNOWLEDGED</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

@@ -238,18 +238,56 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH for-7.5 0/5] memcg: clean up memory.high enforcement</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261010210957.1350874-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-12</strong><div class="date-range-nav">Active on: <a href="#2026-10-12">2026-10-12</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series cleans up memory.high enforcement in the Linux kernel by moving it out of try_charge_memcg() and using a worker for kernel threads and remote charges. The changes aim to improve performance and reduce delays caused by reclaiming and sleeping during charges.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-12</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-14</strong><div class="date-range-nav">Active on: <a href="#2026-10-14">2026-10-14</a> &bull; <a href="#2026-10-12">2026-10-12</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series cleans up the enforcement of memory.high limits in Linux by moving it to a separate function and using a worker for kernel threads and remote charges. The changes aim to improve performance by avoiding unnecessary reclaiming and sleeping during charges, and also fix issues with high handler usage. The patches modify the memcg_enforce_high() function, add handling for kernel threads and remote charges, introduce a guard against queuing work from PF_MEMALLOC tasks, and simplify the scan and comments.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-12">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Harry Yoo</span>
+<a class="date-chip" href="../2026-10-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-12">2026-10-12</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Harry Yoo noted that try_charge_memcg() is doing too much and suggested breaking out the memory.high enforcement into a new function, memcg_enforce_high(), to improve readability and maintainability.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Sat, Oct 10, 2026 at 02:09:53PM -0700, Shakeel Butt wrote:
+&gt; try_charge_memcg() does a lot. It charges the page counters, reclaims
+&gt; when a limit is hit, may call the OOM killer, and at the end it checks
+&gt; and enforces memory.high. Move the memory.high part into a new function,
+&gt; memcg_enforce_high(), so that try_charge_memcg() is shorter and the
+&gt; memory.high code is easier to read and change.
+&gt; 
+&gt; The code and its comments move as they are. The only difference is that
+&gt; the new function gets allow_spinning from gfp_mask itself.
+&gt; 
+&gt; No functional change.
+&gt; ---
+
+Missing Signed-off-by: ?
+
+Otherwise LGTM.
+Reviewed-by: Harry Yoo (Meta) &lt;harry@kernel.org&gt;
+
+-- 
+Cheers,
+Harry / Hyeonggon</pre>
+</details>
+<a href="https://lore.kernel.org/r/aszdXDpqLUX1S4Qq@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: LGTM, Requested Signed-off-by</div>
+</div>
+</div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Shakeel Butt</span>
+<span class="review-author">Shakeel Butt (author)</span>
 <a class="date-chip" href="../2026-10-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-12">2026-10-12</a>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Responded positively to Harry&#x27;s review, acknowledging the missing Signed-off-by: line and thanking him for his feedback.</div>
+<div class="review-comment-text">The author addressed concerns about the patch&#x27;s behavior and implementation details. Specifically, they clarified that the high_work worker can queue itself from its own reclaim without delaying the actual charge request, but may waste CPU if high reclaim is not successful. They also explained why they chose to keep a separate check for memory.high enforcement in the high enforcement function, rather than unifying it with the existing check in try_charge_memcg().</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Mon, Oct 12, 2026 at 02:22:40PM +0100, Harry Yoo wrote:
@@ -276,23 +314,333 @@ Oh I don&#x27;t know how I missed this.
 
 Thanks for the review.
 
-</pre>
+---
+
+On Wed, Oct 14, 2026 at 01:39:06PM +0200, Michal Hocko wrote:
+&gt; On Sat 10-10-26 14:09:56, Shakeel Butt wrote:
+&gt; &gt; Kernel threads and remote chargers use high_work when memory.high is
+&gt; &gt; exceeded. Their allocations during reclaim can also charge memory,
+&gt; &gt; for example when zswap stores a page.
+&gt; &gt; 
+&gt; &gt; Without a check, the high_work worker can queue itself from its own
+&gt; &gt; reclaim. The pending bit is cleared before high_work runs, so each run
+&gt; &gt; can queue another run.
+&gt; 
+&gt; What does that mean really? Does this delays the actual run?
+
+It will not delay the actual charge request. This mainly means that we keep
+enqueing the high reclaim work even from high reclaim context and can
+potentially keep wasting CPU if high reclaim is not very successful.
+
+&gt;  
+&gt; &gt; Skip memory.high enforcement for charges from task context with
+&gt; &gt; PF_MEMALLOC set when they would use high_work. This covers kernel
+&gt; &gt; threads and remote charges. The memory is still charged. Interrupt
+&gt; &gt; charges keep their current path.
+&gt; &gt; 
+&gt; &gt; In a VM with incompressible zswap data, the worker queued itself 163 times
+&gt; &gt; without this check.
+&gt; &gt; 
+&gt; &gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; 
+&gt; The patch itself looks OK. I am wondering whether we can unify the check
+&gt; with the existing one which forces the allocation through in main
+&gt; charging path.
+
+The force charge (and ENOMEM) paths bypass the memory.high enforcement
+altogether. Only successful charges (done_restock label) goes through
+memory.high enforcement. So, even if we move this check in try_charge_memcg, it
+will still be a separate check before calling high enforcement function. I think
+this check is very high_work specific and better to be in the high enforcement
+function.
+
+---
+
+On Wed, Oct 14, 2026 at 01:46:23PM +0200, Michal Hocko wrote:
+&gt; On Sat 10-10-26 14:09:57, Shakeel Butt wrote:
+&gt; [...]
+&gt; &gt; -	/* Interrupts, kernel threads, and remote chargers stop here. */
+&gt; &gt; -	if (use_worker)
+&gt; &gt; +	/*
+&gt; &gt; +	 * Use a worker for interrupts, kernel threads, and tasks whose mm
+&gt; &gt; +	 * does not match the charged hierarchy.
+&gt; &gt; +	 */
+&gt; &gt; +	if (use_high_work) {
+&gt; &gt; +		if (!iter)
+&gt; &gt; +			return;
+&gt; &gt; +		if (allow_spinning)
+&gt; &gt; +			schedule_work(&amp;iter-&gt;high_work);
+&gt; &gt; +		else
+&gt; &gt; +			irq_work_queue(&amp;iter-&gt;high_irq_work);
+&gt; &gt;  		return;
+&gt; &gt; +	}
+&gt; &gt; +
+&gt; &gt; +	if (iter) {
+&gt; 
+&gt; Would it be much simpler to bail out on iter==NULL (i.e. nothing over
+&gt; high limit) right after the loop?
+&gt; 
+
+I want this patch to not change any behavior. If we return here when iter is
+NULL, we will skip a potential call to __mem_cgroup_handle_over_high() when
+current-&gt;memcg_nr_pages_over_high &gt; MEMCG_CHARGE_BATCH. Though I agree that is
+very subtle and most probably unexpected. If we decide to remove it, we should
+do it in a separate patch. Actually I am working on a followup series where I
+plan to remove the sync enforcement of memory.high and put high enforcement on
+the code paths which can potentially do a lot of allocation within a single
+kernel entry.
+
+&gt; &gt; +		/*
+&gt; &gt; +		 * Count the full batch so reclaim work and delay penalties scale
+&gt; &gt; +		 * with the pages charged by this task.
+&gt; &gt; +		 */
+&gt; &gt; +		current-&gt;memcg_nr_pages_over_high += nr_pages;
+&gt; &gt; +		set_notify_resume(current);
+&gt; &gt; +	}
+&gt; &gt;  
+&gt; &gt;  	/*
+&gt; &gt; -	 * Reclaim is set up above to be called from the userland
+&gt; &gt; -	 * return path. But also attempt synchronous reclaim to avoid
+&gt; &gt; -	 * excessive overrun while the task is still inside the
+&gt; &gt; -	 * kernel. If this is successful, the return path will see it
+&gt; &gt; -	 * when it rechecks the overage and simply bail out.
+&gt; &gt; +	 * Earlier charges may have left high overage pending even if this charge
+&gt; &gt; +	 * found no new overage. Handle it now if this charge can block, to limit
+&gt; &gt; +	 * overrun while the task remains in the kernel.
+&gt; &gt;  	 */
+&gt; &gt;  	if (current-&gt;memcg_nr_pages_over_high &gt; MEMCG_CHARGE_BATCH &amp;&amp;
+&gt; &gt;  	    !(current-&gt;flags &amp; PF_MEMALLOC) &amp;&amp;
+&gt; &gt; -- 
+&gt; &gt; 2.53.0-Meta
+&gt; 
+&gt; -- 
+&gt; Michal Hocko
+&gt; SUSE Labs
+
+---
+
+On Wed, Oct 14, 2026 at 06:59:30PM +0200, Michal Hocko wrote:
+&gt; On Wed 14-10-26 09:06:00, Shakeel Butt wrote:
+&gt; &gt; On Wed, Oct 14, 2026 at 01:39:06PM +0200, Michal Hocko wrote:
+&gt; &gt; &gt; On Sat 10-10-26 14:09:56, Shakeel Butt wrote:
+&gt; &gt; &gt; &gt; Kernel threads and remote chargers use high_work when memory.high is
+&gt; &gt; &gt; &gt; exceeded. Their allocations during reclaim can also charge memory,
+&gt; &gt; &gt; &gt; for example when zswap stores a page.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; Without a check, the high_work worker can queue itself from its own
+&gt; &gt; &gt; &gt; reclaim. The pending bit is cleared before high_work runs, so each run
+&gt; &gt; &gt; &gt; can queue another run.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; What does that mean really? Does this delays the actual run?
+&gt; &gt; 
+&gt; &gt; It will not delay the actual charge request. This mainly means that we keep
+&gt; &gt; enqueing the high reclaim work even from high reclaim context and can
+&gt; &gt; potentially keep wasting CPU if high reclaim is not very successful.
+&gt; 
+&gt; Hmm, so is there any practical problem if we do that? What exactly do you
+&gt; mean by &quot;keep wasting CPU&quot;?
+
+More specifically if high_work kworker keeps enqueing high_work, most probably
+the memcg does not have reclaimable memory and keep retrying it wastes CPU.
+
+&gt;  
+&gt; &gt; &gt; &gt; Skip memory.high enforcement for charges from task context with
+&gt; &gt; &gt; &gt; PF_MEMALLOC set when they would use high_work. This covers kernel
+&gt; &gt; &gt; &gt; threads and remote charges. The memory is still charged. Interrupt
+&gt; &gt; &gt; &gt; charges keep their current path.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; In a VM with incompressible zswap data, the worker queued itself 163 times
+&gt; &gt; &gt; &gt; without this check.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; &gt; &gt; 
+&gt; &gt; &gt; The patch itself looks OK. I am wondering whether we can unify the check
+&gt; &gt; &gt; with the existing one which forces the allocation through in main
+&gt; &gt; &gt; charging path.
+&gt; &gt; 
+&gt; &gt; The force charge (and ENOMEM) paths bypass the memory.high enforcement
+&gt; &gt; altogether.
+&gt; 
+&gt; Exactly. Isn&#x27;t that exactl what we want to achieve here as well?
+&gt; 
+&gt; &gt; Only successful charges (done_restock label) goes through
+&gt; &gt; memory.high enforcement. So, even if we move this check in try_charge_memcg, it
+&gt; &gt; will still be a separate check before calling high enforcement function. I think
+&gt; &gt; this check is very high_work specific and better to be in the high enforcement
+&gt; &gt; function.
+&gt; 
+&gt; I meant something like the following
+
+Oh ok this makes sense. Do you want to send a patch or should I add this in this
+series replacing the 4th patch?
+
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 856a7d07586c..832b40ee5b6f 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2653,7 +2653,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  	bool passed_oom = false;
+&gt;  	unsigned int reclaim_options;
+&gt;  	bool drained = false;
+&gt; -	bool raised_max_event = false;
+&gt;  	unsigned long pflags;
+&gt;  	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+&gt;  
+&gt; @@ -2661,6 +2660,15 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  	if (consume_stock(memcg, nr_pages))
+&gt;  		return 0;
+&gt;  
+&gt; +	/*
+&gt; +	 * Prevent unbounded recursion when reclaim operations need to
+&gt; +	 * allocate memory. This might exceed the limits temporarily,
+&gt; +	 * but we prefer facilitating memory reclaim and getting back
+&gt; +	 * under the limit over triggering OOM kills in these cases.
+&gt; +	 */
+&gt; +	if (unlikely(current-&gt;flags &amp; PF_MEMALLOC))
+&gt; +		goto force;
+&gt; +
+&gt;  	if (!allow_spinning)
+&gt;  		/* Avoid the refill and flush of the older stock */
+&gt;  		batch = nr_pages;
+&gt; @@ -2683,15 +2691,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  		goto retry;
+&gt;  	}
+&gt;  
+&gt; -	/*
+&gt; -	 * Prevent unbounded recursion when reclaim operations need to
+&gt; -	 * allocate memory. This might exceed the limits temporarily,
+&gt; -	 * but we prefer facilitating memory reclaim and getting back
+&gt; -	 * under the limit over triggering OOM kills in these cases.
+&gt; -	 */
+&gt; -	if (unlikely(current-&gt;flags &amp; PF_MEMALLOC))
+&gt; -		goto force;
+&gt; -
+&gt;  	if (unlikely(task_in_memcg_oom(current)))
+&gt;  		goto nomem;
+&gt;  
+&gt; @@ -2712,7 +2711,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  		goto nomem;
+&gt;  
+&gt;  	__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
+&gt; -	raised_max_event = true;
+&gt;  
+&gt;  	psi_memstall_enter(&amp;pflags);
+&gt;  	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+&gt; @@ -2773,13 +2771,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  	if (!(gfp_mask &amp; (__GFP_NOFAIL | __GFP_HIGH)))
+&gt;  		return -ENOMEM;
+&gt;  force:
+&gt; -	/*
+&gt; -	 * If the allocation has to be enforced, don&#x27;t forget to raise
+&gt; -	 * a MEMCG_MAX event.
+&gt; -	 */
+&gt; -	if (!raised_max_event)
+&gt; -		__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
+&gt; -
+&gt;  	/*
+&gt;  	 * The allocation either can&#x27;t fail or will lead to more memory
+&gt;  	 * being freed very soon.  Allow memory usage go over the limit
+&gt; @@ -2789,6 +2780,8 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  	if (do_memsw_account())
+&gt;  		page_counter_charge(&amp;memcg-&gt;memsw, nr_pages);
+&gt;  
+&gt; +	if (mem_cgroup_margin(memcg))
+&gt; +		__memcg_memory_event(memcg, MEMCG_MAX, allow_spinning);
+&gt;  	return 0;
+&gt;  
+&gt;  done_restock:
+&gt; 
+&gt; -- 
+&gt; Michal Hocko
+&gt; SUSE Labs
+
+---
+
+On Wed, Oct 14, 2026 at 09:27:57PM +0200, Michal Hocko wrote:
+&gt; On Wed 14-10-26 10:55:21, Shakeel Butt wrote:
+&gt; &gt; On Wed, Oct 14, 2026 at 06:59:30PM +0200, Michal Hocko wrote:
+&gt; &gt; &gt; On Wed 14-10-26 09:06:00, Shakeel Butt wrote:
+&gt; &gt; &gt; &gt; On Wed, Oct 14, 2026 at 01:39:06PM +0200, Michal Hocko wrote:
+&gt; &gt; &gt; &gt; &gt; On Sat 10-10-26 14:09:56, Shakeel Butt wrote:
+&gt; &gt; &gt; &gt; &gt; &gt; Kernel threads and remote chargers use high_work when memory.high is
+&gt; &gt; &gt; &gt; &gt; &gt; exceeded. Their allocations during reclaim can also charge memory,
+&gt; &gt; &gt; &gt; &gt; &gt; for example when zswap stores a page.
+&gt; &gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; &gt; Without a check, the high_work worker can queue itself from its own
+&gt; &gt; &gt; &gt; &gt; &gt; reclaim. The pending bit is cleared before high_work runs, so each run
+&gt; &gt; &gt; &gt; &gt; &gt; can queue another run.
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; What does that mean really? Does this delays the actual run?
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; It will not delay the actual charge request. This mainly means that we keep
+&gt; &gt; &gt; &gt; enqueing the high reclaim work even from high reclaim context and can
+&gt; &gt; &gt; &gt; potentially keep wasting CPU if high reclaim is not very successful.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Hmm, so is there any practical problem if we do that? What exactly do you
+&gt; &gt; &gt; mean by &quot;keep wasting CPU&quot;?
+&gt; &gt; 
+&gt; &gt; More specifically if high_work kworker keeps enqueing high_work, most probably
+&gt; &gt; the memcg does not have reclaimable memory and keep retrying it wastes CPU.
+&gt; 
+&gt; Yes but this is not specific to PF_MEMALLOC context, or do I miss
+&gt; something?
+
+Yes you are right and you didn&#x27;t miss anything.
+
+&gt;  
+&gt; &gt; &gt; &gt; &gt; &gt; Skip memory.high enforcement for charges from task context with
+&gt; &gt; &gt; &gt; &gt; &gt; PF_MEMALLOC set when they would use high_work. This covers kernel
+&gt; &gt; &gt; &gt; &gt; &gt; threads and remote charges. The memory is still charged. Interrupt
+&gt; &gt; &gt; &gt; &gt; &gt; charges keep their current path.
+&gt; &gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; &gt; In a VM with incompressible zswap data, the worker queued itself 163 times
+&gt; &gt; &gt; &gt; &gt; &gt; without this check.
+&gt; &gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; &gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; The patch itself looks OK. I am wondering whether we can unify the check
+&gt; &gt; &gt; &gt; &gt; with the existing one which forces the allocation through in main
+&gt; &gt; &gt; &gt; &gt; charging path.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; The force charge (and ENOMEM) paths bypass the memory.high enforcement
+&gt; &gt; &gt; &gt; altogether.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Exactly. Isn&#x27;t that exactl what we want to achieve here as well?
+&gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; Only successful charges (done_restock label) goes through
+&gt; &gt; &gt; &gt; memory.high enforcement. So, even if we move this check in try_charge_memcg, it
+&gt; &gt; &gt; &gt; will still be a separate check before calling high enforcement function. I think
+&gt; &gt; &gt; &gt; this check is very high_work specific and better to be in the high enforcement
+&gt; &gt; &gt; &gt; function.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; I meant something like the following
+&gt; &gt; 
+&gt; &gt; Oh ok this makes sense. Do you want to send a patch or should I add this in this
+&gt; &gt; series replacing the 4th patch?
+&gt; 
+&gt; Feel free to take it. I haven&#x27;t even tried to compile this. Just wanted
+&gt; to show what I have in mind.
+
+Cool, I will resend the updated series after the merge window.</pre>
 </details>
+<a href="https://lore.kernel.org/r/as0U-erMrDTG9fkt@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-10-12">
+</div>
+<div class="thread-node depth-0" id="2026-10-14">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Harry Yoo</span>
-<a class="date-chip" href="../2026-10-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-12">2026-10-12</a>
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-10-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-14">2026-10-14</a>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a missing Signed-off-by: line in the first patch and suggested adding it. Otherwise, LGTM with Reviewed-by: tag.</div>
+<div class="review-comment-text">Reviewer Michal Hocko noted that try_charge_memcg() is doing too many things, including charging page counters, reclaiming when a limit is hit, calling the OOM killer, and enforcing memory.high. He suggested moving the memory.high enforcement into a new function, memcg_enforce_high(), to make the code shorter and easier to read.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Sat, Oct 10, 2026 at 02:09:53PM -0700, Shakeel Butt wrote:
+<pre class="raw-body-text">On Sat 10-10-26 14:09:53, Shakeel Butt wrote:
 &gt; try_charge_memcg() does a lot. It charges the page counters, reclaims
 &gt; when a limit is hit, may call the OOM killer, and at the end it checks
 &gt; and enforces memory.high. Move the memory.high part into a new function,
@@ -303,22 +651,663 @@ Thanks for the review.
 &gt; the new function gets allow_spinning from gfp_mask itself.
 &gt; 
 &gt; No functional change.
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+Thanks!
+
 &gt; ---
-
-Missing Signed-off-by: ?
-
-Otherwise LGTM.
-Reviewed-by: Harry Yoo (Meta) &lt;harry@kernel.org&gt;
+&gt;  mm/memcontrol.c | 125 ++++++++++++++++++++++++++----------------------
+&gt;  1 file changed, 69 insertions(+), 56 deletions(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index aad0498a7bd6..20c5dfe1a894 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2696,6 +2696,74 @@ void __mem_cgroup_handle_over_high(gfp_t gfp_mask)
+&gt;  	css_put(&amp;memcg-&gt;css);
+&gt;  }
+&gt;  
+&gt; +/*
+&gt; + * Called after @nr_pages were charged to @memcg. If @memcg or one of its
+&gt; + * ancestors is over memory.high or memory.swap.high, start reclaim or slow
+&gt; + * down the task.
+&gt; + */
+&gt; +static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt; +			       gfp_t gfp_mask)
+&gt; +{
+&gt; +	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+&gt; +
+&gt; +	/*
+&gt; +	 * If the hierarchy is above the normal consumption range, schedule
+&gt; +	 * reclaim on returning to userland.  We can perform reclaim here
+&gt; +	 * if __GFP_RECLAIM but let&#x27;s always punt for simplicity and so that
+&gt; +	 * GFP_KERNEL can consistently be used during reclaim.  @memcg is
+&gt; +	 * not recorded as it most likely matches current&#x27;s and won&#x27;t
+&gt; +	 * change in the meantime.  As high limit is checked again before
+&gt; +	 * reclaim, the cost of mismatch is negligible.
+&gt; +	 */
+&gt; +	do {
+&gt; +		bool mem_high, swap_high;
+&gt; +
+&gt; +		mem_high = page_counter_read(&amp;memcg-&gt;memory) &gt;
+&gt; +			READ_ONCE(memcg-&gt;memory.high);
+&gt; +		swap_high = page_counter_read(&amp;memcg-&gt;swap) &gt;
+&gt; +			READ_ONCE(memcg-&gt;swap.high);
+&gt; +
+&gt; +		/* Don&#x27;t bother a random interrupted task */
+&gt; +		if (!in_task()) {
+&gt; +			if (mem_high) {
+&gt; +				if (allow_spinning)
+&gt; +					schedule_work(&amp;memcg-&gt;high_work);
+&gt; +				else
+&gt; +					irq_work_queue(&amp;memcg-&gt;high_irq_work);
+&gt; +				break;
+&gt; +			}
+&gt; +			continue;
+&gt; +		}
+&gt; +
+&gt; +		if (mem_high || swap_high) {
+&gt; +			/*
+&gt; +			 * The allocating tasks in this cgroup will need to do
+&gt; +			 * reclaim or be throttled to prevent further growth
+&gt; +			 * of the memory or swap footprints.
+&gt; +			 *
+&gt; +			 * Target some best-effort fairness between the tasks,
+&gt; +			 * and distribute reclaim work and delay penalties
+&gt; +			 * based on how much each task is actually allocating.
+&gt; +			 */
+&gt; +			current-&gt;memcg_nr_pages_over_high += nr_pages;
+&gt; +			set_notify_resume(current);
+&gt; +			break;
+&gt; +		}
+&gt; +	} while ((memcg = parent_mem_cgroup(memcg)));
+&gt; +
+&gt; +	/*
+&gt; +	 * Reclaim is set up above to be called from the userland
+&gt; +	 * return path. But also attempt synchronous reclaim to avoid
+&gt; +	 * excessive overrun while the task is still inside the
+&gt; +	 * kernel. If this is successful, the return path will see it
+&gt; +	 * when it rechecks the overage and simply bail out.
+&gt; +	 */
+&gt; +	if (current-&gt;memcg_nr_pages_over_high &gt; MEMCG_CHARGE_BATCH &amp;&amp;
+&gt; +	    !(current-&gt;flags &amp; PF_MEMALLOC) &amp;&amp;
+&gt; +	    gfpflags_allow_blocking(gfp_mask))
+&gt; +		__mem_cgroup_handle_over_high(gfp_mask);
+&gt; +}
+&gt; +
+&gt;  static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  			    unsigned int nr_pages)
+&gt;  {
+&gt; @@ -2853,62 +2921,7 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+&gt;  	if (batch &gt; nr_pages)
+&gt;  		refill_stock(memcg, batch - nr_pages);
+&gt;  
+&gt; -	/*
+&gt; -	 * If the hierarchy is above the normal consumption range, schedule
+&gt; -	 * reclaim on returning to userland.  We can perform reclaim here
+&gt; -	 * if __GFP_RECLAIM but let&#x27;s always punt for simplicity and so that
+&gt; -	 * GFP_KERNEL can consistently be used during reclaim.  @memcg is
+&gt; -	 * not recorded as it most likely matches current&#x27;s and won&#x27;t
+&gt; -	 * change in the meantime.  As high limit is checked again before
+&gt; -	 * reclaim, the cost of mismatch is negligible.
+&gt; -	 */
+&gt; -	do {
+&gt; -		bool mem_high, swap_high;
+&gt; -
+&gt; -		mem_high = page_counter_read(&amp;memcg-&gt;memory) &gt;
+&gt; -			READ_ONCE(memcg-&gt;memory.high);
+&gt; -		swap_high = page_counter_read(&amp;memcg-&gt;swap) &gt;
+&gt; -			READ_ONCE(memcg-&gt;swap.high);
+&gt; -
+&gt; -		/* Don&#x27;t bother a random interrupted task */
+&gt; -		if (!in_task()) {
+&gt; -			if (mem_high) {
+&gt; -				if (allow_spinning)
+&gt; -					schedule_work(&amp;memcg-&gt;high_work);
+&gt; -				else
+&gt; -					irq_work_queue(&amp;memcg-&gt;high_irq_work);
+&gt; -				break;
+&gt; -			}
+&gt; -			continue;
+&gt; -		}
+&gt; -
+&gt; -		if (mem_high || swap_high) {
+&gt; -			/*
+&gt; -			 * The allocating tasks in this cgroup will need to do
+&gt; -			 * reclaim or be throttled to prevent further growth
+&gt; -			 * of the memory or swap footprints.
+&gt; -			 *
+&gt; -			 * Target some best-effort fairness between the tasks,
+&gt; -			 * and distribute reclaim work and delay penalties
+&gt; -			 * based on how much each task is actually allocating.
+&gt; -			 */
+&gt; -			current-&gt;memcg_nr_pages_over_high += batch;
+&gt; -			set_notify_resume(current);
+&gt; -			break;
+&gt; -		}
+&gt; -	} while ((memcg = parent_mem_cgroup(memcg)));
+&gt; -
+&gt; -	/*
+&gt; -	 * Reclaim is set up above to be called from the userland
+&gt; -	 * return path. But also attempt synchronous reclaim to avoid
+&gt; -	 * excessive overrun while the task is still inside the
+&gt; -	 * kernel. If this is successful, the return path will see it
+&gt; -	 * when it rechecks the overage and simply bail out.
+&gt; -	 */
+&gt; -	if (current-&gt;memcg_nr_pages_over_high &gt; MEMCG_CHARGE_BATCH &amp;&amp;
+&gt; -	    !(current-&gt;flags &amp; PF_MEMALLOC) &amp;&amp;
+&gt; -	    gfpflags_allow_blocking(gfp_mask))
+&gt; -		__mem_cgroup_handle_over_high(gfp_mask);
+&gt; +	memcg_enforce_high(memcg, batch, gfp_mask);
+&gt;  	return ret;
+&gt;  }
+&gt;  
+&gt; -- 
+&gt; 2.53.0-Meta
 
 -- 
-Cheers,
-Harry / Hyeonggon
-</pre>
+Michal Hocko
+SUSE Labs
+
+---
+
+On Sat 10-10-26 14:09:54, Shakeel Butt wrote:
+&gt; Kernel threads never return to userspace, so deferred memory.high
+&gt; reclaim does not run. Reclaim and throttling during a charge can also
+&gt; delay work they do for other tasks.
+&gt; 
+&gt; Treat kernel threads like interrupts. Queue high_work for the first
+&gt; cgroup over memory.high and skip reclaim and throttling in the charging
+&gt; thread.
+&gt; 
+&gt; User workers created by create_io_thread() and vhost_task_create() keep
+&gt; their current behavior. Vhost kernel threads use the new path, even when
+&gt; they borrow the owner&#x27;s mm.
+&gt; 
+&gt; The worker requests a fixed batch of pages each time. A fast allocator
+&gt; can keep usage well above memory.high. Kernel threads also skip
+&gt; memory.swap.high throttling and its high-event reporting. The memory.max
+&gt; and memory.swap.max checks stay the same.
+&gt; 
+&gt; Suggested-by: Tejun Heo &lt;tj@kernel.org&gt;
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+yes this makes sense as a general improvemnt.
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+
+Thanks!
+&gt; ---
+&gt;  mm/memcontrol.c | 13 +++++++++++--
+&gt;  1 file changed, 11 insertions(+), 2 deletions(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 20c5dfe1a894..8116fce6ab96 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2705,6 +2705,7 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  			       gfp_t gfp_mask)
+&gt;  {
+&gt;  	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+&gt; +	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD);
+&gt;  
+&gt;  	/*
+&gt;  	 * If the hierarchy is above the normal consumption range, schedule
+&gt; @@ -2723,8 +2724,12 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		swap_high = page_counter_read(&amp;memcg-&gt;swap) &gt;
+&gt;  			READ_ONCE(memcg-&gt;swap.high);
+&gt;  
+&gt; -		/* Don&#x27;t bother a random interrupted task */
+&gt; -		if (!in_task()) {
+&gt; +		/*
+&gt; +		 * Don&#x27;t make an unrelated interrupted task handle this charge.
+&gt; +		 * Kernel threads may be working for other tasks, so let a worker
+&gt; +		 * reclaim instead.
+&gt; +		 */
+&gt; +		if (use_worker) {
+&gt;  			if (mem_high) {
+&gt;  				if (allow_spinning)
+&gt;  					schedule_work(&amp;memcg-&gt;high_work);
+&gt; @@ -2751,6 +2756,10 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		}
+&gt;  	} while ((memcg = parent_mem_cgroup(memcg)));
+&gt;  
+&gt; +	/* Interrupts and kernel threads stop here. */
+&gt; +	if (use_worker)
+&gt; +		return;
+&gt; +
+&gt;  	/*
+&gt;  	 * Reclaim is set up above to be called from the userland
+&gt;  	 * return path. But also attempt synchronous reclaim to avoid
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Sat 10-10-26 14:09:55, Shakeel Butt wrote:
+&gt; Some charges go to a cgroup outside the current mm&#x27;s cgroup and its
+&gt; ancestors. The high handler uses current-&gt;mm, so it cannot handle these
+&gt; overages. Filesystem notifications and remote page faults can take
+&gt; this path.
+
+Hmm, you made me look at other places in the charge path where we are
+assuming current-&gt;memcg == memcg. We have reclaim recursion and oom
+checks. The former makes sense, for the latter it is likely not
+harmful.
+
+&gt; Use mm_match_cgroup() before checking the high limits. If it does not
+&gt; match, use high_work instead of recording task overage or doing
+&gt; synchronous reclaim and throttling. Charges to the same cgroup or an
+&gt; ancestor keep their current handling. Tasks without an mm also use the
+&gt; worker.
+&gt; 
+&gt; Like kernel threads, remote chargers skip memory.swap.high throttling
+&gt; and its high-event reporting, and a fast allocator can outrun the worker.
+&gt; The memory.max and memory.swap.max checks stay the same.
+
+Makes sense.
+
+&gt; Suggested-by: Tejun Heo &lt;tj@kernel.org&gt;
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+Thanks!
+
+&gt; ---
+&gt;  mm/memcontrol.c | 6 ++++--
+&gt;  1 file changed, 4 insertions(+), 2 deletions(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 8116fce6ab96..3456960cbe68 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2705,7 +2705,8 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  			       gfp_t gfp_mask)
+&gt;  {
+&gt;  	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+&gt; -	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD);
+&gt; +	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD) ||
+&gt; +		!current-&gt;mm || !mm_match_cgroup(current-&gt;mm, memcg);
+&gt;  
+&gt;  	/*
+&gt;  	 * If the hierarchy is above the normal consumption range, schedule
+&gt; @@ -2728,6 +2729,7 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		 * Don&#x27;t make an unrelated interrupted task handle this charge.
+&gt;  		 * Kernel threads may be working for other tasks, so let a worker
+&gt;  		 * reclaim instead.
+&gt; +		 * Remote charges need reclaim from their charged hierarchy.
+&gt;  		 */
+&gt;  		if (use_worker) {
+&gt;  			if (mem_high) {
+&gt; @@ -2756,7 +2758,7 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		}
+&gt;  	} while ((memcg = parent_mem_cgroup(memcg)));
+&gt;  
+&gt; -	/* Interrupts and kernel threads stop here. */
+&gt; +	/* Interrupts, kernel threads, and remote chargers stop here. */
+&gt;  	if (use_worker)
+&gt;  		return;
+&gt;  
+&gt; -- 
+&gt; 2.53.0-Meta
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Sat 10-10-26 14:09:56, Shakeel Butt wrote:
+&gt; Kernel threads and remote chargers use high_work when memory.high is
+&gt; exceeded. Their allocations during reclaim can also charge memory,
+&gt; for example when zswap stores a page.
+&gt; 
+&gt; Without a check, the high_work worker can queue itself from its own
+&gt; reclaim. The pending bit is cleared before high_work runs, so each run
+&gt; can queue another run.
+
+What does that mean really? Does this delays the actual run?
+ 
+&gt; Skip memory.high enforcement for charges from task context with
+&gt; PF_MEMALLOC set when they would use high_work. This covers kernel
+&gt; threads and remote charges. The memory is still charged. Interrupt
+&gt; charges keep their current path.
+&gt; 
+&gt; In a VM with incompressible zswap data, the worker queued itself 163 times
+&gt; without this check.
+&gt; 
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+The patch itself looks OK. I am wondering whether we can unify the check
+with the existing one which forces the allocation through in main
+charging path.
+
+&gt; ---
+&gt;  mm/memcontrol.c | 8 ++++++++
+&gt;  1 file changed, 8 insertions(+)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 3456960cbe68..d1e022e6572f 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2708,6 +2708,14 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD) ||
+&gt;  		!current-&gt;mm || !mm_match_cgroup(current-&gt;mm, memcg);
+&gt;  
+&gt; +	/*
+&gt; +	 * Reclaim can charge memory, for example when zswap stores a page.
+&gt; +	 * Don&#x27;t queue high_work from a reclaiming task, or the
+&gt; +	 * high_work worker could keep queuing itself.
+&gt; +	 */
+&gt; +	if (in_task() &amp;&amp; use_worker &amp;&amp; (current-&gt;flags &amp; PF_MEMALLOC))
+&gt; +		return;
+&gt; +
+&gt;  	/*
+&gt;  	 * If the hierarchy is above the normal consumption range, schedule
+&gt;  	 * reclaim on returning to userland.  We can perform reclaim here
+&gt; -- 
+&gt; 2.53.0-Meta
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Sat 10-10-26 14:09:57, Shakeel Butt wrote:
+[...]
+&gt; -	/* Interrupts, kernel threads, and remote chargers stop here. */
+&gt; -	if (use_worker)
+&gt; +	/*
+&gt; +	 * Use a worker for interrupts, kernel threads, and tasks whose mm
+&gt; +	 * does not match the charged hierarchy.
+&gt; +	 */
+&gt; +	if (use_high_work) {
+&gt; +		if (!iter)
+&gt; +			return;
+&gt; +		if (allow_spinning)
+&gt; +			schedule_work(&amp;iter-&gt;high_work);
+&gt; +		else
+&gt; +			irq_work_queue(&amp;iter-&gt;high_irq_work);
+&gt;  		return;
+&gt; +	}
+&gt; +
+&gt; +	if (iter) {
+
+Would it be much simpler to bail out on iter==NULL (i.e. nothing over
+high limit) right after the loop?
+
+&gt; +		/*
+&gt; +		 * Count the full batch so reclaim work and delay penalties scale
+&gt; +		 * with the pages charged by this task.
+&gt; +		 */
+&gt; +		current-&gt;memcg_nr_pages_over_high += nr_pages;
+&gt; +		set_notify_resume(current);
+&gt; +	}
+&gt;  
+&gt;  	/*
+&gt; -	 * Reclaim is set up above to be called from the userland
+&gt; -	 * return path. But also attempt synchronous reclaim to avoid
+&gt; -	 * excessive overrun while the task is still inside the
+&gt; -	 * kernel. If this is successful, the return path will see it
+&gt; -	 * when it rechecks the overage and simply bail out.
+&gt; +	 * Earlier charges may have left high overage pending even if this charge
+&gt; +	 * found no new overage. Handle it now if this charge can block, to limit
+&gt; +	 * overrun while the task remains in the kernel.
+&gt;  	 */
+&gt;  	if (current-&gt;memcg_nr_pages_over_high &gt; MEMCG_CHARGE_BATCH &amp;&amp;
+&gt;  	    !(current-&gt;flags &amp; PF_MEMALLOC) &amp;&amp;
+&gt; -- 
+&gt; 2.53.0-Meta
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Wed 14-10-26 09:06:00, Shakeel Butt wrote:
+&gt; On Wed, Oct 14, 2026 at 01:39:06PM +0200, Michal Hocko wrote:
+&gt; &gt; On Sat 10-10-26 14:09:56, Shakeel Butt wrote:
+&gt; &gt; &gt; Kernel threads and remote chargers use high_work when memory.high is
+&gt; &gt; &gt; exceeded. Their allocations during reclaim can also charge memory,
+&gt; &gt; &gt; for example when zswap stores a page.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Without a check, the high_work worker can queue itself from its own
+&gt; &gt; &gt; reclaim. The pending bit is cleared before high_work runs, so each run
+&gt; &gt; &gt; can queue another run.
+&gt; &gt; 
+&gt; &gt; What does that mean really? Does this delays the actual run?
+&gt; 
+&gt; It will not delay the actual charge request. This mainly means that we keep
+&gt; enqueing the high reclaim work even from high reclaim context and can
+&gt; potentially keep wasting CPU if high reclaim is not very successful.
+
+Hmm, so is there any practical problem if we do that? What exactly do you
+mean by &quot;keep wasting CPU&quot;?
+ 
+&gt; &gt; &gt; Skip memory.high enforcement for charges from task context with
+&gt; &gt; &gt; PF_MEMALLOC set when they would use high_work. This covers kernel
+&gt; &gt; &gt; threads and remote charges. The memory is still charged. Interrupt
+&gt; &gt; &gt; charges keep their current path.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; In a VM with incompressible zswap data, the worker queued itself 163 times
+&gt; &gt; &gt; without this check.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; &gt; 
+&gt; &gt; The patch itself looks OK. I am wondering whether we can unify the check
+&gt; &gt; with the existing one which forces the allocation through in main
+&gt; &gt; charging path.
+&gt; 
+&gt; The force charge (and ENOMEM) paths bypass the memory.high enforcement
+&gt; altogether.
+
+Exactly. Isn&#x27;t that exactl what we want to achieve here as well?
+
+&gt; Only successful charges (done_restock label) goes through
+&gt; memory.high enforcement. So, even if we move this check in try_charge_memcg, it
+&gt; will still be a separate check before calling high enforcement function. I think
+&gt; this check is very high_work specific and better to be in the high enforcement
+&gt; function.
+
+I meant something like the following
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 856a7d07586c..832b40ee5b6f 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2653,7 +2653,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	bool passed_oom = false;
+ 	unsigned int reclaim_options;
+ 	bool drained = false;
+-	bool raised_max_event = false;
+ 	unsigned long pflags;
+ 	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+ 
+@@ -2661,6 +2660,15 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (consume_stock(memcg, nr_pages))
+ 		return 0;
+ 
++	/*
++	 * Prevent unbounded recursion when reclaim operations need to
++	 * allocate memory. This might exceed the limits temporarily,
++	 * but we prefer facilitating memory reclaim and getting back
++	 * under the limit over triggering OOM kills in these cases.
++	 */
++	if (unlikely(current-&gt;flags &amp; PF_MEMALLOC))
++		goto force;
++
+ 	if (!allow_spinning)
+ 		/* Avoid the refill and flush of the older stock */
+ 		batch = nr_pages;
+@@ -2683,15 +2691,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 		goto retry;
+ 	}
+ 
+-	/*
+-	 * Prevent unbounded recursion when reclaim operations need to
+-	 * allocate memory. This might exceed the limits temporarily,
+-	 * but we prefer facilitating memory reclaim and getting back
+-	 * under the limit over triggering OOM kills in these cases.
+-	 */
+-	if (unlikely(current-&gt;flags &amp; PF_MEMALLOC))
+-		goto force;
+-
+ 	if (unlikely(task_in_memcg_oom(current)))
+ 		goto nomem;
+ 
+@@ -2712,7 +2711,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 		goto nomem;
+ 
+ 	__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
+-	raised_max_event = true;
+ 
+ 	psi_memstall_enter(&amp;pflags);
+ 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+@@ -2773,13 +2771,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (!(gfp_mask &amp; (__GFP_NOFAIL | __GFP_HIGH)))
+ 		return -ENOMEM;
+ force:
+-	/*
+-	 * If the allocation has to be enforced, don&#x27;t forget to raise
+-	 * a MEMCG_MAX event.
+-	 */
+-	if (!raised_max_event)
+-		__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
+-
+ 	/*
+ 	 * The allocation either can&#x27;t fail or will lead to more memory
+ 	 * being freed very soon.  Allow memory usage go over the limit
+@@ -2789,6 +2780,8 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (do_memsw_account())
+ 		page_counter_charge(&amp;memcg-&gt;memsw, nr_pages);
+ 
++	if (mem_cgroup_margin(memcg))
++		__memcg_memory_event(memcg, MEMCG_MAX, allow_spinning);
+ 	return 0;
+ 
+ done_restock:
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Wed 14-10-26 10:55:21, Shakeel Butt wrote:
+&gt; On Wed, Oct 14, 2026 at 06:59:30PM +0200, Michal Hocko wrote:
+&gt; &gt; On Wed 14-10-26 09:06:00, Shakeel Butt wrote:
+&gt; &gt; &gt; On Wed, Oct 14, 2026 at 01:39:06PM +0200, Michal Hocko wrote:
+&gt; &gt; &gt; &gt; On Sat 10-10-26 14:09:56, Shakeel Butt wrote:
+&gt; &gt; &gt; &gt; &gt; Kernel threads and remote chargers use high_work when memory.high is
+&gt; &gt; &gt; &gt; &gt; exceeded. Their allocations during reclaim can also charge memory,
+&gt; &gt; &gt; &gt; &gt; for example when zswap stores a page.
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; Without a check, the high_work worker can queue itself from its own
+&gt; &gt; &gt; &gt; &gt; reclaim. The pending bit is cleared before high_work runs, so each run
+&gt; &gt; &gt; &gt; &gt; can queue another run.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; What does that mean really? Does this delays the actual run?
+&gt; &gt; &gt; 
+&gt; &gt; &gt; It will not delay the actual charge request. This mainly means that we keep
+&gt; &gt; &gt; enqueing the high reclaim work even from high reclaim context and can
+&gt; &gt; &gt; potentially keep wasting CPU if high reclaim is not very successful.
+&gt; &gt; 
+&gt; &gt; Hmm, so is there any practical problem if we do that? What exactly do you
+&gt; &gt; mean by &quot;keep wasting CPU&quot;?
+&gt; 
+&gt; More specifically if high_work kworker keeps enqueing high_work, most probably
+&gt; the memcg does not have reclaimable memory and keep retrying it wastes CPU.
+
+Yes but this is not specific to PF_MEMALLOC context, or do I miss
+something?
+ 
+&gt; &gt; &gt; &gt; &gt; Skip memory.high enforcement for charges from task context with
+&gt; &gt; &gt; &gt; &gt; PF_MEMALLOC set when they would use high_work. This covers kernel
+&gt; &gt; &gt; &gt; &gt; threads and remote charges. The memory is still charged. Interrupt
+&gt; &gt; &gt; &gt; &gt; charges keep their current path.
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; In a VM with incompressible zswap data, the worker queued itself 163 times
+&gt; &gt; &gt; &gt; &gt; without this check.
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; The patch itself looks OK. I am wondering whether we can unify the check
+&gt; &gt; &gt; &gt; with the existing one which forces the allocation through in main
+&gt; &gt; &gt; &gt; charging path.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; The force charge (and ENOMEM) paths bypass the memory.high enforcement
+&gt; &gt; &gt; altogether.
+&gt; &gt; 
+&gt; &gt; Exactly. Isn&#x27;t that exactl what we want to achieve here as well?
+&gt; &gt; 
+&gt; &gt; &gt; Only successful charges (done_restock label) goes through
+&gt; &gt; &gt; memory.high enforcement. So, even if we move this check in try_charge_memcg, it
+&gt; &gt; &gt; will still be a separate check before calling high enforcement function. I think
+&gt; &gt; &gt; this check is very high_work specific and better to be in the high enforcement
+&gt; &gt; &gt; function.
+&gt; &gt; 
+&gt; &gt; I meant something like the following
+&gt; 
+&gt; Oh ok this makes sense. Do you want to send a patch or should I add this in this
+&gt; series replacing the 4th patch?
+
+Feel free to take it. I haven&#x27;t even tried to compile this. Just wanted
+to show what I have in mind.
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Wed 14-10-26 10:43:33, Shakeel Butt wrote:
+&gt; On Wed, Oct 14, 2026 at 01:46:23PM +0200, Michal Hocko wrote:
+&gt; &gt; On Sat 10-10-26 14:09:57, Shakeel Butt wrote:
+&gt; &gt; [...]
+&gt; &gt; &gt; -	/* Interrupts, kernel threads, and remote chargers stop here. */
+&gt; &gt; &gt; -	if (use_worker)
+&gt; &gt; &gt; +	/*
+&gt; &gt; &gt; +	 * Use a worker for interrupts, kernel threads, and tasks whose mm
+&gt; &gt; &gt; +	 * does not match the charged hierarchy.
+&gt; &gt; &gt; +	 */
+&gt; &gt; &gt; +	if (use_high_work) {
+&gt; &gt; &gt; +		if (!iter)
+&gt; &gt; &gt; +			return;
+&gt; &gt; &gt; +		if (allow_spinning)
+&gt; &gt; &gt; +			schedule_work(&amp;iter-&gt;high_work);
+&gt; &gt; &gt; +		else
+&gt; &gt; &gt; +			irq_work_queue(&amp;iter-&gt;high_irq_work);
+&gt; &gt; &gt;  		return;
+&gt; &gt; &gt; +	}
+&gt; &gt; &gt; +
+&gt; &gt; &gt; +	if (iter) {
+&gt; &gt; 
+&gt; &gt; Would it be much simpler to bail out on iter==NULL (i.e. nothing over
+&gt; &gt; high limit) right after the loop?
+&gt; &gt; 
+&gt; 
+&gt; I want this patch to not change any behavior. If we return here when iter is
+&gt; NULL, we will skip a potential call to __mem_cgroup_handle_over_high() when
+&gt; current-&gt;memcg_nr_pages_over_high &gt; MEMCG_CHARGE_BATCH. Though I agree that is
+&gt; very subtle and most probably unexpected. If we decide to remove it, we should
+&gt; do it in a separate patch.
+
+OK, makes sense.
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+-- 
+Michal Hocko
+SUSE Labs</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
-<div class="review-comment-signals">Signals: LGTM</div>
-</div>
-</div>
+<a href="https://lore.kernel.org/r/as9j3rH3qRtFO0-7@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>

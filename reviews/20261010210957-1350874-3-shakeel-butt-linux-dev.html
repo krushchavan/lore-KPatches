@@ -238,9 +238,103 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH for-7.5 2/5] memcg: use high_work for kernel threads</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261010210957.1350874-3-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-10</strong><div class="date-range-nav">Active on: <a href="#2026-10-10">2026-10-10</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the memory cgroup (memcg) handling for kernel threads, treating them similarly to interrupts. It introduces a new condition to determine whether a worker should be used for reclaim and throttling during a charge, skipping these operations if a kernel thread is involved. The change affects how kernel threads handle memory.high reclamation and throttling, allowing them to skip these tasks and instead rely on workers to manage memory usage.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-10-10</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-14</strong><div class="date-range-nav">Active on: <a href="#2026-10-14">2026-10-14</a> &bull; <a href="#2026-10-10">2026-10-10</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series introduces a change to the memory cgroup (memcg) subsystem, specifically modifying how kernel threads handle high memory usage. The current implementation defers reclaim and throttling for kernel threads, which can lead to delayed work and potential issues. This patch proposes treating kernel threads like interrupts by queueing high_work for the first cgroup over memory.high and skipping reclaim and throttling in the charging thread.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-10-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-14">2026-10-14</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Acknowledged the patch as a general improvement and applied the Acked-by tag. No specific technical concerns were raised, but further discussion is needed to finalize the changes.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Sat 10-10-26 14:09:54, Shakeel Butt wrote:
+&gt; Kernel threads never return to userspace, so deferred memory.high
+&gt; reclaim does not run. Reclaim and throttling during a charge can also
+&gt; delay work they do for other tasks.
+&gt; 
+&gt; Treat kernel threads like interrupts. Queue high_work for the first
+&gt; cgroup over memory.high and skip reclaim and throttling in the charging
+&gt; thread.
+&gt; 
+&gt; User workers created by create_io_thread() and vhost_task_create() keep
+&gt; their current behavior. Vhost kernel threads use the new path, even when
+&gt; they borrow the owner&#x27;s mm.
+&gt; 
+&gt; The worker requests a fixed batch of pages each time. A fast allocator
+&gt; can keep usage well above memory.high. Kernel threads also skip
+&gt; memory.swap.high throttling and its high-event reporting. The memory.max
+&gt; and memory.swap.max checks stay the same.
+&gt; 
+&gt; Suggested-by: Tejun Heo &lt;tj@kernel.org&gt;
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+
+yes this makes sense as a general improvemnt.
+
+Acked-by: Michal Hocko &lt;mhocko@suse.com&gt;
+
+Thanks!
+&gt; ---
+&gt;  mm/memcontrol.c | 13 +++++++++++--
+&gt;  1 file changed, 11 insertions(+), 2 deletions(-)
+&gt; 
+&gt; diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+&gt; index 20c5dfe1a894..8116fce6ab96 100644
+&gt; --- a/mm/memcontrol.c
+&gt; +++ b/mm/memcontrol.c
+&gt; @@ -2705,6 +2705,7 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  			       gfp_t gfp_mask)
+&gt;  {
+&gt;  	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+&gt; +	bool use_worker = !in_task() || (current-&gt;flags &amp; PF_KTHREAD);
+&gt;  
+&gt;  	/*
+&gt;  	 * If the hierarchy is above the normal consumption range, schedule
+&gt; @@ -2723,8 +2724,12 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		swap_high = page_counter_read(&amp;memcg-&gt;swap) &gt;
+&gt;  			READ_ONCE(memcg-&gt;swap.high);
+&gt;  
+&gt; -		/* Don&#x27;t bother a random interrupted task */
+&gt; -		if (!in_task()) {
+&gt; +		/*
+&gt; +		 * Don&#x27;t make an unrelated interrupted task handle this charge.
+&gt; +		 * Kernel threads may be working for other tasks, so let a worker
+&gt; +		 * reclaim instead.
+&gt; +		 */
+&gt; +		if (use_worker) {
+&gt;  			if (mem_high) {
+&gt;  				if (allow_spinning)
+&gt;  					schedule_work(&amp;memcg-&gt;high_work);
+&gt; @@ -2751,6 +2756,10 @@ static void memcg_enforce_high(struct mem_cgroup *memcg, unsigned int nr_pages,
+&gt;  		}
+&gt;  	} while ((memcg = parent_mem_cgroup(memcg)));
+&gt;  
+&gt; +	/* Interrupts and kernel threads stop here. */
+&gt; +	if (use_worker)
+&gt; +		return;
+&gt; +
+&gt;  	/*
+&gt;  	 * Reclaim is set up above to be called from the userland
+&gt;  	 * return path. But also attempt synchronous reclaim to avoid
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+
+-- 
+Michal Hocko
+SUSE Labs
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<div class="review-comment-signals">Signals: NEEDS_WORK</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

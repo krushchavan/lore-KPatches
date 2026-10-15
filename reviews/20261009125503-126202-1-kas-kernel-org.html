@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v3] mm: page_alloc: make defrag_mode retries follow the promoted order</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261009125503.126202-1-kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-09</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-13</strong><div class="date-range-nav">Active on: <a href="#2026-10-13">2026-10-13</a> &bull; <a href="#2026-10-12">2026-10-12</a> &bull; <a href="#2026-10-10">2026-10-10</a> &bull; <a href="#2026-10-09">2026-10-09</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the behavior of page allocation in defrag_mode to make retry decisions follow the promoted order, rather than the original request order. This change is intended to prevent a situation where an order-0 request can retry indefinitely without reaching the ALLOC_NOFRAGMENT fallback. The patch also makes adjustments for promoted requests, ensuring that they do not reset no_progress_loops and allowing them to fall back to the fallback attempt with a full retry budget. The goal of this change is to reduce memory pressure and prevent OOM killing in certain workloads.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-09</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-14</strong><div class="date-range-nav">Active on: <a href="#2026-10-14">2026-10-14</a> &bull; <a href="#2026-10-13">2026-10-13</a> &bull; <a href="#2026-10-12">2026-10-12</a> &bull; <a href="#2026-10-10">2026-10-10</a> &bull; <a href="#2026-10-09">2026-10-09</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the page allocation mechanism in Linux to make defragmentation mode retries follow the promoted order of requests, rather than the original request order. This change aims to prevent indefinite retrying by order-0 requests and reduce memory pressure caused by frequent direct reclaim runs. The promoted order is computed once per iteration and passed to relevant functions, ensuring consistency across different callers. Additionally, the patch resets retry counters when a promoted request takes the fallback path, allowing for a full retry budget before OOM killing is considered.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-09">
 <div class="review-comment">
@@ -387,8 +387,262 @@ Johannes feedback.
 <a href="https://lore.kernel.org/r/asyzhoDeI3U4T9wZ@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: acknowledged previous feedback, did not provide specific details</div>
 </div>
+</div>
+<div class="thread-node depth-2" id="2026-10-13">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-10-13_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-13">2026-10-13</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author responded to feedback from Vlastimil by providing a revised patch that incorporates their suggestion and confirming the behavior remains unchanged.
+
+The author is responding to Andrew Morton&#x27;s feedback about the patch being too late for 7.4-rc1 and instead hopes it will be included in the next -rc cycle.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">They do. The patch with Vlastimil&#x27;s suggestion is below. It is shorter.
+Behaviour is unchanged; the reproducer gives the same results on both
+versions.
+
+Vlastimil, does it look like what you had in mind?
+
+---
+
+Do you mean the next -rc cycle? I hoped to get it into 7.4-rc1, as we
+agreed earlier.
+
+-----------------------------------&gt;8----------------------------------
+
+From: &quot;Kiryl Shutsemau (Meta)&quot; &lt;kas@kernel.org&gt;
+Subject: [PATCH v4] mm: page_alloc: make defrag_mode retries follow the promoted order
+
+Since commit 7e8756d7ad22 (&quot;mm: page_alloc: fix non-movable reclaim
+storm in defrag_mode&quot;), direct reclaim and compaction for non-movable
+requests under defrag_mode run at pageblock_order, to produce the whole
+blocks that ALLOC_NOFRAGMENT needs. The retry decisions that follow
+still use the request order. An order-0 request can therefore retry
+indefinitely without ever reaching the ALLOC_NOFRAGMENT fallback:
+
+- Reclaim at pageblock_order gives up after one pass as soon as a zone
+  looks compaction_ready(), and do_try_to_free_pages() then returns 1
+  even though nothing was reclaimed. It returns before the retry that
+  would reclaim memory.low-protected cgroups, so when most memory is
+  protected, the pass that did run finds next to nothing.
+
+- Compaction at pageblock_order fails or is deferred.
+
+- should_reclaim_retry() takes the reported progress as progress for
+  the order-0 request and resets no_progress_loops. The request
+  retries.
+
+Order 1-3 requests loop the same way, and should_compact_retry() also
+checks their pageblock_order compaction result against the request
+order.
+
+On a production host (64G, defrag_mode, memory.low covering most of the
+workload), 95% of direct reclaim runs were order-9 runs that returned 1
+with nothing reclaimed, at up to 60k runs per second. Across ~200M
+should_reclaim_retry() calls in a day, no_progress_loops never left 0.
+The spinning allocations were SLUB slab refills for inode and dentry
+caches. The time spent registers as memory pressure, and pressure-based
+OOM killing takes down both workloads and system services.
+
+For promoted requests:
+
+- Reclaim progress does not reset no_progress_loops, as for costly
+  orders.
+
+- should_compact_retry() checks the compaction result at the promoted
+  order and does not retry COMPACT_SKIPPED, since the request can fall
+  back. The compaction priority floor and the COMPACT_SUCCESS retry
+  limit stay those of the request order, so a non-costly request still
+  gets its COMPACT_PRIO_SYNC_FULL pass before it falls back.
+
+When a promoted request takes the fallback, reset the retry counters,
+so that the fallback attempt gets a full retry budget before the OOM
+killer is considered. A request whose reclaim was not promoted spent
+its budget on the request itself and keeps its counters, as Usama Arif
+pointed out.
+
+__alloc_pages_slowpath() computes the promoted order once per iteration
+and keeps it in alloc_context for direct reclaim, direct compaction and
+the two retry helpers, so no callee has to recompute it. Harry Yoo asked
+for the promoted order to be explicit rather than derived in each
+callee, and Vlastimil Babka suggested alloc_context over new function
+parameters.
+
+In a VM reproducer (32G, defrag_mode, inode churn under memory.low):
+
+                                        before    after
+    should_reclaim_retry() calls           63M     293k
+    peak memory pressure (PSI some avg10)  99%      12%
+
+File creation runs 5.7x faster.
+
+Fixes: 7e8756d7ad22 (&quot;mm: page_alloc: fix non-movable reclaim storm in defrag_mode&quot;)
+Cc: stable@vger.kernel.org
+Assisted-by: LLM
+Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+---
+v4:
+ - keep the promoted order in alloc_context instead of passing it as a
+   new parameter (Vlastimil Babka)
+
+ mm/page_alloc.c | 65 +++++++++++++++++++++++++++++--------------------
+ mm/page_alloc.h |  2 ++
+ 2 files changed, 41 insertions(+), 26 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 12fac9084c48..c593913a14f8 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4127,6 +4127,12 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
+ 	return page;
+ }
+ 
++static inline bool order_nofrag_promoted(unsigned int order,
++					 const struct alloc_context *ac)
++{
++	return ac-&gt;reclaim_compact_order != order;
++}
++
+ /*
+  * Maximum number of compaction retries with a progress before OOM
+  * killer is consider as the only way to move forward.
+@@ -4149,22 +4155,7 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
+ 		.order = order,
+ 		.page = NULL,
+ 	};
+-	int compact_order = order;
+-
+-	/*
+-	 * If fallbacks are not permitted (defrag_mode), we either
+-	 * need to reclaim space in a block of matching type, or clear
+-	 * out an entire block to allow __rmqueue_claim() to convert.
+-	 *
+-	 * Reclaim by itself is primarily freeing space in movable
+-	 * blocks, since that&#x27;s where the LRU pages live. So this
+-	 * works for movable requests, but not for others.
+-	 *
+-	 * For those, promote the order to help make blocks, instead
+-	 * of spinning in reclaim alone unproductively.
+-	 */
+-	if ((alloc_flags &amp; ALLOC_NOFRAGMENT) &amp;&amp; ac-&gt;migratetype != MIGRATE_MOVABLE)
+-		compact_order = max(order, pageblock_order);
++	int compact_order = ac-&gt;reclaim_compact_order;
+ 
+ 	if (!compact_order)
+ 		return NULL;
+@@ -4257,7 +4248,7 @@ should_compact_retry(gfp_t gfp_mask, struct alloc_context *ac, int order,
+ 	int retries = *compaction_retries;
+ 	enum compact_priority priority = *compact_priority;
+ 
+-	if (!order)
++	if (!ac-&gt;reclaim_compact_order)
+ 		return false;
+ 
+ 	if (fatal_signal_pending(current))
+@@ -4266,10 +4257,12 @@ should_compact_retry(gfp_t gfp_mask, struct alloc_context *ac, int order,
+ 	/*
+ 	 * Compaction was skipped due to a lack of free order-0
+ 	 * migration targets. Continue if reclaim can help.
++	 * Promoted requests fall back instead.
+ 	 */
+ 	if (compact_result == COMPACT_SKIPPED) {
+-		ret = compaction_zonelist_suitable(ac, order, alloc_flags,
+-						   gfp_mask);
++		if (!order_nofrag_promoted(order, ac))
++			ret = compaction_zonelist_suitable(ac, order,
++							   alloc_flags, gfp_mask);
+ 		goto out;
+ 	}
+ 
+@@ -4468,11 +4461,7 @@ __alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,
+ 	struct page *page = NULL;
+ 	unsigned long pflags;
+ 	bool drained = false;
+-	int reclaim_order = order;
+-
+-	/* Match the slowpath compaction promotion in __alloc_pages_direct_compact */
+-	if ((alloc_flags &amp; ALLOC_NOFRAGMENT) &amp;&amp; ac-&gt;migratetype != MIGRATE_MOVABLE)
+-		reclaim_order = max(order, pageblock_order);
++	int reclaim_order = ac-&gt;reclaim_compact_order;
+ 
+ 	psi_memstall_enter(&amp;pflags);
+ 	*did_some_progress = __perform_reclaim(gfp_mask, reclaim_order, ac);
+@@ -4648,9 +4637,12 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
+ 	/*
+ 	 * Costly allocations might have made a progress but this doesn&#x27;t mean
+ 	 * their order will become available due to high fragmentation so
+-	 * always increment the no progress counter for them
++	 * always increment the no progress counter for them. The same goes for
++	 * promoted requests: their reclaim reports progress when it backs off
++	 * for compaction without freeing anything.
+ 	 */
+-	if (did_some_progress &amp;&amp; order &lt;= PAGE_ALLOC_COSTLY_ORDER)
++	if (did_some_progress &amp;&amp; order &lt;= PAGE_ALLOC_COSTLY_ORDER &amp;&amp;
++	    !order_nofrag_promoted(order, ac))
+ 		*no_progress_loops = 0;
+ 	else
+ 		(*no_progress_loops)++;
+@@ -4934,6 +4926,22 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	/* If allocation has taken excessively long, warn about it */
+ 	check_alloc_stall_warn(gfp_mask, ac-&gt;nodemask, order, alloc_start_time);
+ 
++	/*
++	 * If fallbacks are not permitted (defrag_mode), we either
++	 * need to reclaim space in a block of matching type, or clear
++	 * out an entire block to allow __rmqueue_claim() to convert.
++	 *
++	 * Reclaim by itself is primarily freeing space in movable
++	 * blocks, since that&#x27;s where the LRU pages live. So this
++	 * works for movable requests, but not for others.
++	 *
++	 * For those, promote the order to help make blocks, instead
++	 * of spinning in reclaim alone unproductively.
++	 */
++	ac-&gt;reclaim_compact_order = order;
++	if ((alloc_flags &amp; ALLOC_NOFRAGMENT) &amp;&amp; ac-&gt;migratetype != MIGRATE_MOVABLE)
++		ac-&gt;reclaim_compact_order = max(order, pageblock_order);
++
+ 	/* Try direct reclaim and then allocating */
+ 	if (!compact_first) {
+ 		page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags,
+@@ -5015,6 +5023,11 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	/* Reclaim/compaction failed to prevent the fallback */
+ 	if (defrag_mode &amp;&amp; (alloc_flags &amp; ALLOC_NOFRAGMENT)) {
+ 		alloc_flags &amp;= ~ALLOC_NOFRAGMENT;
++		/* Retries went into making blocks, start the fallback afresh */
++		if (order_nofrag_promoted(order, ac)) {
++			no_progress_loops = 0;
++			compaction_retries = 0;
++		}
+ 		goto retry;
+ 	}
+ 
+diff --git a/mm/page_alloc.h b/mm/page_alloc.h
+index b9259deddb59..2b1017a91928 100644
+--- a/mm/page_alloc.h
++++ b/mm/page_alloc.h
+@@ -93,6 +93,8 @@ struct alloc_context {
+ 	bool spread_dirty_pages;
+ 	/* Only flags that are global to the whole allocation go here. */
+ 	unsigned int alloc_flags;
++	/* Set by __alloc_pages_slowpath() before reclaim and compaction */
++	unsigned int reclaim_compact_order;
+ };
+ 
+ /*
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Andrew Morton</div>
+<a href="https://lore.kernel.org/r/as5q14OsbK2CmOrh@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged feedback, provided revised patch, clarification</div>
+</div>
 <div class="thread-children">
-<div class="thread-node depth-3" id="2026-10-13">
+<div class="thread-node depth-3">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Vlastimil (SUSE)</span>
@@ -399,7 +653,7 @@ Johannes feedback.
 </div>
 <div class="review-comment-text">Gave Reviewed-by
 
-Vlastimil expressed concern about the timing of the patch, noting that it&#x27;s too late to rush for the 7.3 final release and suggesting that it be fixed in a later release, such as 7.4-rc1 or rc2, due to its impact on defrag_mode not being default.</div>
+Reviewer suggested that the patch should be targeted for a later release, specifically 7.4-rc1 or rc2, due to its impact on defrag_mode and the fact that it&#x27;s too late to rush for the 7.3 final.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">We&#x27;re fixing a 7.3 commit that went into the stable trees. Too late to rush
@@ -412,7 +666,32 @@ weeks this time [1] so perhaps rc1 is comfortable in any case.
 </details>
 <div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
 <a href="https://lore.kernel.org/r/1f765ae3-434c-4e65-b749-c1e71cce7f33@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: timing concern, patch delay</div>
+<div class="review-comment-signals">Signals: requested changes, considered timing</div>
+</div>
+</div>
+<div class="thread-node depth-3" id="2026-10-14">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Johannes Weiner</span>
+<a class="date-chip" href="../2026-10-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-14">2026-10-14</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Johannes Weiner noted that the patch does not handle the case where defrag_mode retries follow the promoted order correctly and suggested adding a check for this scenario.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">order_defrag_promoted?
+
+Otherwise looks good to me!
+Reviewed-by: Johannes Weiner &lt;hannes@cmpxchg.org&gt;
+
+And agree 7.4-rc1 with CC stable is fine. Sadly, not sure if anyone
+but Meta is using the feature right now.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/20261014202936.GC371161@cmpxchg.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: patch review, requested changes</div>
 </div>
 </div>
 </div>
