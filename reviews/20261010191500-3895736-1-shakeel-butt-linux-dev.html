@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] sched/psi: Remove the RCU wait from trigger destruction</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261010191500.3895736-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-14</strong><div class="date-range-nav">Active on: <a href="#2026-10-14">2026-10-14</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch removes the RCU wait from psi_trigger_destroy() to prevent deadlocks when holding kernfs node_mutex. The change is motivated by a real-world issue in Meta&#x27;s fleet, where PSI trigger destruction was waiting for an RCU grace period while holding this mutex, blocking other users.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-14</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-16</strong><div class="date-range-nav">Active on: <a href="#2026-10-16">2026-10-16</a> &bull; <a href="#2026-10-14">2026-10-14</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch removes the RCU (Read-Copy Update) wait from the destruction of PSI (Pressure Stall Information) triggers in the Linux kernel. The RCU wait was added to protect worker and trigger lookups, but it has become unnecessary due to changes in the PSI scheduling mechanism. The patch updates the psi_trigger_destroy function to use rcu_access_pointer instead of synchronize_rcu, allowing for more efficient destruction of triggers. This change is tested with various scenarios, including trigger churn, notifications, and cgroup removal, without introducing any warnings or issues.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-14">
 <div class="review-comment">
@@ -248,59 +248,144 @@
 <a class="date-chip" href="../2026-10-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-14">2026-10-14</a>
 <span class="review-tag-badge">Acked-by</span>
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#6c4b00;background:#ffeeba" title="Analysis source: Heuristic">Heuristic</span>
+</div>
+<div class="review-comment-text">Gave Acked-by</div>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/as_aB-eIeU16h_JN@slm.duckdns.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-10-16">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">tip-bot2 Butt</span>
+<a class="date-chip" href="../2026-10-16_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-16">2026-10-16</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified the problem as a deadlock caused by holding kernfs node_mutex while waiting for an RCU grace period. Confirmed that the change is correct and safe, with no warnings found in testing.</div>
+<div class="review-comment-text">The reviewer noted that the synchronize_rcu() call in psi_trigger_destroy() is unnecessary because the rtpoll_task pointer is only accessed through rcu_access_pointer(), and a racing trigger destruction may leave the timer armed, so it&#x27;s safe to skip the RCU wait.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Sat, Oct 10, 2026 at 12:15:00PM -0700, Shakeel Butt wrote:
-&gt; In the Meta fleet, we found PSI trigger destruction waiting for an RCU
-&gt; grace period while holding kernfs node_mutex, blocking other users [1].
-&gt; File close and node drain hold this mutex while calling the release
-&gt; callback. Cgroup removal and disabling cgroup.pressure also hold
-&gt; cgroup_mutex during the drain.
-&gt; 
-&gt; The wait was added by commit 0e94682b73bf (&quot;psi: introduce psi monitor&quot;)
-&gt; to protect worker and trigger lookups. Commit 461daba06bdc
-&gt; (&quot;psi: eliminate kthread_worker from psi trigger scheduling mechanism&quot;)
-&gt; replaced the worker queue with a group timer. The scheduler now only
-&gt; checks whether rtpoll_task is NULL; it uses neither the task nor the
-&gt; trigger. Commit a06247c6804f (&quot;psi: Fix uaf issue when psi trigger is
-&gt; destroyed while being polled&quot;) removed trigger replacement and polling&#x27;s
-&gt; RCU lookup.
-&gt; 
-&gt; Trigger lists are protected by mutexes. Proc poll/select entries are
-&gt; removed before their file references are dropped. eventpoll_release()
-&gt; removes epoll entries before the file release callback.
-&gt; Commit aff037078eca (&quot;sched/psi: use kernfs polling functions for PSI
-&gt; trigger polling&quot;) moved cgroup polling to a kernfs waitqueue whose
-&gt; lifetime follows the file.
-&gt; 
-&gt; A late timer firing only wakes the group waitqueue. The system group is
-&gt; static, and commit 5457025fa8ca (&quot;sched/psi: Shut down rtpoll_timer in
-&gt; psi_cgroup_free()&quot;) shuts down the cgroup timer before freeing the group.
-&gt; Cgroup reclamation already waits for scheduler readers.
-&gt; 
-&gt; Remove synchronize_rcu() from psi_trigger_destroy() and use
-&gt; rcu_access_pointer() for the worker NULL check. Keep kthread_stop()
-&gt; outside the trigger mutex.
-&gt; 
-&gt; Tested trigger churn, notifications and cgroup removal in an 8-CPU VM
-&gt; with KASAN, lockdep, and full and lazy preemption. No warnings were found.
-&gt; 
-&gt; Link: https://github.com/bpftrace/user-tools/tree/master/runnablelockmonitor [1]
-&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+<pre class="raw-body-text">The following commit has been merged into the sched/core branch of tip:
 
+Commit-ID:     6f88f6cbb0472a8481ba560578a1d7c8d802eba7
+Gitweb:        https://git.kernel.org/tip/6f88f6cbb0472a8481ba560578a1d7c8d802eba7
+Author:        Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+AuthorDate:    Sat, 10 Oct 2026 12:15:00 -07:00
+Committer:     Peter Zijlstra &lt;peterz@infradead.org&gt;
+CommitterDate: Fri, 16 Oct 2026 09:49:03 +02:00
+
+sched/psi: Remove the RCU wait from trigger destruction
+
+In the Meta fleet, we found PSI trigger destruction waiting for an RCU
+grace period while holding kernfs node_mutex, blocking other users [1].
+File close and node drain hold this mutex while calling the release
+callback. Cgroup removal and disabling cgroup.pressure also hold
+cgroup_mutex during the drain.
+
+The wait was added by commit 0e94682b73bf (&quot;psi: introduce psi monitor&quot;)
+to protect worker and trigger lookups. Commit 461daba06bdc
+(&quot;psi: eliminate kthread_worker from psi trigger scheduling mechanism&quot;)
+replaced the worker queue with a group timer. The scheduler now only
+checks whether rtpoll_task is NULL; it uses neither the task nor the
+trigger. Commit a06247c6804f (&quot;psi: Fix uaf issue when psi trigger is
+destroyed while being polled&quot;) removed trigger replacement and polling&#x27;s
+RCU lookup.
+
+Trigger lists are protected by mutexes. Proc poll/select entries are
+removed before their file references are dropped. eventpoll_release()
+removes epoll entries before the file release callback.
+Commit aff037078eca (&quot;sched/psi: use kernfs polling functions for PSI
+trigger polling&quot;) moved cgroup polling to a kernfs waitqueue whose
+lifetime follows the file.
+
+A late timer firing only wakes the group waitqueue. The system group is
+static, and commit 5457025fa8ca (&quot;sched/psi: Shut down rtpoll_timer in
+psi_cgroup_free()&quot;) shuts down the cgroup timer before freeing the group.
+Cgroup reclamation already waits for scheduler readers.
+
+Remove synchronize_rcu() from psi_trigger_destroy() and use
+rcu_access_pointer() for the worker NULL check. Keep kthread_stop()
+outside the trigger mutex.
+
+Tested trigger churn, notifications and cgroup removal in an 8-CPU VM
+with KASAN, lockdep, and full and lazy preemption. No warnings were found.
+
+Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+Signed-off-by: Peter Zijlstra (Intel) &lt;peterz@infradead.org&gt;
 Acked-by: Tejun Heo &lt;tj@kernel.org&gt;
+Link: https://github.com/bpftrace/user-tools/tree/master/runnablelockmonitor [1]
+Link: https://patch.msgid.link/20261010191500.3895736-1-shakeel.butt@linux.dev
+---
+ kernel/sched/psi.c | 25 +++++--------------------
+ 1 file changed, 5 insertions(+), 20 deletions(-)
 
-Thanks.
-
--- 
-tejun
-
-</pre>
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index 4e15241..7c53814 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -626,8 +626,6 @@ static void init_rtpoll_triggers(struct psi_group *group, u64 now)
+ static void psi_schedule_rtpoll_work(struct psi_group *group, unsigned long delay,
+ 				   bool force)
+ {
+-	struct task_struct *task;
+-
+ 	/*
+ 	 * atomic_xchg should be called even when !force to provide a
+ 	 * full memory barrier (see the comment inside psi_rtpoll_work).
+@@ -635,19 +633,16 @@ static void psi_schedule_rtpoll_work(struct psi_group *group, unsigned long dela
+ 	if (atomic_xchg(&amp;group-&gt;rtpoll_scheduled, 1) &amp;&amp; !force)
+ 		return;
+ 
+-	rcu_read_lock();
+-
+-	task = rcu_dereference(group-&gt;rtpoll_task);
+ 	/*
+-	 * kworker might be NULL in case psi_trigger_destroy races with
+-	 * psi_task_change (hotpath) which can&#x27;t use locks
++	 * Only test whether a worker is installed; do not dereference the task.
++	 * A racing trigger destruction may leave the timer armed.
++	 * psi_cgroup_free() shuts it down before freeing the group.
++	 * The system PSI group is static.
+ 	 */
+-	if (likely(task))
++	if (likely(rcu_access_pointer(group-&gt;rtpoll_task)))
+ 		mod_timer(&amp;group-&gt;rtpoll_timer, jiffies + delay);
+ 	else
+ 		atomic_set(&amp;group-&gt;rtpoll_scheduled, 0);
+-
+-	rcu_read_unlock();
+ }
+ 
+ static void psi_rtpoll_work(struct psi_group *group)
+@@ -1489,21 +1484,11 @@ void psi_trigger_destroy(struct psi_trigger *t)
+ 	}
+ 
+ 	/*
+-	 * Wait for psi_schedule_rtpoll_work RCU to complete its read-side
+-	 * critical section before destroying the trigger and optionally the
+-	 * rtpoll_task.
+-	 */
+-	synchronize_rcu();
+-	/*
+ 	 * Stop kthread &#x27;psimon&#x27; after releasing rtpoll_trigger_lock to prevent
+ 	 * a deadlock while waiting for psi_rtpoll_work to acquire
+ 	 * rtpoll_trigger_lock
+ 	 */
+ 	if (task_to_destroy) {
+-		/*
+-		 * After the RCU grace period has expired, the worker
+-		 * can no longer be found through group-&gt;rtpoll_task.
+-		 */
+ 		kthread_stop(task_to_destroy);
+ 		atomic_set(&amp;group-&gt;rtpoll_scheduled, 0);
+ 	}</pre>
 </details>
-<div class="review-comment-signals">Signals: LGTM</div>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/179213767937.2666988.13837414149970977922.tip-bot2@tip-bot2" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: rcu_access_pointer, racing trigger destruction</div>
 </div>
 </div>
 </div>
