@@ -3,34 +3,6 @@
   "subject": "[PATCH v3 00/12] mm/collapse: separate a collapse from its callers",
   "url": "https://lore.kernel.org/all/20260916093145.4022188-1-kirill@shutemov.name/",
   "dates": {
-    "2026-09-18": {
-      "report_file": "2026-09-18_ollama_llama3.1-8b.html",
-      "developer": "Kiryl Shutsemau",
-      "reviews": [
-        {
-          "author": "Baolin Wang",
-          "summary": "The reviewer noted that the original patch did not properly separate the locking boundary between collapse_scan_pmd() and collapse_run_pmd(), which led to inconsistent lock behavior in khugepaged's walk and madvise_collapse(). The reviewer suggested open-coding the lock drop in the two callers, khugepaged and madvise_collapse(), to maintain a clear locking contract.",
-          "sentiment": "needs_work",
-          "sentiment_signals": [
-            "lock ordering issue",
-            "inconsistent behavior"
-          ],
-          "has_inline_review": true,
-          "tags_given": [
-            "Reviewed-by"
-          ],
-          "analysis_source": "llm",
-          "raw_body": "On 9/16/26 5:31 PM, Kiryl Shutsemau wrote:\n> From: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\n> \n> A collapse is two jobs.  One reads a PTE table under mmap_lock and decides\n> whether the range is worth collapsing.  The other allocates, isolates,\n> copies and flushes, and wants the lock given up first.\n> \n> collapse_single_pmd() did both, so the boundary between them was somewhere\n> in the middle of a function.\n> \n> Give each half its own function:\n> \n>    - collapse_scan_pmd() scans one table and only reads.  The anonymous\n>      scan that used to carry that name keeps its body as\n>      collapse_scan_anon_pmd(), and collapse_scan_pmd() is now the entry\n>      that picks the anonymous or the file side.\n> \n>    - collapse_run_pmd() does the collapse the scan asked for, and is\n>      handed what the scan returned.  SCAN_SUCCEED means there is\n>      something to collapse.  SCAN_PTE_MAPPED_HUGEPAGE means the page\n>      cache already holds the PMD folio and only the PTE table is left to\n>      retract.  Both are work for the run; anything else is why there is\n>      nothing to do.\n> \n> collapse_single_pmd() is now the two of them with the mmap_lock drop in\n> between, so its callers see what they saw before.\n> \n> What the scan found and the run needs travels in collapse_control.  For\n> an anonymous table that is the orders and the referenced and swapped-out\n> counts, which mthp_collapse() and collapse_huge_page() now read from\n> there instead of taking as arguments.  For a file it is the file itself\n> and the offset in it.\n> \n> The file side moves with the anonymous one.  collapse_scan_file() used to\n> run with mmap_lock already given up, and called collapse_file() itself\n> when the page cache looked worth it.  It now runs under the lock like the\n> anonymous scan and only reads; the run does the collapse.  A file\n> collapse works on the page cache and never sees a VMA, so the scan takes\n> the file reference while it still has one and the run gives it back.\n> \n> That changes what a refused file table costs khugepaged.  Every file\n> table it scanned used to end its pass over that mm, because the lock had\n> been dropped to scan it; now only a table it goes on to collapse does.\n> \n> Two things on the file side stop being rescanned.  When the page cache\n> already holds the PMD folio, the scan says so and the run goes straight\n> to retracting the PTE table.  A run that refuses dirty pages and may\n> write them back retries collapse_file() alone.  The checks the scan makes\n> ahead of it are ones collapse_file() repeats under the page cache lock.\n> \n> Tracing changes with it.  mm_khugepaged_scan_pmd and\n> mm_khugepaged_scan_file used to fire after the collapse, so for an\n> accepted table their status field carried what the collapse made of it.\n> They now fire before it and read SCAN_SUCCEED for an accepted table.  What\n> the collapse then made of it is for mm_collapse_huge_page and\n> mm_khugepaged_collapse_file to report.\n> \n> Assisted-by: LLM\n> Reviewed-by: Zi Yan <ziy@nvidia.com>\n> Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n> ---\n\nLGTM.\nReviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>\n\n---\n\nOn 9/16/26 5:31 PM, Kiryl Shutsemau wrote:\n> From: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\n> \n> collapse_scan_pmd() and collapse_run_pmd() each have a clear locking\n> contract.  The scan is called with mmap_lock held for reading and returns\n> with it still held.  The collapse is called without it.\n> \n> collapse_single_pmd() kept that boundary inside itself.  It dropped the\n> lock on some paths and not others, and reported which by way of a bool its\n> callers had to carry along and then act on.\n> \n> Open-code it in the two callers.  Each scans under the lock it already\n> holds and, when the scan found work, gives the lock up before running the\n> collapse.\n> khugepaged's lock_dropped and madvise_collapse()'s mmap_unlocked both go:\n> the code dropping the lock is now the code that wanted to know.\n> \n> khugepaged's walk carries on to the next table while the scan keeps\n> refusing, and ends once a collapse has taken the lock from under it.\n> madvise_collapse() re-finds its VMA after a collapse, which it did before,\n> and now uses a NULL vma to say that it has to.  It still reports the drop\n> to its own caller, from the line that does it.\n> \n> The lock is given up and taken again at the same points as before.  No\n> functional change.\n> \n> Assisted-by: LLM\n> Reviewed-by: Zi Yan <ziy@nvidia.com>\n> Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n> ---\n\nThanks for removing the ugly 'lock_dropped', and I also did some testing \nwith my shmem mTHP collapse, and no issues found. So,\n\nReviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>",
-          "reply_to": "",
-          "message_date": "2026-09-18",
-          "message_id": "0230e861-8364-4302-a607-c34809a4a809@linux.alibaba.com",
-          "email": "baolin.wang@linux.alibaba.com",
-          "is_maintainer": false
-        }
-      ],
-      "analysis_source": "llm-per-reviewer",
-      "patch_summary": "This patch set separates the collapse engine from its callers by introducing a clear interface and policy between them. The collapse engine, currently in khugepaged.c, is split into four distinct calls: collapse_control_init, collapse_policy_set, collapse_scan_pmd, and collapse_run_pmd. This separation allows for better modularity and maintainability of the code, as well as improved handling of lock states and policy decisions. The patch set also includes changes to madvise.c to gain a new operation and updates to various functions to follow the new interface."
-    },
     "2026-09-23": {
       "report_file": "2026-09-23_ollama_llama3.1-8b.html",
       "developer": "Kiryl Shutsemau",
