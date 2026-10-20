@@ -1,0 +1,44 @@
+{
+  "thread_id": "CAKEwX=N4jj3PGXFx6wwh=PG4Vt6hRJ=-kqX24B55zoXyhAa1WQ@mail.gmail.com",
+  "subject": "[PATCH mm-next] mm/swap: free swap cache folios the zap path gave up on",
+  "url": "https://lore.kernel.org/all/CAKEwX=N4jj3PGXFx6wwh=PG4Vt6hRJ=-kqX24B55zoXyhAa1WQ@mail.gmail.com/",
+  "dates": {
+    "2026-10-20": {
+      "report_file": "2026-10-19_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Jiayuan Chen",
+          "summary": "reviewer noted that in a specific interleaving scenario between readahead thread A and zap thread B, thread A holds the folio lock while the swap count is decremented to 0 by zap, causing the folio to remain locked and not be freed; reviewer suggested checking after the read instead of before\n\nReviewer Jiayuan Chen noted that while the interleaving of swap cache freeing and zap dropping is rare per event, it can add up over time and cause significant memory retention issues in production environments, specifically citing a reproducer that leaves 480 GB behind in an hour.\n\nreviewer noted that the read path holds the lock by the time zap tries to free swap cache, potentially causing a deadlock, and suggested using BIO_COMPLETE_IN_TASK for readahead swap IOs",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "lock ordering violation",
+            "requested change",
+            "performance issue",
+            "potential deadlock"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes, exactly that. With the check in swap_read_folio():\n\nthread A (readahead)         thread B\nswap_cache_alloc_folio(B's entry)\n  folio locked, added to cache\n  swap count 1 (B's PTE)\nswap_read_folio()\n  folio_free_swap()\n   count is 1, nothing to do\n  zswap_load() / submit_bio()\n  .                  MADV_DONTNEED\n  .                   swap count 1 -> 0\n  .                   __try_to_reclaim_swap()\n  .                    folio_trylock() fails\n  .                    gives up\n  read completes\nfolio_unlock()\nfolio_put()\n-> count 0, folio in swap cache, unmapped\n\nThe check runs before the zap, so it sees count 1. The zap comes\nwhile A holds the lock for the read.\n\nChecking after the read instead is what I tried first. It works for\nthe synchronous path and not for the bdev one:\n\nzswap (sync)             bdev (async)\nswap_read_folio()           swap_read_folio()\n  zswap_load()             submit_bio()\n  .    <- zap, count 1 -> 0     return  <- zap, count 1 -> 0\n  read done, lock still held     ...\n  count is 0: free the slot, fine   swap_bio_read_end_io() (irq)\nfolio_unlock()             folio_unlock()\n                     no ci->lock here, slot stays\n\nThe write side is the same picture with swap_writeout() and\nend_swap_bio_write().\n\n---\n\nIt is rare per event, but it adds up. On production it takes days to\nleave a few GiB behind. The DONTNEED there comes from jemalloc, which\nissues it on every free the application does, so it never stops. Our\nreproducer is the extreme case, built only to verify the problem: it\nleaves 480 GB in about an hour. I'll put the numbers in the commit\nmessage.\n\n---\n\nRight, and that would still leave the writeback side. The worker covers \nboth in one place.",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-10-20",
+          "message_id": "d4a35334-56e2-4590-8b4c-1c030c36e5bb@linux.dev",
+          "email": "jiayuan.chen@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a potential issue where the swap cache folios are not freed after the zap path gives up on them, which can lead to interleaving of read and write operations. To fix this, the patch suggests submitting readahead swap IOs with BIO_COMPLETE_IN_TASK to ensure that the slot is freed after reading. If this approach is not feasible, the patch falls back to using sweep_work to clean up the swap cache folios."
+    },
+    "2026-10-19": {
+      "report_file": "2026-10-19_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a potential issue where the swap cache folios are not freed after the zap path gives up on them, which can lead to interleaving of read and write operations. To fix this, the patch suggests submitting readahead swap IOs with BIO_COMPLETE_IN_TASK to ensure that the slot is freed after reading. If this approach is not feasible, the patch falls back to using sweep_work to clean up the swap cache folios."
+    }
+  }
+}
