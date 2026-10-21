@@ -238,103 +238,80 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] mm, swap: revalidate populated clusters before scanning</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261019160615.2348500-1-nphamcs@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-20</strong><div class="date-range-nav">Active on: <a href="#2026-10-20">2026-10-20</a> &bull; <a href="#2026-10-19">2026-10-19</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a potential race condition in the swap cluster allocation process by revalidating populated clusters before scanning them. It ensures that the cluster table is not published until the lock is reacquired, preventing a NULL pointer dereference when the resumed scan tries to access the table.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-21</strong><div class="date-range-nav">Active on: <a href="#2026-10-21">2026-10-21</a> &bull; <a href="#2026-10-20">2026-10-20</a> &bull; <a href="#2026-10-19">2026-10-19</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch revalidates populated clusters before scanning to prevent potential issues where someone can free the table between publishing and lock acquisition in swap_cluster_populate(). The patch adds a simple check to cover edge cases, but it&#x27;s suggested that more robust solutions could be explored by enforcing metadata lifetime or using reference counting.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-19">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham (author)</span>
+<a class="date-chip" href="../2026-10-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-19">2026-10-19</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), but couldn&#x27;t reproduce the issue and will report back if they manage to do so.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I&#x27;m revisiting the lifecycle of clusters, because vswap introduced
+dynamic (i.e run-time freeing) behavior to it. For the most part it
+looks good (both physical and virtual side), but this look racy to me.
+I don&#x27;t see how it can be safe. Once you drop the lock, all bets are
+off...
+
+But at the same time, I have not been able to reproduce it (yet). Will
+report here if I manage to.
+
+(Side note: my vswap code is actually safe in this scenario. CPU0
+allocates a new cluster entirely, and lock it before publishing it. So
+even if the cluster index is cached in CPU1, this race cannot happen).</pre>
+</details>
+<a href="https://lore.kernel.org/r/CAKEwX=O7i6ehqyLNCpp9bqoREmahXwGS4Ja8bCsKUzyAMu_QLg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a potential race condition, couldn&#x27;t reproduce the issue</div>
+</div>
+</div>
 <div class="thread-node depth-0" id="2026-10-20">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Youngjun Park</span>
-<a class="date-chip" href="../2026-10-19_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-20">2026-10-20</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="review-author">Nhat Pham (author)</span>
+<a class="date-chip" href="../2026-10-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-20">2026-10-20</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Identified a potential race condition in the swap cluster allocation process and suggested that publishing the table only after reacquiring the cluster lock is correct. Agreed with Kemeng&#x27;s suggestion to reject unusable clusters under the lock.</div>
+<div class="review-comment-text">Author acknowledged that the swap_cluster_alloc_table() function does not hold nor acquire cluster&#x27;s lock, agreed to restructure in v2 to address this issue.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Mon, Oct 19, 2026 at 09:06:15AM -0700, Nhat Pham wrote:
-&gt; swap_cluster_populate() can publish a cluster&#x27;s table with the cluster
-&gt; lock dropped. A cached allocator can use and empty it before the
-&gt; populating allocator reacquires the lock. The resumed scan can then
-&gt; dereference a NULL table.
-&gt; 
-&gt; For example, CPU1 can retain a cached cluster offset on an SSD with
-&gt; per-page discard disabled:
-&gt; 
-&gt;     CPU0                          CPU1
-&gt;     ----                          ----
-&gt;     swap_cluster_populate()
-&gt;       swap_cluster_alloc_table() fails
-&gt;       spin_unlock(&amp;ci-&gt;lock)
-&gt;       local_unlock(&amp;percpu_swap_cluster.lock)
-&gt;       swap_cluster_alloc_table()
-&gt;         rcu_assign_pointer(ci-&gt;table, table)
-&gt;                                   swap_alloc_fast()
-&gt;                                   local_unlock(&amp;percpu_swap_cluster.lock)
-&gt;                                   mem_cgroup_try_charge_swap() fails
-&gt;                                   swap_cache_del_folio()
-&gt;                                     __swap_cluster_free_entries()
-&gt;                                       free_cluster()
-&gt;                                         __free_cluster()
-&gt;                                           swap_cluster_free_table()
-&gt;                                             rcu_assign_pointer(..., NULL)
-&gt;       local_lock(&amp;percpu_swap_cluster.lock)
-&gt;       spin_lock(&amp;ci-&gt;lock)
-&gt;       return ci
-&gt;     alloc_swap_scan_cluster()
-&gt;       cluster_scan_range()
-&gt;         __swap_table_get()
+<pre class="raw-body-text">Ah nope, I saw that Kemeng implemented your approach:
 
-Hello Nhat.
+https://lore.kernel.org/linux-mm/20260907091356.53026-2-shikemeng@huaweicloud.com/
 
-Good catch!
-
-&gt; Reject an unusable cluster under its lock before scanning it. Relocate
-&gt; it only while its table is present.
-&gt; 
-&gt; Fixes: cdd77f84d966 (&quot;mm, swap: consolidate cluster allocation helpers&quot;)
-&gt; Cc: stable@vger.kernel.org
-&gt; Signed-off-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
-&gt; ---
-&gt;  mm/swapfile.c | 7 ++++++-
-&gt;  1 file changed, 6 insertions(+), 1 deletion(-)
-&gt; 
-&gt; diff --git a/mm/swapfile.c b/mm/swapfile.c
-&gt; index c3288910b3e3..988b7316e0a1 100644
-&gt; --- a/mm/swapfile.c
-&gt; +++ b/mm/swapfile.c
-&gt; @@ -981,7 +981,11 @@ static unsigned int alloc_swap_scan_cluster(struct swap_info_struct *si,
-&gt;  	bool need_reclaim, ret, usable;
-&gt;  
-&gt;  	lockdep_assert_held(&amp;ci-&gt;lock);
-&gt; -	VM_WARN_ON(!cluster_is_usable(ci, order));
-&gt; +	if (!cluster_is_usable(ci, order)) {
-&gt; +		if (cluster_table_is_alloced(ci))
-&gt; +			relocate_cluster(si, ci);
-&gt; +		goto out_unlock;
-&gt; +	}
-
-If this patch is applied as bloew, does it prevent the issue described here?
-
-https://lore.kernel.org/linux-mm/20260720071342.50742-2-shikemeng@huaweicloud.com/
-(This patch publishes cluster table after lock acquired.)
-
-This patch is chagned the way I suggested during review... :(
-
-As you pointed out, another context can free the table 
-without alloc context knwoing this situation.  
-I missed this situation.
-
-IMHO, Publishing the table only after reacquiring the cluster lock, as Kemeng
-suggested, and rejecting an unusable cluster under the lock as in this
-patch both look correct to me!
-
-Reviewed-by: Youngjun Park &lt;youngjun.park@lge.com&gt;
-
-</pre>
+My bad! But yeah I think we still need this small fix (or Kemeng&#x27;s
+original proposal?), unless I missed something...?</pre>
 </details>
-<div class="review-comment-signals">Signals: AGREEMENT</div>
+<a href="https://lore.kernel.org/r/CAKEwX=OwzpxUfdANEXoCeZPBqch+91C4gKwhrcikm6Gj_LBPKw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed, agreed to restructure</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-10-21">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-10-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-21">2026-10-21</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that swap_cluster_alloc_table() does not hold nor acquire the cluster&#x27;s lock, allowing someone to free the table between publishing and subsequent lock acquisition in its caller, swap_cluster_populate().</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Right I remember that, I acked part of that and was waiting the update
+on that sashiko comment, as the first patch isn&#x27;t perfect, while
+Kemeng&#x27;s mail at &quot;shikemeng@huaweicloud.com&quot; is now bouncing back...
+I&#x27;m not sure if Kemeng still plans to update that.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/CAMgjq7AsUWGw5K5Xk1qz67atXmXB7vYDww-+u9t8Mz7rNAH-6Q@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 </div>
 </div>
 </div>

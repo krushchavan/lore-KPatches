@@ -4,38 +4,81 @@
   "url": "https://lore.kernel.org/all/20261019160615.2348500-1-nphamcs@gmail.com/",
   "dates": {
     "2026-10-20": {
-      "report_file": "2026-10-19_ollama_llama3.1-8b.html",
+      "report_file": "2026-10-20_ollama_llama3.1-8b.html",
       "developer": "Nhat Pham",
       "reviews": [
         {
-          "author": "Youngjun Park",
-          "summary": "Identified a potential race condition in the swap cluster allocation process and suggested that publishing the table only after reacquiring the cluster lock is correct. Agreed with Kemeng's suggestion to reject unusable clusters under the lock.",
-          "sentiment": "positive",
+          "author": "Nhat Pham (author)",
+          "summary": "Author acknowledged that the swap_cluster_alloc_table() function does not hold nor acquire cluster's lock, agreed to restructure in v2 to address this issue.",
+          "sentiment": "needs_work",
           "sentiment_signals": [
-            "AGREEMENT"
+            "acknowledged a fix is needed",
+            "agreed to restructure"
           ],
           "has_inline_review": false,
-          "tags_given": [
-            "Reviewed-by"
-          ],
+          "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "On Mon, Oct 19, 2026 at 09:06:15AM -0700, Nhat Pham wrote:\n> swap_cluster_populate() can publish a cluster's table with the cluster\n> lock dropped. A cached allocator can use and empty it before the\n> populating allocator reacquires the lock. The resumed scan can then\n> dereference a NULL table.\n> \n> For example, CPU1 can retain a cached cluster offset on an SSD with\n> per-page discard disabled:\n> \n>     CPU0                          CPU1\n>     ----                          ----\n>     swap_cluster_populate()\n>       swap_cluster_alloc_table() fails\n>       spin_unlock(&ci->lock)\n>       local_unlock(&percpu_swap_cluster.lock)\n>       swap_cluster_alloc_table()\n>         rcu_assign_pointer(ci->table, table)\n>                                   swap_alloc_fast()\n>                                   local_unlock(&percpu_swap_cluster.lock)\n>                                   mem_cgroup_try_charge_swap() fails\n>                                   swap_cache_del_folio()\n>                                     __swap_cluster_free_entries()\n>                                       free_cluster()\n>                                         __free_cluster()\n>                                           swap_cluster_free_table()\n>                                             rcu_assign_pointer(..., NULL)\n>       local_lock(&percpu_swap_cluster.lock)\n>       spin_lock(&ci->lock)\n>       return ci\n>     alloc_swap_scan_cluster()\n>       cluster_scan_range()\n>         __swap_table_get()\n\nHello Nhat.\n\nGood catch!\n\n> Reject an unusable cluster under its lock before scanning it. Relocate\n> it only while its table is present.\n> \n> Fixes: cdd77f84d966 (\"mm, swap: consolidate cluster allocation helpers\")\n> Cc: stable@vger.kernel.org\n> Signed-off-by: Nhat Pham <nphamcs@gmail.com>\n> ---\n>  mm/swapfile.c | 7 ++++++-\n>  1 file changed, 6 insertions(+), 1 deletion(-)\n> \n> diff --git a/mm/swapfile.c b/mm/swapfile.c\n> index c3288910b3e3..988b7316e0a1 100644\n> --- a/mm/swapfile.c\n> +++ b/mm/swapfile.c\n> @@ -981,7 +981,11 @@ static unsigned int alloc_swap_scan_cluster(struct swap_info_struct *si,\n>  \tbool need_reclaim, ret, usable;\n>  \n>  \tlockdep_assert_held(&ci->lock);\n> -\tVM_WARN_ON(!cluster_is_usable(ci, order));\n> +\tif (!cluster_is_usable(ci, order)) {\n> +\t\tif (cluster_table_is_alloced(ci))\n> +\t\t\trelocate_cluster(si, ci);\n> +\t\tgoto out_unlock;\n> +\t}\n\nIf this patch is applied as bloew, does it prevent the issue described here?\n\nhttps://lore.kernel.org/linux-mm/20260720071342.50742-2-shikemeng@huaweicloud.com/\n(This patch publishes cluster table after lock acquired.)\n\nThis patch is chagned the way I suggested during review... :(\n\nAs you pointed out, another context can free the table \nwithout alloc context knwoing this situation.  \nI missed this situation.\n\nIMHO, Publishing the table only after reacquiring the cluster lock, as Kemeng\nsuggested, and rejecting an unusable cluster under the lock as in this\npatch both look correct to me!\n\nReviewed-by: Youngjun Park <youngjun.park@lge.com>\n\n",
+          "raw_body": "Ah nope, I saw that Kemeng implemented your approach:\n\nhttps://lore.kernel.org/linux-mm/20260907091356.53026-2-shikemeng@huaweicloud.com/\n\nMy bad! But yeah I think we still need this small fix (or Kemeng's\noriginal proposal?), unless I missed something...?",
           "reply_to": "",
           "message_date": "2026-10-20",
-          "message_id": "",
-          "email": "youngjun.park@lge.com",
+          "message_id": "CAKEwX=OwzpxUfdANEXoCeZPBqch+91C4gKwhrcikm6Gj_LBPKw@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch addresses a potential race condition in the swap cluster allocation process by revalidating populated clusters before scanning them. It ensures that the cluster table is not published until the lock is reacquired, preventing a NULL pointer dereference when the resumed scan tries to access the table."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch revalidates populated clusters before scanning to prevent potential issues where someone can free the table between publishing and lock acquisition in swap_cluster_populate(). The patch adds a simple check to cover edge cases, but it's suggested that more robust solutions could be explored by enforcing metadata lifetime or using reference counting."
     },
     "2026-10-19": {
       "report_file": "2026-10-19_ollama_llama3.1-8b.html",
       "developer": "Nhat Pham",
-      "reviews": [],
-      "analysis_source": "llm",
-      "patch_summary": "This patch addresses a potential race condition in the swap cluster allocation process by revalidating populated clusters before scanning them. It ensures that the cluster table is not published until the lock is reacquired, preventing a NULL pointer dereference when the resumed scan tries to access the table."
+      "reviews": [
+        {
+          "author": "Nhat Pham (author)",
+          "summary": "Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), but couldn't reproduce the issue and will report back if they manage to do so.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a potential race condition",
+            "couldn't reproduce the issue"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I'm revisiting the lifecycle of clusters, because vswap introduced\ndynamic (i.e run-time freeing) behavior to it. For the most part it\nlooks good (both physical and virtual side), but this look racy to me.\nI don't see how it can be safe. Once you drop the lock, all bets are\noff...\n\nBut at the same time, I have not been able to reproduce it (yet). Will\nreport here if I manage to.\n\n(Side note: my vswap code is actually safe in this scenario. CPU0\nallocates a new cluster entirely, and lock it before publishing it. So\neven if the cluster index is cached in CPU1, this race cannot happen).",
+          "reply_to": "",
+          "message_date": "2026-10-19",
+          "message_id": "CAKEwX=O7i6ehqyLNCpp9bqoREmahXwGS4Ja8bCsKUzyAMu_QLg@mail.gmail.com",
+          "email": "nphamcs@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch revalidates populated clusters before scanning to prevent dereferencing a NULL table. It checks if the cluster's table is allocated and relocates it only when its table is present. This fix addresses an issue where a cached allocator can use and empty a cluster's table before the populating allocator reacquires the lock, leading to a NULL pointer dereference during scanning."
+    },
+    "2026-10-21": {
+      "report_file": "2026-10-20_ollama_llama3.1-8b.html",
+      "developer": "Nhat Pham",
+      "reviews": [
+        {
+          "author": "Kairui Song",
+          "summary": "Reviewer noted that swap_cluster_alloc_table() does not hold nor acquire the cluster's lock, allowing someone to free the table between publishing and subsequent lock acquisition in its caller, swap_cluster_populate().",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Right I remember that, I acked part of that and was waiting the update\non that sashiko comment, as the first patch isn't perfect, while\nKemeng's mail at \"shikemeng@huaweicloud.com\" is now bouncing back...\nI'm not sure if Kemeng still plans to update that.",
+          "reply_to": "Nhat Pham",
+          "message_date": "2026-10-21",
+          "message_id": "CAMgjq7AsUWGw5K5Xk1qz67atXmXB7vYDww-+u9t8Mz7rNAH-6Q@mail.gmail.com",
+          "email": "ryncsn@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch revalidates populated clusters before scanning to prevent potential issues where someone can free the table between publishing and lock acquisition in swap_cluster_populate(). The patch adds a simple check to cover edge cases, but it's suggested that more robust solutions could be explored by enforcing metadata lifetime or using reference counting."
     }
   }
 }
