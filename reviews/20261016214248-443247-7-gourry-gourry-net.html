@@ -238,9 +238,165 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 6/6] test/daxctl-devices.sh: cycle offline/online to cover unplug and replug</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261016214248.443247-7-gourry@gourry.net/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-16</strong><div class="date-range-nav">Active on: <a href="#2026-10-16">2026-10-16</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the test script for daxctl devices to include a cycle of online and offline operations, simulating device unplug and re-plug scenarios. The changes cover cases where a device is brought online from an unplugged state and vice versa, as well as checking that memory can be unplugged even if it&#x27;s already offline. Additionally, the script checks block counts and kernel memory states after each operation to ensure correctness.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-10-16</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-21</strong><div class="date-range-nav">Active on: <a href="#2026-10-21">2026-10-21</a> &bull; <a href="#2026-10-16">2026-10-16</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series adds test cases to the daxctl-devices.sh script to cover unplug and replug scenarios, including cycling offline/online pairs to ensure correct behavior. The tests check block counts, daxX.Y/state, and hotplug_state reported by &#x27;daxctl list&#x27;. Additionally, it addresses issues with silent test failures due to missing sysfs attributes and proposes new state-dependent test cases.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-21">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Alison Schofield</span>
+<a class="date-chip" href="../2026-10-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-21">2026-10-21</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Requested changes to handle missing sysfs attributes and added new state-dependent test cases. Also mentioned a separate fix for undercounting memory blocks on multi-range devices.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Fri, Oct 16, 2026 at 05:42:48PM -0400, Gregory Price (Meta) wrote:
+&gt; From: Gregory Price &lt;gourry@gourry.net&gt;
+&gt; 
+&gt; Repeat the online/offline pair to cover onlining from &#x27;unplugged&#x27;, and
+&gt; check that offline-memory unplugs an already offline device. After each
+&gt; step, check block counts and, where present, daxX.Y/state and the
+&gt; &#x27;hotplug_state&#x27; reported by &#x27;daxctl list&#x27;.
+
+Hi Greg,
+
+Please change how the tests handle the absence of the new sysfs attribute.
+If a test expects the new interface, a missing attribute should cause
+the test to fail, with a clear error message. We have had problems in
+the past with tests silently not executing letting defects go undetected.
+
+Note that we don&#x27;t require backward compatibility for the unit tests.
+The utilities must continue working with older kernels, but tests for new
+functionality should fail loudly when that functionality is missing.
+(I&#x27;m aware that not all tests follow that guideline, and they need fixing.)
+
+Please also leave the existing test cases as they were and run the new
+state-dependent cases last.
+
+A few stale state cases would exercise daxctl behavior that the kernel
+selftest can&#x27;t cover - 
+
+  - Offline one memory block out-of-band, verify that daxctl list
+    reports hotplug_state &quot;inconsistent&quot;, then verify that
+    offline-memory still leaves the device unplugged with its blocks
+    removed.
+
+  - Offline all blocks out-of-band, then verify that
+    &quot;reconfigure-device -m devdax&quot; succeeds and the blocks are removed.
+
+  - With all blocks offline but the device state still reporting
+    online, verify that online-memory falls back to the per-block path
+    and brings everything online.
+
+For &quot;blocks removed&quot;, please check that the device&#x27;s memory blocks
+are gone from /sys/devices/system/memory.  ie verify in sysfs directly
+independent of the libdaxctl code being tested.
+
+About multi-range devices-
+
+I found that libdaxctl undercounts memory blocks on multi-range devices.
+I&#x27;m posting a separate fix and test for that. Nothing in this series needs
+to change. I&#x27;ll cc you for review.
+
+Our ndctl emulation can&#x27;t exercise multi-range hotplug, but the kernel
+selftest can run against a real multi-range device. Could you add coverage
+there, including the partial-add case where the kernel reports success
+even though not all ranges were added?
+
+-- Alison
+
+
+&gt; 
+&gt; Signed-off-by: Gregory Price &lt;gourry@gourry.net&gt;
+&gt; ---
+&gt;  test/daxctl-devices.sh | 53 ++++++++++++++++++++++++++++++++++++++++++
+&gt;  1 file changed, 53 insertions(+)
+&gt; 
+&gt; diff --git a/test/daxctl-devices.sh b/test/daxctl-devices.sh
+&gt; index 659428d..cdb13f6 100755
+&gt; --- a/test/daxctl-devices.sh
+&gt; +++ b/test/daxctl-devices.sh
+&gt; @@ -67,6 +67,40 @@ daxctl_get_mode()
+&gt;  	&quot;$DAXCTL&quot; list -d &quot;$1&quot; | jq -er &#x27;.[].mode&#x27;
+&gt;  }
+&gt;  
+&gt; +daxctl_get_online_blocks()
+&gt; +{
+&gt; +	&quot;$DAXCTL&quot; list -d &quot;$1&quot; | jq -er &#x27;.[].online_memblocks&#x27;
+&gt; +}
+&gt; +
+&gt; +daxctl_get_total_blocks()
+&gt; +{
+&gt; +	&quot;$DAXCTL&quot; list -d &quot;$1&quot; | jq -er &#x27;.[].total_memblocks&#x27;
+&gt; +}
+&gt; +
+&gt; +check_memory_online()
+&gt; +{
+&gt; +	local total
+&gt; +
+&gt; +	total=$(daxctl_get_total_blocks &quot;$1&quot;)
+&gt; +	(( total &gt; 0 ))
+&gt; +	[[ $(daxctl_get_online_blocks &quot;$1&quot;) == &quot;$total&quot; ]]
+&gt; +}
+&gt; +
+&gt; +check_memory_offline()
+&gt; +{
+&gt; +	[[ $(daxctl_get_online_blocks &quot;$1&quot;) == &quot;0&quot; ]]
+&gt; +}
+&gt; +
+&gt; +# skipped on kernels without daxX.Y/state
+&gt; +check_kmem_state()
+&gt; +{
+&gt; +	local path=&quot;/sys/bus/dax/devices/$1/state&quot;
+&gt; +
+&gt; +	[[ -f &quot;$path&quot; ]] || return 0
+&gt; +	[[ $(cat &quot;$path&quot;) == &quot;$2&quot; ]]
+&gt; +	[[ $(&quot;$DAXCTL&quot; list -d &quot;$1&quot; | jq -er &#x27;.[].hotplug_state&#x27;) == &quot;$2&quot; ]]
+&gt; +}
+&gt; +
+&gt;  set_online_policy()
+&gt;  {
+&gt;  	echo &quot;online&quot; &gt; /sys/devices/system/memory/auto_online_blocks
+&gt; @@ -100,7 +134,26 @@ daxctl_test()
+&gt;  	&quot;$DAXCTL&quot; reconfigure-device -N -m system-ram &quot;$daxdev&quot;
+&gt;  	[[ $(daxctl_get_mode &quot;$daxdev&quot;) == &quot;system-ram&quot; ]]
+&gt;  	&quot;$DAXCTL&quot; online-memory &quot;$daxdev&quot;
+&gt; +	check_memory_online &quot;$daxdev&quot;
+&gt; +	check_kmem_state &quot;$daxdev&quot; &quot;online_movable&quot;
+&gt;  	&quot;$DAXCTL&quot; offline-memory &quot;$daxdev&quot;
+&gt; +	check_memory_offline &quot;$daxdev&quot;
+&gt; +	check_kmem_state &quot;$daxdev&quot; &quot;unplugged&quot;
+&gt; +	# again, now from &#x27;unplugged&#x27; where supported
+&gt; +	&quot;$DAXCTL&quot; online-memory &quot;$daxdev&quot;
+&gt; +	check_memory_online &quot;$daxdev&quot;
+&gt; +	check_kmem_state &quot;$daxdev&quot; &quot;online_movable&quot;
+&gt; +	&quot;$DAXCTL&quot; offline-memory &quot;$daxdev&quot;
+&gt; +	check_memory_offline &quot;$daxdev&quot;
+&gt; +	check_kmem_state &quot;$daxdev&quot; &quot;unplugged&quot;
+&gt; +	# an already offline device is unplugged too, where supported
+&gt; +	if [[ -f /sys/bus/dax/devices/$daxdev/state ]]; then
+&gt; +		&quot;$DAXCTL&quot; reconfigure-device -m devdax &quot;$daxdev&quot;
+&gt; +		&quot;$DAXCTL&quot; reconfigure-device -N -m system-ram &quot;$daxdev&quot;
+&gt; +		check_kmem_state &quot;$daxdev&quot; &quot;offline&quot;
+&gt; +		&quot;$DAXCTL&quot; offline-memory &quot;$daxdev&quot;
+&gt; +		check_kmem_state &quot;$daxdev&quot; &quot;unplugged&quot;
+&gt; +	fi
+&gt;  	&quot;$DAXCTL&quot; reconfigure-device -m devdax &quot;$daxdev&quot;
+&gt;  	[[ $(daxctl_get_mode &quot;$daxdev&quot;) == &quot;devdax&quot; ]]
+&gt;  	&quot;$DAXCTL&quot; reconfigure-device -m system-ram &quot;$daxdev&quot;
+&gt; -- 
+&gt; 2.53.0-Meta
+&gt; 
+
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Gregory Price (Meta)</div>
+<div class="review-comment-signals">Signals: WAITING_FOR_REVIEW</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

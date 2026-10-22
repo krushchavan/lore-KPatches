@@ -239,7 +239,7 @@
     <h1>[PATCH] mm, swap: revalidate populated clusters before scanning</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261019160615.2348500-1-nphamcs@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-10-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-21</strong><div class="date-range-nav">Active on: <a href="#2026-10-21">2026-10-21</a> &bull; <a href="#2026-10-20">2026-10-20</a> &bull; <a href="#2026-10-19">2026-10-19</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch revalidates populated clusters before scanning to prevent potential issues where someone can free the table between publishing and lock acquisition in swap_cluster_populate(). The patch adds a simple check to cover edge cases, but it&#x27;s suggested that more robust solutions could be explored by enforcing metadata lifetime or using reference counting.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch revalidates populated clusters before scanning to prevent dereferencing a NULL table. It checks if the cluster&#x27;s table is allocated and relocates it only when its table is present. This fix addresses an issue where a cached allocator can use and empty a cluster&#x27;s table before the populating allocator reacquires the lock, leading to a NULL pointer dereference during scanning.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-19">
 <div class="review-comment">
@@ -269,7 +269,7 @@ even if the cluster index is cached in CPU1, this race cannot happen).</pre>
 <div class="review-comment-signals">Signals: acknowledged a potential race condition, couldn&#x27;t reproduce the issue</div>
 </div>
 </div>
-<div class="thread-node depth-0" id="2026-10-20">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Nhat Pham (author)</span>
@@ -277,7 +277,160 @@ even if the cluster index is cached in CPU1, this race cannot happen).</pre>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Author acknowledged that the swap_cluster_alloc_table() function does not hold nor acquire cluster&#x27;s lock, agreed to restructure in v2 to address this issue.</div>
+<div class="review-comment-text">Author expressed surprise and confusion about the status of their patch series, implying they were not aware it was still being reviewed.
+
+Author acknowledges that swap_cluster_alloc_table() does not hold nor acquire cluster&#x27;s lock, making it vulnerable to table freeing between publishing and subsequent lock acquisition. Author suggests two possible approaches to address this issue: either lock the cluster before publishing the table or enforce metadata lifetime through a reference count.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Ah I missed that patch series and your review! What happened to it?
+Did we just never land it?
+
+Looks like we are still doing neither Keming&#x27;s approach (table
+copying) nor your approach (publishing at the end of
+swap_cluster_alloc_table()).
+
+---
+
+Yeah I feel like it&#x27;s still not safe with your approach...
+swap_cluster_alloc_table() does not hold nor acquire cluster&#x27;s lock.
+Between its publishing of the table and the subsequent lock
+acquisition in its caller (swap_cluster_populate()), someone can still
+come in and free the table.
+
+It&#x27;s tricky. We do not have an explicit contract for the metadata&#x27;s
+lifetime, so it&#x27;s a bit of reading the tea leaves for me...
+
+I think this is the last gap, and it&#x27;s rare enough, so this simple
+check should suffice to cover the edgiest of the edge cases :) But who
+knows :) If bugs re-surfaced again, I think we can spend a bit more
+time ironcladding the lifetime of clusters/tables:
+
+1. Allocate outside of lock context, but make swap_cluster_populate()
+lock the cluster, check cluster&#x27;s status, and only then publish the
+table (and return with the cluster locked). Basically Keming&#x27;s
+approach.
+
+2. Carefully enforce metadata&#x27;s lifetime. Perhaps we can add a refcnt?
+In addition to occupied slots holding cluster&#x27;s refcnt, we can allow
+for temporary holders. As long as we can acquire a refcnt, we know for
+sure the metadata is not freed under us. This is my approach for the
+old vswap patch series, but it&#x27;s tricky, especially with caching in
+the picture.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Youngjun Park</div>
+<a href="https://lore.kernel.org/r/CAKEwX=MRvzzd0Fn=UX+LcRo+K9wuqCWSB42NNn7rvZkZukRRrg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: surprise, confusion, acknowledges a fix is needed</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-10-20">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Youngjun Park</span>
+<a class="date-chip" href="../2026-10-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-20">2026-10-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the relocated cluster check is missing a table allocation check, and suggested adding it to prevent NULL pointer dereferences.
+
+Reviewer noted that publishing the table after acquiring the cluster lock, as suggested by Kemeng, is also a correct approach to prevent the issue described in the linked email and requested further consideration of this alternative solution.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hello Nhat.
+
+Good catch!
+
+---
+
+If this patch is applied as bloew, does it prevent the issue described here?
+
+https://lore.kernel.org/linux-mm/20260720071342.50742-2-shikemeng@huaweicloud.com/
+(This patch publishes cluster table after lock acquired.)
+
+This patch is chagned the way I suggested during review... :(
+
+As you pointed out, another context can free the table 
+without alloc context knwoing this situation.  
+I missed this situation.
+
+IMHO, Publishing the table only after reacquiring the cluster lock, as Kemeng
+suggested, and rejecting an unusable cluster under the lock as in this
+patch both look correct to me!
+
+Reviewed-by: Youngjun Park &lt;youngjun.park@lge.com&gt;</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/atcRLYvKavedT6Hs@yjaykim-PowerEdge-T330" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, requested further consideration, alternative solution</div>
+</div>
+</div>
+<div class="thread-node depth-1" id="2026-10-21">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-10-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-21">2026-10-21</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kairui Song noted that the patch does not fully address the issue of calling swap_cluster_alloc_table() without holding the ci lock, and suggested adding a &#x27;bool locked&#x27; parameter to this function to ensure it locks the ci before assigning tables. This change would also prevent misuse as reported by Kemeng earlier.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Nice catch!
+
+I think the real problem is that it turns out calling
+swap_cluster_alloc_table() without holding ci lock is bad idea... I
+think this patch still leaves some other call site too?
+
+We may instead add a &quot;bool locked&quot; to swap_cluster_alloc_table, and
+let it lock the ci first before it does any assign (not the alloc) if
+the allocation context is not locked. That is, keep the
+sleep-allocated tables private until swap_cluster_populate()
+reacquires local/global/ci, then install them under ci-&gt;lock,
+something like pre-cdd77f84d966, always assign it atomically.
+
+That should also cover the problem reported by Kemeng a few weeks
+earlier too, and prevent further misuse. My Bad on that change :P</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/CAMgjq7AEg6XEUJPaM3mMBQAeS_KiDv8_za4w-R2WaZ=ZGenvuw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-10-21_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-21">2026-10-21</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kairui Song expressed uncertainty about the first patch being perfect and mentioned that they had previously acknowledged part of it, but were waiting for an update from Kemeng due to their email bouncing back.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Right I remember that, I acked part of that and was waiting the update
+on that sashiko comment, as the first patch isn&#x27;t perfect, while
+Kemeng&#x27;s mail at &quot;shikemeng@huaweicloud.com&quot; is now bouncing back...
+I&#x27;m not sure if Kemeng still plans to update that.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/CAMgjq7AsUWGw5K5Xk1qz67atXmXB7vYDww-+u9t8Mz7rNAH-6Q@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: uncertainty, waiting for update</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Nhat Pham (author)</span>
+<a class="date-chip" href="../2026-10-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-20">2026-10-20</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges that another patch already implements the suggested approach, but still thinks their original patch is necessary and suggests it might be a small fix or an alternative to Kemeng&#x27;s proposal.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">Ah nope, I saw that Kemeng implemented your approach:
@@ -288,30 +441,39 @@ My bad! But yeah I think we still need this small fix (or Kemeng&#x27;s
 original proposal?), unless I missed something...?</pre>
 </details>
 <a href="https://lore.kernel.org/r/CAKEwX=OwzpxUfdANEXoCeZPBqch+91C4gKwhrcikm6Gj_LBPKw@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledged a fix is needed, agreed to restructure</div>
+<div class="review-comment-signals">Signals: acknowledged another patch, still thinks own patch is necessary</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-10-21">
+</div>
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Kairui Song</span>
-<a class="date-chip" href="../2026-10-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-21">2026-10-21</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="review-author">Nhat Pham (author)</span>
+<a class="date-chip" href="../2026-10-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-20">2026-10-20</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that swap_cluster_alloc_table() does not hold nor acquire the cluster&#x27;s lock, allowing someone to free the table between publishing and subsequent lock acquisition in its caller, swap_cluster_populate().</div>
+<div class="review-comment-text">Author inquires about additional callsites where the issue might occur, suggesting uncertainty about the scope of the problem.
+
+Author is considering the reviewer&#x27;s suggestion to add a lock, but needs more time to think about it and hasn&#x27;t committed to making any changes yet.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Right I remember that, I acked part of that and was waiting the update
-on that sashiko comment, as the first patch isn&#x27;t perfect, while
-Kemeng&#x27;s mail at &quot;shikemeng@huaweicloud.com&quot; is now bouncing back...
-I&#x27;m not sure if Kemeng still plans to update that.</pre>
+<pre class="raw-body-text">Do we have another callsite? There&#x27;s a callsite in setup code, but I
+assume that&#x27;s safe...?
+
+But at this point, who knows any more. The caching only stores a
+swapfile struct, and an offset. I wonder if there is a potential race
+between swapoff-then-re-swapon and cached allocation? That&#x27;d be pretty
+wild.
+
+---
+
+Hmm so a bitlock?
+
+Lemme think about it a bit.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
-<a href="https://lore.kernel.org/r/CAMgjq7AsUWGw5K5Xk1qz67atXmXB7vYDww-+u9t8Mz7rNAH-6Q@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
+<div class="reply-to-label">&#8627; replying to Kairui Song</div>
+<a href="https://lore.kernel.org/r/CAKEwX=O=PL3DEaEDe=F-=zhQ=VW3_UtcqesdX9fH_cr6orb2wQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: uncertainty, inquiry, considering</div>
 </div>
 </div>
 </div>
