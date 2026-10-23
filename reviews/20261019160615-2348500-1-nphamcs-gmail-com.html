@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH] mm, swap: revalidate populated clusters before scanning</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261019160615.2348500-1-nphamcs@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-21</strong><div class="date-range-nav">Active on: <a href="#2026-10-21">2026-10-21</a> &bull; <a href="#2026-10-20">2026-10-20</a> &bull; <a href="#2026-10-19">2026-10-19</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-10-19</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-22</strong><div class="date-range-nav">Active on: <a href="#2026-10-22">2026-10-22</a> &bull; <a href="#2026-10-21">2026-10-21</a> &bull; <a href="#2026-10-20">2026-10-20</a> &bull; <a href="#2026-10-19">2026-10-19</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch revalidates populated clusters before scanning to prevent dereferencing a NULL table. It checks if the cluster&#x27;s table is allocated and relocates it only when its table is present. This fix addresses an issue where a cached allocator can use and empty a cluster&#x27;s table before the populating allocator reacquires the lock, leading to a NULL pointer dereference during scanning.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-19">
@@ -418,6 +418,79 @@ I&#x27;m not sure if Kemeng still plans to update that.</pre>
 <div class="reply-to-label">&#8627; replying to Nhat Pham</div>
 <a href="https://lore.kernel.org/r/CAMgjq7AsUWGw5K5Xk1qz67atXmXB7vYDww-+u9t8Mz7rNAH-6Q@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: uncertainty, waiting for update</div>
+</div>
+</div>
+<div class="thread-node depth-1" id="2026-10-22">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-10-22_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-22">2026-10-22</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Kairui Song noted that swap_cluster_alloc_table() may allocate tables while holding a spinlock, which could lead to lock ordering violations if the cluster is relocated before the table is fully initialized; they suggested adding a &#x27;locked&#x27; parameter to indicate whether the allocation should be done under the cluster&#x27;s lock.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Ah, no, not that complex, just something like:
+
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -449,9 +449,13 @@ static void swap_cluster_free_table(struct
+swap_cluster_info *ci)
+        swap_cluster_free_count_table(table);
+ }
+
+-static int swap_cluster_alloc_table(struct swap_cluster_info *ci, gfp_t gfp)
++static int swap_cluster_alloc_table(struct swap_cluster_info *ci, gfp_t gfp,
++               bool locked)
+ {
+        struct swap_table *table = NULL;
++       struct swap_memcg_table *memcg_table = NULL;
++       unsigned long *zeromap = NULL;
++
+        struct folio *folio;
+
+        /* The cluster must be empty and not on any list during allocation. */
+@@ -472,8 +476,8 @@ static int swap_cluster_alloc_table(struct
+swap_cluster_info *ci, gfp_t gfp)
+ #ifdef CONFIG_MEMCG
+        if (!mem_cgroup_disabled()) {
+                VM_WARN_ON_ONCE(ci-&gt;memcg_table);
+-               ci-&gt;memcg_table = kzalloc_obj(*ci-&gt;memcg_table, gfp);
+-               if (!ci-&gt;memcg_table) {
++               memcg_table = kzalloc_obj(*ci-&gt;memcg_table, gfp);
++               if (!memcg_table) {
+                        swap_cluster_free_count_table(table);
+                        return -ENOMEM;
+                }
+@@ -484,8 +488,8 @@ static int swap_cluster_alloc_table(struct
+swap_cluster_info *ci, gfp_t gfp)
+        VM_WARN_ON_ONCE(ci-&gt;zero_bitmap);
+        ci-&gt;zero_bitmap = bitmap_zalloc(SWAPFILE_CLUSTER, gfp);
+        if (!ci-&gt;zero_bitmap) {
+-               swap_cluster_free_table(ci);
+                swap_cluster_free_count_table(table);
++               kfree(memcg_table);
+                return -ENOMEM;
+        }
+ #endif
+@@ -494,6 +498,20 @@ static int swap_cluster_alloc_table(struct
+swap_cluster_info *ci, gfp_t gfp)
+         * Make tables visible to cluster_is_usable() after everything is
+         * ready.
+         */
++       if (!locked) {
++               / * Lock it here before assign, not after the asssign
+and return */
+...
+
+This should fix all potential issues I think?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<a href="https://lore.kernel.org/r/CAMgjq7BSzYTbrzbA4vGqMbvegoHnDtJ0vA9PcwCet-m6Ow3ouA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>
