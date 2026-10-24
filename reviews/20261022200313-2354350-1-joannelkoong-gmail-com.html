@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v1] mm: move LRU size stat updates out of lru_lock in folio batches</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261022200313.2354350-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-22</strong><div class="date-range-nav">Active on: <a href="#2026-10-22">2026-10-22</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-10-22</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-23</strong><div class="date-range-nav">Active on: <a href="#2026-10-23">2026-10-23</a> &bull; <a href="#2026-10-22">2026-10-22</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch moves the updates to LRU size statistics out of the lru_lock critical section in folio batches, reducing contention and improving performance. The stats are accumulated while holding the lock and applied after dropping it, resulting in at most one update per LRU list per batch. This change is expected to improve throughput by reducing the time spent waiting for the lru_lock and making the code more efficient.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-22">
@@ -273,6 +273,88 @@ This code looks good though.</pre>
 <div class="reply-to-label">&#8627; replying to Joanne Koong</div>
 <a href="https://lore.kernel.org/r/atp7tN-UfEAu3wdk@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, performance profiling</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-10-23">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joanne Koong (author)</span>
+<a class="date-chip" href="../2026-10-23_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-23">2026-10-23</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that moving LRU size stat updates out of lru_lock improves throughput and agreed to restructure in v2 to address reviewer&#x27;s concerns.
+
+Author analyzed a perf profile run on her patch and found that while stat updates are only 0.7% of total cycles, lock contention from callers waiting for the lru_lock is still hurting throughput.
+
+Author addressed Shakeel Butt&#x27;s concern that removing LRU stat updates from lru_lock would not improve throughput, citing measurements showing similar performance with and without the patch.
+
+Author acknowledges that moving LRU size stat updates out of lru_lock in folio batches may not have a significant impact on throughput, citing experiments and benchmark results. She plans to investigate further, specifically looking into page cache stats.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Will do in v2. THe relevant part of [1] is that a change that added
+just a few instructions to the memcg stat update path cost about 2%
+throughput because the LRU stat updates run under lru_lock and the
+overhead went away once they were moved outside of the lock, which is
+what motivated this patch.
+
+---
+
+The perf profile run on the top commit of mm-new (commit fcec4f4bcc
+&quot;riscv: mm: fix concurrency in mark_new_valid_map()) using the same
+benchmark setup (80 threads, shmem) shows:
+- 52.8% of all cycles are spent spinning on the lru_lock (evenly split
+between folio_batch_move_lru() and folios_put_refs())
+- About 25% of the time spent holding lru_lock in those 2 paths goes
+to the LRU stat updates (the ones this patch moves to outside the
+lock) and the rest is the list manipulation itself
+- Most of the cost in __mod_memcg_lruvec_state() is cache misses
+(loading pn-&gt;memcg, pn-&gt;lruvec_stats_percpu, and the per-cpu
+counters).
+
+The stat updates are only 0.7% of total cycles but I think it&#x27;s the
+lock contention on callers waiting for the lock that ends up hurting
+throughput.
+
+---
+
+With the LRU stat updates removed from these paths entirely, I&#x27;m
+seeing that throughput is essentially the same as with this patch
+(within noise):
+
+                       mm-new   this patch   no stat updates
+    shmem, 80 threads  7.94M    10.33M       10.31M
+    anon,  20 threads  3.04M     3.35M        3.33M
+
+I think once the updates are moved out of the critical section
+entirely, they don&#x27;t cost much to do.
+
+---
+
+I had experimented a little with doing this for LRU size stats in the
+reclaim paths in vmscan and deferring the count_memcg_events() calls
+in the same batch paths, but none of them made a measurable difference
+to throughput. For the reclaim paths, I think it&#x27;s because there
+reclaim rather than the lru_lock is the bottleneck, and my benchmark
+doesn&#x27;t really exercise the paths that call count_memcg_events(). As
+far as I can tell, the rmap stats (NR_ANON_MAPPED, NR_FILE_MAPPED) are
+under the page table lock but that lock isn&#x27;t really contended. I
+think the other maybe-potentially-promising candidate is the page
+cache stats (NR_FILE_PAGES, NR_SHMEM, ...) that are updated per folio
+under the mapping&#x27;s i_pages lock but that would matter only for
+threads working on a single shared file. I can look more into the page
+cache stats and see whether the complexity would be worth it there.
+
+Thanks for taking a look at this patch!
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<a href="https://lore.kernel.org/r/CAJnrk1bDfg=uEO5xU3S8nK3AY-Zg=j3oYX1+cv8kVqmFiD8dCA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a performance improvement, agreed to revise the patch, acknowledged a performance issue</div>
+</div>
+</div>
 </div>
 </div>
 </div>
