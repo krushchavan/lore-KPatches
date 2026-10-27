@@ -1,0 +1,66 @@
+{
+  "thread_id": "at9xXRhD2xZhszEj@thinkstation",
+  "subject": "[PATCH] shmem: do not extend i_size when no data was copied",
+  "url": "https://lore.kernel.org/all/at9xXRhD2xZhszEj@thinkstation/",
+  "dates": {
+    "2026-10-26": {
+      "report_file": "2026-10-26_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Raised concerns about the patch's scope and suggested that generic_perform_write() might be a better place to fix the issue.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Mon, Oct 26, 2026 at 04:48:58PM +0100, Jan Kara wrote:\n> On Mon 26-10-26 15:34:08, Kiryl Shutsemau wrote:\n> > On Sun, Oct 25, 2026 at 04:46:19PM +0000, Hungyu Lin wrote:\n> > > shmem_write_end() advances i_size to pos + copied even when copied is\n> > > zero. A buffered write past EOF can therefore extend a tmpfs file\n> > > without writing any data.\n> > \n> > + willy, jack, fsdevel.\n> > \n> > This doesn't seem to be tmpfs-specific, right? I see the same with ext4.\n> > \n> > simple_write_end() and generic_write_end() check pos + copied the same\n> > way, so filesystems that use them through generic_perform_write() are\n> > affected too.\n> > \n> > It makes me think maybe generic_perform_write() is the right place to\n> > fix it. Hm?\n> \n> Well, that would be nice. But how'd you like to do that? i_size update is\n> the responsibility of ->write_end and we have to call ->write_end if copied\n> == 0 so that is undoes what ->write_begin has prepared.\n\nHm.\n\nA zero-length copy only moves i_size if the write starts beyond EOF.\nSo we can bring the prefault back just for that case, before\n->write_begin():\n\n        if (unlikely(pos > i_size_read(mapping->host)) &&\n            fault_in_iov_iter_readable(i, bytes) == bytes) {\n                status = -EFAULT;\n                break;\n        }\n\nOverwrites and appends keep skipping the prefault. It is racy against\na concurrent munmap(), as it was before 665575cff098, but that is\nuserspace racing with itself.\n\nThe per-filesystem alternative is a 'copied &&' in every ->write_end.\n\nAnd generic_write_end() cannot take it as is: generic_cont_expand_simple()\nrelies on a zero-length ->write_end() extending i_size. So we need some\nreplacement.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n\n",
+          "reply_to": "",
+          "message_date": "2026-10-26",
+          "message_id": "",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Jan Kara",
+          "summary": "Agreed that the patch is a good idea, but pointed out that i_size update is the responsibility of ->write_end and suggested that the fix should undo what ->write_begin has prepared.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "POSITIVE"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Mon 26-10-26 15:34:08, Kiryl Shutsemau wrote:\n> On Sun, Oct 25, 2026 at 04:46:19PM +0000, Hungyu Lin wrote:\n> > shmem_write_end() advances i_size to pos + copied even when copied is\n> > zero. A buffered write past EOF can therefore extend a tmpfs file\n> > without writing any data.\n> \n> + willy, jack, fsdevel.\n> \n> This doesn't seem to be tmpfs-specific, right? I see the same with ext4.\n> \n> simple_write_end() and generic_write_end() check pos + copied the same\n> way, so filesystems that use them through generic_perform_write() are\n> affected too.\n> \n> It makes me think maybe generic_perform_write() is the right place to\n> fix it. Hm?\n\nWell, that would be nice. But how'd you like to do that? i_size update is\nthe responsibility of ->write_end and we have to call ->write_end if copied\n== 0 so that is undoes what ->write_begin has prepared.\n\n\t\t\t\t\t\t\t\tHonza\n\n-- \nJan Kara <jack@suse.com>\nSUSE Labs, CR\n",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-10-26",
+          "message_id": "",
+          "email": "jack@suse.cz",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Provided a possible solution to the problem, which involves bringing the prefault back for zero-length copies and overhauling generic_write_end().",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": true,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Mon, Oct 26, 2026 at 04:48:58PM +0100, Jan Kara wrote:\n> On Mon 26-10-26 15:34:08, Kiryl Shutsemau wrote:\n> > On Sun, Oct 25, 2026 at 04:46:19PM +0000, Hungyu Lin wrote:\n> > > shmem_write_end() advances i_size to pos + copied even when copied is\n> > > zero. A buffered write past EOF can therefore extend a tmpfs file\n> > > without writing any data.\n> > \n> > + willy, jack, fsdevel.\n> > \n> > This doesn't seem to be tmpfs-specific, right? I see the same with ext4.\n> > \n> > simple_write_end() and generic_write_end() check pos + copied the same\n> > way, so filesystems that use them through generic_perform_write() are\n> > affected too.\n> > \n> > It makes me think maybe generic_perform_write() is the right place to\n> > fix it. Hm?\n> \n> Well, that would be nice. But how'd you like to do that? i_size update is\n> the responsibility of ->write_end and we have to call ->write_end if copied\n> == 0 so that is undoes what ->write_begin has prepared.\n\nHm.\n\nA zero-length copy only moves i_size if the write starts beyond EOF.\nSo we can bring the prefault back just for that case, before\n->write_begin():\n\n        if (unlikely(pos > i_size_read(mapping->host)) &&\n            fault_in_iov_iter_readable(i, bytes) == bytes) {\n                status = -EFAULT;\n                break;\n        }\n\nOverwrites and appends keep skipping the prefault. It is racy against\na concurrent munmap(), as it was before 665575cff098, but that is\nuserspace racing with itself.\n\nThe per-filesystem alternative is a 'copied &&' in every ->write_end.\n\nAnd generic_write_end() cannot take it as is: generic_cont_expand_simple()\nrelies on a zero-length ->write_end() extending i_size. So we need some\nreplacement.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n\n",
+          "reply_to": "Jan Kara",
+          "message_date": "2026-10-26",
+          "message_id": "",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Patch aims to prevent i_size extension when no data is copied, but raises questions about the correct location for the fix."
+    }
+  }
+}

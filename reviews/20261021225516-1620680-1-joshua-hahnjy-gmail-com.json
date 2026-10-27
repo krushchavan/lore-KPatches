@@ -1,0 +1,60 @@
+{
+  "thread_id": "20261021225516.1620680-1-joshua.hahnjy@gmail.com",
+  "subject": "[PATCH v7 0/5] mm/page_counter: move stock from mem_cgroup to page_counter",
+  "url": "https://lore.kernel.org/all/20261021225516.1620680-1-joshua.hahnjy@gmail.com/",
+  "dates": {
+    "2026-10-26": {
+      "report_file": "2026-10-26_ollama_llama3.1-8b.html",
+      "developer": "Joshua Hahn",
+      "reviews": [
+        {
+          "author": "Michal Hocko",
+          "summary": "Reviewer noted that the patch does not address the issue of cgroup v1 users having a different size of precharged cache for memory and memsw stocks, which could lead to an inflated appearance of memory usage compared to memsw usage.\n\nReviewer Michal Hocko asked for clarification on what 'opting into its own per-CPU caching' means, specifically in the context of each page_counter having its own cache of pre-charged pages.\n\nReviewer Michal Hocko requested a high-level design overview in the cover letter, specifically asking about changes to locking and implications for caching at different levels of the hierarchy.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "lack of clear understanding",
+            "request for explanation",
+            "requested additional information",
+            "asked for clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "[Sorry for coming to this really late]\n\nOn Wed 21-10-26 15:55:09, Joshua Hahn wrote:\n\n---\n\nWhat does it mean that each counter can opt into its own per-cpu\ncaching?\n\n---\n\nThis is quite a large change and I believe it will be really benefitial\nto have some high level design overview in the cover rather than trying to\nchase it in respective patches.\nNamely, are there any changes to the locking (which is arguably quite\ntricky to allow completely lockless fast path)? Also what are\nimplications to caching at different levels of the hierarchy? An example\nof cache propagation up/down the hierarchy during\ncharge/uncharge/draining would be really useful to wrap ones head around\nhow this is supposed to work.",
+          "reply_to": "Joshua Hahn",
+          "message_date": "2026-10-26",
+          "message_id": "at8XfoqWwe9HSL9y@tiehlicka",
+          "email": "mhocko@suse.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Joshua Hahn (author)",
+          "summary": "The author is addressing concerns about the patch's impact on cgroupv2, specifically how it will interact with new page_counters being added to struct memcg. The author acknowledges that the current implementation of stocking charge for memcg is equivalent to stocking charge for the memcg->memory page_counter and explains that their ongoing work adds new per-tier page_counters to struct memcg, which cannot use the stock fastpath due to its inability to distinguish memory residence. They argue that their patch avoids hierarchy walks for most charges.\n\nAuthor agrees that additional context is needed and plans to provide it by adding call traces, indicating that no fix is currently planned but more information will be provided.\n\nAuthor addressed a concern about the impact of separate stocking on cgroup v1 users by explaining that memory.usage_in_bytes will be reported as the smaller of raw memory and memsw values to preserve the invariant.\n\nAuthor acknowledged that cgroup v2 users should not see any changes in the patch series and offered to provide additional explanation on how stocking currently works.\n\nThe author is addressing concerns about the behavior of reporting memory usage when memsw and memory stocks are decoupled. He acknowledges that there can be an inversion where memsw reports a higher usage than memory, but explains that this is due to how direct charging works in such scenarios. The author proposes fuzzily reporting the minimum of the two reported values, which he claims aligns with the existing fuzzy nature of usage_in_bytes.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "no fix planned",
+            "additional context needed",
+            "clarification",
+            "explanation",
+            "acknowledged",
+            "offered to explain"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "So right now for cgroupv2, there's kind of a 1-1 mapping between\npage_counter and memcg. I say \"kind of\" because there still is a\npage_counter for swap, but it takes a completely different charging\npath (i.e. not try_charge_memcg).\n\nThis means that currently stocking charge for memcg is equivalent to\nstocking charge for the memcg->memory page_counter.\n\nHowever, one of the series that I'm currently working on [1] adds new\npage_counters to struct memcg to track the usage of memory\nper-memcg, per-tier. The goal is to (1) track how much memory of a\ncgroup lives on which tier, and (2) to limit the usage so that a single\ncgroup doesn't use up all the fast tier memory alone, and shares it\nfairly with all the other cgroups on the host.\n\nWhen adding a new per-tier page_counter to struct mem_cgroup that gets\ncharged for every memcg_charge, I cannot use the stock fastpath since\nthe stock does not distinguish where the memory resides. It would\nessentialy boil down to this pattern:\n\ntry_charge_memcg\n   \\__ page_couner_try_charge(memcg->tier[0])\n   \\__ consume_stock()\n\nWhere every path still has to do a hierarchy charge to the tier it's\ncharging to, whereas this patch gets us:\n\ntry_charge_memcg\n   \\__ page_counter_try_charge(memcg->tier[0])\n          \\__ consume_stock(memcg->tier[0])\n   \\__ page_countertry_charge(memcg->memory)\n          \\__ consume_stock(memcg->memory)\n\nSo that we can avoid the hierarchy walk for most charges.\n\nI'd be happy to submit a new cover letter which better explains this\nidea!\n\n---\n\nSounds good with me. I can add the call traces above which should\nexplain my thought process a bit more. Hopefully the problem I am\ntrying to solve is evident there.\n\n---\n\nNo changes to locking. In fact this series is mostly just moving code\nfrom mm/memcontrol.c to mm/page_counter.c, everything is essentially\nthe same.\n\n---\n\nThis series should not have any changes for cgroup v2, including when\nand where the cache is stocked / drained in the hierarchy. I can\ninclude a snippet on how stocking currently works to add a visual\nexplanation, if that helps too.\n\n---\n\nYeah, so this part is a little bit annoying. Let's just look at a single\nleaf cgroup for example, where the limit for memsw and memory are both\n64 pages.\n\ncharge_memcg(64)\n\traw memory: 64\t\t\traw memsw: 64\n\treported memory: 64\t\treported memsw: 64\n\tmemory stock: 0\t\t\tmemory stock: 0\n\nswap out 32 pages\n\traw memory: 32\t\t\traw memsw: 64\n\treported memory: 32\t\treported memsw: 64\n\tmemory stock: 0\t\t\tmemsw stock: 0\n\nfree 32 pages\n\traw memory: 0\t\t\traw memsw: 32\n\treported memory: 0\t\treported memsw: 32\n\tmemory stock: 0\t\t\tmemsw stock: 0\n\ncharge_memcg(1)\n\traw memory: 1\t\t\traw memsw: 33\n\treported memory: 64\t\treported memsw: 33\n\tmemory stock: 63\t\tmemsw stock: 0\n\nWhere the last charge_memcg() causes the inversion. memsw tries to\ncharge a batch of 64 to refill the stock, but fails since 32+64=96\nputs the memsw over its max limit. So it falls back to direct charging\nwhere it charges the page_counter directly, and ends up with 0 stock\nand reporting a usage of 33.\n\nOn the other hand, memory will greedily refill the stock with 64 pages\nand since usage is 0, the batch refill will succeed, and it will report\na usage of 64.\n\nSo the idea with reporting the minimum is to report the minimum of the\ntwo reported values, we will just fuzzily report the stocked value.\nIIRC usage_in_bytes has always been fuzzy anyways, due to how much\nmemory has been stocked.\n\nThanks again for taking a look, Michal! I hope you have a great day : -)\nJoshua",
+          "reply_to": "Michal Hocko",
+          "message_date": "2026-10-26",
+          "message_id": "20261026155937.1235453-1-joshua.hahnjy@gmail.com",
+          "email": "joshua.hahnjy@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series moves the stock management from mem_cgroup to page_counter, allowing each page_counter to have its own per-CPU cache of pre-charged pages. This change is necessary for future work on scalable and performant page_counters, such as the tiered memcg limits series. The decoupling of memory and memsw stocks in cgroup v1 users may lead to different sizes of precharged caches, but the patch preserves the invariant that memory.usage_in_bytes is less than or equal to memory.memsw.usage_in_bytes by reporting the smaller value. This change has no functional impact on memcg v2 users."
+    }
+  }
+}
