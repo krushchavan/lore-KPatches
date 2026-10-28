@@ -1,0 +1,84 @@
+{
+  "thread_id": "auDkbDlgSZxqlk2G@thinkstation",
+  "subject": "[PATCHv7 13/18] mm: Drop fake head checks",
+  "url": "https://lore.kernel.org/all/auDkbDlgSZxqlk2G@thinkstation/",
+  "dates": {
+    "2026-10-27": {
+      "report_file": "2026-10-27_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "From: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\nDate: Tue, 27 Oct 2026 17:23:47 +0000\nSubject: [PATCH] mm/hugetlb_vmemmap: map the shared tail page writable\n\npage_ref_add_unless_zero() reads the refcount and then updates it with\na cmpxchg.  A lockless get, such as a page cache lookup or a PFN\nscanner, can read a non-zero refcount from a page that is then freed\nand reused as a hugetlb tail page.  If HVO remaps its struct page to\nthe shared tail page in between, the cmpxchg writes to read-only\nvmemmap:\n\n    CPU0 (lockless get)               CPU1\n    c = atomic_read(&page->_refcount)\n                                      page freed\n                                      page allocated as a hugetlb tail\n                                      HVO remaps the struct page RO\n    try_cmpxchg(&page->_refcount, &c, c + 1)\n      -> write fault on read-only vmemmap\n\nThe refcount is zero by then and the compare fails, but LOCK CMPXCHG on\nx86 writes anyway.  The kernel oopses when hugetlb pages are allocated\nat runtime with HVO enabled while a lockless get races with it.\n\nCommit bd225530a4c7 (\"mm/hugetlb_vmemmap: fix race with speculative PFN\nwalkers\") closed the window with RCU on both sides.  The RCU was removed\ntogether with fake heads, on the wrong belief that it was only needed\nfor them.\n\nMap the shared tail page writable instead of restoring the RCU.  Every\nstruct page on it is a tail with a zero refcount, so a late cmpxchg\nfails and leaves the page unchanged.  RCU would put rcu_read_lock()\nback around every get and synchronize_rcu() back into hugetlb\nallocation and freeing.\n\nThe cost is the protection against stray writes to tail struct pages.\nThe shared page is shared by all hugetlb folios of the same order in\nthe zone, so such a write now corrupts all of them instead of oopsing.\n\nBootmem folios optimized in early boot get their tails mapped writable\nand write protected later.  Drop the write protect step.\n\nFixes: 32c440d67e6c (\"mm: drop fake head checks\")\nFixes: 01b1d0ffb6f7 (\"hugetlb: remove VMEMMAP_SYNCHRONIZE_RCU\")\nReported-by: David Hildenbrand (Arm) <david@kernel.org>\nCloses: https://lore.kernel.org/r/ebc7bde1-f52e-4da8-b16f-822d6c0a4d74@kernel.org\nCc: stable@vger.kernel.org\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n Documentation/mm/vmemmap_dedup.rst | 13 +++++++++----\n include/linux/mm.h                 |  2 --\n mm/hugetlb.c                       |  4 ----\n mm/hugetlb_vmemmap.c               | 21 +++++++--------------\n mm/sparse-vmemmap.c                | 23 -----------------------\n 5 files changed, 16 insertions(+), 47 deletions(-)\n\ndiff --git a/Documentation/mm/vmemmap_dedup.rst b/Documentation/mm/vmemmap_dedup.rst\nindex 9fa8642ded48..6cd85aca4b96 100644\n--- a/Documentation/mm/vmemmap_dedup.rst\n+++ b/Documentation/mm/vmemmap_dedup.rst\n@@ -131,8 +131,15 @@ pages of ``struct page`` (page 1 to page 7) are tail pages.\n The optimization is only applied when the size of the struct page is a power\n of 2. In this case, all tail pages of the same order are identical. See\n compound_head(). This allows us to remap the tail pages of the vmemmap to a\n-shared, read-only page. The head page is also remapped to a new page. This\n-allows the original vmemmap pages to be freed.\n+shared page. The head page is also remapped to a new page. This allows the\n+original vmemmap pages to be freed.\n+\n+The shared page is mapped writable. A lockless get of a page reference can\n+read a non-zero refcount before the remap and attempt its atomic update\n+after it. The refcount of a tail page is zero, so the update fails without\n+changing the page. Nothing else may write to the shared page: it is shared\n+by all HugeTLB pages of the same size in the zone, and a stray write would\n+corrupt all of them.\n \n Here is how things look after remapping::\n \n@@ -196,8 +203,6 @@ happens at a later stage when we populate the sections. HugeTLB reuses the\n the head vmemmap page representing, whereas device-dax reuses the tail\n vmemmap page. This results in only half of the savings compared to HugeTLB.\n \n-Deduplicated tail pages are not mapped read-only.\n-\n Here's how things look like on device-dax after the sections are populated::\n \n  +-----------+ ---virt_to_page---> +-----------+   mapping to   +-----------+\ndiff --git a/include/linux/mm.h b/include/linux/mm.h\nindex dd09c438fa23..bfaf4ce6d831 100644\n--- a/include/linux/mm.h\n+++ b/include/linux/mm.h\n@@ -5162,8 +5162,6 @@ int vmemmap_populate(unsigned long start, unsigned long end, int node,\n int vmemmap_populate_hvo(unsigned long start, unsigned long end,\n \t\t\t unsigned int order, struct zone *zone,\n \t\t\t unsigned long headsize);\n-void vmemmap_wrprotect_hvo(unsigned long start, unsigned long end, int node,\n-\t\t\t  unsigned long headsize);\n void vmemmap_populate_print_last(void);\n #ifdef CONFIG_MEMORY_HOTPLUG\n void vmemmap_free(unsigned long start, unsigned long end,\ndiff --git a/mm/hugetlb.c b/mm/hugetlb.c\nindex cea25773a6c9..7596704d94b5 100644\n--- a/mm/hugetlb.c\n+++ b/mm/hugetlb.c\n@@ -3220,10 +3220,6 @@ static bool __init hugetlb_bootmem_page_earlycma(struct huge_bootmem_page *m)\n  * if marked with the 'noinit' flag. Set it to the default (MIGRATE_MOVABLE)\n  * here, or MIGRATE_CMA if this was a page allocated through an early CMA\n  * reservation.\n- *\n- * In case of vmemmap optimized folios, the tail vmemmap pages are mapped\n- * read-only, but that's ok - for sparse vmemmap this does not write to\n- * the page structure.\n  */\n static void __init hugetlb_bootmem_init_migratetype(struct folio *folio,\n \t\t\t\t\t\t\t  struct hstate *h)\ndiff --git a/mm/hugetlb_vmemmap.c b/mm/hugetlb_vmemmap.c\nindex 917db0984143..77f9d035d04c 100644\n--- a/mm/hugetlb_vmemmap.c\n+++ b/mm/hugetlb_vmemmap.c\n@@ -222,10 +222,12 @@ static void vmemmap_remap_pte(pte_t *pte, unsigned long addr,\n \t\tVM_WARN_ON_ONCE(!PageTail((const struct page *)addr));\n \n \t\t/*\n-\t\t * Remap the tail pages as read-only to catch illegal write\n-\t\t * operation to the tail pages.\n+\t\t * Map the shared tail page writable. A lockless get that read\n+\t\t * a non-zero refcount before the remap can still do its\n+\t\t * cmpxchg after it. The refcount is zero, so the cmpxchg\n+\t\t * fails and leaves the page unchanged.\n \t\t */\n-\t\tentry = mk_pte(walk->vmemmap_tail, PAGE_KERNEL_RO);\n+\t\tentry = mk_pte(walk->vmemmap_tail, PAGE_KERNEL);\n \t}\n \n \tlist_add(&page->lru, walk->vmemmap_pages);\n@@ -629,19 +631,10 @@ static void __hugetlb_vmemmap_optimize_folios(struct hstate *h,\n \tnr_to_optimize = 0;\n \tlist_for_each_entry(folio, folio_list, lru) {\n \t\tint ret;\n-\t\tunsigned long spfn, epfn;\n \n-\t\tif (boot && folio_test_hugetlb_vmemmap_optimized(folio)) {\n-\t\t\t/*\n-\t\t\t * Already optimized by pre-HVO, just map the\n-\t\t\t * mirrored tail page structs RO.\n-\t\t\t */\n-\t\t\tspfn = (unsigned long)&folio->page;\n-\t\t\tepfn = spfn + hugetlb_vmemmap_size(h);\n-\t\t\tvmemmap_wrprotect_hvo(spfn, epfn, folio_nid(folio),\n-\t\t\t\t\tHUGETLB_VMEMMAP_RESERVE_SIZE);\n+\t\t/* Already optimized by pre-HVO */\n+\t\tif (boot && folio_test_hugetlb_vmemmap_optimized(folio))\n \t\t\tcontinue;\n-\t\t}\n \n \t\tnr_to_optimize++;\n \ndiff --git a/mm/sparse-vmemmap.c b/mm/sparse-vmemmap.c\nindex 5a2469fb1838..3f25d4a0bf47 100644\n--- a/mm/sparse-vmemmap.c\n+++ b/mm/sparse-vmemmap.c\n@@ -299,29 +299,6 @@ int __meminit vmemmap_populate_basepages(unsigned long start, unsigned long end,\n \treturn vmemmap_populate_range(start, end, node, altmap, -1, 0);\n }\n \n-/*\n- * Write protect the mirrored tail page structs for HVO. This will be\n- * called from the hugetlb code when gathering and initializing the\n- * memblock allocated gigantic pages. The write protect can't be\n- * done earlier, since it can't be guaranteed that the reserved\n- * page structures will not be written to during initialization,\n- * even if CONFIG_DEFERRED_STRUCT_PAGE_INIT is enabled.\n- *\n- * The PTEs are known to exist, and nothing else should be touching\n- * these pages. The caller is responsible for any TLB flushing.\n- */\n-void vmemmap_wrprotect_hvo(unsigned long addr, unsigned long end,\n-\t\t\t\t    int node, unsigned long headsize)\n-{\n-\tunsigned long maddr;\n-\tpte_t *pte;\n-\n-\tfor (maddr = addr + headsize; maddr < end; maddr += PAGE_SIZE) {\n-\t\tpte = virt_to_kpte(maddr);\n-\t\tptep_set_wrprotect(&init_mm, maddr, pte);\n-\t}\n-}\n-\n #ifdef CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP\n static __meminit struct page *vmemmap_get_tail(unsigned int order, struct zone *zone)\n {\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "",
+          "message_date": "2026-10-27",
+          "message_id": "auDkbDlgSZxqlk2G@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) agreed to send the patch out for official feedback, indicating no technical concerns or objections.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "agreement",
+            "lack of technical discussion"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I'd be fine with that. Best to send it out officially such that we get more\nfeedback from other folks.\n\n\n-- \nCheers,\n\nDavid\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-10-27",
+          "message_id": "9da1d287-c101-4af0-8371-888e78b3defe@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a race condition in the hugetlb_vmemmap code by mapping the shared tail page writable instead of restoring RCU protection. The issue arises when a lockless get reads a non-zero refcount from a page that is then freed and reused as a hugetlb tail page, causing a write fault on read-only vmemmap. The patch also drops the write protect step for bootmem folios optimized in early boot."
+    },
+    "2026-10-28": {
+      "report_file": "2026-10-27_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Muchun Song",
+          "summary": "Reviewer Muchun Song questioned whether the described issue is specific to x86 architecture and suggested adding a more general description.\n\nReviewer Muchun Song expressed concern about removing the read-only mapping for bootmem folios, arguing that it's still in the initialization stage and no one should be touching those pages yet, which could lead to encountering uninitialized struct page\n\nReviewer Muchun Song noted that the patch does not address a potential issue on RISC-V architecture, where page_ref_add_unless_zero() can read a non-zero refcount from a page that is then freed and reused as a hugetlb tail page, leading to a write fault on read-only vmemmap.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "questioning",
+            "suggestion",
+            "requested changes",
+            "potential issue",
+            "RISC-V architecture"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Is this an X86-specific issue? If not, I suggest a more generic\ndescription.\n\n---\n\nFor bootmem folios, I don't think the RO mapping should be removed,\nbecause we are in the initialization stage of struct page.\nNo one should touch those pages at this point; otherwise, they could\nencounter uninitialized struct page as well. This assumes no race\nexists during early boot.\n\nSince such a problem does not exist during the boot stage, why should\nwe give up the protection that RO provides?\n\nThoughts?\n\nThanks,\nMuchun\n\n---\n\n_______________________________________________\nlinux-riscv mailing list\nlinux-riscv@lists.infradead.org\nhttp://lists.infradead.org/mailman/listinfo/linux-riscv",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-10-28",
+          "message_id": "7cb3dd91-f518-49b6-b311-9ec807b3c63b@linux.dev",
+          "email": "muchun.song@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch fixes a race condition in the hugetlb_vmemmap code by mapping the shared tail page writable instead of restoring RCU protection. The issue arises when a lockless get reads a non-zero refcount from a page that is then freed and reused as a hugetlb tail page, causing a write fault on read-only vmemmap. The patch also drops the write protect step for bootmem folios optimized in early boot."
+    }
+  }
+}
