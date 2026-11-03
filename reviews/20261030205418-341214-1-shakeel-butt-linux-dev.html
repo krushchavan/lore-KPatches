@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 0/5] memcg: clean up memory.high enforcement</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261030205418.341214-1-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-30</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-10-31</strong><div class="date-range-nav">Active on: <a href="#2026-10-31">2026-10-31</a> &bull; <a href="#2026-10-30">2026-10-30</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-10-30</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-02</strong><div class="date-range-nav">Active on: <a href="#2026-11-02">2026-11-02</a> &bull; <a href="#2026-10-31">2026-10-31</a> &bull; <a href="#2026-10-30">2026-10-30</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series cleans up memory.high enforcement by using a worker for kernel threads and remote charges, improving performance and handling edge cases such as reclaiming and sleeping during charging. It also forces charges from PF_MEMALLOC tasks before checking limits to prevent self-reclaiming and ensures that local user charges are handled correctly. The changes aim to provide a best-effort solution while maintaining the hard limit of memory.max for interrupts and swap. The patches modify various functions, including memcg_enforce_high(), to implement these improvements.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-31">
@@ -252,6 +252,156 @@
 </div>
 <div class="review-comment-text">Gave Acked-by</div>
 <a href="https://lore.kernel.org/r/F94627B5-26E7-4F9F-ADAD-395026632C45@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-11-02">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Michal Hocko noted that the current implementation of try_charge_memcg() can lead to a false event being triggered when reclaim operations need to allocate memory, and suggested checking the margin after the charge is forced instead.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">This is racy. Not a huge deal as we would get a false event in the worst
+case but I think it would make more sense to check the margine after the
+charge is forced. So this would become
+--- 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 856a7d07586c..bd202ec05acf 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2653,13 +2653,20 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	bool passed_oom = false;
+ 	unsigned int reclaim_options;
+ 	bool drained = false;
+-	bool raised_max_event = false;
+ 	unsigned long pflags;
+ 	bool allow_spinning = gfpflags_allow_spinning(gfp_mask);
+ 
+ retry:
+ 	if (consume_stock(memcg, nr_pages))
+ 		return 0;
++	/*
++	 * Reclaim may need memory to free memory. Let it go over the
++	 * limits for a while rather than fail or OOM kill. Doing this
++	 * before trying the limits also skips memory.high, so the
++	 * high_work worker can&#x27;t queue itself from its own reclaim.
++	 */
++	if (unlikely(current-&gt;flags &amp; PF_MEMALLOC))
++		goto force;
+ 
+ 	if (!allow_spinning)
+ 		/* Avoid the refill and flush of the older stock */
+@@ -2683,15 +2690,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 		goto retry;
+ 	}
+ 
+-	/*
+-	 * Prevent unbounded recursion when reclaim operations need to
+-	 * allocate memory. This might exceed the limits temporarily,
+-	 * but we prefer facilitating memory reclaim and getting back
+-	 * under the limit over triggering OOM kills in these cases.
+-	 */
+-	if (unlikely(current-&gt;flags &amp; PF_MEMALLOC))
+-		goto force;
+-
+ 	if (unlikely(task_in_memcg_oom(current)))
+ 		goto nomem;
+ 
+@@ -2712,7 +2710,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 		goto nomem;
+ 
+ 	__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
+-	raised_max_event = true;
+ 
+ 	psi_memstall_enter(&amp;pflags);
+ 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+@@ -2773,13 +2770,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (!(gfp_mask &amp; (__GFP_NOFAIL | __GFP_HIGH)))
+ 		return -ENOMEM;
+ force:
+-	/*
+-	 * If the allocation has to be enforced, don&#x27;t forget to raise
+-	 * a MEMCG_MAX event.
+-	 */
+-	if (!raised_max_event)
+-		__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
+-
+ 	/*
+ 	 * The allocation either can&#x27;t fail or will lead to more memory
+ 	 * being freed very soon.  Allow memory usage go over the limit
+@@ -2789,6 +2779,15 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	if (do_memsw_account())
+ 		page_counter_charge(&amp;memcg-&gt;memsw, nr_pages);
+ 
++	/*
++	 * If the allocation has to be enforced, don&#x27;t forget to raise
++	 * a MEMCG_MAX event.
++	 */
++	for (mem_over_limit = memcg; mem_over_limit;
++	     mem_over_limit = parent_mem_cgroup(mem_over_limit))
++		if (!mem_cgroup_margin(mem_over_limit))
++			__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);
++
+ 	return 0;
+ 
+ done_restock:
+-- 
+Michal Hocko
+SUSE Labs</pre>
+</details>
+<a href="https://lore.kernel.org/r/auhN7v127jwy-q-W@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: racy, false event</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Shakeel Butt (author)</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges that their original approach was also racy, but notes that it had &#x27;some additional issues&#x27; without providing details.
+
+The author is addressing a concern about the patch&#x27;s interaction with the `raised_max_event` mechanism. They acknowledge that this event cannot be removed, as it is also used by another part of the code (374f65b14819), and therefore forced charges will raise MEMCG_MAX again if it was already raised before reclaim.
+
+The author addressed Michal Hocko&#x27;s concern about the behavior of !mem_cgroup_margin() when usage equals max, explaining that it indeed triggers an event in this case.
+
+Author acknowledges that the patch needs to handle events for all ancestors, agrees to keep their current version, and implies a fix is planned.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I actually tested your version as well i.e. after the charge. It is just
+as racy and it has some additional issues which are inlined.
+
+---
+
+First, raised_max_event can&#x27;t go. Since 374f65b14819 rejected charges use it
+too, and without it forced charges that already raised MEMCG_MAX before reclaim
+raise it again.
+
+---
+
+Second, !mem_cgroup_margin() is true at usage == max, so a charge that fits
+exactly raises an event (unlike today).
+
+---
+
+Third, we definitely need a break here otherwise every ancestor at its limit gets
+an event which does not happen today.
+
+I want to keep my current version.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Michal Hocko</div>
+<a href="https://lore.kernel.org/r/auli2Zlf1F0tyi4X@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a problem, additional issues, acknowledged a technical issue</div>
+</div>
+</div>
 </div>
 </div>
 </div>

@@ -4,32 +4,79 @@
   "url": "https://lore.kernel.org/all/20261030205418.341214-3-shakeel.butt@linux.dev/",
   "dates": {
     "2026-10-31": {
-      "report_file": "2026-10-31_ollama_llama3.1-8b.html",
+      "report_file": "2026-11-02_ollama_llama3.1-8b.html",
       "developer": "Shakeel Butt",
       "reviews": [
         {
           "author": "Muchun Song",
-          "summary": "Acked the patch without providing any feedback or analysis.",
+          "summary": "Gave Acked-by",
           "sentiment": "POSITIVE",
           "sentiment_signals": [],
           "has_inline_review": false,
           "tags_given": [
             "Acked-by"
           ],
-          "raw_body": "\n\n> On Oct 31, 2026, at 04:54, Shakeel Butt <shakeel.butt@linux.dev> wrote:\n> \n> Reclaim can charge memory, for example when zswap stores a page.\n> try_charge_memcg() forces these PF_MEMALLOC charges, but only after\n> they fail at a limit. A charge that fits still has memory.high\n> enforced. That can make a task in direct reclaim do more reclaim and\n> sleep longer later, and kswapd records overage that it never handles.\n> \n> It is also a problem for the next patches, which make kernel threads\n> queue high_work. The worker charges memory from its own reclaim, so it\n> can queue itself again. With those patches but not this one, the worker\n> queued itself in 118 of 284 runs in a VM test with incompressible zswap\n> data.\n> \n> Check PF_MEMALLOC before trying the limits. Reclaim charges then skip\n> memory.high, as they can already go over memory.max. Drop the\n> PF_MEMALLOC check in memcg_enforce_high(), which no longer sees them.\n> \n> Other effects:\n> - As before, the check reads current, so it also catches interrupts on\n>  a PF_MEMALLOC task such as kswapd. Softirqs set PF_MEMALLOC\n>  themselves for swap over network, so the check can't be limited to\n>  task context.\n> - These charges no longer charge a batch or refill the per-cpu stock.\n> - MEMCG_MAX still goes to the first cgroup that the charge puts over\n>  its limit. On cgroup v1, memory.failcnt no longer counts them.\n> - high_work can still run again and again when there is nothing left\n>  to reclaim. This only stops reclaim from queuing more reclaim.\n> \n> Suggested-by: Michal Hocko <mhocko@suse.com>\n> Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>\n\nAcked-by: Muchun Song <muchun.song@linux.dev>\n\nThanks.\n\n",
-          "reply_to": "",
+          "raw_body": "",
+          "reply_to": "Shakeel Butt",
           "message_date": "2026-10-31",
-          "message_id": "",
-          "analysis_source": "llm"
+          "message_id": "7CE7A687-C45B-4F99-8F58-88633E052D85@linux.dev",
+          "analysis_source": "heuristic"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch forces memory charges from reclaim before trying the limits, allowing reclaim to go over memory.high and preventing tasks like kswapd from sleeping longer due to excessive reclaim."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the memcg (memory cgroup) charging mechanism to force charges from reclaim before trying the limits. This change is necessary because reclaim can charge memory, and if it fails at a limit, it can lead to issues such as increased sleep time for tasks in direct reclaim and kswapd recording overage that it never handles. The patch checks for PF_MEMALLOC before trying the limits, allowing reclaim charges to skip memory.high enforcement and preventing kernel threads from queuing high_work. This change also has effects on how charges are counted and handled by cgroups."
     },
     "2026-10-30": {
       "report_file": "2026-10-30_ollama_llama3.1-8b.html",
       "developer": "Shakeel Butt",
       "reviews": []
+    },
+    "2026-11-02": {
+      "report_file": "2026-11-02_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Michal Hocko",
+          "summary": "Reviewer Michal Hocko noted that the patch introduces a potential race condition by checking PF_MEMALLOC before forcing charges, and suggested moving this check after the charge is forced to avoid false events.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "race condition",
+            "potential issue"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "This is racy. Not a huge deal as we would get a false event in the worst\ncase but I think it would make more sense to check the margine after the\ncharge is forced. So this would become\n--- \ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 856a7d07586c..bd202ec05acf 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -2653,13 +2653,20 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tbool passed_oom = false;\n \tunsigned int reclaim_options;\n \tbool drained = false;\n-\tbool raised_max_event = false;\n \tunsigned long pflags;\n \tbool allow_spinning = gfpflags_allow_spinning(gfp_mask);\n \n retry:\n \tif (consume_stock(memcg, nr_pages))\n \t\treturn 0;\n+\t/*\n+\t * Reclaim may need memory to free memory. Let it go over the\n+\t * limits for a while rather than fail or OOM kill. Doing this\n+\t * before trying the limits also skips memory.high, so the\n+\t * high_work worker can't queue itself from its own reclaim.\n+\t */\n+\tif (unlikely(current->flags & PF_MEMALLOC))\n+\t\tgoto force;\n \n \tif (!allow_spinning)\n \t\t/* Avoid the refill and flush of the older stock */\n@@ -2683,15 +2690,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \t\tgoto retry;\n \t}\n \n-\t/*\n-\t * Prevent unbounded recursion when reclaim operations need to\n-\t * allocate memory. This might exceed the limits temporarily,\n-\t * but we prefer facilitating memory reclaim and getting back\n-\t * under the limit over triggering OOM kills in these cases.\n-\t */\n-\tif (unlikely(current->flags & PF_MEMALLOC))\n-\t\tgoto force;\n-\n \tif (unlikely(task_in_memcg_oom(current)))\n \t\tgoto nomem;\n \n@@ -2712,7 +2710,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \t\tgoto nomem;\n \n \t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n-\traised_max_event = true;\n \n \tpsi_memstall_enter(&pflags);\n \tnr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,\n@@ -2773,13 +2770,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tif (!(gfp_mask & (__GFP_NOFAIL | __GFP_HIGH)))\n \t\treturn -ENOMEM;\n force:\n-\t/*\n-\t * If the allocation has to be enforced, don't forget to raise\n-\t * a MEMCG_MAX event.\n-\t */\n-\tif (!raised_max_event)\n-\t\t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n-\n \t/*\n \t * The allocation either can't fail or will lead to more memory\n \t * being freed very soon.  Allow memory usage go over the limit\n@@ -2789,6 +2779,15 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tif (do_memsw_account())\n \t\tpage_counter_charge(&memcg->memsw, nr_pages);\n \n+\t/*\n+\t * If the allocation has to be enforced, don't forget to raise\n+\t * a MEMCG_MAX event.\n+\t */\n+\tfor (mem_over_limit = memcg; mem_over_limit;\n+\t     mem_over_limit = parent_mem_cgroup(mem_over_limit))\n+\t\tif (!mem_cgroup_margin(mem_over_limit))\n+\t\t\t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n+\n \treturn 0;\n \n done_restock:\n-- \nMichal Hocko\nSUSE Labs",
+          "reply_to": "Shakeel Butt",
+          "message_date": "2026-11-02",
+          "message_id": "auhN7v127jwy-q-W@tiehlicka",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author acknowledged that their original patch was not sufficient to address the issue, tested an alternative approach (trying charge after reclaim) but found it had its own problems and is still working on a solution.\n\nAuthor acknowledged a fix is needed for the issue of raised_max_event being removed, which would cause forced charges to raise MEMCG_MAX again.\n\nAuthor acknowledged that the patch causes an event to be raised when a charge exactly matches the limit, and this is different from current behavior.\n\nAuthor acknowledged that the patch needs a change to prevent multiple ancestors of a cgroup from receiving events when reclaim charges exceed limits, and stated they want to keep their current version.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged additional issues",
+            "still working on a solution",
+            "acknowledged a fix is needed",
+            "acknowledged a technical issue",
+            "provided additional context",
+            "acknowledged need for change",
+            "stated desire to keep current version"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I actually tested your version as well i.e. after the charge. It is just\nas racy and it has some additional issues which are inlined.\n\n---\n\nFirst, raised_max_event can't go. Since 374f65b14819 rejected charges use it\ntoo, and without it forced charges that already raised MEMCG_MAX before reclaim\nraise it again.\n\n---\n\nSecond, !mem_cgroup_margin() is true at usage == max, so a charge that fits\nexactly raises an event (unlike today).\n\n---\n\nThird, we definitely need a break here otherwise every ancestor at its limit gets\nan event which does not happen today.\n\nI want to keep my current version.",
+          "reply_to": "Michal Hocko",
+          "message_date": "2026-11-02",
+          "message_id": "auli2Zlf1F0tyi4X@linux.dev",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the memcg (memory cgroup) charging mechanism to force charges from reclaim before trying the limits. This change is necessary because reclaim can charge memory, and if it fails at a limit, it can lead to issues such as increased sleep time for tasks in direct reclaim and kswapd recording overage that it never handles. The patch checks for PF_MEMALLOC before trying the limits, allowing reclaim charges to skip memory.high enforcement and preventing kernel threads from queuing high_work. This change also has effects on how charges are counted and handled by cgroups."
     }
   }
 }

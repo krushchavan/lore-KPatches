@@ -1,0 +1,60 @@
+{
+  "thread_id": "aujA7X0IPvtRTmFG@cmpxchg.org",
+  "subject": "[PATCH 2/3] mm/swap: account synchronous swap reads as memory stall",
+  "url": "https://lore.kernel.org/all/aujA7X0IPvtRTmFG@cmpxchg.org/",
+  "dates": {
+    "2026-11-03": {
+      "report_file": "2026-11-02_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Kairui Song",
+          "summary": "Reviewer Kairui Song tested the patch on top of V1 and found it worked well, suggesting no need to move functions but offering to send a revised version (V2) including their changes while retaining the original authorship.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "no clear signal"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I've tested the following code on top of V1, and it worked well; it\nseems there is no need to move some functions or am I missing anything?\nHow about I keep your authorship and just send V2 including this ? :)\nAny other suggestions are welcomed!\n\ndiff --git a/include/linux/swap_ops.h b/include/linux/swap_ops.h\nindex 57ac6c703f68..4d9ddd754712 100644\n--- a/include/linux/swap_ops.h\n+++ b/include/linux/swap_ops.h\n@@ -17,6 +17,17 @@ struct swap_iocb {\n struct swap_io_ctx {\n     struct swap_iocb    *sio;\n     struct swap_info_struct    *sis;\n+\n+    /*\n+     * Pressure accounting window: opened by the addition of first\n+     * folio in a batch, closed by submittion of the batch.\n+     * Values below tracks per-task state, so the task that opened\n+     * the batch must be the one to close it.\n+     */\n+    bool            workingset;\n+    bool            in_delayacct;\n+    bool            in_thrashing;\n+    unsigned long        in_memstall;\n };\n\n /*\ndiff --git a/mm/page_io.c b/mm/page_io.c\nindex 83ed0246ebfc..7d45e5acb951 100644\n--- a/mm/page_io.c\n+++ b/mm/page_io.c\n@@ -470,31 +470,45 @@ void swap_read_folio(struct swap_io_ctx *ctx,\nstruct folio *folio)\n     struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);\n     bool synchronous = sis->flags & SWP_SYNCHRONOUS_IO;\n     bool workingset = folio_test_workingset(folio);\n-    unsigned long pflags;\n-    bool in_thrashing;\n\n     VM_BUG_ON_FOLIO(!folio_test_swapcache(folio) && !synchronous, folio);\n     VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);\n     VM_BUG_ON_FOLIO(folio_test_uptodate(folio), folio);\n\n+    /*\n+     * A batch this folio can't join has to be submitted before the\n+     * pressure window, so that each batch is billed for its own read,\n+     * especially before the possible lookup and decompression below\n+     * rather than making the batch wait for them.\n+     */\n+    if (ctx->sio && !swap_can_merge(ctx, folio, READ))\n+        swap_read_submit(ctx);\n+\n     /*\n      * Count submission time as memory stall and delay. When the device\n      * is congested, or the submitting cgroup IO-throttled, submission\n-     * can be a significant part of overall IO time.\n+     * can be a significant part of overall IO time. Reads are batched and\n+     * submitted later, so both windows stay open on @ctx, and are closed\n+     * by swap_read_submit() after the submission, also when the batch\n+     * ends up with no folio queued.\n      */\n-    if (workingset) {\n-        delayacct_thrashing_start(&in_thrashing);\n-        psi_memstall_enter(&pflags);\n+    if (!ctx->in_delayacct) {\n+        delayacct_swapin_start();\n+        ctx->in_delayacct = true;\n+    }\n+    if (workingset && !ctx->workingset) {\n+        delayacct_thrashing_start(&ctx->in_thrashing);\n+        psi_memstall_enter(&ctx->in_memstall);\n+        ctx->workingset = true;\n     }\n-    delayacct_swapin_start();\n\n     if (swap_read_folio_zeromap(folio)) {\n         folio_unlock(folio);\n-        goto finish;\n+        return;\n     }\n\n     if (zswap_load(folio) != -ENOENT)\n-        goto finish;\n+        return;\n\n     /* We have to read from slower devices. Increase zswap protection. */\n     zswap_folio_swapin(folio);\n@@ -506,13 +520,6 @@ void swap_read_folio(struct swap_io_ctx *ctx,\nstruct folio *folio)\n      */\n     if (synchronous)\n         swap_read_submit(ctx);\n-\n-finish:\n-    if (workingset) {\n-        delayacct_thrashing_end(&in_thrashing);\n-        psi_memstall_leave(&pflags);\n-    }\n-    delayacct_swapin_end();\n }\n\n static void swap_write_end(struct swap_iocb *sio, bool failed)\n@@ -725,10 +732,19 @@ void swap_write_submit(struct swap_io_ctx *ctx)\n\n void swap_read_submit(struct swap_io_ctx *ctx)\n {\n-    if (!ctx->sio)\n-        return;\n-    count_vm_events(NRSWPIN, 1);\n-    ctx->sis->ops->submit_read(ctx);\n-    ctx->sio = NULL;\n-    ctx->sis = NULL;\n+    if (ctx->sio) {\n+        count_vm_events(NRSWPIN, 1);\n+        ctx->sis->ops->submit_read(ctx);\n+        ctx->sio = NULL;\n+        ctx->sis = NULL;\n+    }\n+    if (ctx->workingset) {\n+        delayacct_thrashing_end(&ctx->in_thrashing);\n+        psi_memstall_leave(&ctx->in_memstall);\n+        ctx->workingset = false;\n+    }\n+    if (ctx->in_delayacct) {\n+        delayacct_swapin_end();\n+        ctx->in_delayacct = false;\n+    }\n }",
+          "reply_to": "Johannes Weiner",
+          "message_date": "2026-11-03",
+          "message_id": "CAMgjq7DZYKXGw1McsDT345HS4BNqa46xte_dTJia6EMv2Dy6jg@mail.gmail.com",
+          "email": "ryncsn@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch accounts for synchronous swap reads as memory stalls by modifying the folio_wait_bit_common function to trigger delay accounting and PSI (Pressure Stall Information) when a page is locked, not up-to-date, and in the working set."
+    },
+    "2026-11-02": {
+      "report_file": "2026-11-02_ollama_llama3.1-8b.html",
+      "developer": "Johannes Weiner",
+      "reviews": [
+        {
+          "author": "Johannes Weiner (author)",
+          "summary": "Author explained their design choice to keep the write side in the same sequence, removing redundancy in swap_add_folio(), and confirmed it's easier for readers.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "confirmed design choice",
+            "explained reasoning"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I did that to keep the write side in the same sequence, and remove the\nthen fully redundant submission in swap_add_folio(). Seems a bit\neasier on readers that way.",
+          "reply_to": "Kairui Song",
+          "message_date": "2026-11-02",
+          "message_id": "aujgC6qPrTqewPPP@cmpxchg.org",
+          "email": "hannes@cmpxchg.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch accounts for synchronous swap reads as memory stalls by modifying the folio_wait_bit_common function to trigger delay accounting and PSI (Pressure Stall Information) when a page is locked, not up-to-date, and in the working set."
+    }
+  }
+}

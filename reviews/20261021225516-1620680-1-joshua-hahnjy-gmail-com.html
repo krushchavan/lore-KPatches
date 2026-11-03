@@ -238,9 +238,712 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v7 0/5] mm/page_counter: move stock from mem_cgroup to page_counter</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261021225516.1620680-1-joshua.hahnjy@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-26</strong><div class="date-range-nav">Active on: <a href="#2026-10-26">2026-10-26</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series moves the stock management from mem_cgroup to page_counter, allowing each page_counter to have its own per-CPU cache of pre-charged pages. This change is necessary for future work on scalable and performant page_counters, such as the tiered memcg limits series. The decoupling of memory and memsw stocks in cgroup v1 users may lead to different sizes of precharged caches, but the patch preserves the invariant that memory.usage_in_bytes is less than or equal to memory.memsw.usage_in_bytes by reporting the smaller value. This change has no functional impact on memcg v2 users.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-26</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-02</strong><div class="date-range-nav">Active on: <a href="#2026-11-02">2026-11-02</a> &bull; <a href="#2026-10-26">2026-10-26</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series moves the concept of &#x27;stock&#x27; from mem_cgroup to page_counter, which changes how and when memory stocking becomes fuzzy for cgroup v1 users. The change aims to simplify the logic behind stocking, but may introduce complexity in certain scenarios.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-10-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-10-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-26">2026-10-26</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Michal Hocko requested a high-level design overview of the patch in the cover letter, specifically asking about locking and cache implications at different hierarchy levels. He also questioned how the invariant that memory.memsw.usage_in_bytes is larger than or equal to memory.usage_in_bytes can be broken when counters are always charged together.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">[Sorry for coming to this really late]
+
+On Wed 21-10-26 15:55:09, Joshua Hahn wrote:
+&gt; v6 --&gt; v7
+&gt; =========
+&gt; - Preserve two cgroup v1 proprerties that previously followed implicitly
+&gt;   from sharing a stock:
+&gt;   - memory.usage_in_bytes &lt;= memory.memsw.usage_in_bytes
+&gt;   - Reclaim does not swap when memory and memsw have equal limits.
+&gt; - Wordsmithing commit messages for 4/5 and 5/5 to document the
+&gt;   cgroupv1 divergence (bounded) between memory and memsw caused by
+&gt;   independent stock.
+&gt; 
+&gt; INTRODUCTION
+&gt; ============
+&gt; Memcg keeps a per-CPU stock of precharged pages so that small, frequent
+&gt; allocations do not walk the page_counter hierarchy every time.
+&gt; Today, the stock implementation is within memcontrol code, even though
+&gt; the operation it caches is a page_counter charge. This makes it
+&gt; difficult to add new page_counters to a memcg and preserve the fast
+&gt; path behavior.
+&gt; 
+&gt; This matters for future work like my tiered memcg limits series [1]
+&gt; which introduces multiple new page_counters to memcg. Without making
+&gt; stock a page_counter-level property, it means that every memcg charge
+&gt; now goes through multiple page_counter hierarchy walks, instead of
+&gt; being able to cache these charges.
+&gt; 
+&gt; To make future page_counters scalable and performant, move stock from
+&gt; mem_cgroup to page_counter so that each page_counter can opt into its
+&gt; own per-CPU cache of pre-charged pages.
+
+What does it mean that each counter can opt into its own per-cpu
+caching?
+
+&gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; has all the stock management handled transparently within the
+&gt; page_counter layer.
+
+This is quite a large change and I believe it will be really benefitial
+to have some high level design overview in the cover rather than trying to
+chase it in respective patches.
+Namely, are there any changes to the locking (which is arguably quite
+tricky to allow completely lockless fast path)? Also what are
+implications to caching at different levels of the hierarchy? An example
+of cache propagation up/down the hierarchy during
+charge/uncharge/draining would be really useful to wrap ones head around
+how this is supposed to work.
+
+&gt; EFFECT ON MEMCG V2 USERS
+&gt; ========================
+&gt; This series has no functional changes intended for memcg v2 users. We
+&gt; preserve all draining, refilling, and (un)charging behavior, including
+&gt; the uncharge path&#x27;s refills / direct uncharges.
+&gt; 
+&gt; EFFECT ON MEMCG V1 USERS
+&gt; ========================
+&gt; For memcg v1 users, the decoupling of the memsw and memory stock means
+&gt; that each of them now manage their own independent stocks and can lead
+&gt; to a different size of precharged cache for each.
+&gt; 
+&gt; Cgroup v1 has an invariant that memory.memsw.usage_in_bytes is larger
+&gt; than or equal to memory.usage_in_bytes, because memsw is a superset of
+&gt; memory. With separate stocking, this could have been broken in scenarios
+&gt; where the memory stock is bigger than the memsw stock, leading to
+&gt; memory usage appearing to be inflated and greater than memsw usage,
+&gt; even though the real usage preserves the invariant.
+
+How can this happen when counters are always charged together?
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Mon 26-10-26 08:59:37, Joshua Hahn wrote:
+&gt; On Mon, 26 Oct 2026 10:03:58 +0100 Michal Hocko &lt;mhocko@suse.com&gt; wrote:
+&gt; 
+&gt; &gt; [Sorry for coming to this really late]
+&gt; 
+&gt; Hi Michal, no worries at all : -) Thanks for taking a look!
+&gt; 
+&gt; &gt; On Wed 21-10-26 15:55:09, Joshua Hahn wrote:
+&gt; &gt; &gt; v6 --&gt; v7
+&gt; &gt; &gt; =========
+&gt; &gt; &gt; - Preserve two cgroup v1 proprerties that previously followed implicitly
+&gt; &gt; &gt;   from sharing a stock:
+&gt; &gt; &gt;   - memory.usage_in_bytes &lt;= memory.memsw.usage_in_bytes
+&gt; &gt; &gt;   - Reclaim does not swap when memory and memsw have equal limits.
+&gt; &gt; &gt; - Wordsmithing commit messages for 4/5 and 5/5 to document the
+&gt; &gt; &gt;   cgroupv1 divergence (bounded) between memory and memsw caused by
+&gt; &gt; &gt;   independent stock.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; INTRODUCTION
+&gt; &gt; &gt; ============
+&gt; &gt; &gt; Memcg keeps a per-CPU stock of precharged pages so that small, frequent
+&gt; &gt; &gt; allocations do not walk the page_counter hierarchy every time.
+&gt; &gt; &gt; Today, the stock implementation is within memcontrol code, even though
+&gt; &gt; &gt; the operation it caches is a page_counter charge. This makes it
+&gt; &gt; &gt; difficult to add new page_counters to a memcg and preserve the fast
+&gt; &gt; &gt; path behavior.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; This matters for future work like my tiered memcg limits series [1]
+&gt; &gt; &gt; which introduces multiple new page_counters to memcg. Without making
+&gt; &gt; &gt; stock a page_counter-level property, it means that every memcg charge
+&gt; &gt; &gt; now goes through multiple page_counter hierarchy walks, instead of
+&gt; &gt; &gt; being able to cache these charges.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; To make future page_counters scalable and performant, move stock from
+&gt; &gt; &gt; mem_cgroup to page_counter so that each page_counter can opt into its
+&gt; &gt; &gt; own per-CPU cache of pre-charged pages.
+&gt; &gt; 
+&gt; &gt; What does it mean that each counter can opt into its own per-cpu
+&gt; &gt; caching?
+&gt; 
+&gt; So right now for cgroupv2, there&#x27;s kind of a 1-1 mapping between
+&gt; page_counter and memcg. I say &quot;kind of&quot; because there still is a
+&gt; page_counter for swap, but it takes a completely different charging
+&gt; path (i.e. not try_charge_memcg).
+&gt; 
+&gt; This means that currently stocking charge for memcg is equivalent to
+&gt; stocking charge for the memcg-&gt;memory page_counter.
+
+correct
+
+&gt; However, one of the series that I&#x27;m currently working on [1] adds new
+&gt; page_counters to struct memcg to track the usage of memory
+&gt; per-memcg, per-tier. The goal is to (1) track how much memory of a
+&gt; cgroup lives on which tier, and (2) to limit the usage so that a single
+&gt; cgroup doesn&#x27;t use up all the fast tier memory alone, and shares it
+&gt; fairly with all the other cgroups on the host.
+
+Right. I guess you have layed down your motivation quite well in your
+original cover letter.
+
+&gt; When adding a new per-tier page_counter to struct mem_cgroup that gets
+&gt; charged for every memcg_charge, I cannot use the stock fastpath since
+&gt; the stock does not distinguish where the memory resides. It would
+&gt; essentialy boil down to this pattern:
+&gt; 
+&gt; try_charge_memcg
+&gt;    \__ page_couner_try_charge(memcg-&gt;tier[0])
+&gt;    \__ consume_stock()
+&gt; 
+&gt; Where every path still has to do a hierarchy charge to the tier it&#x27;s
+&gt; charging to, whereas this patch gets us:
+&gt; 
+&gt; try_charge_memcg
+&gt;    \__ page_counter_try_charge(memcg-&gt;tier[0])
+&gt;           \__ consume_stock(memcg-&gt;tier[0])
+&gt;    \__ page_countertry_charge(memcg-&gt;memory)
+&gt;           \__ consume_stock(memcg-&gt;memory)
+&gt; 
+&gt; So that we can avoid the hierarchy walk for most charges.
+&gt; 
+&gt; I&#x27;d be happy to submit a new cover letter which better explains this
+&gt; idea!
+
+I guess I still do not understand what you mean by opting-in to the
+caching. I believe you should focus less about what you plan to do and
+rather explain what _this_ patchset achieves and how it works.
+Also focus on describing why do we need to keep caches on all layers of
+the hierarchy.
+
+&gt; &gt; &gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; &gt; &gt; has all the stock management handled transparently within the
+&gt; &gt; &gt; page_counter layer.
+&gt; &gt; 
+&gt; &gt; This is quite a large change and I believe it will be really benefitial
+&gt; &gt; to have some high level design overview in the cover rather than trying to
+&gt; &gt; chase it in respective patches.
+&gt; 
+&gt; Sounds good with me. I can add the call traces above which should
+&gt; explain my thought process a bit more. Hopefully the problem I am
+&gt; trying to solve is evident there.
+
+I believe I follow where you are heading. I am not sure this is the
+right path but that is a separate discussion. I would focus on whether
+moving cache to the counter makes sense on its own (without that future
+work) at this stage. Quite honestly I am still not convinced this move
+is the right thing but I would like to fully understand the mechanics
+first. Having discrepancies among different counters just sounds like a
+potential source of future problems.
+
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Mon 02-11-26 07:20:17, Joshua Hahn wrote:
+&gt; On Mon, 2 Nov 2026 13:25:28 +0100 Michal Hocko &lt;mhocko@suse.com&gt; wrote:
+&gt; 
+&gt; &gt; On Mon 26-10-26 08:59:37, Joshua Hahn wrote:
+&gt; &gt; I guess I still do not understand what you mean by opting-in to the
+&gt; &gt; caching.
+&gt; 
+&gt; Reading my original cover letter again, yeah. It does feel a bit strange
+&gt; to call it &quot;opt-in&quot;... I guess I just meant that not all page_coutners
+&gt; will be getting it, it would only really be the memory page_counter
+&gt; (and memsw page_counter for cgroup v2). I&#x27;ll change the wording in the
+&gt; next version.
+
+OK, that makes it clear to me now.
+
+[...]
+&gt; &gt; &gt; &gt; &gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; &gt; &gt; &gt; &gt; has all the stock management handled transparently within the
+&gt; &gt; &gt; &gt; &gt; page_counter layer.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; This is quite a large change and I believe it will be really benefitial
+&gt; &gt; &gt; &gt; to have some high level design overview in the cover rather than trying to
+&gt; &gt; &gt; &gt; chase it in respective patches.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Sounds good with me. I can add the call traces above which should
+&gt; &gt; &gt; explain my thought process a bit more. Hopefully the problem I am
+&gt; &gt; &gt; trying to solve is evident there.
+&gt; &gt; 
+&gt; &gt; I believe I follow where you are heading. I am not sure this is the
+&gt; &gt; right path but that is a separate discussion. I would focus on whether
+&gt; &gt; moving cache to the counter makes sense on its own (without that future
+&gt; &gt; work) at this stage.
+&gt; 
+&gt; If I&#x27;m being honest, most of the generic benefits that exist beyond that
+&gt; work were in the other part of this series that I got rid of to scale
+&gt; down the scope of this version. But to explicitly name the generic
+&gt; benefits, it would be unbounded memcg stock caching per-cpu, eliminating
+&gt; random evictions, (like you mentioned above as well) limiting stocks
+&gt; to leaf memcgs only, etc.
+
+limiting cache to leaf memcgs makes a lot of sense and addresses a big
+concern I had. How exactly does this work?
+ 
+&gt; I think there was a proposal to make the number of memcg stocks per cpu
+&gt; even lower than it already is, because the author wanted to include
+&gt; additional fields into the stock that would make 7 no longer fit into
+&gt; a single cacheline. I feel like we are reaching some limits with that
+&gt; side as well, so the &quot;unbounded&quot; portion seems to be quite opportune.
+&gt; 
+&gt; But I believe those benefits that we would like to see are made better
+&gt; by this series, which makes the stocking transparent such that the new
+&gt; optimizations don&#x27;t make the existing memcg charging code any more
+&gt; complex than it is. By abstracting away this mechanism, we can make sure
+&gt; that memcg just handles the logical charging semantics, and page_counter
+&gt; handles the implementation-level details of stock management.
+
+Yes, these are all good arguments. Especially when clarified that this
+leaf only feature. I have to say I was struggling to see how caching on
+all levels of the hierarchy would work in practice.
+
+&gt; Personally I am a big fan of how try_charge_memcg looks after this
+&gt; series, what do you think? 
+&gt; 
+&gt; &gt; Quite honestly I am still not convinced this move
+&gt; &gt; is the right thing but I would like to fully understand the mechanics
+&gt; &gt; first. Having discrepancies among different counters just sounds like a
+&gt; &gt; potential source of future problems.
+&gt; 
+&gt; I hope that I can present a good argument for why this is not as
+&gt; concern as it may seem initially.
+&gt; 
+&gt; My first point is that the memory usage counters were always fuzzy, as
+&gt; specified in the memcg v1 documentation too: 
+&gt; 
+&gt; usage_in_bytes ... doesn&#x27;t show &#x27;exact&#x27; value of memory (and swap)
+&gt; usage, it&#x27;s a fuzz value for efficient access.
+&gt; 
+&gt; Secondly, the raw value of the usage is actually always accurate. It is
+&gt; just the stock portion that overcharge the memory at times, making it
+&gt; seem like there is a discrepancy. Flushing the memcg stock immediately
+&gt; bring the counters to their real values (like what happens right now).
+&gt; 
+&gt; Finally, this is a change that is only limited to cgroup v1 users.
+
+Right but is there any actual point in adding caching for memsw charges
+now? If you have a way to opt-in to caching then you can simply disabled
+that for memsw counter altogether. Fewer problems to deal with, explain
+etc...
+
+&gt; This entire series actually has no effect at all on cgroup v2 users,
+&gt; which I think is a nice perk. Obviously I&#x27;m not out here trying to
+&gt; make cgroup v1 unusable, but I wonder if anyone is still using the
+&gt; legacy feature.
+&gt; 
+&gt; I hope this wasn&#x27;t too much of a brain dump on you. Thanks for your
+&gt; feedback Michal. Please let me know if there is anything I can do to
+&gt; clarify my intent.
+&gt; 
+&gt; Would you prefer if we continud the discussion here, or if I sent out
+&gt; a new series with just the cover letter changed? (I don&#x27;t anticipate
+&gt; any code changes, based on sashiko review or anything else that I see).
+
+Let&#x27;s just iron out things first.
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Mon 02-11-26 08:30:14, Joshua Hahn wrote:
+&gt; On Mon, 2 Nov 2026 17:16:12 +0100 Michal Hocko &lt;mhocko@suse.com&gt; wrote:
+&gt; 
+&gt; &gt; &gt; &gt; &gt; &gt; &gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; &gt; &gt; &gt; &gt; &gt; &gt; has all the stock management handled transparently within the
+&gt; &gt; &gt; &gt; &gt; &gt; &gt; page_counter layer.
+&gt; &gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; &gt; This is quite a large change and I believe it will be really benefitial
+&gt; &gt; &gt; &gt; &gt; &gt; to have some high level design overview in the cover rather than trying to
+&gt; &gt; &gt; &gt; &gt; &gt; chase it in respective patches.
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; Sounds good with me. I can add the call traces above which should
+&gt; &gt; &gt; &gt; &gt; explain my thought process a bit more. Hopefully the problem I am
+&gt; &gt; &gt; &gt; &gt; trying to solve is evident there.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; I believe I follow where you are heading. I am not sure this is the
+&gt; &gt; &gt; &gt; right path but that is a separate discussion. I would focus on whether
+&gt; &gt; &gt; &gt; moving cache to the counter makes sense on its own (without that future
+&gt; &gt; &gt; &gt; work) at this stage.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; If I&#x27;m being honest, most of the generic benefits that exist beyond that
+&gt; &gt; &gt; work were in the other part of this series that I got rid of to scale
+&gt; &gt; &gt; down the scope of this version. But to explicitly name the generic
+&gt; &gt; &gt; benefits, it would be unbounded memcg stock caching per-cpu, eliminating
+&gt; &gt; &gt; random evictions, (like you mentioned above as well) limiting stocks
+&gt; &gt; &gt; to leaf memcgs only, etc.
+&gt; &gt; 
+&gt; &gt; limiting cache to leaf memcgs makes a lot of sense and addresses a big
+&gt; &gt; concern I had. How exactly does this work?
+&gt; 
+&gt; It&#x27;s not a big change, actually. This was the implementation from the
+&gt; origianl RFC of the series:
+&gt; 
+&gt; https://lore.kernel.org/all/20260410210742.550489-8-joshua.hahnjy@gmail.com/
+&gt; 
+&gt; The idea is that you treat a cgroup as a leaf until it becomes a parent,
+&gt; at which point you drain the stock. Stock can land on the parent due
+&gt; to hierarchy walks, but I can also write another part to this that
+&gt; prevents stock from getting cached when a cgroup has children.
+
+OK, makes sense.
+
+&gt; &gt; &gt; I think there was a proposal to make the number of memcg stocks per cpu
+&gt; &gt; &gt; even lower than it already is, because the author wanted to include
+&gt; &gt; &gt; additional fields into the stock that would make 7 no longer fit into
+&gt; &gt; &gt; a single cacheline. I feel like we are reaching some limits with that
+&gt; &gt; &gt; side as well, so the &quot;unbounded&quot; portion seems to be quite opportune.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; But I believe those benefits that we would like to see are made better
+&gt; &gt; &gt; by this series, which makes the stocking transparent such that the new
+&gt; &gt; &gt; optimizations don&#x27;t make the existing memcg charging code any more
+&gt; &gt; &gt; complex than it is. By abstracting away this mechanism, we can make sure
+&gt; &gt; &gt; that memcg just handles the logical charging semantics, and page_counter
+&gt; &gt; &gt; handles the implementation-level details of stock management.
+&gt; &gt; 
+&gt; &gt; Yes, these are all good arguments. Especially when clarified that this
+&gt; &gt; leaf only feature. I have to say I was struggling to see how caching on
+&gt; &gt; all levels of the hierarchy would work in practice.
+&gt; 
+&gt; Sounds good. If it makes sense to you then, I can fold in the
+&gt; leaf-only caching into this series to maintain more parity with the
+&gt; existing code. How does that sound? 
+
+good
+
+&gt; &gt; &gt; Personally I am a big fan of how try_charge_memcg looks after this
+&gt; &gt; &gt; series, what do you think? 
+&gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; Quite honestly I am still not convinced this move
+&gt; &gt; &gt; &gt; is the right thing but I would like to fully understand the mechanics
+&gt; &gt; &gt; &gt; first. Having discrepancies among different counters just sounds like a
+&gt; &gt; &gt; &gt; potential source of future problems.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; I hope that I can present a good argument for why this is not as
+&gt; &gt; &gt; concern as it may seem initially.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; My first point is that the memory usage counters were always fuzzy, as
+&gt; &gt; &gt; specified in the memcg v1 documentation too: 
+&gt; &gt; &gt; 
+&gt; &gt; &gt; usage_in_bytes ... doesn&#x27;t show &#x27;exact&#x27; value of memory (and swap)
+&gt; &gt; &gt; usage, it&#x27;s a fuzz value for efficient access.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Secondly, the raw value of the usage is actually always accurate. It is
+&gt; &gt; &gt; just the stock portion that overcharge the memory at times, making it
+&gt; &gt; &gt; seem like there is a discrepancy. Flushing the memcg stock immediately
+&gt; &gt; &gt; bring the counters to their real values (like what happens right now).
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Finally, this is a change that is only limited to cgroup v1 users.
+&gt; &gt; 
+&gt; &gt; Right but is there any actual point in adding caching for memsw charges
+&gt; &gt; now? If you have a way to opt-in to caching then you can simply disabled
+&gt; &gt; that for memsw counter altogether. Fewer problems to deal with, explain
+&gt; &gt; etc...
+&gt; 
+&gt; I think the problem actually still exists, unfortunately. In fact I
+&gt; think the issue becomes bigger if you remove stocking for memsw.
+
+Yes, you are right. We do actually cache memsw through the charging path
+which charges both mem and memsw with the batch. 
+-- 
+Michal Hocko
+SUSE Labs
+
+---
+
+On Mon 02-11-26 12:40:33, Joshua Hahn wrote:
+&gt; &gt; &gt; &gt; &gt; Personally I am a big fan of how try_charge_memcg looks after this
+&gt; &gt; &gt; &gt; &gt; series, what do you think?
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; &gt; Quite honestly I am still not convinced this move
+&gt; &gt; &gt; &gt; &gt; &gt; is the right thing but I would like to fully understand the mechanics
+&gt; &gt; &gt; &gt; &gt; &gt; first. Having discrepancies among different counters just sounds like a
+&gt; &gt; &gt; &gt; &gt; &gt; potential source of future problems.
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; I hope that I can present a good argument for why this is not as
+&gt; &gt; &gt; &gt; &gt; concern as it may seem initially.
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; My first point is that the memory usage counters were always fuzzy, as
+&gt; &gt; &gt; &gt; &gt; specified in the memcg v1 documentation too:
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; usage_in_bytes ... doesn&#x27;t show &#x27;exact&#x27; value of memory (and swap)
+&gt; &gt; &gt; &gt; &gt; usage, it&#x27;s a fuzz value for efficient access.
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; Secondly, the raw value of the usage is actually always accurate. It is
+&gt; &gt; &gt; &gt; &gt; just the stock portion that overcharge the memory at times, making it
+&gt; &gt; &gt; &gt; &gt; seem like there is a discrepancy. Flushing the memcg stock immediately
+&gt; &gt; &gt; &gt; &gt; bring the counters to their real values (like what happens right now).
+&gt; &gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; Finally, this is a change that is only limited to cgroup v1 users.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; Right but is there any actual point in adding caching for memsw charges
+&gt; &gt; &gt; &gt; now? If you have a way to opt-in to caching then you can simply disabled
+&gt; &gt; &gt; &gt; that for memsw counter altogether. Fewer problems to deal with, explain
+&gt; &gt; &gt; &gt; etc...
+&gt; &gt; &gt;
+&gt; &gt; &gt; I think the problem actually still exists, unfortunately. In fact I
+&gt; &gt; &gt; think the issue becomes bigger if you remove stocking for memsw.
+&gt; &gt;
+&gt; &gt; Yes, you are right. We do actually cache memsw through the charging path
+&gt; &gt; which charges both mem and memsw with the batch.
+&gt; 
+&gt; Thanks, Michal! So it seems like we are in alignment on everything
+&gt; except the cgroup v1 implications for fuzziness. FWIW I think nothing
+&gt; really changes from the userspace POV. memsw and memory usage has
+&gt; always been fuzzy due to stocking, so all this series does is to
+&gt; change &quot;why&quot; and &quot;when&quot; the stocking becomes fuzzy.
+
+Right. The discrepancy was not so obvious but I agree that this change
+doesn&#x27;t fundamentally change the picture.
+
+&gt; What do you think about this? The other alternative would be to remove
+&gt; stocking for cgroup v1 users completely. But I am not sure that is a
+&gt; good solution either. For the record, I tried making the stock tied
+&gt; together so that they refill together, but that was a nightmare in
+&gt; terms of added complexity.
+
+Nah, that seems overreaching without much added value. While we do not
+support new features in v1 we shouldn&#x27;t cripple performance for those
+users unless there is no other way around.
+
+-- 
+Michal Hocko
+SUSE Labs</pre>
+</details>
+<a href="https://lore.kernel.org/r/at8XfoqWwe9HSL9y@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested design overview, questioned patch logic</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged Michal&#x27;s concern about cgroup v1 implications and agreed that nothing changes from the userspace POV, confirming alignment on all issues except fuzziness.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Sounds good with me, and I also agree here. OK! I think it seems like
+we are in alignment with everything. Let me spin up a new cover letter
+being more explicit about everything we&#x27;ve covered here and send it
+out soon. This was really helpful for me, thank you for your time
+Michal : -)
+
+Have a great day!!
+Joshua</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Michal Hocko</div>
+<a href="https://lore.kernel.org/r/CAN+CAwNVuxqHxbaEuu2n8BmUtXhuVeX5v-v5Gu7eegyV0sT+=g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: alignment, agreement</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch doesn&#x27;t fundamentally change the cgroup v1 implications for fuzziness, and suggested considering removing stocking for cgroup v1 users completely as an alternative solution.
+
+Reviewer argued that removing stocking for cgroup v1 users would be overreaching and cripple performance without sufficient added value, suggesting a more nuanced approach is needed.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Right. The discrepancy was not so obvious but I agree that this change
+doesn&#x27;t fundamentally change the picture.
+
+---
+
+Nah, that seems overreaching without much added value. While we do not
+support new features in v1 we shouldn&#x27;t cripple performance for those
+users unless there is no other way around.
+
+-- 
+Michal Hocko
+SUSE Labs</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
+<a href="https://lore.kernel.org/r/aujSP_sfbasQaKu7@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreement, considering alternative solutions, overreaching</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledges Michal&#x27;s concern about cgroup v1 implications for fuzziness and explains that the patch only changes &#x27;why&#x27; and &#x27;when&#x27; stocking becomes fuzzy, not the userspace POV.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks, Michal! So it seems like we are in alignment on everything
+except the cgroup v1 implications for fuzziness. FWIW I think nothing
+really changes from the userspace POV. memsw and memory usage has
+always been fuzzy due to stocking, so all this series does is to
+change &quot;why&quot; and &quot;when&quot; the stocking becomes fuzzy.
+
+What do you think about this? The other alternative would be to remove
+stocking for cgroup v1 users completely. But I am not sure that is a
+good solution either. For the record, I tried making the stock tied
+together so that they refill together, but that was a nightmare in
+terms of added complexity.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Michal Hocko</div>
+<a href="https://lore.kernel.org/r/CAN+CAwOwRJUDXHj0RMr4p2+sdA1V9bX-OgOH1PpER+u_cB2fAg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges a concern, provides an explanation</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that caching memsw through the charging path breaks the invariant that memory &lt;= memsw, and suggested removing stocking for cgroup v1 users as a potential solution.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Yes, you are right. We do actually cache memsw through the charging path
+which charges both mem and memsw with the batch. 
+-- 
+Michal Hocko
+SUSE Labs</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
+<a href="https://lore.kernel.org/r/aujCcqKKyio7oZ0x@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: potential issue with memsw caching, suggested alternative solution</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Joshua Hahn (author)</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author addressed Michal&#x27;s concern about the &#x27;opt-in&#x27; wording in the patch, explaining it was meant for memory page_counter and memsw page_counter, and agreed to change the wording in the next version.
+
+Author addresses Michal&#x27;s concern about the patch&#x27;s scope and potential optimizations, agrees to add leaf-only caching to the current series to maintain parity with existing code.
+
+The author acknowledges that removing stocking for memsw exacerbates the issue of invariant memory &lt;= memsw being broken, and proposes removing stocking for cgroup v1 users as a potential solution.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">It&#x27;s not a big change, actually. This was the implementation from the
+origianl RFC of the series:
+
+https://lore.kernel.org/all/20260410210742.550489-8-joshua.hahnjy@gmail.com/
+
+The idea is that you treat a cgroup as a leaf until it becomes a parent,
+at which point you drain the stock. Stock can land on the parent due
+to hierarchy walks, but I can also write another part to this that
+prevents stock from getting cached when a cgroup has children.
+
+---
+
+Sounds good. If it makes sense to you then, I can fold in the
+leaf-only caching into this series to maintain more parity with the
+existing code. How does that sound?
+
+---
+
+I think the problem actually still exists, unfortunately. In fact I
+think the issue becomes bigger if you remove stocking for memsw.
+
+Let&#x27;s say only memory gets stock. Then on a single page charge for a
+new cgroup:
+
+memory page_counter charges 64 pages to refill the stock, memsw only
+charges 1 page to fulfill the current allocation. Then you have
+memory: 64 pages
+memsw: 1 page
+
+And the invariant that memory &lt;= memsw is immediately broken.
+
+Unfortunately only stocking for memsw is not a solution as well since
+successful memsw charges still charge memory and will therefore go
+through a hierarchy walk.
+
+Actually maybe then, the solution is just to remove stocking for
+cgroup v1 users? Does that sound like a fair tradeoff to you?</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Michal Hocko</div>
+<a href="https://lore.kernel.org/r/20261102163014.237806-1-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation, agreed to restructure</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-11-02">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Michal Hocko</span>
+<a class="date-chip" href="../2026-11-02_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-02">2026-11-02</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Michal Hocko noted that the patch description initially seemed to imply an &#x27;opt-in&#x27; mechanism for page_counters, but clarified that this was not the case and only referred to the memory page_counter and memsw page_counter for cgroup v2. He expressed understanding after reading the original cover letter again.
+
+Reviewer Michal Hocko asked how the patch handles limiting the cache to leaf memcgroups, expressing relief that it addresses one of his concerns.
+
+Reviewer Michal Hocko expressed initial concerns about the patch, but after clarification that it&#x27;s a &#x27;leaf only&#x27; feature, he found it more understandable and acknowledged the benefits of caching on all levels of the hierarchy.
+
+Reviewer Michal Hocko questioned the necessity of adding caching for memsw charges, suggesting that disabling it would be a simpler solution if opt-in is available.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">OK, that makes it clear to me now.
+
+[...]
+
+---
+
+limiting cache to leaf memcgs makes a lot of sense and addresses a big
+concern I had. How exactly does this work?
+
+---
+
+Yes, these are all good arguments. Especially when clarified that this
+leaf only feature. I have to say I was struggling to see how caching on
+all levels of the hierarchy would work in practice.
+
+---
+
+Right but is there any actual point in adding caching for memsw charges
+now? If you have a way to opt-in to caching then you can simply disabled
+that for memsw counter altogether. Fewer problems to deal with, explain
+etc...</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
+<a href="https://lore.kernel.org/r/aui3TJqadHUv-4RW@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, understanding, NEEDS_WORK</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
@@ -249,18 +952,49 @@
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The author is addressing concerns about the patch&#x27;s impact on cgroupv2, specifically how it will interact with new page_counters being added to struct memcg. The author acknowledges that the current implementation of stocking charge for memcg is equivalent to stocking charge for the memcg-&gt;memory page_counter and explains that their ongoing work adds new per-tier page_counters to struct memcg, which cannot use the stock fastpath due to its inability to distinguish memory residence. They argue that their patch avoids hierarchy walks for most charges.
-
-Author agrees that additional context is needed and plans to provide it by adding call traces, indicating that no fix is currently planned but more information will be provided.
-
-Author addressed a concern about the impact of separate stocking on cgroup v1 users by explaining that memory.usage_in_bytes will be reported as the smaller of raw memory and memsw values to preserve the invariant.
-
-Author acknowledged that cgroup v2 users should not see any changes in the patch series and offered to provide additional explanation on how stocking currently works.
-
-The author is addressing concerns about the behavior of reporting memory usage when memsw and memory stocks are decoupled. He acknowledges that there can be an inversion where memsw reports a higher usage than memory, but explains that this is due to how direct charging works in such scenarios. The author proposes fuzzily reporting the minimum of the two reported values, which he claims aligns with the existing fuzzy nature of usage_in_bytes.</div>
+<div class="review-comment-text">The author is addressing concerns about the patch&#x27;s impact on cgroup v2 users, specifically regarding locking and caching behavior. The author explains that there are no changes to locking and that the series should not affect caching at different levels of the hierarchy for cgroup v2 users. They agree to add a high-level design overview in the cover letter and provide additional explanations, including call traces and visual examples.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">So right now for cgroupv2, there&#x27;s kind of a 1-1 mapping between
+<pre class="raw-body-text">On Mon, 26 Oct 2026 10:03:58 +0100 Michal Hocko &lt;mhocko@suse.com&gt; wrote:
+
+&gt; [Sorry for coming to this really late]
+
+Hi Michal, no worries at all : -) Thanks for taking a look!
+
+&gt; On Wed 21-10-26 15:55:09, Joshua Hahn wrote:
+&gt; &gt; v6 --&gt; v7
+&gt; &gt; =========
+&gt; &gt; - Preserve two cgroup v1 proprerties that previously followed implicitly
+&gt; &gt;   from sharing a stock:
+&gt; &gt;   - memory.usage_in_bytes &lt;= memory.memsw.usage_in_bytes
+&gt; &gt;   - Reclaim does not swap when memory and memsw have equal limits.
+&gt; &gt; - Wordsmithing commit messages for 4/5 and 5/5 to document the
+&gt; &gt;   cgroupv1 divergence (bounded) between memory and memsw caused by
+&gt; &gt;   independent stock.
+&gt; &gt; 
+&gt; &gt; INTRODUCTION
+&gt; &gt; ============
+&gt; &gt; Memcg keeps a per-CPU stock of precharged pages so that small, frequent
+&gt; &gt; allocations do not walk the page_counter hierarchy every time.
+&gt; &gt; Today, the stock implementation is within memcontrol code, even though
+&gt; &gt; the operation it caches is a page_counter charge. This makes it
+&gt; &gt; difficult to add new page_counters to a memcg and preserve the fast
+&gt; &gt; path behavior.
+&gt; &gt; 
+&gt; &gt; This matters for future work like my tiered memcg limits series [1]
+&gt; &gt; which introduces multiple new page_counters to memcg. Without making
+&gt; &gt; stock a page_counter-level property, it means that every memcg charge
+&gt; &gt; now goes through multiple page_counter hierarchy walks, instead of
+&gt; &gt; being able to cache these charges.
+&gt; &gt; 
+&gt; &gt; To make future page_counters scalable and performant, move stock from
+&gt; &gt; mem_cgroup to page_counter so that each page_counter can opt into its
+&gt; &gt; own per-CPU cache of pre-charged pages.
+&gt; 
+&gt; What does it mean that each counter can opt into its own per-cpu
+&gt; caching?
+
+So right now for cgroupv2, there&#x27;s kind of a 1-1 mapping between
 page_counter and memcg. I say &quot;kind of&quot; because there still is a
 page_counter for swap, but it takes a completely different charging
 path (i.e. not try_charge_memcg).
@@ -298,26 +1032,55 @@ So that we can avoid the hierarchy walk for most charges.
 I&#x27;d be happy to submit a new cover letter which better explains this
 idea!
 
----
+&gt; &gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; &gt; has all the stock management handled transparently within the
+&gt; &gt; page_counter layer.
+&gt; 
+&gt; This is quite a large change and I believe it will be really benefitial
+&gt; to have some high level design overview in the cover rather than trying to
+&gt; chase it in respective patches.
 
 Sounds good with me. I can add the call traces above which should
 explain my thought process a bit more. Hopefully the problem I am
 trying to solve is evident there.
 
----
+&gt; Namely, are there any changes to the locking (which is arguably quite
+&gt; tricky to allow completely lockless fast path)?
 
 No changes to locking. In fact this series is mostly just moving code
 from mm/memcontrol.c to mm/page_counter.c, everything is essentially
-the same.
+the same. 
 
----
+&gt; Also what are implications to caching at different levels of the
+&gt; hierarchy? An example of cache propagation up/down the hierarchy during
+&gt; charge/uncharge/draining would be really useful to wrap ones head around
+&gt; how this is supposed to work.
 
 This series should not have any changes for cgroup v2, including when
 and where the cache is stocked / drained in the hierarchy. I can
 include a snippet on how stocking currently works to add a visual
 explanation, if that helps too.
 
----
+&gt; &gt; EFFECT ON MEMCG V2 USERS
+&gt; &gt; ========================
+&gt; &gt; This series has no functional changes intended for memcg v2 users. We
+&gt; &gt; preserve all draining, refilling, and (un)charging behavior, including
+&gt; &gt; the uncharge path&#x27;s refills / direct uncharges.
+&gt; &gt; 
+&gt; &gt; EFFECT ON MEMCG V1 USERS
+&gt; &gt; ========================
+&gt; &gt; For memcg v1 users, the decoupling of the memsw and memory stock means
+&gt; &gt; that each of them now manage their own independent stocks and can lead
+&gt; &gt; to a different size of precharged cache for each.
+&gt; &gt; 
+&gt; &gt; Cgroup v1 has an invariant that memory.memsw.usage_in_bytes is larger
+&gt; &gt; than or equal to memory.usage_in_bytes, because memsw is a superset of
+&gt; &gt; memory. With separate stocking, this could have been broken in scenarios
+&gt; &gt; where the memory stock is bigger than the memsw stock, leading to
+&gt; &gt; memory usage appearing to be inflated and greater than memsw usage,
+&gt; &gt; even though the real usage preserves the invariant.
+&gt; 
+&gt; How can this happen when counters are always charged together?
 
 Yeah, so this part is a little bit annoying. Let&#x27;s just look at a single
 leaf cgroup for example, where the limit for memsw and memory are both
@@ -359,55 +1122,354 @@ IIRC usage_in_bytes has always been fuzzy anyways, due to how much
 memory has been stocked.
 
 Thanks again for taking a look, Michal! I hope you have a great day : -)
-Joshua</pre>
+Joshua
+
+&gt; -- 
+&gt; Michal Hocko
+&gt; SUSE Labs
+
+[1] https://lore.kernel.org/all/20260807202059.2620949-1-joshua.hahnjy@gmail.com/
+
+---
+
+On Mon, 2 Nov 2026 13:25:28 +0100 Michal Hocko &lt;mhocko@suse.com&gt; wrote:
+
+&gt; On Mon 26-10-26 08:59:37, Joshua Hahn wrote:
+&gt; &gt; &gt; &gt; To make future page_counters scalable and performant, move stock from
+&gt; &gt; &gt; &gt; mem_cgroup to page_counter so that each page_counter can opt into its
+&gt; &gt; &gt; &gt; own per-CPU cache of pre-charged pages.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; What does it mean that each counter can opt into its own per-cpu
+&gt; &gt; &gt; caching?
+&gt; &gt; 
+&gt; &gt; So right now for cgroupv2, there&#x27;s kind of a 1-1 mapping between
+&gt; &gt; page_counter and memcg. I say &quot;kind of&quot; because there still is a
+&gt; &gt; page_counter for swap, but it takes a completely different charging
+&gt; &gt; path (i.e. not try_charge_memcg).
+&gt; &gt; 
+&gt; &gt; This means that currently stocking charge for memcg is equivalent to
+&gt; &gt; stocking charge for the memcg-&gt;memory page_counter.
+&gt; 
+&gt; correct
+&gt; 
+&gt; &gt; However, one of the series that I&#x27;m currently working on [1] adds new
+&gt; &gt; page_counters to struct memcg to track the usage of memory
+&gt; &gt; per-memcg, per-tier. The goal is to (1) track how much memory of a
+&gt; &gt; cgroup lives on which tier, and (2) to limit the usage so that a single
+&gt; &gt; cgroup doesn&#x27;t use up all the fast tier memory alone, and shares it
+&gt; &gt; fairly with all the other cgroups on the host.
+&gt; 
+&gt; Right. I guess you have layed down your motivation quite well in your
+&gt; original cover letter.
+
+Thanks, Michal!
+
+&gt; &gt; When adding a new per-tier page_counter to struct mem_cgroup that gets
+&gt; &gt; charged for every memcg_charge, I cannot use the stock fastpath since
+&gt; &gt; the stock does not distinguish where the memory resides. It would
+&gt; &gt; essentialy boil down to this pattern:
+&gt; &gt; 
+&gt; &gt; try_charge_memcg
+&gt; &gt;    \__ page_couner_try_charge(memcg-&gt;tier[0])
+&gt; &gt;    \__ consume_stock()
+&gt; &gt; 
+&gt; &gt; Where every path still has to do a hierarchy charge to the tier it&#x27;s
+&gt; &gt; charging to, whereas this patch gets us:
+&gt; &gt; 
+&gt; &gt; try_charge_memcg
+&gt; &gt;    \__ page_counter_try_charge(memcg-&gt;tier[0])
+&gt; &gt;           \__ consume_stock(memcg-&gt;tier[0])
+&gt; &gt;    \__ page_countertry_charge(memcg-&gt;memory)
+&gt; &gt;           \__ consume_stock(memcg-&gt;memory)
+&gt; &gt; 
+&gt; &gt; So that we can avoid the hierarchy walk for most charges.
+&gt; &gt; 
+&gt; &gt; I&#x27;d be happy to submit a new cover letter which better explains this
+&gt; &gt; idea!
+&gt; 
+&gt; I guess I still do not understand what you mean by opting-in to the
+&gt; caching.
+
+Reading my original cover letter again, yeah. It does feel a bit strange
+to call it &quot;opt-in&quot;... I guess I just meant that not all page_coutners
+will be getting it, it would only really be the memory page_counter
+(and memsw page_counter for cgroup v2). I&#x27;ll change the wording in the
+next version.
+
+&gt; I believe you should focus less about what you plan to do and
+&gt; rather explain what _this_ patchset achieves and how it works.
+&gt; Also focus on describing why do we need to keep caches on all layers of
+&gt; the hierarchy.
+
+Yes, I&#x27;ll do that. Actually, this patchset is really quite limited in
+what it does. I actually explicitly tried to do no optimizations or
+behavioral changes at all, this is mostly just a clean-cut code
+move from memcg code to page_counter code. 
+
+You may recall earlier versions of this series did a bunch more stuff
+(making the stock scale past 7 memcgs, dynamically allocating the stock,
+at some point I even had a version that only cached leaf cgroups, etc.)
+
+I got some feedback that these optimizations were orthogonal to the
+movement of stock from memcg to page_counter, which is why this version
+explicitly does none of the fancy optimizations on top. It mostly is
+just moving code from memcg to page_counter.
+
+&gt; &gt; &gt; &gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; &gt; &gt; &gt; has all the stock management handled transparently within the
+&gt; &gt; &gt; &gt; page_counter layer.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; This is quite a large change and I believe it will be really benefitial
+&gt; &gt; &gt; to have some high level design overview in the cover rather than trying to
+&gt; &gt; &gt; chase it in respective patches.
+&gt; &gt; 
+&gt; &gt; Sounds good with me. I can add the call traces above which should
+&gt; &gt; explain my thought process a bit more. Hopefully the problem I am
+&gt; &gt; trying to solve is evident there.
+&gt; 
+&gt; I believe I follow where you are heading. I am not sure this is the
+&gt; right path but that is a separate discussion. I would focus on whether
+&gt; moving cache to the counter makes sense on its own (without that future
+&gt; work) at this stage.
+
+If I&#x27;m being honest, most of the generic benefits that exist beyond that
+work were in the other part of this series that I got rid of to scale
+down the scope of this version. But to explicitly name the generic
+benefits, it would be unbounded memcg stock caching per-cpu, eliminating
+random evictions, (like you mentioned above as well) limiting stocks
+to leaf memcgs only, etc.
+
+I think there was a proposal to make the number of memcg stocks per cpu
+even lower than it already is, because the author wanted to include
+additional fields into the stock that would make 7 no longer fit into
+a single cacheline. I feel like we are reaching some limits with that
+side as well, so the &quot;unbounded&quot; portion seems to be quite opportune.
+
+But I believe those benefits that we would like to see are made better
+by this series, which makes the stocking transparent such that the new
+optimizations don&#x27;t make the existing memcg charging code any more
+complex than it is. By abstracting away this mechanism, we can make sure
+that memcg just handles the logical charging semantics, and page_counter
+handles the implementation-level details of stock management.
+
+Personally I am a big fan of how try_charge_memcg looks after this
+series, what do you think? 
+
+&gt; Quite honestly I am still not convinced this move
+&gt; is the right thing but I would like to fully understand the mechanics
+&gt; first. Having discrepancies among different counters just sounds like a
+&gt; potential source of future problems.
+
+I hope that I can present a good argument for why this is not as
+concern as it may seem initially.
+
+My first point is that the memory usage counters were always fuzzy, as
+specified in the memcg v1 documentation too: 
+
+usage_in_bytes ... doesn&#x27;t show &#x27;exact&#x27; value of memory (and swap)
+usage, it&#x27;s a fuzz value for efficient access.
+
+Secondly, the raw value of the usage is actually always accurate. It is
+just the stock portion that overcharge the memory at times, making it
+seem like there is a discrepancy. Flushing the memcg stock immediately
+brings the counters to their real values (like what happens right now).
+
+Finally, this is a change that is only limited to cgroup v1 users.
+This entire series actually has no effect at all on cgroup v2 users,
+which I think is a nice perk. Obviously I&#x27;m not out here trying to
+make cgroup v1 unusable, but I wonder if anyone is still using the
+legacy feature.
+
+I hope this wasn&#x27;t too much of a brain dump on you. Thanks for your
+feedback Michal. Please let me know if there is anything I can do to
+clarify my intent.
+
+Would you prefer if we continud the discussion here, or if I sent out
+a new series with just the cover letter changed? (I don&#x27;t anticipate
+any code changes, based on sashiko review or anything else that I see).
+
+Thanks again. I hope you have a great day!
+Joshua
+
+---
+
+On Mon, 2 Nov 2026 17:16:12 +0100 Michal Hocko &lt;mhocko@suse.com&gt; wrote:
+
+&gt; &gt; &gt; &gt; &gt; &gt; We get an added benefit of simplifying try_charge_memcg(), which now
+&gt; &gt; &gt; &gt; &gt; &gt; has all the stock management handled transparently within the
+&gt; &gt; &gt; &gt; &gt; &gt; page_counter layer.
+&gt; &gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; &gt; This is quite a large change and I believe it will be really benefitial
+&gt; &gt; &gt; &gt; &gt; to have some high level design overview in the cover rather than trying to
+&gt; &gt; &gt; &gt; &gt; chase it in respective patches.
+&gt; &gt; &gt; &gt; 
+&gt; &gt; &gt; &gt; Sounds good with me. I can add the call traces above which should
+&gt; &gt; &gt; &gt; explain my thought process a bit more. Hopefully the problem I am
+&gt; &gt; &gt; &gt; trying to solve is evident there.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; I believe I follow where you are heading. I am not sure this is the
+&gt; &gt; &gt; right path but that is a separate discussion. I would focus on whether
+&gt; &gt; &gt; moving cache to the counter makes sense on its own (without that future
+&gt; &gt; &gt; work) at this stage.
+&gt; &gt; 
+&gt; &gt; If I&#x27;m being honest, most of the generic benefits that exist beyond that
+&gt; &gt; work were in the other part of this series that I got rid of to scale
+&gt; &gt; down the scope of this version. But to explicitly name the generic
+&gt; &gt; benefits, it would be unbounded memcg stock caching per-cpu, eliminating
+&gt; &gt; random evictions, (like you mentioned above as well) limiting stocks
+&gt; &gt; to leaf memcgs only, etc.
+&gt; 
+&gt; limiting cache to leaf memcgs makes a lot of sense and addresses a big
+&gt; concern I had. How exactly does this work?
+
+It&#x27;s not a big change, actually. This was the implementation from the
+origianl RFC of the series:
+
+https://lore.kernel.org/all/20260410210742.550489-8-joshua.hahnjy@gmail.com/
+
+The idea is that you treat a cgroup as a leaf until it becomes a parent,
+at which point you drain the stock. Stock can land on the parent due
+to hierarchy walks, but I can also write another part to this that
+prevents stock from getting cached when a cgroup has children.
+
+&gt; &gt; I think there was a proposal to make the number of memcg stocks per cpu
+&gt; &gt; even lower than it already is, because the author wanted to include
+&gt; &gt; additional fields into the stock that would make 7 no longer fit into
+&gt; &gt; a single cacheline. I feel like we are reaching some limits with that
+&gt; &gt; side as well, so the &quot;unbounded&quot; portion seems to be quite opportune.
+&gt; &gt; 
+&gt; &gt; But I believe those benefits that we would like to see are made better
+&gt; &gt; by this series, which makes the stocking transparent such that the new
+&gt; &gt; optimizations don&#x27;t make the existing memcg charging code any more
+&gt; &gt; complex than it is. By abstracting away this mechanism, we can make sure
+&gt; &gt; that memcg just handles the logical charging semantics, and page_counter
+&gt; &gt; handles the implementation-level details of stock management.
+&gt; 
+&gt; Yes, these are all good arguments. Especially when clarified that this
+&gt; leaf only feature. I have to say I was struggling to see how caching on
+&gt; all levels of the hierarchy would work in practice.
+
+Sounds good. If it makes sense to you then, I can fold in the
+leaf-only caching into this series to maintain more parity with the
+existing code. How does that sound? 
+
+&gt; &gt; Personally I am a big fan of how try_charge_memcg looks after this
+&gt; &gt; series, what do you think? 
+&gt; &gt; 
+&gt; &gt; &gt; Quite honestly I am still not convinced this move
+&gt; &gt; &gt; is the right thing but I would like to fully understand the mechanics
+&gt; &gt; &gt; first. Having discrepancies among different counters just sounds like a
+&gt; &gt; &gt; potential source of future problems.
+&gt; &gt; 
+&gt; &gt; I hope that I can present a good argument for why this is not as
+&gt; &gt; concern as it may seem initially.
+&gt; &gt; 
+&gt; &gt; My first point is that the memory usage counters were always fuzzy, as
+&gt; &gt; specified in the memcg v1 documentation too: 
+&gt; &gt; 
+&gt; &gt; usage_in_bytes ... doesn&#x27;t show &#x27;exact&#x27; value of memory (and swap)
+&gt; &gt; usage, it&#x27;s a fuzz value for efficient access.
+&gt; &gt; 
+&gt; &gt; Secondly, the raw value of the usage is actually always accurate. It is
+&gt; &gt; just the stock portion that overcharge the memory at times, making it
+&gt; &gt; seem like there is a discrepancy. Flushing the memcg stock immediately
+&gt; &gt; bring the counters to their real values (like what happens right now).
+&gt; &gt; 
+&gt; &gt; Finally, this is a change that is only limited to cgroup v1 users.
+&gt; 
+&gt; Right but is there any actual point in adding caching for memsw charges
+&gt; now? If you have a way to opt-in to caching then you can simply disabled
+&gt; that for memsw counter altogether. Fewer problems to deal with, explain
+&gt; etc...
+
+I think the problem actually still exists, unfortunately. In fact I
+think the issue becomes bigger if you remove stocking for memsw.
+
+Let&#x27;s say only memory gets stock. Then on a single page charge for a
+new cgroup:
+
+memory page_counter charges 64 pages to refill the stock, memsw only
+charges 1 page to fulfill the current allocation. Then you have
+memory: 64 pages
+memsw: 1 page
+
+And the invariant that memory &lt;= memsw is immediately broken.
+
+Unfortunately only stocking for memsw is not a solution as well since
+successful memsw charges still charge memory and will therefore go
+through a hierarchy walk.
+
+Actually maybe then, the solution is just to remove stocking for
+cgroup v1 users? Does that sound like a fair tradeoff to you?
+
+&gt; &gt; This entire series actually has no effect at all on cgroup v2 users,
+&gt; &gt; which I think is a nice perk. Obviously I&#x27;m not out here trying to
+&gt; &gt; make cgroup v1 unusable, but I wonder if anyone is still using the
+&gt; &gt; legacy feature.
+&gt; &gt; 
+&gt; &gt; I hope this wasn&#x27;t too much of a brain dump on you. Thanks for your
+&gt; &gt; feedback Michal. Please let me know if there is anything I can do to
+&gt; &gt; clarify my intent.
+&gt; &gt; 
+&gt; &gt; Would you prefer if we continud the discussion here, or if I sent out
+&gt; &gt; a new series with just the cover letter changed? (I don&#x27;t anticipate
+&gt; &gt; any code changes, based on sashiko review or anything else that I see).
+&gt; 
+&gt; Let&#x27;s just iron out things first.
+
+Sounds good to me. Thanks!
+
+---
+
+&gt; &gt; &gt; &gt; Personally I am a big fan of how try_charge_memcg looks after this
+&gt; &gt; &gt; &gt; series, what do you think?
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; &gt; Quite honestly I am still not convinced this move
+&gt; &gt; &gt; &gt; &gt; is the right thing but I would like to fully understand the mechanics
+&gt; &gt; &gt; &gt; &gt; first. Having discrepancies among different counters just sounds like a
+&gt; &gt; &gt; &gt; &gt; potential source of future problems.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; I hope that I can present a good argument for why this is not as
+&gt; &gt; &gt; &gt; concern as it may seem initially.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; My first point is that the memory usage counters were always fuzzy, as
+&gt; &gt; &gt; &gt; specified in the memcg v1 documentation too:
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; usage_in_bytes ... doesn&#x27;t show &#x27;exact&#x27; value of memory (and swap)
+&gt; &gt; &gt; &gt; usage, it&#x27;s a fuzz value for efficient access.
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; Secondly, the raw value of the usage is actually always accurate. It is
+&gt; &gt; &gt; &gt; just the stock portion that overcharge the memory at times, making it
+&gt; &gt; &gt; &gt; seem like there is a discrepancy. Flushing the memcg stock immediately
+&gt; &gt; &gt; &gt; bring the counters to their real values (like what happens right now).
+&gt; &gt; &gt; &gt;
+&gt; &gt; &gt; &gt; Finally, this is a change that is only limited to cgroup v1 users.
+&gt; &gt; &gt;
+&gt; &gt; &gt; Right but is there any actual point in adding caching for memsw charges
+&gt; &gt; &gt; now? If you have a way to opt-in to caching then you can simply disabled
+&gt; &gt; &gt; that for memsw counter altogether. Fewer problems to deal with, explain
+&gt; &gt; &gt; etc...
+&gt; &gt;
+&gt; &gt; I think the problem actually still exists, unfortunately. In fact I
+&gt; &gt; think the issue becomes bigger if you remove stocking for memsw.
+&gt;
+&gt; Yes, you are right. We do actually cache memsw through the charging path
+&gt; which charges both mem and memsw with the batch.
+
+Thanks, Michal! So it seems like we are in alignment on everything
+except the cgroup v1 implications for fuzziness. FWIW I think nothing
+really changes from the userspace POV. memsw and memory usage has
+always been fuzzy due to stocking, so all this series does is to
+change &quot;why&quot; and &quot;when&quot; the stocking becomes fuzzy.
+
+What do you think about this? The other alternative would be to remove
+stocking for cgroup v1 users completely. But I am not sure that is a
+good solution either. For the record, I tried making the stock tied
+together so that they refill together, but that was a nightmare in
+terms of added complexity.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Michal Hocko</div>
 <a href="https://lore.kernel.org/r/20261026155937.1235453-1-joshua.hahnjy@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: no fix planned, additional context needed, clarification</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-10-26">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Michal Hocko</span>
-<a class="date-chip" href="../2026-10-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-26">2026-10-26</a>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer noted that the patch does not address the issue of cgroup v1 users having a different size of precharged cache for memory and memsw stocks, which could lead to an inflated appearance of memory usage compared to memsw usage.
-
-Reviewer Michal Hocko asked for clarification on what &#x27;opting into its own per-CPU caching&#x27; means, specifically in the context of each page_counter having its own cache of pre-charged pages.
-
-Reviewer Michal Hocko requested a high-level design overview in the cover letter, specifically asking about changes to locking and implications for caching at different levels of the hierarchy.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">[Sorry for coming to this really late]
-
-On Wed 21-10-26 15:55:09, Joshua Hahn wrote:
-
----
-
-What does it mean that each counter can opt into its own per-cpu
-caching?
-
----
-
-This is quite a large change and I believe it will be really benefitial
-to have some high level design overview in the cover rather than trying to
-chase it in respective patches.
-Namely, are there any changes to the locking (which is arguably quite
-tricky to allow completely lockless fast path)? Also what are
-implications to caching at different levels of the hierarchy? An example
-of cache propagation up/down the hierarchy during
-charge/uncharge/draining would be really useful to wrap ones head around
-how this is supposed to work.</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Joshua Hahn</div>
-<a href="https://lore.kernel.org/r/at8XfoqWwe9HSL9y@tiehlicka" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, lack of clear understanding, request for explanation</div>
-</div>
-</div>
+<div class="review-comment-signals">Signals: acknowledged need for clarification, agreed to provide additional information</div>
 </div>
 </div>
 </div>

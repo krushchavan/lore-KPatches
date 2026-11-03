@@ -85,6 +85,58 @@
       "reviews": [],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series cleans up memory.high enforcement by using a worker for kernel threads and remote charges, improving performance and handling edge cases such as reclaiming and sleeping during charging. It also forces charges from PF_MEMALLOC tasks before checking limits to prevent self-reclaiming and ensures that local user charges are handled correctly. The changes aim to provide a best-effort solution while maintaining the hard limit of memory.max for interrupts and swap. The patches modify various functions, including memcg_enforce_high(), to implement these improvements."
+    },
+    "2026-11-02": {
+      "report_file": "2026-11-02_ollama_llama3.1-8b.html",
+      "developer": "Shakeel Butt",
+      "reviews": [
+        {
+          "author": "Michal Hocko",
+          "summary": "Reviewer Michal Hocko noted that the current implementation of try_charge_memcg() can lead to a false event being triggered when reclaim operations need to allocate memory, and suggested checking the margin after the charge is forced instead.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "racy",
+            "false event"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "This is racy. Not a huge deal as we would get a false event in the worst\ncase but I think it would make more sense to check the margine after the\ncharge is forced. So this would become\n--- \ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 856a7d07586c..bd202ec05acf 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -2653,13 +2653,20 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tbool passed_oom = false;\n \tunsigned int reclaim_options;\n \tbool drained = false;\n-\tbool raised_max_event = false;\n \tunsigned long pflags;\n \tbool allow_spinning = gfpflags_allow_spinning(gfp_mask);\n \n retry:\n \tif (consume_stock(memcg, nr_pages))\n \t\treturn 0;\n+\t/*\n+\t * Reclaim may need memory to free memory. Let it go over the\n+\t * limits for a while rather than fail or OOM kill. Doing this\n+\t * before trying the limits also skips memory.high, so the\n+\t * high_work worker can't queue itself from its own reclaim.\n+\t */\n+\tif (unlikely(current->flags & PF_MEMALLOC))\n+\t\tgoto force;\n \n \tif (!allow_spinning)\n \t\t/* Avoid the refill and flush of the older stock */\n@@ -2683,15 +2690,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \t\tgoto retry;\n \t}\n \n-\t/*\n-\t * Prevent unbounded recursion when reclaim operations need to\n-\t * allocate memory. This might exceed the limits temporarily,\n-\t * but we prefer facilitating memory reclaim and getting back\n-\t * under the limit over triggering OOM kills in these cases.\n-\t */\n-\tif (unlikely(current->flags & PF_MEMALLOC))\n-\t\tgoto force;\n-\n \tif (unlikely(task_in_memcg_oom(current)))\n \t\tgoto nomem;\n \n@@ -2712,7 +2710,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \t\tgoto nomem;\n \n \t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n-\traised_max_event = true;\n \n \tpsi_memstall_enter(&pflags);\n \tnr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,\n@@ -2773,13 +2770,6 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tif (!(gfp_mask & (__GFP_NOFAIL | __GFP_HIGH)))\n \t\treturn -ENOMEM;\n force:\n-\t/*\n-\t * If the allocation has to be enforced, don't forget to raise\n-\t * a MEMCG_MAX event.\n-\t */\n-\tif (!raised_max_event)\n-\t\t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n-\n \t/*\n \t * The allocation either can't fail or will lead to more memory\n \t * being freed very soon.  Allow memory usage go over the limit\n@@ -2789,6 +2779,15 @@ static int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,\n \tif (do_memsw_account())\n \t\tpage_counter_charge(&memcg->memsw, nr_pages);\n \n+\t/*\n+\t * If the allocation has to be enforced, don't forget to raise\n+\t * a MEMCG_MAX event.\n+\t */\n+\tfor (mem_over_limit = memcg; mem_over_limit;\n+\t     mem_over_limit = parent_mem_cgroup(mem_over_limit))\n+\t\tif (!mem_cgroup_margin(mem_over_limit))\n+\t\t\t__memcg_memory_event(mem_over_limit, MEMCG_MAX, allow_spinning);\n+\n \treturn 0;\n \n done_restock:\n-- \nMichal Hocko\nSUSE Labs",
+          "reply_to": "",
+          "message_date": "2026-11-02",
+          "message_id": "auhN7v127jwy-q-W@tiehlicka",
+          "email": "mhocko@suse.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Shakeel Butt (author)",
+          "summary": "Author acknowledges that their original approach was also racy, but notes that it had 'some additional issues' without providing details.\n\nThe author is addressing a concern about the patch's interaction with the `raised_max_event` mechanism. They acknowledge that this event cannot be removed, as it is also used by another part of the code (374f65b14819), and therefore forced charges will raise MEMCG_MAX again if it was already raised before reclaim.\n\nThe author addressed Michal Hocko's concern about the behavior of !mem_cgroup_margin() when usage equals max, explaining that it indeed triggers an event in this case.\n\nAuthor acknowledges that the patch needs to handle events for all ancestors, agrees to keep their current version, and implies a fix is planned.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges a problem",
+            "additional issues",
+            "acknowledged a technical issue",
+            "explained reasoning",
+            "clarification",
+            "explanation",
+            "acknowledges a technical issue",
+            "implies a fix is planned"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I actually tested your version as well i.e. after the charge. It is just\nas racy and it has some additional issues which are inlined.\n\n---\n\nFirst, raised_max_event can't go. Since 374f65b14819 rejected charges use it\ntoo, and without it forced charges that already raised MEMCG_MAX before reclaim\nraise it again.\n\n---\n\nSecond, !mem_cgroup_margin() is true at usage == max, so a charge that fits\nexactly raises an event (unlike today).\n\n---\n\nThird, we definitely need a break here otherwise every ancestor at its limit gets\nan event which does not happen today.\n\nI want to keep my current version.",
+          "reply_to": "Michal Hocko",
+          "message_date": "2026-11-02",
+          "message_id": "auli2Zlf1F0tyi4X@linux.dev",
+          "email": "shakeel.butt@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series cleans up memory.high enforcement by using a worker for kernel threads and remote charges, improving performance and handling edge cases such as reclaiming and sleeping during charging. It also forces charges from PF_MEMALLOC tasks before checking limits to prevent self-reclaiming and ensures that local user charges are handled correctly. The changes aim to provide a best-effort solution while maintaining the hard limit of memory.max for interrupts and swap. The patches modify various functions, including memcg_enforce_high(), to implement these improvements."
     }
   }
 }
