@@ -9,6 +9,84 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch optimizes the handling of large folios in the Linux kernel's memory management system by batching contiguous PTEs into a single refcount grab, reducing overhead and improving performance. The patch introduces a new function `gup_pte_batch_len` to determine how many PTEs can be committed as one run, and modifies the `gup_grab_folio_pages` function to take advantage of this optimization. This results in significant performance improvements for large folios, with a 12.8x reduction in execution time for 64 kB mTHP mappings."
+    },
+    "2026-11-03": {
+      "report_file": "2026-11-03_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) noted that the patch needs more work and suggested basing it on top of the gup-fast series, which provides helpers for checking required unsharing of multiple PTEs.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "needs more work",
+            "cleaner way"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "That's a clear indication that this needs more work.\n\nI'll try to get to it soon and see how it could be done in a cleaner way, likely\nit should be based on top of the gup-fast series where we will have helpers to\ncheck for required unsharing of multiple PTEs.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-11-03",
+          "message_id": "fa017227-448b-468f-9797-33c02854f018@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author is addressing a concern about the sequence of merging helper functions, offering two options for combining the series and suggests getting rid of redundant code in gup.c",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I'm all for sharing the same helpers.\n\nHow would you like to sequence things?\n\nDo you prefer to merge both series separately,\nand then get a follow-up series that merges\nthe helper functions?\n\nWould you like Yeoreum Yun and me to combine\nthe series, merge the helper functions beforehand,\nand then send you one larger, combined series?\n\nI have spent enough time in gup.c that I would\nbe happy to get rid of some more of that code.\n\n-- \nAll Rights Reversed.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-03",
+          "message_id": "9d1572bd5e868d3c9d953aa5fae81967cc81ba55.camel@surriel.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) confirmed that they plan to review the gup-fast series first and then build on top of it, indicating no immediate concerns or issues with the current patch.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "no specific technical issue raised",
+            "focus on reviewing other patches"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "My plan is to get the small series for gup-fast ready, stage that, and then\nbuild on top of it.\n\nBy then I should have been able to dig through most of your series. The cleanups\ncan stay part of this series.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-11-03",
+          "message_id": "1affac11-da98-40b3-8cc2-6e8374b5ab69@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author acknowledged that the patch may not work correctly for large folios and agreed to restructure in v2, indicating a fix is needed.\n\nAuthor agrees to fold in a suggested cleanup and is open to sending it as a separate series or incorporating it into their existing patch set, but expresses uncertainty about the PUD and PMD paths.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged a potential issue",
+            "agreed to restructure",
+            "agreement",
+            "uncertainty"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "On Tue, 3 Nov 2026 17:55:31 +0100\n\"David Hildenbrand (Arm)\" <david@kernel.org> wrote:\n\n---\n\nThat sounds good. It looks like with this small change below,\nGUP-fast and slow GUP can share another helper.\n\nI can fold that into my series as well, or send the cleanups\nin a separate series, whatever works best for you.\n\nThe PUD and PMD paths do not look as easy to untangle, but\nmaybe after some more cleanups on each end?\n\n---8<---\n\ndiff --git a/mm/gup.c b/mm/gup.c\n--- a/mm/gup.c\n+++ b/mm/gup.c\n@@ -940,14 +940,20 @@\n  * run under FOLL_WRITE or FOLL_PIN does need the per-page check, so it stays\n  * one page at a time.\n+ *\n+ * @fpb_flags selects the scan: slow GUP merges young/dirty so\n+ * folio_mark_dirty() sees any dirty PTE in the run; fast GUP scans\n+ * locklessly and revalidates the run after grabbing it. @vma is only\n+ * needed for FPB_MERGE_WRITE and may be NULL otherwise.\n  */\n static unsigned long gup_pte_batch_len(struct vm_area_struct *vma,\n \t\tunsigned long address, unsigned long walk_end,\n-\t\tstruct folio *folio, pte_t *ptep, pte_t *batch_pte, unsigned int flags)\n+\t\tstruct folio *folio, pte_t *ptep, pte_t *batch_pte,\n+\t\tunsigned int flags, fpb_t fpb_flags)\n {\n \tunsigned long max;\n@@ -961,8 +961,7 @@\n \tmax = (walk_end - address) >> PAGE_SHIFT;\n \tif (max <= 1)\n \t\treturn 1;\n \n-\t/* Merge young/dirty across batch so folio_mark_dirty sees any dirty. */\n \treturn folio_pte_batch_flags(folio, vma, ptep, batch_pte, max,\n-\t\t\t\t     FPB_RESPECT_WRITE | FPB_MERGE_YOUNG_DIRTY);\n+\t\t\t\t     fpb_flags);\n }\n@@ -1018,7 +1018,8 @@\n \t\t\tfolio = page_folio(page);\n \t\t\tbatch_pte = pte;\n \n \t\t\tbatch = gup_pte_batch_len(vma, address, walk_end, folio,\n-\t\t\t\t\t ptep, &batch_pte, flags);\n+\t\t\t\t\t ptep, &batch_pte, flags,\n+\t\t\t\t\t FPB_RESPECT_WRITE | FPB_MERGE_YOUNG_DIRTY);\n \t\t\tret = gup_grab_folio_pages(folio, page, batch,\n \t\t\t\t\t\t     pte_dirty(batch_pte), flags,",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-03",
+          "message_id": "20261103210830.2870eaae@fangorn",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch optimizes the handling of large folios in the Linux kernel's memory management system by batching contiguous PTEs into a single refcount grab, reducing overhead and improving performance for certain workloads. The patch introduces a new function `gup_pte_batch_len` to determine how many PTEs can be batched together, and modifies the `gup_grab_folio_pages` function to use this information. This change is particularly beneficial for large folios (mTHP) and reduces the number of refcount grabs required, leading to significant performance improvements."
     }
   }
 }

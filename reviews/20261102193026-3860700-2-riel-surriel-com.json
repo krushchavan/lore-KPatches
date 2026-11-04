@@ -9,6 +9,127 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch breaks out the gup_fill_pages() helper from the __get_user_pages() function, allowing it to be reused by other functions in the follow_page_mask() call chain. The helper fills pages[] and flushes each page's caches in a loop. No functional changes are intended with this patch. It is a refactoring effort to improve code organization and reusability."
+    },
+    "2026-11-03": {
+      "report_file": "2026-11-03_ollama_llama3.1-8b.html",
+      "developer": "Rik van Riel",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David questioned the necessity of checking if pages exist before filling them, suggesting it's unnecessary and potentially error-prone.\n\nReviewer David pointed out that the gup_fill_pages() function uses a loop variable 'subpage' which is misleading, as it's not actually accessing sub-pages but rather incrementing the 'page' pointer.\n\nReviewer David suggested that the patch could be based on the gup-fast batching series, which might not require the magic of flushing caches and dcache pages in an open-coded loop.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "misleading code",
+            "requested change"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Why is that check needed? Why should someone try filling something that doesn't\nexist?\n\n---\n\nThere is no such thing as a subpage as Willy keeps saying :)\n\nWhy not reuse \"page\" ?\n\n\tfor (i = 0; i < nr; i++, page++) {\n\n---\n\nNow I wonder why GUP-fast doesn't need any of that. Likely because architectures\nthat support GUP-fast don't need any such magic.\n\nMaybe we should in fact base this on the gup-fast batching series and also use\nthe helper in there (passing vma=NULL)?\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-11-03",
+          "message_id": "df9c504e-e62a-40c0-a513-e8b8c758dd57@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author acknowledged that faultin_page_range() and populate_vma_page_range() both call the GUP code with a NULL pages pointer, but did not indicate whether this is an issue or how it will be addressed.\n\nAuthor Rik Riel addressed David's concern about cache flushes in GUP-fast by explaining that most callers already handle VIVT cache aliasing, and proposed two possible solutions to the asymmetry: adding dcache flushing to unpin_user_pages_dirty_lock() or moving it to the GUP callers. No fix is planned for this patch.\n\nAuthor responded to David's feedback by asking for clarification on which GUP-fast batching series is being referred to and whether both paths should use the same gup_fill_pages() helper, indicating no immediate plan to address a specific technical issue.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "acknowledged issue",
+            "no clear resolution",
+            "clarification",
+            "explanation",
+            "clarifying question",
+            "request for information"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "faultin_page_range() and populate_vma_page_range\nboth call the GUP code with a NULL pages pointer.\n\n---\n\nThese cache flushes seem to be common on architectures\nwith virtually indexed caches, where the cache needs \nto be flushed if the memory is accessed through a \ndifferent virtual address than where userspace might\nhave written data.\n\nOn 32 bit ARM, MIPS, and sh, the kernel seems to\nimplement an actual cache flush here, but also\nclaims to support GUP-fast.\n\nI don't understand how that would possibly be safe,\nsince the pages returned by GUP-fast could be\naccessed under a different cache alias than where\nuserspace accesses the memory.\n\nI think one reason GUP-fast can get away without\na dcache flush is that most of the callers take\ncare of that, for example by using raw_copy_to_user()\nto copy data using the user's virtual address, which\ntakes care of VIVT cache aliasing.\n\nLikewise, drivers that do zero-copy DMA into user\nmemory will get the cache flushed on VIVT architectures\ninside dma_unmap().\n\nThe dcache flush inside GUP covers rarer cases, where\nthe kernel accesses memory at a different address than\nwhere userspace wrote to that memory.\n\n cat /proc/<pid>/cmdline              KERNEL\n ----                                 -------------------\n read(buf=U)\n   -------------------------------->\n                                      get_mm_cmdline(mm, U):\n                                        access_remote_vm(mm, arg_start,\n                                          kbuf, len, FOLL_ANON):\n                                          get_user_page_vma_remote()\n                                          (slow GUP + its flushes)\n                                          kmap_local_folio(P)\n                                          memcpy(kbuf <- K)   // read\n                                          kunmap_local(K)\n                                        copy_to_user(U, kbuf) // write\n                                          through U itself\n read buf at U\n   ------>\n            clean: the final write to U went\n            through U. Same line. No hazard.\n\nIn this case, the dcache flush in slow GUP ensures\nthat data written before the GUP is visible to the\nreader.\n\nIn the write path, e.g. for PTRACE_POKE, __access_remote_vm\nflushes after the write has been done, so the other\nprocess will see the data on the next read.\n\nIt looks like process_vm_writev() might be missing that\ncache flush after a write, though.\n\nHowever, now we have a situation where:\n1) Only a few oddball callers of GUP need the dcache flush, and\n2) Those need to do their OWN flush after a write, and\n3) The dcache flush is not needed for most other GUP callers.\n\nWe could do two different things here to solve the\nasymmetry.\n\nEither we could add dcache flushing to \nunpin_user_pages_dirty_lock(), and make sure all\nthe callers that need to call that function, or\nwe could move the cache flushing to the GUP callers.\n\nThen we have KSM, which uses GUP, and which would like\nto see the latest page contents...\n\n---\n\nI just moved this code out of __get_user_pages(),\nbut if we can get rid of it completely by using\na different helper, all the better.\n\nWhich GUP-fast batching series are you talking\nabout, here?\n\nIn Yeoreum Yun's series, the batch filling seems \nto be done inline in gup_fast_pte_range(), and not\nin a helper:\n\nhttps://lore.kernel.org/all/20261102-refactor_gup_fast-v2-4-bc1ac018c834@arm.com/\n\nShould both paths be using the same gup_fill_pages()\nhelper?\n\nThe cache flushing part is broken out into its own\nhelper function later in this series, so we could\nsequence those differently.\n\n-- \nAll Rights Reversed.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-03",
+          "message_id": "3a7d12b52a5de61277842f2cca0dd90d42728135.camel@surriel.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "reviewer pointed out that the patch's check for a non-existent pages array was unnecessary, as it was already absent in the original code\n\nReviewer David noted that the patch is inconsistent, undocumented, and error-prone, specifically questioning whether GUP-fast should also flush the dcache for consistency and requesting clarification on when to call this function\n\nReviewer David suggested breaking out a separate helper function for filling pages, similar to what was done in gup_fast_pmd_leaf, and proposed distinguishing between gup and gup-fast using the VMA argument.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "inconsistency",
+            "lack of documentation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "That's not what I meant. I know that we have GUP users without\npages array.\n\nIn the code change you are performing the check is not required.\n\nThat's why there wasn't one in the first place.\n\n---\n\nIt's all very inconsistent. And undocumented. And error prone.\n\nCould we have GUP-fast also flush the dcache for consistency or\nmust that only be called with the PT lock held?\n\n---\n\nWe also have gup_fast_pmd_leaf that fills an array. I think all of these should\njust use a helper (instead of manually looping).\n\nFor now we can distinguish gup vs. gup-fast using the VMA argument.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-11-03",
+          "message_id": "856ed0da-d806-4f2e-95e7-f276f2408e8d@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author is considering adding a check to gup_fill_pages() to ensure pages exist before attempting to access them, rather than relying on callers to perform this check.\n\nThe author is addressing David's concern that gup_fast callers may need dcache flushes, explaining that most callers either perform DMA operations or access pages through user virtual addresses, and suggesting moving cache flushes to __get_user_pages() instead.\n\nAuthor agrees that other parts of the code could benefit from the same gup_fill_pages() helper function, and plans to apply it in a future version (v2)",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "considering alternative approach",
+            "clarification",
+            "explanation",
+            "acknowledges need for further work",
+            "plans to address in v2"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "It looks like 2 of the 3 callers of gup_fill_pages()\ncheck for pages existing. The other does not.\n\nShould we just have the check in this one place, and\nnot depend on the caller?\n\n---\n\nI think we could, but it does not look like any of\nthem need it.\n\nOut of the 83 callers of gup_fast, many DMA into the\npage, and the drivers do their own flushing. Also,\nflushing before the DMA write doesn't help.\n\nKVM, Infiniband, and others pin the pages, sometimes\nfor longer periods of time, and either flush around \ntheir reads and writes, or run only on architectures\nwhere we don't need to.\n\nThe others access the page through the user's own\nvirtual address, which again does not require a\ndcache flush.\n\nOnly a small number of slow GUP callers need dcache\nflushes.\n\nIt may make more sense to move the cache flushes\nall the way out into __get_user_pages() and away\nfrom the follow_page_mask() call chain, so we can\nmaybe merge more of the helper functions between\nslow GUP and fast GUP.\n\n---\n\nI think all of those could use the same helper\nfunction I am breaking out here, once the dcache\nflushing moves to its own helper.\n\n-- \nAll Rights Reversed.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-03",
+          "message_id": "4ffa2c82c538c12447d48fee2532f67c35f7eab7.camel@surriel.com",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer David (Arm) noted that the patch description should explicitly state what functional changes are intended and expressed skepticism about the usefulness of breaking out gup_fill_pages() helper, but acknowledged it could make calling code nicer.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "skepticism",
+            "acknowledgment"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "That should be spelled out in the patch description.\n\nThe change as it stands in this patch looks useless :)\n\nAlthough trying to fill something that doesn't exist is a bit weird.\n\nBut if it makes the calling code nicer, sure.",
+          "reply_to": "Rik Riel",
+          "message_date": "2026-11-03",
+          "message_id": "e610aa21-4d35-4d9d-8754-bbfdec57a9a5@kernel.org",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Rik Riel (author)",
+          "summary": "Author acknowledged that the patch by itself isn't super useful but agreed to restructure it in a future version (v2) to split out array filling from cache flushing, allowing for shared helpers between GUP-fast and regular GUP.\n\nAuthor is addressing David's concern about the scope of changes by suggesting a way to limit the impact of breaking out gup_fill_pages() helper, proposing either folding in additional callers or sending them as a separate series.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "acknowledged need for improvement",
+            "planned restructuring",
+            "clarification",
+            "request for feedback"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "I agree this patch by itself isn't super useful.\n\nIt's goal is to be able to have this code in one\nspot, and not in multiple places in gup.c\n\nI'll split out the array filling from the cache\nflushing, so we can move the cache flushing out\nfrom under the lock, and have GUP-fast and regular\nGUP share the same helper.\n\n---\n\nIt really doesn't look too bad. Here are all\nthe GUP callers that need a cache flush:\n- kernel/events/uprobes.c (through get_user_pages_remote)\n- /proc/pid/cmdline (through access_remote_vm)\n- fs/proc/base.c (through access_remote_vm)\n- kernel/trace/trace_events_user.c (pin_user_pages_remote)\n- arch/x86/kernel/cpu/sgx/ioctl.c (get_user_pages ... urgh)\n- kernel/ptrace.c (access_remote_vm)\n- mm/process_vm_access.c (pin_user_pages_remote)\n- fs/exec.c (pin_user_pages_remote)\n- virt/kvm/async_pf.c (get_user_pages_remote)\n\nIn other words, if we change the SGX code to just\ncall get_user_pages_remote(), and then move the\ncache flushing to get_user_pages_remote() and\npin_user_pages_remote() we should be all set.\n\nWant me to fold that into this series, or send\nit in as a small, separate prequel series?\n\nAs a separate series it would:\n1) split out the gup_fill_pages() and gup_flush_pages()\n   helpers\n2) convert the SGX code to use get_user_pages_remote()\n3) move the flush call up the stack into pin_user_pages_remote()\n   and get_user_pages_remote()\n\nJust let me know if you prefer that separate, or\nfolded in. \n\n-- \nAll Rights Reversed.",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-03",
+          "message_id": "f11575d4f0fa63fa1afc6ca6060440c9991bc112.camel@surriel.com",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch breaks out the gup_fill_pages() helper from the __get_user_pages() function, allowing it to be reused by other functions in the follow_page_mask() call chain. The new helper fills pages[] and flushes each page's caches in a separate loop, reducing code duplication and improving maintainability. No functional changes are intended with this patch, which is part of an 8-part series of patches."
     }
   }
 }

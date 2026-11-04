@@ -238,381 +238,58 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/6] mm: fix pfn walker races with memory offline</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261027042204.3741307-1-gourry@gourry.net/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-27</strong><div class="date-range-nav">Active on: <a href="#2026-10-27">2026-10-27</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch addresses a bug in the Linux kernel&#x27;s compaction module where it fails to wait for pfn walkers before poisoning offlined memory maps, leading to DEBUG_VM faults. The fix involves holding an SRCU-fast read section from block check to last use of pages and making remove_pfn_range_from_zone() clear zone-&gt;contiguous and wait before poisoning. This patch also takes into account the contiguous zone skipping online checks and ensures scanner positions outlive the section.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-27</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-03</strong><div class="date-range-nav">Active on: <a href="#2026-11-03">2026-11-03</a> &bull; <a href="#2026-10-27">2026-10-27</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses six races in the Linux kernel&#x27;s memory management code that can cause crashes or incorrect behavior when memory is offline. The patches introduce a new function, pfn_walk, which waits for pending page walkers before poisoning the memory map, and modify various functions to use this new function or hold get_online_mems() instead. This ensures that memory is not accessed after it has been marked as offline, preventing crashes and incorrect behavior. The changes are tested on a QEMU guest with three NUMA nodes and a pc-dimm left offline at boot, and the results show that the patches fix all six races without introducing any significant performance cost.</div></div>
     <div class="thread-tree">
-<div class="thread-node depth-0">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Gregory (Meta) (author)</span>
-<a class="date-chip" href="../2026-10-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-27">2026-10-27</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author acknowledges a mix of design and firefighting in their patch series, admits it can be hard to know what questions to ask without posting initial patches, but does not explicitly state that they will revise or address specific concerns.
-
-Author acknowledges that some fixes could be pulled out ahead, agreeing to consider reviewer&#x27;s suggestion.
-
-The author is addressing David&#x27;s concern about the effectiveness of using ballooning and hotplugging as VM memory overcommit tools, specifically regarding the potential for race conditions to crash these tools. The author explains that their approach is effective in reducing the size of cold machines at boot and in runtime proactive reclaim, but acknowledges that it may not be perfect and requires further investigation into why virtio balloon and mem are separate entities.
-
-Author acknowledged that zonelist iteration is a complex issue and has been optimized multiple times, introducing more bugs; they are considering RCU solutions for the zonelist races but unsure about safely quiescing PFN walkers without atomics in their fast path.
-
-Author acknowledged that David&#x27;s feedback was reasonable, explaining that they intentionally avoided proposing a complex architectural fix and instead chose to use available tools.
-
-Author acknowledged that using SRCU-fast on PowerPC results in significant performance overhead due to the lack of NMI-safe per-CPU operations, and implemented a fallback solution for those architectures to not free zonelists.
-
-Author questions the safety of long-term compaction suspension, citing issues with fragmentation and spurious failures when requiring N_MEMORY_USER_NUMA.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">Fair, there&#x27;s a mix of design vs firefighting tension going on here.
-
-I&#x27;m trying to get out ahead of a rapidly evolving scaling issue before
-it becomes big.  But I will admit it&#x27;s sometimes hard to even figure
-out what questions to ask without posting the wrong patches first.
-
-(Cunningham&#x27;s law :P)
-
----
-
-Ehhh... i&#x27;d argue it&#x27;s the same shape.  But i&#x27;ll concede some of these
-could be pulled out ahead as you&#x27;ve said elsewhere.
-
----
-
-Actual balloon inflation/deflation.  It is disgusting, but it&#x27;s
-effective.  Right now we use hotplug at boot to minimize the size of
-cold machines to avoid thundering herd issues, and then add it when
-they actually get allocated for work.
-
-At runtime we use ballooning to reduce a VM to its actual RSS based
-on PSI feedback (see: that virtio stats extension i sent you some while
-ago), but would like to use hotplug to give the host a defense against
-a storm of deflate_on_oom scenarios across a large number of guests.
-
-Basically using PSI stats we can make guests do somewhat aggressive
-proactive reclaim on without having to build any new tooling, and
-while being able to back-off aggressively.
-
-Free-page reporting is also on by default, but this only helps you if
-your guests are being extra nice about things.
-
-(spoiler: they&#x27;re not! they&#x27;re greedly little imps! :D)
-
-My experiments made balloon prefer to try to reclaim movable regions
-in contiguous blocks, and then just hand that contiguous block off to
-virtio-mem for offline without having to drop the balloon.
-
-tl;dr: This seems effective and works quite well.
-
-I&#x27;ve become a little confused as to why virtio balloon and mem are
-separate entities when they could work together this way.
-
-Haven&#x27;t had the time to read up on the development history.
-
----
-
-largely the zonelist iteration - which looking back through history 
-has already been &quot;optimized&quot; multiple times, only for those things
-to introduce more bugs :\.
-
-The zonelist races seem more ammenable to RCU solutions than the pfn
-walks.  I&#x27;m not sure how to safely quiesce every possible PFN walker
-without atomics in their fast path.
-
----
-
-This seems reasonable, I was trying not to schlopp you with a half-baked
-architectural fix and instead use the available tools.
-
-But maybe we should chat (after the window).
-
-I&#x27;ll try to be on IRC more often.
-
----
-
-Yes - but specifically this affects PowerPC because it:
- - has NMI
- - does NOT have NMI-safe per-CPU operations
- - supports memory hotplug
- - uses atomics for SRCU-fast
-
-So using SRCU fast in these contexts is not cheap.
-
-For what I could measure in QEMU, the atomics on PPC seem like they
-could be significant (15-20% overhead) in microbenchmarks.
-
-Hard to say what that turns into on real hardware.
-
-I implemented a fallback solution for those architectures to just not
-free the zonelists in this case.  They have to iterate the dead zones,
-but it&#x27;s a much less overhead comparatively (&lt;1%, but measurable).
-
-For everyone else SRCU-fast is imperceptible overhead.
-
----
-
-Is long-term compaction suspension even safe? I had to make COMPACTION a
-requirement for N_MEMORY_USER_NUMA in order to not generate spurious
-failures due to fragmentation.
-
-~Gregory
-
--- 
-~Gregory</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to David (Arm)</div>
-<a href="https://lore.kernel.org/r/179311617372.2530325.90240880272181996.b4-reply@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledges complexity, admits uncertainty, acknowledged reviewer&#x27;s suggestion</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-1">
+<div class="thread-node depth-0" id="2026-10-27">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">David (Arm)</span>
 <a class="date-chip" href="../2026-10-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-27">2026-10-27</a>
 <span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#721c24;background:#f8d7da">Contentious</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer David requested more discussion on the high-level design of the patch, specifically why it&#x27;s not used for other pfn_to_online_page() users and how it interacts with zone-&gt;contig.
-
-Reviewer David (Arm) questioned the relevance of patch [PATCH 4/6] mm/page_alloc: don&#x27;t undo another isolation in alloc_contig_range to the original patch series &#x27;mm: fix pfn walker races with memory offline&#x27;, suggesting it is unrelated
-
-Reviewer expressed strong disagreement with Gregory&#x27;s approach to fixing pfn walker races and suggested it is &#x27;disgusting&#x27; to pair balloon inflation/deflation with virtio-mem
-
-reviewer noted that the proposed solution has performance implications on PowerPC and other architectures due to their lack of SRCU-fast support without atomics, requesting a discussion on resolving this issue
-
-Reviewer David asked for clarification on the specific areas of concern and expected overhead, indicating a need for more information to assess the patch
-
-Reviewer suggested considering alternative approaches to memory online/offline synchronization, specifically mentioning the use of memory notifiers and re-evaluating the solution for zone-&gt;contig + compaction
-
-reviewer expressed concern over the overhead of SRCU-fast on the read side and suggested considering RCU for remaining cases, also mentioning a personal reason for not addressing this earlier</div>
+<div class="review-comment-text">Reviewer David from Arm expressed concerns that the patch series is low priority and should be discussed further, citing a lack of real-world reports and suggesting that the issues are not as likely to happen as thought. He also suggested using an RCU for pfn_to_online_page() + zone-&gt;contig thingies instead of get_online_mems(), and proposed adding infrastructure in a separate patch rather than manging it into a patch that fixes a DEBUG_VM splat.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Appreciated.
+<pre class="raw-body-text">On 10/27/26 05:21, Gregory Price (Meta) wrote:
+&gt; Several pfn walkers check that a struct page is online, then use it
+&gt; after memory offline has poisoned it (CONFIG_DEBUG_VM) or removal has
+&gt; freed the vmemmap.  Five of the races crash the kernel; the sixth leaves
+&gt; an offline spinning with the device hotplug lock held.
 
-For this long-standing considered low-priority thing in particular it is
-reasonable to go back in time, see how often it was raised (quite often by me)
-and how often it was actually reported (I found one case).
+I have roughly the exact same list of AI garbage fixes here from a certain company.
 
-Then discuss the high level design in more than a single sentence :)
+And I consider this all extremely low priority.
 
-Discuss why we are not using it for other pfn_to_online_page() users, how it
-interacts with zone-&gt;contig etc etc.
-
-There really isn&#x27;t a lot on the design in the cover letter.
-
----
-
-Right, but I suspect that&#x27;s &quot;[PATCH 4/6] mm/page_alloc: don&#x27;t undo another
-isolation in alloc_contig_range&quot; which is *not at all* related to &quot;mm: fix pfn
-walker races with memory offline&quot;.
-
----
-
-Do you mean free-page reporting or actual balloon inflation/deflation paired
-with virtio-mem. I hope not the latter, because that is just disgusting.
-
----
-
-And that&#x27;s where the overall design needs to discuss this and how to resolve it.
-
-:)
-
----
-
-Which areas are you mostly concerned about and from which piece do you expect
-the overhead?
-
----
-
-For &quot;broader&quot; things that are not just a simple pfn_to_online_page() user, we
-could also have memory online/offline sync in more efficient ways using the
-memory notifier.
-
-It&#x27;s also tricky, but maybe for zone-&gt;contig + compaction the better solution?
-
----
-
-So the big problem is the overhead on the read side for srcu?
-
-If we can find something else to suspend compaction, we could maybe switch to
-rcu for the remaining cases.
-
-Now that I think about it, I recall why I didn&#x27;t fix this earlier :)
+So this is something to discuss throughout the next months and do it properly.
 
 -- 
 Cheers,
 
-David</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Gregory (Meta)</div>
-<a href="https://lore.kernel.org/r/1c61eeb7-5fad-46e5-9643-e99050b9042d@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, questioning relevance, strong disagreement</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Gregory (Meta) (author)</span>
-<a class="date-chip" href="../2026-10-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-27">2026-10-27</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">The author is addressing concerns about the stability issues caused by pfn walker races with memory offline, specifically crashes and hung attempts due to GFP_KERNEL landing on movable memory. They acknowledge that these issues are not just theoretical but have been observed in production environments, including NULL derefs suspected to be zonelist dereferences. The author expects these issues to scale up as the number of VMs and hotplug operations increase.
-
-The author acknowledges that the feedback from David about the patch being pushed during the merge window might be inconvenient, but is open to carrying the fixes as needed if they are not deemed worthy of consideration for the current window.
-
-Author acknowledged that PFN walks are harder to handle with RCU and agreed that get_online_mems is a backportable solution, but expressed concerns about having to rework it later.
-
-The author addressed David&#x27;s concern that the patch may introduce performance issues due to the use of SRCU-fast on the fast path, particularly on PowerPC architectures. The author acknowledged this potential issue and has been auditing the zonelist walk macros for private nodes, but has not yet found a solution to mitigate the performance impact.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">tl;dr:
-
-while these are ai-generated, I&#x27;m not posting untested, unreviewed
-schlopp for the sake of getting patches upstream.
-
-I actually care about this issue.
+David
 
 ---
 
-Some of these don&#x27;t show up as crashes but instead as hung offline
-attempts (GFP_KERNEL landing on movable).  That shows up as our
-hypervisor just failing to overcommit / guests hanging.
+On 10/27/26 12:31, Gregory Price (Meta) wrote:
+&gt; On 2026-10-27 09:57 +0100, David Hildenbrand (Arm) wrote:
+&gt;&gt; On 10/27/26 05:21, Gregory Price (Meta) wrote:
+&gt;&gt;&gt; Several pfn walkers check that a struct page is online, then use it
+&gt;&gt;&gt; after memory offline has poisoned it (CONFIG_DEBUG_VM) or removal has
+&gt;&gt;&gt; freed the vmemmap.  Five of the races crash the kernel; the sixth leaves
+&gt;&gt;&gt; an offline spinning with the device hotplug lock held.
+&gt;&gt;
+&gt;&gt; I have roughly the exact same list of AI garbage fixes here from a certain company.
+&gt;&gt;
+&gt;&gt; And I consider this all extremely low priority.
+&gt;&gt;
+&gt;&gt; So this is something to discuss throughout the next months and do it properly.
+&gt;&gt;
+&gt; 
+&gt; I actually have a reason for these fixes other than &quot;bot said bad&quot;.
 
-The compaction/alloc_contig bug is one I&#x27;ve seen in production.
-
-I&#x27;ve seen a handful of NULL derefs in production i suspect are the
-zonelist derefs, but it&#x27;s hard to say (they&#x27;re rare enough that we
-lose the dumps before someone has a thought to pull them).
-
-I expect this will scale up as we increase the number of VMs and
-the amount of hotplug we&#x27;re doing.
-
-For clarity, we use ballooning + hotplug as a combo:
- - ballooning to do cooperative overcommit
- - hotplug to defend host stability when the overcommit ratio is extreme
-   (basically deflate_on_oom because a host stability issue)
-
-We&#x27;re pretty aggressive about ballooning guests to squeeze them and
-dropping the balloon to hot-unplug that memory when a guest is cold.
-
-
-skippable side note on virtio-balloon/mem:
-
-I have some improvements to virtio-balloon and virtio-mem that allow for
-handoff from balloon directly to mem for hot-unplug without having to
-drop the balloon, but I haven&#x27;t posted those (and we don&#x27;t run those in
-production, so this is not the nexus of crashes).
-
-Similarly I have another extension that lets the host set a &quot;NO_ALLOC&quot;
-bit on the zone so a balloon-only system can provide the host a way to
-defend against mass deflate_on_oom events (we prefer guests to OOM and
-have the host to kill them due to PSI, rather than threaten host
-stability). Also not in production and not posted, but there have been
-a lot of experiments on overcommit here.
-
----
-
-Sure, I realize I&#x27;m pushing this out during the merge window, but I
-felt it reasonable to get some thoughts on whether these fixes are
-worth considering for the window.
-
-If the answer is no just put em on the back burner. We can carry
-fixes as-needed.
-
----
-
-Agreed, although the PFN walks seem genuinely harder to wrangle into an
-good rcu shape.
-
-get_online_mems seems like the backportable solution, but i can see not
-wanting to have to go clean it back up later.
-
----
-
-Agreed.  Although I fear the structural fix for this will have uglier
-performance issue than we think.  Then again, maybe it doesn&#x27;t matter
-(if you&#x27;re doing a PFN walk, then you&#x27;re likely already doing something
-stupidly expensive).
-
-Where i&#x27;m largely concerned is the page allocator and the
-compaction/contig code not taking a regression.
-
-For zonelists i&#x27;ve ended up with something like this:
-
-@@ -1461,7 +1466,7 @@ typedef struct pglist_data {
-         * Generally the first zones will be references to this node&#x27;s
-         * node_zones.
-         */
--       struct zonelist node_zonelists[MAX_ZONELISTS];
-+       struct zonelist __rcu *node_zonelists[MAX_ZONELISTS];
-
-...
-
-static inline struct srcu_ctr __percpu *zonelist_read_lock(void)
-{
-       return srcu_read_lock_fast(&amp;zonelist_srcu);
-}
-
-static inline void zonelist_read_unlock(struct srcu_ctr __percpu *scp)
-{
-       srcu_read_unlock_fast(&amp;zonelist_srcu, scp);
-}
-
-DEFINE_LOCK_GUARD_0(zonelist_read, _T-&gt;scp = zonelist_read_lock(),
-                   zonelist_read_unlock(_T-&gt;scp),
-                   struct srcu_ctr __percpu *scp)
-
-static inline struct zonelist *pgdat_zonelist(pg_data_t *pgdat, int type)
-{
-       return zonelist_dereference(pgdat-&gt;node_zonelists[type]);
-}
-
-With this the zonelist cookie checks evaporate, but you still end up
-with guard() at every walk location - not great, but better i suppose.
-
-I was hoping this could be sunken into the zonelist walk macros, but
-I haven&#x27;t seen that pan out.  I&#x27;ve been spending a lot of time auditing
-that code for private nodes as well.
-
-
-On performance:
-
-I&#x27;ve been hammering this with will-it-scale and a bunch of workload
-tests on a variety of hosts and have not seen any obvious regressions
-outside of powerpc (which i can&#x27;t test directly, but SRCU-fast requires
-atomics for powerpc from what i can tell - so it will eat overhead
-without a fallback... if there is actually any hotplug ppc hardware out
-there to care about?)
-
--- 
-~Gregory</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to David (Arm)</div>
-<a href="https://lore.kernel.org/r/179310895201.1491991.14362391061932133491.b4-reply@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: acknowledges stability issues, expects problems to worsen, acknowledging inconvenience</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-3" id="2026-10-27">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">David (Arm)</span>
-<a class="date-chip" href="../2026-10-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-27">2026-10-27</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer David (Arm) expressed skepticism about the patch&#x27;s relevance, pointing out that there were no real-world reports of these issues in production for over a decade and questioning the motivation behind the patch.
-
-reviewer noted that DEBUG_VM reports are irrelevant in production and questioned the urgency of fixing a theoretical issue, suggesting it has lower priority compared to other tasks
-
-Reviewer David (Arm) suggested that protecting individual pfn_to_online_page() calls is not sufficient and proposed checking the context in which it&#x27;s called, possibly introducing a variant for legitimate use cases.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">So you found them on production kernels?
+So you found them on production kernels?
 
 We did not have a single real report of that for probably a decade or
 even longer in production.
@@ -627,7 +304,23 @@ workloads or only under this synthetic stress test.&quot;
 
 Where I motivated that we need something clean.
 
----
+&gt; 
+&gt; We leverage ballooning and hotplugging as VM memory overcommit tools
+&gt; and are finding that some of these race conditions crash them with
+&gt; large MTBF.
+
+yeah, that makes sense.
+
+&gt; 
+&gt; While most of these are insanely narrow, they are not as unlikely to
+&gt; happen as you think. A vCPU can take a vmexit in these windows much
+&gt; more easily than a host can take an NMI or other interrupt.
+
+Jup, that&#x27;s what I would expect.
+
+&gt; 
+&gt; Thankfully none of these (or the other series) appear to be obvious
+&gt; security issues, but they are stability issues.
 
 Right. And DEBUG_VM reports are irrelevant in production.
 
@@ -638,7 +331,12 @@ issues that could cause issues faster.
 And with all the other things going on, this has lower priority, and I
 wanted to get back to the AI patches I have once the other thing is sorted.
 
----
+&gt; 
+&gt; I have a reproducer for every single one of these (and the other
+&gt; series) - but a handful are unreachable due to a 2-statement read
+&gt; being emitted as a single read by the compiler (which can be undone
+&gt; by a targeted compiler flag). Those were included for completeness.
+
 
 In general, I think we want something that will protect all
 pfn_to_online_page() + zone-&gt;contig thingies, not just selected ones.
@@ -757,17 +455,984 @@ maybe we need a variant that can be called from &quot;wrong context&quot; for a 
 -- 
 Cheers,
 
+David
+
+---
+
+On 10/27/26 05:22, Gregory Price (Meta) wrote:
+&gt; An alloc_contig_range() that overlaps a block going offline can leave
+&gt; the offline spinning until it gets a signal, holding the device hotplug
+&gt; lock.  When isolation fails, alloc_contig_frozen_range() undoes it over
+&gt; the whole range, clearing the offline&#x27;s MIGRATE_ISOLATE too:
+&gt; 
+&gt;   CPU 1 (offline_pages)               CPU 2 (alloc_contig_range)
+&gt;   start_isolate_page_range()
+&gt;     blocks are MIGRATE_ISOLATE
+&gt;                                       start_isolate_page_range()
+&gt;                                         -EBUSY on CPU 1&#x27;s blocks
+&gt;                                       undo_isolate_page_range()
+&gt;                                         blocks are MIGRATE_MOVABLE
+&gt;   test_pages_isolated()
+&gt;     never succeeds again
+&gt; 
+&gt; start_isolate_page_range() fails only on a block someone else isolated,
+&gt; after undoing its own, so this undo only ever clears another caller&#x27;s.
+&gt; Return directly, as before alloc_contig_range() went pageblock granular.
+&gt; 
+&gt; With offline_pages() parked after isolating a DIMM block and a 1G
+&gt; hugetlb allocation made over it, the offline on base still loops 30s
+&gt; later in 4 of 4 runs:
+&gt; 
+&gt;   offline_pages+0x5b2/0x1570
+&gt;   memory_subsys_offline+0x17e/0x470
+&gt;   device_offline+0x250/0x340
+&gt;   state_store+0x88/0x110
+&gt; 
+&gt; With this patch the allocation still fails, and the offline completes in
+&gt; 3 of 3 runs.
+&gt; 
+&gt; Fixes: b2c9e2fbba32 (&quot;mm: make alloc_contig_range work at pageblock granularity&quot;)
+&gt; Cc: stable@vger.kernel.org
+&gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+&gt; ---
+
+We have an existing AI fix for that as well already handled by Vlasta.
+
+I think we&#x27;ll have to establish some model of &quot;ask David first before posting&quot;
+because otherwise we just create duplicate work for everyone.
+
+-- 
+Cheers,
+
+David
+
+---
+
+On 10/27/26 05:21, Gregory Price (Meta) wrote:
+&gt; Compaction checks that a pageblock is online, then uses its pages across
+&gt; lock drops and sleeps.  If offline poisons the memmap meanwhile, a
+&gt; DEBUG_VM kernel faults:
+&gt; 
+&gt;   CPU 1 (compaction)                  CPU 2 (offline_pages)
+&gt;   pageblock_pfn_to_page()
+&gt;     block is online
+&gt;   isolate_migratepages_block()
+&gt;     cond_resched()
+&gt;                                       offline_mem_sections()
+&gt;                                       remove_pfn_range_from_zone()
+&gt;                                         page_init_poison()
+&gt;     set_pageblock_skip(valid_page)
+&gt;       reads the zone of a poisoned page
+&gt; 
+&gt;   Oops: general protection fault, probably for non-canonical address 0xdffffc00000006a2
+&gt;   RIP: 0010:set_pfnblock_bit+0xa6/0x2b0
+&gt;    isolate_migratepages_block+0x2456/0x3c80
+&gt;    compact_zone+0x1638/0x3900
+&gt;    compact_node+0x12a/0x1f0
+&gt;    sysctl_compaction_handler+0xec/0x160
+&gt; 
+&gt; The free scanner faults the same way.  A contiguous zone skips the
+&gt; online check, since offline clears zone-&gt;contiguous only after
+&gt; poisoning.
+&gt; 
+&gt; Hold an SRCU-fast read section (pfn_walk) from the block check to the
+&gt; last use of its pages, and make remove_pfn_range_from_zone() clear
+&gt; zone-&gt;contiguous and wait for it before poisoning.  Offline pays one
+&gt; grace period per range.
+&gt; 
+&gt; Scanner positions outlive the section, and offline can shrink the zone
+&gt; meanwhile, so take the contiguous fast path only inside the current
+&gt; span, publish zone-&gt;contiguous with release, and keep the migrate
+&gt; scanner inside the zone.
+&gt; 
+&gt; With a kprobe parking the migrate scanner across the offline, base
+&gt; faults in 3 of 3 runs and this patch in none.  Unforced offline/online
+&gt; cycling under compaction faults in 8 of 24 runs on base and 0 of 12 with
+&gt; this patch.
+&gt; 
+&gt; Fixes: d33695b16a9f (&quot;mm/memory_hotplug: poison memmap in remove_pfn_range_from_zone()&quot;)
+&gt; Cc: stable@vger.kernel.org
+&gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+&gt; ---
+
+BTW, the order of these patches is all wrong.
+
+There are much more important fixes hiding in this series. And this change here
+would certainly not be the first thing we&#x27;d backport.
+
+Please create a proper series that only addresses the pfn_to_online_page()
+situation, without different, more urgent fixes.
+
+Because there is no way we will fast track anything like this here into stable
+kernels.
+
+-- 
+Cheers,
+
+David
+
+---
+
+On 10/27/26 15:06, Gregory Price (Meta) wrote:
+&gt; On 2026-10-27 14:37 +0100, David Hildenbrand (Arm) wrote:
+&gt;&gt; On 10/27/26 05:22, Gregory Price (Meta) wrote:
+&gt;&gt;
+&gt;&gt; We have an existing AI fix for that as well already handled by Vlasta.
+&gt;&gt;
+&gt;&gt; I think we&#x27;ll have to establish some model of &quot;ask David first before posting&quot;
+&gt;&gt; because otherwise we just create duplicate work for everyone.
+&gt;&gt;
+&gt; 
+&gt; Yeah, this is going to happen more.
+&gt; 
+&gt; I&#x27;ve been sitting in these patches for over a month while they soaked on
+&gt; hardware getting performance tests.  
+
+I mean this fix here is really just independent and shouldn&#x27;t wait that long :)
+
+&gt; 
+&gt; Maybe worth a private tree we can rebase on regularly for these kinds of
+&gt; un-vetted/posted fixes to see what&#x27;s coming?
+
+Maybe. But if it&#x27;s just us core people we can just talk on IRC etc (like Zi did
+two days ago when he was about to post something that I already had on my queue).
+
+-- 
+Cheers,
+
+David
+
+---
+
+On 10/27/26 14:49, Gregory Price (Meta) wrote:
+&gt; On 2026-10-27 13:51 +0100, David Hildenbrand (Arm) wrote:
+&gt;&gt; On 10/27/26 12:31, Gregory Price (Meta) wrote:
+&gt;&gt;&gt;
+&gt;&gt;&gt; I actually have a reason for these fixes other than &quot;bot said bad&quot;.
+&gt;&gt;
+&gt;&gt; So you found them on production kernels?
+&gt;&gt;
+&gt;&gt; We did not have a single real report of that for probably a decade or
+&gt;&gt; even longer in production.
+&gt;&gt;
+&gt;&gt; Recently, we had the single first report about the compaction case from a
+&gt;&gt; stress test (no production):
+&gt;&gt;
+&gt;&gt; https://lore.kernel.org/all/20260903095543.3752338-1-yuan1.liu@intel.com/
+&gt;&gt;
+&gt;&gt; &quot;We are not sure whether this race is reachable under realistic
+&gt;&gt; workloads or only under this synthetic stress test.&quot;
+&gt;&gt;
+&gt;&gt; Where I motivated that we need something clean.
+&gt;&gt;
+&gt; 
+&gt; tl;dr:
+&gt; 
+&gt; while these are ai-generated, I&#x27;m not posting untested, unreviewed
+&gt; schlopp for the sake of getting patches upstream.
+
+Appreciated.
+
+For this long-standing considered low-priority thing in particular it is
+reasonable to go back in time, see how often it was raised (quite often by me)
+and how often it was actually reported (I found one case).
+
+Then discuss the high level design in more than a single sentence :)
+
+Discuss why we are not using it for other pfn_to_online_page() users, how it
+interacts with zone-&gt;contig etc etc.
+
+There really isn&#x27;t a lot on the design in the cover letter.
+
+&gt; 
+&gt; I actually care about this issue.
+&gt; 
+&gt; ---
+&gt; 
+&gt; Some of these don&#x27;t show up as crashes but instead as hung offline
+&gt; attempts (GFP_KERNEL landing on movable).  That shows up as our
+&gt; hypervisor just failing to overcommit / guests hanging.
+&gt; 
+&gt; The compaction/alloc_contig bug is one I&#x27;ve seen in production.
+
+Right, but I suspect that&#x27;s &quot;[PATCH 4/6] mm/page_alloc: don&#x27;t undo another
+isolation in alloc_contig_range&quot; which is *not at all* related to &quot;mm: fix pfn
+walker races with memory offline&quot;.
+
+&gt; 
+&gt; I&#x27;ve seen a handful of NULL derefs in production i suspect are the
+&gt; zonelist derefs, but it&#x27;s hard to say (they&#x27;re rare enough that we
+&gt; lose the dumps before someone has a thought to pull them).
+
+That would be interesting to know.
+
+&gt; 
+&gt; I expect this will scale up as we increase the number of VMs and
+&gt; the amount of hotplug we&#x27;re doing.
+&gt; 
+&gt; For clarity, we use ballooning + hotplug as a combo:
+&gt;  - ballooning to do cooperative overcommit
+&gt;  - hotplug to defend host stability when the overcommit ratio is extreme
+&gt;    (basically deflate_on_oom because a host stability issue)
+&gt; 
+&gt; We&#x27;re pretty aggressive about ballooning guests to squeeze them and
+&gt; dropping the balloon to hot-unplug that memory when a guest is cold.
+
+Yeah, that makes sense.
+
+&gt; 
+&gt; 
+&gt; skippable side note on virtio-balloon/mem:
+&gt; 
+&gt; I have some improvements to virtio-balloon and virtio-mem that allow for
+&gt; handoff from balloon directly to mem for hot-unplug without having to
+&gt; drop the balloon, but I haven&#x27;t posted those (and we don&#x27;t run those in
+&gt; production, so this is not the nexus of crashes).
+
+Do you mean free-page reporting or actual balloon inflation/deflation paired
+with virtio-mem. I hope not the latter, because that is just disgusting.
+
+&gt; 
+&gt; Similarly I have another extension that lets the host set a &quot;NO_ALLOC&quot;
+&gt; bit on the zone so a balloon-only system can provide the host a way to
+&gt; defend against mass deflate_on_oom events (we prefer guests to OOM and
+&gt; have the host to kill them due to PSI, rather than threaten host
+&gt; stability). Also not in production and not posted, but there have been
+&gt; a lot of experiments on overcommit here.
+&gt; 
+&gt;&gt; The thing is that the race between offlining and actual memory removal
+&gt;&gt; is extremely long. Poisoning is just a mechanism to find these theoretical
+&gt;&gt; issues that could cause issues faster.
+&gt;&gt;
+&gt;&gt; And with all the other things going on, this has lower priority, and I
+&gt;&gt; wanted to get back to the AI patches I have once the other thing is sorted.
+&gt;&gt;
+&gt; 
+&gt; Sure, I realize I&#x27;m pushing this out during the merge window, but I
+&gt; felt it reasonable to get some thoughts on whether these fixes are
+&gt; worth considering for the window.
+
+Just a matter of priority. I think this should be tackled in clean way indeed.
+
+&gt; 
+&gt; If the answer is no just put em on the back burner. We can carry
+&gt; fixes as-needed.
+&gt; 
+&gt;&gt;&gt;
+&gt;&gt;&gt; I have a reproducer for every single one of these (and the other
+&gt;&gt;&gt; series) - but a handful are unreachable due to a 2-statement read
+&gt;&gt;&gt; being emitted as a single read by the compiler (which can be undone
+&gt;&gt;&gt; by a targeted compiler flag). Those were included for completeness.
+&gt;&gt;
+&gt;&gt;
+&gt;&gt; In general, I think we want something that will protect all
+&gt;&gt; pfn_to_online_page() + zone-&gt;contig thingies, not just selected ones.
+&gt;&gt; We discussed in the past using some sort of rcu for that.
+&gt;&gt;
+&gt;&gt; get_online_mems is usually the wrong approach.
+&gt;&gt;
+&gt; 
+&gt; Agreed, although the PFN walks seem genuinely harder to wrangle into an
+&gt; good rcu shape.
+
+And that&#x27;s where the overall design needs to discuss this and how to resolve it.
+
+:)
+
+&gt; 
+&gt; get_online_mems seems like the backportable solution, but i can see not
+&gt; wanting to have to go clean it back up later.
+&gt; 
+&gt;&gt; protecting individual pfn_to_online_page is just whack a mole. Likely we want a
+&gt;&gt; way to check whether pfn_to_online_page() is called from the wrong context, and
+&gt;&gt; maybe we need a variant that can be called from &quot;wrong context&quot; for a good reason.
+&gt;&gt;
+&gt; 
+&gt; Agreed.  Although I fear the structural fix for this will have uglier
+&gt; performance issue than we think.  Then again, maybe it doesn&#x27;t matter
+&gt; (if you&#x27;re doing a PFN walk, then you&#x27;re likely already doing something
+&gt; stupidly expensive).
+
+Which areas are you mostly concerned about and from which piece do you expect
+the overhead?
+
+&gt; 
+&gt; Where i&#x27;m largely concerned is the page allocator and the
+&gt; compaction/contig code not taking a regression.
+&gt; 
+&gt; For zonelists i&#x27;ve ended up with something like this:
+&gt; 
+&gt; @@ -1461,7 +1466,7 @@ typedef struct pglist_data {
+&gt;          * Generally the first zones will be references to this node&#x27;s
+&gt;          * node_zones.
+&gt;          */
+&gt; -       struct zonelist node_zonelists[MAX_ZONELISTS];
+&gt; +       struct zonelist __rcu *node_zonelists[MAX_ZONELISTS];
+&gt; 
+&gt; ...
+&gt; 
+&gt; static inline struct srcu_ctr __percpu *zonelist_read_lock(void)
+&gt; {
+&gt;        return srcu_read_lock_fast(&amp;zonelist_srcu);
+&gt; }
+&gt; 
+&gt; static inline void zonelist_read_unlock(struct srcu_ctr __percpu *scp)
+&gt; {
+&gt;        srcu_read_unlock_fast(&amp;zonelist_srcu, scp);
+&gt; }
+&gt; 
+&gt; DEFINE_LOCK_GUARD_0(zonelist_read, _T-&gt;scp = zonelist_read_lock(),
+&gt;                    zonelist_read_unlock(_T-&gt;scp),
+&gt;                    struct srcu_ctr __percpu *scp)
+&gt; 
+&gt; static inline struct zonelist *pgdat_zonelist(pg_data_t *pgdat, int type)
+&gt; {
+&gt;        return zonelist_dereference(pgdat-&gt;node_zonelists[type]);
+&gt; }
+&gt; 
+&gt; With this the zonelist cookie checks evaporate, but you still end up
+&gt; with guard() at every walk location - not great, but better i suppose.
+
+
+For &quot;broader&quot; things that are not just a simple pfn_to_online_page() user, we
+could also have memory online/offline sync in more efficient ways using the
+memory notifier.
+
+It&#x27;s also tricky, but maybe for zone-&gt;contig + compaction the better solution?
+
+&gt; 
+&gt; I was hoping this could be sunken into the zonelist walk macros, but
+&gt; I haven&#x27;t seen that pan out.  I&#x27;ve been spending a lot of time auditing
+&gt; that code for private nodes as well.
+&gt; 
+&gt; 
+&gt; On performance:
+&gt; 
+&gt; I&#x27;ve been hammering this with will-it-scale and a bunch of workload
+&gt; tests on a variety of hosts and have not seen any obvious regressions
+&gt; outside of powerpc (which i can&#x27;t test directly, but SRCU-fast requires
+&gt; atomics for powerpc from what i can tell - so it will eat overhead
+&gt; without a fallback... if there is actually any hotplug ppc hardware out
+&gt; there to care about?)
+
+So the big problem is the overhead on the read side for srcu?
+
+If we can find something else to suspend compaction, we could maybe switch to
+rcu for the remaining cases.
+
+Now that I think about it, I recall why I didn&#x27;t fix this earlier :)
+
+-- 
+Cheers,
+
+David
+
+---
+
+On 10/27/26 19:53, Zi Yan wrote:
+&gt; On 27 Oct 2026, at 10:13, David Hildenbrand (Arm) wrote:
+&gt; 
+&gt;&gt; On 10/27/26 15:06, Gregory Price (Meta) wrote:
+&gt;&gt;&gt;
+&gt;&gt;&gt; Yeah, this is going to happen more.
+&gt;&gt;&gt;
+&gt;&gt;&gt; I&#x27;ve been sitting in these patches for over a month while they soaked on
+&gt;&gt;&gt; hardware getting performance tests.
+&gt;&gt;
+&gt;&gt; I mean this fix here is really just independent and shouldn&#x27;t wait that long :)
+&gt;&gt;
+&gt;&gt;&gt;
+&gt;&gt;&gt; Maybe worth a private tree we can rebase on regularly for these kinds of
+&gt;&gt;&gt; un-vetted/posted fixes to see what&#x27;s coming?
+&gt;&gt;
+&gt;&gt; Maybe. But if it&#x27;s just us core people we can just talk on IRC etc (like Zi did
+&gt;&gt; two days ago when he was about to post something that I already had on my queue).
+&gt; 
+&gt; One idea is that maybe Sashiko is able to identify patches fixing
+&gt; the same issue and does some grouping or tagging on the website.
+&gt; Or send an email about it with a lore link.
+
+I think that&#x27;s too late. For us core devs we just need to sync on &quot;has someone
+already a fix for that or is it worth cleaning the AI shite up and sending it out&quot;.
+
+-- 
+Cheers,
+
 David</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Gregory (Meta)</div>
-<a href="https://lore.kernel.org/r/9051ac3d-60b9-4ed2-b781-b7191898bc83@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: skepticism, questioning, lower priority</div>
+<a href="https://lore.kernel.org/r/01d7d54d-0047-4eb6-a1d2-5b3f113f26cf@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: low priority, suggested alternative approach</div>
 </div>
 </div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Gregory (Meta) (author)</span>
+<a class="date-chip" href="../2026-10-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-27">2026-10-27</a>
+<span class="badge" style="color:#155724;background:#d4edda">Positive</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author is addressing David Hildenbrand&#x27;s (Arm) feedback that the patch series appears low-priority and not based on real-world issues, as well as his suggestion to discuss this further outside of the merge window. The author explains that they have a reason for these fixes beyond &#x27;bot said bad&#x27;, citing production kernel crashes and hangs caused by the race conditions in ballooning and hotplugging VM memory overcommit tools. They also mention that they have reproducers for every single one of these issues, but some are unreachable due to compiler optimizations.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 2026-10-27 09:57 +0100, David Hildenbrand (Arm) wrote:
+&gt; On 10/27/26 05:21, Gregory Price (Meta) wrote:
+&gt; &gt; Several pfn walkers check that a struct page is online, then use it
+&gt; &gt; after memory offline has poisoned it (CONFIG_DEBUG_VM) or removal has
+&gt; &gt; freed the vmemmap.  Five of the races crash the kernel; the sixth leaves
+&gt; &gt; an offline spinning with the device hotplug lock held.
+&gt; 
+&gt; I have roughly the exact same list of AI garbage fixes here from a certain company.
+&gt; 
+&gt; And I consider this all extremely low priority.
+&gt; 
+&gt; So this is something to discuss throughout the next months and do it properly.
+&gt; 
+
+I actually have a reason for these fixes other than &quot;bot said bad&quot;.
+
+We leverage ballooning and hotplugging as VM memory overcommit tools
+and are finding that some of these race conditions crash them with
+large MTBF.
+
+While most of these are insanely narrow, they are not as unlikely to
+happen as you think. A vCPU can take a vmexit in these windows much
+more easily than a host can take an NMI or other interrupt.
+
+Thankfully none of these (or the other series) appear to be obvious
+security issues, but they are stability issues.
+
+I have a reproducer for every single one of these (and the other
+series) - but a handful are unreachable due to a 2-statement read
+being emitted as a single read by the compiler (which can be undone
+by a targeted compiler flag). Those were included for completeness.
+
+--
+
+On properly - I have a follow up series that fixes the zonelist walks
+structurally, but it uses SRCU-fast on the fast path. The catch is that
+PowerPC (and i think others?) don&#x27;t SRCU-fast without atomics, so they
+take a performance hit.  (It also doesn&#x27;t help us for backports)
+
+I&#x27;ve been weighing that solution over never freeing and/or prepopulating
+zones - but this also results in performance impacts (leaving dead zones
+in the list forces the allocator to walk them for no value).
+
+-- 
+~Gregory
+
+---
+
+On 2026-10-27 13:51 +0100, David Hildenbrand (Arm) wrote:
+&gt; On 10/27/26 12:31, Gregory Price (Meta) wrote:
+&gt; &gt; On 2026-10-27 09:57 +0100, David Hildenbrand (Arm) wrote:
+&gt; &gt; 
+&gt; &gt; I actually have a reason for these fixes other than &quot;bot said bad&quot;.
+&gt; 
+&gt; So you found them on production kernels?
+&gt; 
+&gt; We did not have a single real report of that for probably a decade or
+&gt; even longer in production.
+&gt; 
+&gt; Recently, we had the single first report about the compaction case from a
+&gt; stress test (no production):
+&gt; 
+&gt; https://lore.kernel.org/all/20260903095543.3752338-1-yuan1.liu@intel.com/
+&gt; 
+&gt; &quot;We are not sure whether this race is reachable under realistic
+&gt; workloads or only under this synthetic stress test.&quot;
+&gt; 
+&gt; Where I motivated that we need something clean.
+&gt; 
+
+tl;dr:
+
+while these are ai-generated, I&#x27;m not posting untested, unreviewed
+schlopp for the sake of getting patches upstream.
+
+I actually care about this issue.
+
+---
+
+Some of these don&#x27;t show up as crashes but instead as hung offline
+attempts (GFP_KERNEL landing on movable).  That shows up as our
+hypervisor just failing to overcommit / guests hanging.
+
+The compaction/alloc_contig bug is one I&#x27;ve seen in production.
+
+I&#x27;ve seen a handful of NULL derefs in production i suspect are the
+zonelist derefs, but it&#x27;s hard to say (they&#x27;re rare enough that we
+lose the dumps before someone has a thought to pull them).
+
+I expect this will scale up as we increase the number of VMs and
+the amount of hotplug we&#x27;re doing.
+
+For clarity, we use ballooning + hotplug as a combo:
+ - ballooning to do cooperative overcommit
+ - hotplug to defend host stability when the overcommit ratio is extreme
+   (basically deflate_on_oom because a host stability issue)
+
+We&#x27;re pretty aggressive about ballooning guests to squeeze them and
+dropping the balloon to hot-unplug that memory when a guest is cold.
+
+
+skippable side note on virtio-balloon/mem:
+
+I have some improvements to virtio-balloon and virtio-mem that allow for
+handoff from balloon directly to mem for hot-unplug without having to
+drop the balloon, but I haven&#x27;t posted those (and we don&#x27;t run those in
+production, so this is not the nexus of crashes).
+
+Similarly I have another extension that lets the host set a &quot;NO_ALLOC&quot;
+bit on the zone so a balloon-only system can provide the host a way to
+defend against mass deflate_on_oom events (we prefer guests to OOM and
+have the host to kill them due to PSI, rather than threaten host
+stability). Also not in production and not posted, but there have been
+a lot of experiments on overcommit here.
+
+&gt; The thing is that the race between offlining and actual memory removal
+&gt; is extremely long. Poisoning is just a mechanism to find these theoretical
+&gt; issues that could cause issues faster.
+&gt; 
+&gt; And with all the other things going on, this has lower priority, and I
+&gt; wanted to get back to the AI patches I have once the other thing is sorted.
+&gt; 
+
+Sure, I realize I&#x27;m pushing this out during the merge window, but I
+felt it reasonable to get some thoughts on whether these fixes are
+worth considering for the window.
+
+If the answer is no just put em on the back burner. We can carry
+fixes as-needed.
+
+&gt; &gt; 
+&gt; &gt; I have a reproducer for every single one of these (and the other
+&gt; &gt; series) - but a handful are unreachable due to a 2-statement read
+&gt; &gt; being emitted as a single read by the compiler (which can be undone
+&gt; &gt; by a targeted compiler flag). Those were included for completeness.
+&gt; 
+&gt; 
+&gt; In general, I think we want something that will protect all
+&gt; pfn_to_online_page() + zone-&gt;contig thingies, not just selected ones.
+&gt; We discussed in the past using some sort of rcu for that.
+&gt;
+&gt; get_online_mems is usually the wrong approach.
+&gt; 
+
+Agreed, although the PFN walks seem genuinely harder to wrangle into an
+good rcu shape.
+
+get_online_mems seems like the backportable solution, but i can see not
+wanting to have to go clean it back up later.
+
+&gt; protecting individual pfn_to_online_page is just whack a mole. Likely we want a
+&gt; way to check whether pfn_to_online_page() is called from the wrong context, and
+&gt; maybe we need a variant that can be called from &quot;wrong context&quot; for a good reason.
+&gt; 
+
+Agreed.  Although I fear the structural fix for this will have uglier
+performance issue than we think.  Then again, maybe it doesn&#x27;t matter
+(if you&#x27;re doing a PFN walk, then you&#x27;re likely already doing something
+stupidly expensive).
+
+Where i&#x27;m largely concerned is the page allocator and the
+compaction/contig code not taking a regression.
+
+For zonelists i&#x27;ve ended up with something like this:
+
+@@ -1461,7 +1466,7 @@ typedef struct pglist_data {
+         * Generally the first zones will be references to this node&#x27;s
+         * node_zones.
+         */
+-       struct zonelist node_zonelists[MAX_ZONELISTS];
++       struct zonelist __rcu *node_zonelists[MAX_ZONELISTS];
+
+...
+
+static inline struct srcu_ctr __percpu *zonelist_read_lock(void)
+{
+       return srcu_read_lock_fast(&amp;zonelist_srcu);
+}
+
+static inline void zonelist_read_unlock(struct srcu_ctr __percpu *scp)
+{
+       srcu_read_unlock_fast(&amp;zonelist_srcu, scp);
+}
+
+DEFINE_LOCK_GUARD_0(zonelist_read, _T-&gt;scp = zonelist_read_lock(),
+                   zonelist_read_unlock(_T-&gt;scp),
+                   struct srcu_ctr __percpu *scp)
+
+static inline struct zonelist *pgdat_zonelist(pg_data_t *pgdat, int type)
+{
+       return zonelist_dereference(pgdat-&gt;node_zonelists[type]);
+}
+
+With this the zonelist cookie checks evaporate, but you still end up
+with guard() at every walk location - not great, but better i suppose.
+
+I was hoping this could be sunken into the zonelist walk macros, but
+I haven&#x27;t seen that pan out.  I&#x27;ve been spending a lot of time auditing
+that code for private nodes as well.
+
+
+On performance:
+
+I&#x27;ve been hammering this with will-it-scale and a bunch of workload
+tests on a variety of hosts and have not seen any obvious regressions
+outside of powerpc (which i can&#x27;t test directly, but SRCU-fast requires
+atomics for powerpc from what i can tell - so it will eat overhead
+without a fallback... if there is actually any hotplug ppc hardware out
+there to care about?)
+
+-- 
+~Gregory
+
+---
+
+On 2026-10-27 14:37 +0100, David Hildenbrand (Arm) wrote:
+&gt; On 10/27/26 05:22, Gregory Price (Meta) wrote:
+&gt; 
+&gt; We have an existing AI fix for that as well already handled by Vlasta.
+&gt; 
+&gt; I think we&#x27;ll have to establish some model of &quot;ask David first before posting&quot;
+&gt; because otherwise we just create duplicate work for everyone.
+&gt; 
+
+Yeah, this is going to happen more.
+
+I&#x27;ve been sitting in these patches for over a month while they soaked on
+hardware getting performance tests.  
+
+Maybe worth a private tree we can rebase on regularly for these kinds of
+un-vetted/posted fixes to see what&#x27;s coming?
+
+-- 
+~Gregory
+
+---
+
+On 2026-10-27 15:25 +0100, David Hildenbrand (Arm) wrote:
+&gt; On 10/27/26 14:49, Gregory Price (Meta) wrote:
+&gt; &gt; 
+&gt; &gt; while these are ai-generated, I&#x27;m not posting untested, unreviewed
+&gt; &gt; schlopp for the sake of getting patches upstream.
+&gt; 
+&gt; Appreciated.
+&gt; 
+&gt; For this long-standing considered low-priority thing in particular it is
+&gt; reasonable to go back in time, see how often it was raised (quite often by me)
+&gt; and how often it was actually reported (I found one case).
+&gt; 
+&gt; Then discuss the high level design in more than a single sentence :)
+&gt; 
+&gt; Discuss why we are not using it for other pfn_to_online_page() users, how it
+&gt; interacts with zone-&gt;contig etc etc.
+&gt; 
+&gt; There really isn&#x27;t a lot on the design in the cover letter.
+&gt;
+
+Fair, there&#x27;s a mix of design vs firefighting tension going on here.
+
+I&#x27;m trying to get out ahead of a rapidly evolving scaling issue before
+it becomes big.  But I will admit it&#x27;s sometimes hard to even figure
+out what questions to ask without posting the wrong patches first.
+
+(Cunningham&#x27;s law :P)
+
+&gt; &gt; Some of these don&#x27;t show up as crashes but instead as hung offline
+&gt; &gt; attempts (GFP_KERNEL landing on movable).  That shows up as our
+&gt; &gt; hypervisor just failing to overcommit / guests hanging.
+&gt; &gt; 
+&gt; &gt; The compaction/alloc_contig bug is one I&#x27;ve seen in production.
+&gt; 
+&gt; Right, but I suspect that&#x27;s &quot;[PATCH 4/6] mm/page_alloc: don&#x27;t undo another
+&gt; isolation in alloc_contig_range&quot; which is *not at all* related to &quot;mm: fix pfn
+&gt; walker races with memory offline&quot;.
+&gt;
+
+Ehhh... i&#x27;d argue it&#x27;s the same shape.  But i&#x27;ll concede some of these
+could be pulled out ahead as you&#x27;ve said elsewhere.
+
+&gt; &gt; skippable side note on virtio-balloon/mem:
+&gt; &gt; 
+&gt; &gt; I have some improvements to virtio-balloon and virtio-mem that allow for
+&gt; &gt; handoff from balloon directly to mem for hot-unplug without having to
+&gt; &gt; drop the balloon, but I haven&#x27;t posted those (and we don&#x27;t run those in
+&gt; &gt; production, so this is not the nexus of crashes).
+&gt; 
+&gt; Do you mean free-page reporting or actual balloon inflation/deflation paired
+&gt; with virtio-mem. I hope not the latter, because that is just disgusting.
+&gt; 
+
+Actual balloon inflation/deflation.  It is disgusting, but it&#x27;s
+effective.  Right now we use hotplug at boot to minimize the size of
+cold machines to avoid thundering herd issues, and then add it when
+they actually get allocated for work.
+
+At runtime we use ballooning to reduce a VM to its actual RSS based
+on PSI feedback (see: that virtio stats extension i sent you some while
+ago), but would like to use hotplug to give the host a defense against
+a storm of deflate_on_oom scenarios across a large number of guests.
+
+Basically using PSI stats we can make guests do somewhat aggressive
+proactive reclaim on without having to build any new tooling, and
+while being able to back-off aggressively.
+
+Free-page reporting is also on by default, but this only helps you if
+your guests are being extra nice about things.
+
+(spoiler: they&#x27;re not! they&#x27;re greedly little imps! :D)
+
+My experiments made balloon prefer to try to reclaim movable regions
+in contiguous blocks, and then just hand that contiguous block off to
+virtio-mem for offline without having to drop the balloon.
+
+tl;dr: This seems effective and works quite well.
+
+I&#x27;ve become a little confused as to why virtio balloon and mem are
+separate entities when they could work together this way.
+
+Haven&#x27;t had the time to read up on the development history.
+
+&gt; &gt; 
+&gt; &gt; Agreed.  Although I fear the structural fix for this will have uglier
+&gt; &gt; performance issue than we think.  Then again, maybe it doesn&#x27;t matter
+&gt; &gt; (if you&#x27;re doing a PFN walk, then you&#x27;re likely already doing something
+&gt; &gt; stupidly expensive).
+&gt; 
+&gt; Which areas are you mostly concerned about and from which piece do you expect
+&gt; the overhead?
+&gt; 
+
+largely the zonelist iteration - which looking back through history 
+has already been &quot;optimized&quot; multiple times, only for those things
+to introduce more bugs :\.
+
+The zonelist races seem more ammenable to RCU solutions than the pfn
+walks.  I&#x27;m not sure how to safely quiesce every possible PFN walker
+without atomics in their fast path.
+
+&gt; For &quot;broader&quot; things that are not just a simple pfn_to_online_page() user, we
+&gt; could also have memory online/offline sync in more efficient ways using the
+&gt; memory notifier.
+&gt; 
+&gt; It&#x27;s also tricky, but maybe for zone-&gt;contig + compaction the better solution?
+&gt; 
+
+This seems reasonable, I was trying not to schlopp you with a half-baked
+architectural fix and instead use the available tools.
+
+But maybe we should chat (after the window).
+
+I&#x27;ll try to be on IRC more often.
+
+&gt; &gt; On performance:
+&gt; &gt; 
+&gt; &gt; I&#x27;ve been hammering this with will-it-scale and a bunch of workload
+&gt; &gt; tests on a variety of hosts and have not seen any obvious regressions
+&gt; &gt; outside of powerpc (which i can&#x27;t test directly, but SRCU-fast requires
+&gt; &gt; atomics for powerpc from what i can tell - so it will eat overhead
+&gt; &gt; without a fallback... if there is actually any hotplug ppc hardware out
+&gt; &gt; there to care about?)
+&gt; 
+&gt; So the big problem is the overhead on the read side for srcu?
+&gt;
+
+Yes - but specifically this affects PowerPC because it:
+ - has NMI
+ - does NOT have NMI-safe per-CPU operations
+ - supports memory hotplug
+ - uses atomics for SRCU-fast
+
+So using SRCU fast in these contexts is not cheap.
+
+For what I could measure in QEMU, the atomics on PPC seem like they
+could be significant (15-20% overhead) in microbenchmarks.
+
+Hard to say what that turns into on real hardware.
+
+I implemented a fallback solution for those architectures to just not
+free the zonelists in this case.  They have to iterate the dead zones,
+but it&#x27;s a much less overhead comparatively (&lt;1%, but measurable).
+
+For everyone else SRCU-fast is imperceptible overhead.
+
+&gt; If we can find something else to suspend compaction, we could maybe switch to
+&gt; rcu for the remaining cases.
+&gt; 
+
+Is long-term compaction suspension even safe? I had to make COMPACTION a
+requirement for N_MEMORY_USER_NUMA in order to not generate spurious
+failures due to fragmentation.
+
+~Gregory
+
+-- 
+~Gregory
+
+---
+
+On 2026-10-27 19:58 +0100, David Hildenbrand (Arm) wrote:
+&gt; On 10/27/26 19:53, Zi Yan wrote:
+&gt; &gt; On 27 Oct 2026, at 10:13, David Hildenbrand (Arm) wrote:
+&gt; &gt; 
+&gt; &gt;&gt; Maybe. But if it&#x27;s just us core people we can just talk on IRC etc (like Zi did
+&gt; &gt;&gt; two days ago when he was about to post something that I already had on my queue).
+&gt; &gt; 
+&gt; &gt; One idea is that maybe Sashiko is able to identify patches fixing
+&gt; &gt; the same issue and does some grouping or tagging on the website.
+&gt; &gt; Or send an email about it with a lore link.
+&gt; 
+&gt; I think that&#x27;s too late. For us core devs we just need to sync on &quot;has someone
+&gt; already a fix for that or is it worth cleaning the AI shite up and sending it out&quot;.
+&gt; 
+
+It might be worth just having a maintainer Fixes:-only review branch
+that automates pulling these things in and responding to conflicts.
+
+I&#x27;ve been working on some b4 workbench automation to make triaging the
+list a little more sustainable. It&#x27;s getting there, but it needs time.
+
+~Gregory
+
+-- 
+Gregory Price &lt;gourry@gourry.net&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/179310071902.664110.12994053710961856591.b4-reply@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: author_cites_production_kernel_crashes, author_provides_reproducers</div>
 </div>
 </div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Zi Yan</span>
+<a class="date-chip" href="../2026-10-27_ollama_llama3.1-8b.html" title="First appeared in report for 2026-10-27">2026-10-27</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Yan suggested using Sashiko to identify and group patches fixing the same issue, or sending an email about duplicate work to avoid creating unnecessary effort.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 27 Oct 2026, at 10:13, David Hildenbrand (Arm) wrote:
+
+&gt; On 10/27/26 15:06, Gregory Price (Meta) wrote:
+&gt;&gt; On 2026-10-27 14:37 +0100, David Hildenbrand (Arm) wrote:
+&gt;&gt;&gt; On 10/27/26 05:22, Gregory Price (Meta) wrote:
+&gt;&gt;&gt;
+&gt;&gt;&gt; We have an existing AI fix for that as well already handled by Vlasta.
+&gt;&gt;&gt;
+&gt;&gt;&gt; I think we&#x27;ll have to establish some model of &quot;ask David first before posting&quot;
+&gt;&gt;&gt; because otherwise we just create duplicate work for everyone.
+&gt;&gt;&gt;
+&gt;&gt;
+&gt;&gt; Yeah, this is going to happen more.
+&gt;&gt;
+&gt;&gt; I&#x27;ve been sitting in these patches for over a month while they soaked on
+&gt;&gt; hardware getting performance tests.
+&gt;
+&gt; I mean this fix here is really just independent and shouldn&#x27;t wait that long :)
+&gt;
+&gt;&gt;
+&gt;&gt; Maybe worth a private tree we can rebase on regularly for these kinds of
+&gt;&gt; un-vetted/posted fixes to see what&#x27;s coming?
+&gt;
+&gt; Maybe. But if it&#x27;s just us core people we can just talk on IRC etc (like Zi did
+&gt; two days ago when he was about to post something that I already had on my queue).
+
+One idea is that maybe Sashiko is able to identify patches fixing
+the same issue and does some grouping or tagging on the website.
+Or send an email about it with a lore link.
+
+Best Regards,
+Yan, Zi</pre>
+</details>
+<a href="https://lore.kernel.org/r/A4D82AB8-F33A-465C-AE69-933B746E4885@nvidia.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: suggestion, idea</div>
 </div>
 </div>
+<div class="thread-node depth-0" id="2026-11-03">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Vlastimil (SUSE)</span>
+<a class="date-chip" href="../2026-11-03_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-03">2026-11-03</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer noted that alloc_contig_frozen_range_noprof() undoes its own isolation and any other isolated blocks in the range, which can lead to a lock ordering violation when offline_pages() is parked after isolating a DIMM block. They suggested returning directly from start_isolate_page_range() on failure, as before alloc_contig_range() went pageblock granular.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 10/27/26 05:22, Gregory Price (Meta) wrote:
+&gt; An alloc_contig_range() that overlaps a block going offline can leave
+&gt; the offline spinning until it gets a signal, holding the device hotplug
+&gt; lock.  When isolation fails, alloc_contig_frozen_range() undoes it over
+&gt; the whole range, clearing the offline&#x27;s MIGRATE_ISOLATE too:
+&gt; 
+&gt;   CPU 1 (offline_pages)               CPU 2 (alloc_contig_range)
+&gt;   start_isolate_page_range()
+&gt;     blocks are MIGRATE_ISOLATE
+&gt;                                       start_isolate_page_range()
+&gt;                                         -EBUSY on CPU 1&#x27;s blocks
+&gt;                                       undo_isolate_page_range()
+&gt;                                         blocks are MIGRATE_MOVABLE
+&gt;   test_pages_isolated()
+&gt;     never succeeds again
+&gt; 
+&gt; start_isolate_page_range() fails only on a block someone else isolated,
+&gt; after undoing its own, so this undo only ever clears another caller&#x27;s.
+&gt; Return directly, as before alloc_contig_range() went pageblock granular.
+&gt; 
+&gt; With offline_pages() parked after isolating a DIMM block and a 1G
+&gt; hugetlb allocation made over it, the offline on base still loops 30s
+&gt; later in 4 of 4 runs:
+&gt; 
+&gt;   offline_pages+0x5b2/0x1570
+&gt;   memory_subsys_offline+0x17e/0x470
+&gt;   device_offline+0x250/0x340
+&gt;   state_store+0x88/0x110
+&gt; 
+&gt; With this patch the allocation still fails, and the offline completes in
+&gt; 3 of 3 runs.
+&gt; 
+&gt; Fixes: b2c9e2fbba32 (&quot;mm: make alloc_contig_range work at pageblock granularity&quot;)
+&gt; Cc: stable@vger.kernel.org
+&gt; Signed-off-by: Gregory Price (Meta) &lt;gourry@gourry.net&gt;
+
+I&#x27;ve applied this single patch to page_alloc/for-next-fixes and will drop
+the version from Josef [1]. Also transferred Zi&#x27;s R-b since it&#x27;s the same
+code change (plus comment).
+
+[1]
+https://lore.kernel.org/all/20261027-pgalloc-ai-hotfixes-v1-1-9c7d1aca801e@kernel.org/
+
+&gt; ---
+&gt;  mm/page_alloc.c | 6 +++++-
+&gt;  1 file changed, 5 insertions(+), 1 deletion(-)
+&gt; 
+&gt; diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+&gt; index 55d3fc4b307f5..bb3c7e95f2ed4 100644
+&gt; --- a/mm/page_alloc.c
+&gt; +++ b/mm/page_alloc.c
+&gt; @@ -7396,9 +7396,13 @@ int alloc_contig_frozen_range_noprof(unsigned long start, unsigned long end,
+&gt;  	 * put back to page allocator so that buddy can use them.
+&gt;  	 */
+&gt;  
+&gt; +	/*
+&gt; +	 * On failure this has undone its own isolation, and any other
+&gt; +	 * isolated blocks in the range belong to someone else, e.g. offline.
+&gt; +	 */
+&gt;  	ret = start_isolate_page_range(start, end, mode);
+&gt;  	if (ret)
+&gt; -		goto done;
+&gt; +		return ret;
+&gt;  
+&gt;  	drain_all_pages(cc.zone);
+&gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/6091a4d5-ded8-423e-a806-2c4b11f21e09@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>
