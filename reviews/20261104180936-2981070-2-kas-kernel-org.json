@@ -1,0 +1,30 @@
+{
+  "thread_id": "20261104180936.2981070-2-kas@kernel.org",
+  "subject": "[PATCH 1/2] arm64: sdei: Run the event handler on the kernel vectors",
+  "url": "https://lore.kernel.org/all/20261104180936.2981070-2-kas@kernel.org/",
+  "dates": {
+    "2026-11-04": {
+      "report_file": "2026-11-04_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Usama Arif",
+          "summary": "Raised concerns that the patch does not cover all possible exception paths in the NMI entry and exit pair, which could still cause the CPU to loop indefinitely.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "On Wed,  4 Nov 2026 18:09:33 +0000 \"Kiryl Shutsemau (Meta)\" <kas@kernel.org> wrote:\n\n> With KPTI, VBAR_EL1 holds the trampoline vectors from the return to EL0\n> until the next exception from EL0 maps the kernel and installs the\n> kernel vectors. The trampoline vectors only handle exceptions from EL0;\n> their current-EL half is zero-filled.\n> \n> An SDEI event is dispatched regardless of PSTATE.DAIF, so it lands there\n> whenever the CPU is in user space. The SDEI entry trampoline maps the\n> kernel but leaves VBAR_EL1 alone. An exception taken by the handler then\n> executes the zeros, takes an undefined instruction exception to the same\n> vector, and loops there forever. The event never completes and the CPU\n> is lost; RCU stall reports are the first sign of it.\n> \n> RAS notifications land in user space whenever a task consumes the\n> error, and NMI backtraces land wherever the CPU happens to be. The GHES\n> handler takes no exception on its own, but any exception in the handler\n> path does it: a WARN, a kprobe hit, or a fault fixed up by a _nofault()\n> accessor.\n> \n> Install the kernel vectors in do_sdei_event() when VBAR_EL1 holds the\n> trampoline vectors, and restore it before returning to firmware,\n> including when the handler fails. The IRQ-like resume into user space\n> keeps using the interrupted value, as it must go through the trampoline\n> to map the kernel.\n> \n> Fixes: 79e9aa59dc29 (\"arm64: sdei: Add trampoline code for remapping the kernel\")\n> Cc: stable@vger.kernel.org\n> Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n> ---\n>  arch/arm64/kernel/sdei.c | 22 ++++++++++++++++++++--\n>  1 file changed, 20 insertions(+), 2 deletions(-)\n> \n> diff --git a/arch/arm64/kernel/sdei.c b/arch/arm64/kernel/sdei.c\n> index 778f2a1faac8..9fa2a3aeed48 100644\n> --- a/arch/arm64/kernel/sdei.c\n> +++ b/arch/arm64/kernel/sdei.c\n> @@ -18,6 +18,7 @@\n>  #include <asm/sections.h>\n>  #include <asm/stacktrace.h>\n>  #include <asm/sysreg.h>\n> +#include <asm/vectors.h>\n>  #include <asm/vmap_stack.h>\n>  \n>  unsigned long sdei_exit_mode;\n> @@ -214,6 +215,20 @@ unsigned long __kprobes do_sdei_event(struct pt_regs *regs,\n>  \tif (arm64_kernel_unmapped_at_el0())\n>  \t\tclobbered_registers++;\n>  \n> +\t/*\n> +\t * With KPTI, VBAR_EL1 holds the trampoline vectors from the return to\n> +\t * EL0 until the next exception from EL0 maps the kernel. They only\n> +\t * handle exceptions from EL0: an exception taken by the handler would\n> +\t * run their empty current-EL half and never come back. Run the handler\n> +\t * on the kernel vectors. The IRQ-like resume below keeps using the\n> +\t * interrupted VBAR, so it still goes through the trampoline.\n> +\t */\n> +\tif (arm64_kernel_unmapped_at_el0() &&\n> +\t    vbar == (unsigned long)this_cpu_read(this_cpu_vector)) {\n> +\t\twrite_sysreg((unsigned long)vectors, vbar_el1);\n> +\t\tisb();\n> +\t}\n> +\n\nDoes this cover the whole path that can take an exception?  The\nswap is done inside do_sdei_event(), but __sdei_handler() calls\nirqentry_nmi_enter() before it and irqentry_nmi_exit() after it,\nand both of those still run with the trampoline vectors in\nVBAR_EL1 when the event interrupted user space.\n\nBoth can take an exception.  ct_nmi_enter() opens with\nWARN_ON_ONCE(ct_nmi_nesting() < 0), and ct_nmi_exit() has\nWARN_ON_ONCE(ct_nmi_nesting() <= 0) and\nWARN_ON_ONCE(!rcu_is_watching_curr_cpu()).  A WARN is a BRK, so\neither would run the zero filled current-EL half and lose the CPU\nin the way the commit message describes.\n\nWould doing the swap in __sdei_handler(), around the whole NMI\nentry and exit pair, close that window?\n\n\n>  \t/* Retrieve the missing registers values */\n>  \tfor (i = 0; i < clobbered_registers; i++) {\n>  \t\t/* from within the handler, this call always succeeds */\n> @@ -221,8 +236,6 @@ unsigned long __kprobes do_sdei_event(struct pt_regs *regs,\n>  \t}\n>  \n>  \terr = sdei_event_handler(regs, arg);\n> -\tif (err)\n> -\t\treturn SDEI_EV_FAILED;\n>  \n>  \tif (elr != read_sysreg(elr_el1)) {\n>  \t\t/*\n> @@ -233,6 +246,11 @@ unsigned long __kprobes do_sdei_event(struct pt_regs *regs,\n>  \t\tpr_warn(\"unsafe: exception during handler\\n\");\n>  \t}\n>  \n> +\twrite_sysreg(vbar, vbar_el1);\n> +\n> +\tif (err)\n> +\t\treturn SDEI_EV_FAILED;\n> +\n>  \tmode = regs->pstate & (PSR_MODE32_BIT | PSR_MODE_MASK);\n>  \n>  \t/*\n> -- \n> 2.54.0\n> \n> \n\n",
+          "reply_to": "Kiryl Shutsemau (Meta)",
+          "message_date": "2026-11-04",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series addresses a critical issue in the arm64 SDEI (System Description Event Infrastructure) implementation, where an SDEI event dispatched from user space can cause the CPU to loop indefinitely due to zero-filled trampoline vectors. The fix involves installing kernel vectors when VBAR_EL1 holds the trampoline vectors and restoring them before returning to firmware."
+    }
+  }
+}
