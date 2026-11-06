@@ -109,42 +109,70 @@
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
-          "author": "Kiryl Shutsemau (Meta)",
-          "summary": "Posted a new patch to remove the zapped-entry checks, citing performance improvements on Zen 4 with Safe RET enabled.",
-          "sentiment": "positive",
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author is addressing Dave Hansen's concern that the zapped-entry checks should be defined only with CONFIG_DEBUG_VM, and responds by saying it works for them on x86, although they acknowledge other architectures like arm64 and riscv also have shadow stacks. They provide a new patch to remove these checks entirely.",
+          "sentiment": "neutral",
           "sentiment_signals": [
-            "NEEDS_WORK"
+            "acknowledges concern",
+            "provides alternative solution"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
+          "raw_body": "Works for me. x86 is the only architecture with them, although arm64 and\nriscv have shadow stacks too, and the x86 helpers already keep\nWrite=0,Dirty=1 out of other VMAs. Patch below, without the Fixes: tag.\n\nRick, any objection?\n\n-- >8 --\nFrom: \"Kiryl Shutsemau (Meta)\" <kas@kernel.org>\nSubject: [PATCH] x86/mm: Remove the zapped-entry checks\n\nZapping a range calls arch_check_zapped_pte() for every batch of PTEs,\nwhich is every page for small folios, and arch_check_zapped_pmd() or\narch_check_zapped_pud() for every huge leaf. Only x86 implements them, as\nout-of-line functions that warn about a shadow stack entry (Write=0,\nDirty=1) in a VMA without VM_SHADOW_STACK.\n\nThe warning is a VM_WARN_ON_ONCE(), so without CONFIG_DEBUG_VM the\nfunctions are empty, but the calls remain. With the SRSO \"Safe RET\"\nmitigation the return of every such call mispredicts.\n\nThe x86 helpers already keep such entries out of other VMAs.\npte_wrprotect(), pte_mkdirty(), pte_modify() and their PMD versions go\nthrough SavedDirty, and only pte_mkwrite() and pmd_mkwrite() on a\nVM_SHADOW_STACK VMA create the combination.\n\nRemove the checks, their callers and pud_shstk(), which has no other\nuser.\n\nIn a KVM guest on Zen 4 with Safe RET, zapping 4K pages takes one branch\nmiss per page fewer. MADV_DONTNEED of 1 GiB gets 6% faster on anonymous\nmemory and 8% on shmem, munmap() 5%. THP is unchanged. Without Safe RET\nthe difference is within noise.\n\nSuggested-by: Dave Hansen <dave.hansen@linux.intel.com>\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n arch/x86/include/asm/pgtable.h | 16 ----------------\n arch/x86/mm/pgtable.c          | 26 --------------------------\n include/linux/pgtable.h        | 20 --------------------\n mm/huge_memory.c               |  2 --\n mm/memory.c                    |  3 ---\n 5 files changed, 67 deletions(-)\n\ndiff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h\nindex 000fc6c1ca37..613c22c7838a 100644\n--- a/arch/x86/include/asm/pgtable.h\n+++ b/arch/x86/include/asm/pgtable.h\n@@ -199,13 +199,6 @@ static inline int pud_young(pud_t pud)\n \treturn pud_flags(pud) & _PAGE_ACCESSED;\n }\n \n-static inline bool pud_shstk(pud_t pud)\n-{\n-\treturn cpu_feature_enabled(X86_FEATURE_SHSTK) &&\n-\t       (pud_flags(pud) & (_PAGE_RW | _PAGE_DIRTY | _PAGE_PSE)) ==\n-\t       (_PAGE_DIRTY | _PAGE_PSE);\n-}\n-\n static inline int pte_write(pte_t pte)\n {\n \t/*\n@@ -1666,15 +1659,6 @@ static inline bool arch_has_pfn_modify_check(void)\n \treturn boot_cpu_has_bug(X86_BUG_L1TF);\n }\n \n-#define arch_check_zapped_pte arch_check_zapped_pte\n-void arch_check_zapped_pte(struct vm_area_struct *vma, pte_t pte);\n-\n-#define arch_check_zapped_pmd arch_check_zapped_pmd\n-void arch_check_zapped_pmd(struct vm_area_struct *vma, pmd_t pmd);\n-\n-#define arch_check_zapped_pud arch_check_zapped_pud\n-void arch_check_zapped_pud(struct vm_area_struct *vma, pud_t pud);\n-\n #ifdef CONFIG_XEN_PV\n #define arch_has_hw_nonleaf_pmd_young arch_has_hw_nonleaf_pmd_young\n static inline bool arch_has_hw_nonleaf_pmd_young(void)\ndiff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c\nindex 4a105f283cfb..58e5012b56b0 100644\n--- a/arch/x86/mm/pgtable.c\n+++ b/arch/x86/mm/pgtable.c\n@@ -797,29 +797,3 @@ pmd_t pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)\n \n \treturn pmd_clear_saveddirty(pmd);\n }\n-\n-void arch_check_zapped_pte(struct vm_area_struct *vma, pte_t pte)\n-{\n-\t/*\n-\t * Hardware before shadow stack can (rarely) set Dirty=1\n-\t * on a Write=0 PTE. So the below condition\n-\t * only indicates a software bug when shadow stack is\n-\t * supported by the HW. This checking is covered in\n-\t * pte_shstk().\n-\t */\n-\tVM_WARN_ON_ONCE(!(vma->vm_flags & VM_SHADOW_STACK) &&\n-\t\t\tpte_shstk(pte));\n-}\n-\n-void arch_check_zapped_pmd(struct vm_area_struct *vma, pmd_t pmd)\n-{\n-\t/* See note in arch_check_zapped_pte() */\n-\tVM_WARN_ON_ONCE(!(vma->vm_flags & VM_SHADOW_STACK) &&\n-\t\t\tpmd_shstk(pmd));\n-}\n-\n-void arch_check_zapped_pud(struct vm_area_struct *vma, pud_t pud)\n-{\n-\t/* See note in arch_check_zapped_pte() */\n-\tVM_WARN_ON_ONCE(!(vma->vm_flags & VM_SHADOW_STACK) && pud_shstk(pud));\n-}\ndiff --git a/include/linux/pgtable.h b/include/linux/pgtable.h\nindex 780fe849ff8b..fc32289af58a 100644\n--- a/include/linux/pgtable.h\n+++ b/include/linux/pgtable.h\n@@ -621,26 +621,6 @@ static inline unsigned int exec_folio_order(void)\n }\n #endif\n \n-#ifndef arch_check_zapped_pte\n-static inline void arch_check_zapped_pte(struct vm_area_struct *vma,\n-\t\t\t\t\t pte_t pte)\n-{\n-}\n-#endif\n-\n-#ifndef arch_check_zapped_pmd\n-static inline void arch_check_zapped_pmd(struct vm_area_struct *vma,\n-\t\t\t\t\t pmd_t pmd)\n-{\n-}\n-#endif\n-\n-#ifndef arch_check_zapped_pud\n-static inline void arch_check_zapped_pud(struct vm_area_struct *vma, pud_t pud)\n-{\n-}\n-#endif\n-\n #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR\n static inline pte_t ptep_get_and_clear(struct mm_struct *mm,\n \t\t\t\t       unsigned long address,\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex bd44d58e8684..6e49fa841911 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -2558,7 +2558,6 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,\n \t */\n \torig_pmd = pmdp_huge_get_and_clear_full(vma, addr, pmd,\n \t\t\t\t\t\ttlb->fullmm);\n-\tarch_check_zapped_pmd(vma, orig_pmd);\n \ttlb_remove_pmd_tlb_entry(tlb, pmd, addr);\n \n \tis_present = pmd_present(orig_pmd);\n@@ -3045,7 +3044,6 @@ int zap_huge_pud(struct mmu_gather *tlb, struct vm_area_struct *vma,\n \t\treturn 0;\n \n \torig_pud = pudp_huge_get_and_clear_full(vma, addr, pud, tlb->fullmm);\n-\tarch_check_zapped_pud(vma, orig_pud);\n \ttlb_remove_pud_tlb_entry(tlb, pud, addr);\n \tif (!vma_is_mm_managed(vma)) {\n \t\tspin_unlock(ptl);\ndiff --git a/mm/memory.c b/mm/memory.c\nindex 0fb676dd2bd6..25d630033642 100644\n--- a/mm/memory.c\n+++ b/mm/memory.c\n@@ -1755,8 +1755,6 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,\n \t\tclear_full_ptes(mm, addr, pte, nr, tlb->fullmm);\n \t\trss[MM_ANONPAGES] -= nr;\n \t}\n-\t/* Checking a single PTE in a batch is sufficient. */\n-\tarch_check_zapped_pte(vma, ptent);\n \ttlb_remove_tlb_entries(tlb, pte, nr, addr);\n \tif (unlikely(userfaultfd_pte_wp(vma, ptent)))\n \t\t*any_skipped = zap_install_uffd_wp_if_needed(vma, addr, pte,\n@@ -1795,7 +1793,6 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,\n \tif (!page) {\n \t\t/* We don't need up-to-date accessed/dirty bits. */\n \t\tptep_get_and_clear_full(mm, addr, pte, tlb->fullmm);\n-\t\tarch_check_zapped_pte(vma, ptent);\n \t\ttlb_remove_tlb_entry(tlb, pte, addr);\n \t\tif (userfaultfd_pte_wp(vma, ptent))\n \t\t\t*any_skipped = zap_install_uffd_wp_if_needed(vma, addr,\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Dave Hansen",
+          "message_date": "2026-11-03",
+          "message_id": "aumzjHyJsshPJBUI@thinkstation",
+          "email": "kas@kernel.org",
           "is_maintainer": false
         },
         {
-          "author": "Edgecombe, Rick P",
-          "summary": "Expressed lukewarm support for the patch, noting that the checks only catch zapped entries at zap time and have never triggered.",
+          "author": "Edgecombe, P",
+          "summary": "Reviewer Edgecombe expressed lukewarm sentiment about removing the zapped-entry checks, noting their limited protection and lack of triggering instances",
           "sentiment": "neutral",
           "sentiment_signals": [
-            "NEEDS_WORK"
+            "lukewarm",
+            "limited protection"
           ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "",
-          "reply_to": "Kiryl Shutsemau (Meta)",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
+          "raw_body": "Eh, I guess I'm lukewarm on it. These checks only catch the case at zap time, so\r\nit's not a huge protection that is being pulled out. I thought they were useful.\r\nAt the same time, they have never triggered.",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-11-03",
+          "message_id": "b45fe4c2a730a23845a36b5beba4f434c7be7477.camel@intel.com",
+          "email": "rick.p.edgecombe@intel.com",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "The patch removes zapped-entry checks for x86, which are only implemented on this architecture and have never triggered."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the x86 Linux kernel to only define and check for 'zapped-entry' conditions when CONFIG_DEBUG_VM is enabled. This change optimizes performance by reducing branch mispredictions in certain scenarios, such as zapping pages or using MADV_DONTNEED on large memory ranges. The patch introduces conditional compilation directives to control the definition of arch_check_zapped_pte and related functions based on the presence of CONFIG_DEBUG_VM."
+    },
+    "2026-11-05": {
+      "report_file": "2026-11-05_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "Author acknowledged that there are no reports of issues and agreed to retire the check, planning to post a separate patch.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "acknowledged",
+            "agreed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yeah, I have not find any reports.\n\nSo, we can claim that the check served its purpose to stabilize shadow\nstack and can be retired now :P\n\nI will post the patch separately.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Edgecombe, P",
+          "message_date": "2026-11-05",
+          "message_id": "auxuOzjRJPqsTvfm@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the x86 Linux kernel to only define and check for 'zapped-entry' conditions when CONFIG_DEBUG_VM is enabled. This change optimizes performance by reducing branch mispredictions in certain scenarios, such as zapping pages or using MADV_DONTNEED on large memory ranges. The patch introduces conditional compilation directives to control the definition of arch_check_zapped_pte and related functions based on the presence of CONFIG_DEBUG_VM."
     }
   }
 }
