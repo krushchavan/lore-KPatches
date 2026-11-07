@@ -238,8 +238,8 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2] mm: move LRU size stat updates out of lru_lock in folio batches</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261029204157.117879-1-joannelkoong@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-10-29</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-05</strong><div class="date-range-nav">Active on: <a href="#2026-11-05">2026-11-05</a> &bull; <a href="#2026-10-29">2026-10-29</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">Joanne Koong posted a v3 of the patch addressing David Hildenbrand&#x27;s suggestion to add documentation about a potential race condition between reparenting and stats updates.</div></div>
+    <div class="date-range">Submitted: <strong>2026-10-29</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-06</strong><div class="date-range-nav">Active on: <a href="#2026-11-06">2026-11-06</a> &bull; <a href="#2026-11-05">2026-11-05</a> &bull; <a href="#2026-10-29">2026-10-29</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch moves the updates of LRU size statistics out of the lru_lock critical section in folio batches, which reduces contention and improves throughput. The stats are accumulated while holding the lock and applied after dropping it, reducing the overhead of cache misses and improving performance. This change is particularly beneficial for workloads with many threads faulting and freeing memory in a single memcg, where the hold time of lru_lock directly limits throughput. The patch also moves cost_lock into the hole after lru_lock to make room for the batch pointer, keeping struct lruvec from growing. The stats may lag behind the LRU lists by one batch, but this is within the per-cpu batching already present.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-10-29">
 <div class="review-comment">
@@ -268,187 +268,112 @@ is safe and correct though. Better to document it.</pre>
 <div class="thread-node depth-0" id="2026-11-05">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Joanne Koong</span>
+<span class="review-author">Joanne Koong (author)</span>
 <a class="date-chip" href="../2026-11-05_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-05">2026-11-05</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author acknowledged that the swapoff path needs to drop the per-vswap spinlock before calling try_to_unmap(), agreed to restructure in v2.
+
+Author acknowledged a need for additional documentation to address a race condition pointed out by reviewer Shakeel, promising to include it in the next version (v3) of the patch.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Thu, Nov 5, 2026 at 11:37 AM David Hildenbrand (Arm)
+&lt;david@kernel.org&gt; wrote:
+
+---
+
+I&#x27;ll send out a v3 today that adds the documentation Shakeel suggested
+about the race between reparenting on offlining and stats update.
+
+Thanks,
+Joanne</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to David (Arm)</div>
+<a href="https://lore.kernel.org/r/CAJnrk1ZF7FminyCYORxysXW0zA=fuUtBe5YXkabsSTOmXt_vdA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledged a fix is needed, agreed to restructure, promised to restructure in v3</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-11-06">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Posted a v3 addressing David Hildenbrand&#x27;s suggestion to add documentation about a potential race condition between reparenting and stats updates.</div>
+<div class="review-comment-text">Reviewer David (Arm) noted that the patch does not cleanly apply against mm/core.git and requested Andrew to slow down on picking patches until he has picked them, but did not address any technical issues in the patch.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Nov 5, 2026 at 11:53 AM Joanne Koong &lt;joannelkoong@gmail.com&gt; wrote:
-&gt;
-&gt; On Thu, Nov 5, 2026 at 11:37 AM David Hildenbrand (Arm)
-&gt; &lt;david@kernel.org&gt; wrote:
-&gt; &gt;
-&gt; &gt; On 10/30/26 01:19, Shakeel Butt wrote:
-&gt; &gt; &gt; On Thu, Oct 29, 2026 at 01:41:57PM -0700, Joanne Koong wrote:
-&gt; &gt; &gt;&gt; folio_batch_move_lru() and folios_put_refs() take the lruvec&#x27;s lru_lock
-&gt; &gt; &gt;&gt; once per batch, but they update the node and memcg lruvec stats for
-&gt; &gt; &gt;&gt; every folio in the batch while holding the lock. Only the LRU lists and
-&gt; &gt; &gt;&gt; the memcg lru_zone_size need lru_lock. Updating the stats while holding
-&gt; &gt; &gt;&gt; the lru_lock is unnecessary, and they make up a large part of the
-&gt; &gt; &gt;&gt; critical section, as seen in [1] where a change that added just a few
-&gt; &gt; &gt;&gt; instructions to the memcg stat update path cost about 2% throughput
-&gt; &gt; &gt;&gt; because the LRU stat updates run under lru_lock, and the overhead went
-&gt; &gt; &gt;&gt; away once they were moved outside of the lock.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; With many threads faulting and freeing memory in a single memcg, about
-&gt; &gt; &gt;&gt; half of all cycles are spent waiting for lru_lock, and the hold time of
-&gt; &gt; &gt;&gt; the lru_lock directly limits throughput. A perf profile with 80 threads
-&gt; &gt; &gt;&gt; faulting in and freeing shmem in a single memcg shows 52.8% of all
-&gt; &gt; &gt;&gt; cycles spent spinning on lru_lock, split evenly between
-&gt; &gt; &gt;&gt; folio_batch_move_lru() and folios_put_refs(). About 25% of the time
-&gt; &gt; &gt;&gt; spent holding lru_lock in those two paths goes to the LRU stat updates,
-&gt; &gt; &gt;&gt; mostly cache misses loading pn-&gt;memcg, pn-&gt;lruvec_stats_percpu and the
-&gt; &gt; &gt;&gt; per-cpu counters. The stat updates are only 0.7% of all cycles, but they
-&gt; &gt; &gt;&gt; lengthen the critical section that the other threads are waiting on.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; Accumulate the stat changes per LRU list while holding the lock instead,
-&gt; &gt; &gt;&gt; and only apply them after dropping the lock (while still inside
-&gt; &gt; &gt;&gt; the RCU read section that keeps the lruvec&#x27;s memcg alive). This moves
-&gt; &gt; &gt;&gt; the stat updates out of the lru_lock critical section and turns the
-&gt; &gt; &gt;&gt; per-folio updates into at most one update per LRU list per batch.
-&gt; &gt; &gt;
-&gt; &gt; &gt; This updating of stats after dropping the lru lock does introduce one behavior
-&gt; &gt; &gt; change i.e. race between reparenting on offlining and stats update. I think it
-&gt; &gt; &gt; is safe and correct though. Better to document it.
-&gt; &gt; &gt;
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; The batch is attached to the lruvec while lru_lock is held so that the
-&gt; &gt; &gt;&gt; LRU add/del helpers don&#x27;t need to pass it down. To keep struct lruvec
-&gt; &gt; &gt;&gt; from growing, cost_lock is moved into the hole after lru_lock, which
-&gt; &gt; &gt;&gt; leaves room for the batch pointer in the same cacheline as lru_lock.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; The stats can now lag behind the LRU lists by one batch, which is well
-&gt; &gt; &gt;&gt; within the per-cpu batching they already have.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; On a 2-socket Skylake (80 CPUs, 2 NUMA nodes), with threads pinned to
-&gt; &gt; &gt;&gt; CPUs repeatedly faulting in and freeing memory in a single memcg,
-&gt; &gt; &gt;&gt; average pages per second over 7 freshly created memcgs per run, 2 boots
-&gt; &gt; &gt;&gt; each:
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt;                      before    after
-&gt; &gt; &gt;&gt;   shmem, 20 threads  4.74M     5.47M   (+15%)
-&gt; &gt; &gt;&gt;   shmem, 80 threads  7.94M    10.33M   (+30%)
-&gt; &gt; &gt;&gt;   anon,  20 threads  3.04M     3.35M   (+10%)
-&gt; &gt; &gt;&gt;   anon,  80 threads  3.23M     3.41M   (+5%)
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; Link: https://lore.kernel.org/linux-fsdevel/CAJnrk1ZezmmzrYdf8KP6re_a76izMS=qGPeC8ZZXiteHyZZC-Q@mail.gmail.com/ [1]
-&gt; &gt; &gt;&gt; Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
-&gt; &gt; &gt;
-&gt; &gt; &gt; Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
-&gt; &gt; &gt;
-&gt; &gt;
-&gt; &gt; Thanks, I&#x27;m planning on queue this.
-&gt; &gt;
-&gt;
-&gt; I&#x27;ll send out a v3 today that adds the documentation Shakeel suggested
-&gt; about the race between reparenting on offlining and stats update.
-&gt;
+<pre class="raw-body-text">Yes, soon Andrew should probably slow down on picking things that I am supposed
+to pick now.
 
-I&#x27;m seeing that the patch was picked up yesterday into mm-new. Could
-you or Andrew add this paragraph to the commit message after the
-&quot;Accumulate the stats changes...&quot; paragraph?:
+Will resolve itself once patches only cleanly apply against mm/core.git :)
 
-&quot;Applying the stats after dropping lru_lock means a batched update can
-race with reparenting when the memcg is being offlined. This is ok
-because updates to a dying memcg are redirected to its nearest
-non-dying ancestor, which is where its folios end up after
-reparenting.&quot;
-
-Apologies for any inconveniences.
-
-Thanks,
-Joanne
-
-</pre>
+For now, he will drop patches once I pick them.</pre>
 </details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/264c406d-9f71-48a2-8892-ad0c902e3c47@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: patch application issue, reviewer&#x27;s workload</div>
+</div>
+</div>
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David Hildenbrand</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch has been applied and is ready for further testing, but encouraged reporters to provide Acked-bys, Reviewed-bys, and Tested-bys even though the patches have already been applied.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Applied, thanks!
+
+tree: mm/core.git
+branch: core-7.5.misc
+
+Applied patches will appear soon in mm-next, followed by linux-next.
+
+Please report any outstanding bugs that were missed during review, so we
+can either drop the patch series or decide how to fix it up.
+
+It is encouraged to provide Acked-bys, Reviewed-bys, and Tested-bys even
+though the patches have already been applied. If possible, patch trailers
+will be updated.
+
+Note that commit hashes shown below are subject to change due to rebase,
+trailer updates or similar. Further, this is not a guarantee that the
+patches will go upstream. If in doubt, please check the listed branch.
+
+[1/1] mm: move LRU size stat updates out of lru_lock in folio batches
+      https://git.kernel.org/mm/core/c/ee65a1da
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Joanne Koong</div>
+<a href="https://lore.kernel.org/r/179397461320.8873.1139979903597807353.b4-ty@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: patch-applied, encouragement-for-further-testing</div>
+</div>
+</div>
 </div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Joanne Koong</span>
+<span class="review-author">Joanne Koong (author)</span>
 <a class="date-chip" href="../2026-11-05_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-05">2026-11-05</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Requested that David or Andrew add a paragraph to the commit message about the potential race condition between reparenting and stats updates.</div>
+<div class="review-comment-text">The author acknowledges a minor issue with the patch&#x27;s interaction with memcg reparenting, and requests that additional text be added to the commit message to address this concern.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Thu, Nov 5, 2026 at 11:53 AM Joanne Koong &lt;joannelkoong@gmail.com&gt; wrote:
-&gt;
-&gt; On Thu, Nov 5, 2026 at 11:37 AM David Hildenbrand (Arm)
-&gt; &lt;david@kernel.org&gt; wrote:
-&gt; &gt;
-&gt; &gt; On 10/30/26 01:19, Shakeel Butt wrote:
-&gt; &gt; &gt; On Thu, Oct 29, 2026 at 01:41:57PM -0700, Joanne Koong wrote:
-&gt; &gt; &gt;&gt; folio_batch_move_lru() and folios_put_refs() take the lruvec&#x27;s lru_lock
-&gt; &gt; &gt;&gt; once per batch, but they update the node and memcg lruvec stats for
-&gt; &gt; &gt;&gt; every folio in the batch while holding the lock. Only the LRU lists and
-&gt; &gt; &gt;&gt; the memcg lru_zone_size need lru_lock. Updating the stats while holding
-&gt; &gt; &gt;&gt; the lru_lock is unnecessary, and they make up a large part of the
-&gt; &gt; &gt;&gt; critical section, as seen in [1] where a change that added just a few
-&gt; &gt; &gt;&gt; instructions to the memcg stat update path cost about 2% throughput
-&gt; &gt; &gt;&gt; because the LRU stat updates run under lru_lock, and the overhead went
-&gt; &gt; &gt;&gt; away once they were moved outside of the lock.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; With many threads faulting and freeing memory in a single memcg, about
-&gt; &gt; &gt;&gt; half of all cycles are spent waiting for lru_lock, and the hold time of
-&gt; &gt; &gt;&gt; the lru_lock directly limits throughput. A perf profile with 80 threads
-&gt; &gt; &gt;&gt; faulting in and freeing shmem in a single memcg shows 52.8% of all
-&gt; &gt; &gt;&gt; cycles spent spinning on lru_lock, split evenly between
-&gt; &gt; &gt;&gt; folio_batch_move_lru() and folios_put_refs(). About 25% of the time
-&gt; &gt; &gt;&gt; spent holding lru_lock in those two paths goes to the LRU stat updates,
-&gt; &gt; &gt;&gt; mostly cache misses loading pn-&gt;memcg, pn-&gt;lruvec_stats_percpu and the
-&gt; &gt; &gt;&gt; per-cpu counters. The stat updates are only 0.7% of all cycles, but they
-&gt; &gt; &gt;&gt; lengthen the critical section that the other threads are waiting on.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; Accumulate the stat changes per LRU list while holding the lock instead,
-&gt; &gt; &gt;&gt; and only apply them after dropping the lock (while still inside
-&gt; &gt; &gt;&gt; the RCU read section that keeps the lruvec&#x27;s memcg alive). This moves
-&gt; &gt; &gt;&gt; the stat updates out of the lru_lock critical section and turns the
-&gt; &gt; &gt;&gt; per-folio updates into at most one update per LRU list per batch.
-&gt; &gt; &gt;
-&gt; &gt; &gt; This updating of stats after dropping the lru lock does introduce one behavior
-&gt; &gt; &gt; change i.e. race between reparenting on offlining and stats update. I think it
-&gt; &gt; &gt; is safe and correct though. Better to document it.
-&gt; &gt; &gt;
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; The batch is attached to the lruvec while lru_lock is held so that the
-&gt; &gt; &gt;&gt; LRU add/del helpers don&#x27;t need to pass it down. To keep struct lruvec
-&gt; &gt; &gt;&gt; from growing, cost_lock is moved into the hole after lru_lock, which
-&gt; &gt; &gt;&gt; leaves room for the batch pointer in the same cacheline as lru_lock.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; The stats can now lag behind the LRU lists by one batch, which is well
-&gt; &gt; &gt;&gt; within the per-cpu batching they already have.
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; On a 2-socket Skylake (80 CPUs, 2 NUMA nodes), with threads pinned to
-&gt; &gt; &gt;&gt; CPUs repeatedly faulting in and freeing memory in a single memcg,
-&gt; &gt; &gt;&gt; average pages per second over 7 freshly created memcgs per run, 2 boots
-&gt; &gt; &gt;&gt; each:
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt;                      before    after
-&gt; &gt; &gt;&gt;   shmem, 20 threads  4.74M     5.47M   (+15%)
-&gt; &gt; &gt;&gt;   shmem, 80 threads  7.94M    10.33M   (+30%)
-&gt; &gt; &gt;&gt;   anon,  20 threads  3.04M     3.35M   (+10%)
-&gt; &gt; &gt;&gt;   anon,  80 threads  3.23M     3.41M   (+5%)
-&gt; &gt; &gt;&gt;
-&gt; &gt; &gt;&gt; Link: https://lore.kernel.org/linux-fsdevel/CAJnrk1ZezmmzrYdf8KP6re_a76izMS=qGPeC8ZZXiteHyZZC-Q@mail.gmail.com/ [1]
-&gt; &gt; &gt;&gt; Signed-off-by: Joanne Koong &lt;joannelkoong@gmail.com&gt;
-&gt; &gt; &gt;
-&gt; &gt; &gt; Acked-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
-&gt; &gt; &gt;
-&gt; &gt;
-&gt; &gt; Thanks, I&#x27;m planning on queue this.
-&gt; &gt;
-&gt;
-&gt; I&#x27;ll send out a v3 today that adds the documentation Shakeel suggested
-&gt; about the race between reparenting on offlining and stats update.
-&gt;
-
-I&#x27;m seeing that the patch was picked up yesterday into mm-new. Could
+<pre class="raw-body-text">I&#x27;m seeing that the patch was picked up yesterday into mm-new. Could
 you or Andrew add this paragraph to the commit message after the
 &quot;Accumulate the stats changes...&quot; paragraph?:
 
@@ -461,11 +386,10 @@ reparenting.&quot;
 Apologies for any inconveniences.
 
 Thanks,
-Joanne
-
-</pre>
+Joanne</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to David Hildenbrand</div>
+<a href="https://lore.kernel.org/r/CAJnrk1acAiHB06DKAJhuSZBNHn0dkRYJ5RU54sSz+xGXhwwnwA@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges an issue, requests changes</div>
 </div>
 </div>
 </div>

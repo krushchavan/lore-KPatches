@@ -1,0 +1,92 @@
+{
+  "thread_id": "au3C8lNElGg4LnR1@thinkstation",
+  "subject": "[PATCH] mm/khugepaged: don't map folios that are not uptodate in MADV_COLLAPSE",
+  "url": "https://lore.kernel.org/all/au3C8lNElGg4LnR1@thinkstation/",
+  "dates": {
+    "2026-11-06": {
+      "report_file": "2026-11-06_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer suggested rejecting the MADV_COLLAPSE operation and logging a warning when folios are not uptodate, instead of just asserting it",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "I think so. But looking at these hard-to-trigger but in the end very nasty\nproblems, should we actually reject the operation and do a pr_warn_once() or\nsomething?\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-11-06",
+          "message_id": "254c6f0a-9353-4806-a5ab-a071cd59c64f@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author is addressing David's feedback that the patch should assert whether a folio is uptodate in set_pte_range() and do_set_pmd(). The author agrees that rejecting the mapping is better than asserting, and instead proposes to add a function file_folio_not_uptodate() that checks if a folio is uptodate. This function will be called from finish_fault(), do_set_pmd(), and other places where it's necessary. The author provides a patch with compile-tested changes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged fix needed",
+            "proposed alternative solution"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yes, rejecting sounds better.\n\nNot in set_pte_range() as I suggested, though. Fault-around only gets\nthere with folios that next_uptodate_folio() checked under the folio\nlock, and for CoW it maps the new anon folio after do_cow_fault() has\nalready copied from the page cache one.\n\nChecking the folio ->fault() returned in finish_fault() covers PTE, PMD\nand CoW; do_set_pmd() covers khugepaged. Both return VM_FAULT_SIGBUS.\n\nSomething like this, only compile-tested:\n\ndiff --git a/mm/memory.c b/mm/memory.c\nindex 6fe0b7dab927..ff2f2deff761 100644\n--- a/mm/memory.c\n+++ b/mm/memory.c\n@@ -5674,6 +5674,22 @@ static vm_fault_t __do_fault(struct vm_fault *vmf)\n        return ret;\n }\n\n+/*\n+ * A page cache folio that is not uptodate holds data that was never read in\n+ * or cleared, and mapping it leaks stale memory to userspace. The callers are\n+ * expected to check, so treat a hit as a kernel bug and refuse the mapping.\n+ */\n+static bool file_folio_not_uptodate(struct folio *folio)\n+{\n+       if (likely(folio_test_uptodate(folio)))\n+               return false;\n+       /* Driver pages from ->fault() never get PG_uptodate */\n+       if (folio_test_anon(folio) || !folio->mapping)\n+               return false;\n+       WARN_ONCE(1, \"refusing to map a page cache folio that is not uptodate\\n\");\n+       return true;\n+}\n+\n #ifdef CONFIG_TRANSPARENT_HUGEPAGE\n static void deposit_prealloc_pte(struct vm_fault *vmf)\n {\n@@ -5714,6 +5730,9 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *pa\n                return ret;\n        page = &folio->page;\n\n+       if (file_folio_not_uptodate(folio))\n+               return VM_FAULT_SIGBUS;\n+\n        /*\n         * Just backoff if any subpage of a THP is corrupted otherwise\n         * the corrupted page may mapped by PMD silently to escape the\n@@ -5849,6 +5868,16 @@ vm_fault_t finish_fault(struct vm_fault *vmf)\n        unsigned long addr;\n        bool needs_fallback = false;\n\n+       /*\n+        * Check the folio ->fault() returned. For CoW that is the source of the\n+        * copy; DAX CoW has none.\n+        */\n+       if (vmf->page) {\n+               folio = page_folio(vmf->page);\n+               if (file_folio_not_uptodate(folio))\n+                       return VM_FAULT_SIGBUS;\n+       }\n+\n fallback:\n        addr = vmf->address;\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-06",
+          "message_id": "au3YD92l6BwCQIPJ@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David (Arm)",
+          "summary": "Reviewer requested that the suggested assertion be sent as a proper patch, indicating agreement with the proposed change to catch potential issues.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "agreement",
+            "request"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Can you send that as a proper patch? I think this is the right thing to do to\ncatch more of these things if they ever pop up in a better way.\n\n-- \nCheers,\n\nDavid",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-11-06",
+          "message_id": "cc803a06-f6a1-440b-9752-917f3698da6c@kernel.org",
+          "email": "david@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "Pedro Falcato",
+          "summary": "Reviewer Pedro Falcato expressed concerns about the fragility of page table manipulation APIs and usage in the kernel, specifically highlighting instances where it's possible to perform operations without holding necessary locks or with incorrect folio states. He suggested adding basic assertions (initially VM_WARN_ON_ONCE) to prevent such issues.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvements"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Yes. FWIW, this is something that's been going through my mind. Our page table\nmanipulation APIs (and usage) are way too fragile and allow you to do the\nmost insane things without ever realizing it (e.g you can clear a pte, set\nover a PTE, get-and-clear and discard the result, and do all of the above with\nno locks held, set a pte for a folio that's not uptodate, set a pte for a folio\nfor which you don't have the lock, etc).\n\nSome basic assertions (even if there's no easy way to back down from those)\nwould be nice, or ideally yes a rejection.\n\nI would just add that these very much should be VM_WARN_ON_ONCE instead of\npr_warn_once(). pr_warn_once() will (AIUI) not be caught by fuzzers, at least\nnot as easily.\n\nAlso, if they're inexpensive enough, we might want to upgrade them to full\nWARN_ON_ONCE().\n\n-- \nPedro",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-06",
+          "message_id": "au3bJel0YnSeowCq@pedro-suse.lan",
+          "email": "pfalcato@suse.de",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch prevents the khugepaged from mapping folios that are not up-to-date when using MADV_COLLAPSE, addressing a previously overlooked issue where other callers checked for up-to-dateness but khugepaged did not. The fix involves adding an assertion to ensure that the folio is up-to-date before attempting to map it. This change ensures consistency in handling up-to-dateness across different mapping scenarios."
+    }
+  }
+}

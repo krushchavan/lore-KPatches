@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 0/2] arm64: sdei: Handle exceptions taken inside the event handler</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261105120835.3321912-1-kirill@shutemov.name/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-05</strong><div class="date-range-nav">Active on: <a href="#2026-11-05">2026-11-05</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-11-05</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-06</strong><div class="date-range-nav">Active on: <a href="#2026-11-06">2026-11-06</a> &bull; <a href="#2026-11-05">2026-11-05</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses an issue where SDEI events can cause exceptions in the event handler, leading to unexpected behavior and crashes. The patches modify the SDEI event handling code to run the handler on kernel vectors instead of trampoline vectors, which are not suitable for synchronous exceptions. Additionally, the patches save and restore exception registers around the event handler to prevent overwriting of interrupted context&#x27;s registers. This change improves the robustness of SDEI event handling and prevents issues such as CPU stalls, SIGILL, and SIGSEGV in user tasks.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-11-05">
@@ -667,6 +667,245 @@ Catalin</pre>
 </details>
 <a href="https://lore.kernel.org/r/auzM-l40BLsT3clg@arm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes, alternative solutions</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Ada Diaz</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Ada Diaz noted that the patch does not handle the case where an exception is taken inside the event handler, which can lead to a lost CPU and incorrect exception handling.
+
+Reviewer Ada Diaz suggested that the issue is not with the SDEI handler but rather with arch/arm64/entry.S not properly handling SDEI events, and also pointed out that the SDEI trampoline may be missing some kernel entry logic which could break assumptions.
+
+Reviewer Ada Diaz suggested that SDEI exception handling should be unified with regular kernel entry by swapping VBAR in __sdei_asm_entry_trampoline and __sdei_asm_exit_trampoline, rather than doing special handling in the handler.
+
+Reviewer Ada Diaz suggested modifying do_sdei_event() to explicitly choose the correct vector base for KPTI=on, bypassing unmapped EL1 exceptions of the trampoline vector by using vectors instead of VBAR.
+
+Reviewer Ada Diaz suggested replacing the code in __sdei_handler() with changes from entry.S, without modifying the existing function.
+
+Reviewer Ada Diaz suggested making the vector base on return from firmware more explicit, citing consistency with other entry paths and potential for future de-duplication.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hello,
+
+On 05/11/2026 12:08, Kiryl Shutsemau wrote:
+
+---
+
+This quite broken indeed, thank you for sending a patch !
+
+However, given this and Catalin&#x27;s comment regarding PMR save/restore,
+to me this sounds more like `arch/arm64/entry.S` is not doing its job
+properly for SDEI events, rather than the SDEI handler missing something.
+
+In fact, it appears that the SDEI trampoline misses a fair amount of
+the &quot;regular&quot; kernel and trampoline entry in general, which might subtly
+break more assumptions...
+
+---
+
+Given that this is done in `entry.S` for a regular kernel entry,
+I feel like this should be done there too for SDEI : bringing the two
+paths closer rather than needing to do some additional special handling
+in the handler.
+
+`__sdei_asm_entry_trampoline` and `__sdei_asm_exit_trampoline` already
+check if the CPU was running at EL0 and maps/unmaps the kernel accordingly.
+We could swap VBAR to the EL1 vectors and back to the EL0 trampoline there...
+
+---
+
+...and to maintain the expected behaviouron return, rather than using
+VBAR (which would bypass the trampoline in the EL0 IRQ-like resume case),
+we could explicitly choose the correct vector base for KPTI=on ?
+Something along those lines in `do_sdei_event()` :
+
+	/* KPTI=off =&gt; vectors or the appropriate mitigation, KPTI=on =&gt; trampoline */
+	unsigned long vbar = __raw_this_cpu_read(this_cpu_vector)
+	[...]
+	/* KPTI=on =&gt; have to bypass unmapped EL1 exceptions of the trampoline vector */
+	if (arm64_kernel_unmapped_at_el0() &amp;&amp; mode == kernel_mode)
+		vbar = vectors
+	[...]
+	if (mode == kernel_mode)
+		return vbar + 0x280;
+	else if (mode &amp; PSR_MODE32_BIT)
+		return vbar + 0x680;
+
+	return vbar + 0x480;
+
+---
+
+With what I mentioned above, this would be completely replaced by the
+changes in `entry.S`, with no change in `__sdei_handler()`.
+
+---
+
+And this part would be made more explicit as to what vector base
+we should be jumping back to on return from firmware.
+
+
+What are your thoughts ?
+I understand that this is a completely different approach, but I feel it
+would be more in line with what we already do for other entry paths.
+This might even allow us to de-duplicate them in the future and reduce
+the chance of this happening again.
+
+If my suggestion is not sound, apart from what Catalin already mentioned
+the patch looks good to me !
+
+Kind regards,
+Ada</pre>
+</details>
+<a href="https://lore.kernel.org/r/1bae50ad-a65e-4ccb-b247-8d9544e4c5ee@arm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: lost CPU, incorrect exception handling, requested changes</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Catalin Marinas</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Catalin Marinas pointed out that the patch does not handle the case where an exception is taken inside the event handler&#x27;s interrupt handling code, which can lead to a deadlock between the per-vswap spinlock and the folio lock.
+
+Reviewer Catalin Marinas noted that the patch may have implications for VHE (EL2) and KVM world switch on hyp vectors, requesting further investigation before considering stable inclusion.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Ada,
+
+On Fri, Nov 06, 2026 at 04:14:56PM +0000, Ada Couprie Diaz wrote:
+
+---
+
+I agree moving this closer to the normal entry path makes sense and the
+PMR handling probably belongs there as well. However, I think there are
+implications for VHE (the handler runs at EL2 with VBAR_EL2) and for an
+event that interrupts a KVM world switch on the hyp vectors. I need to
+dig some more into this.
+
+In the meantime, I queued Kiryl&#x27;s two patches, they&#x27;re small enough for
+stable. Any entry.S rework can come on top of them for future kernels.
+
+Thanks.
+
+-- 
+Catalin</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Ada Diaz</div>
+<a href="https://lore.kernel.org/r/au4eDdjGkb9tn_T_@arm.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: deadlock, locking, implications</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author is addressing the issue of the new splat being introduced by this patch, and suggests switching to raw_cpu_read() in a re-spin for stable trees.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks!
+
+Would it still make sense to switch to raw_cpu_read() in this patch for
+stable@? The splat is new with this patch, so without it stable trees
+would also need the PMR fix.
+
+Let me know if you want a re-spin with raw_cpu_read().
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Catalin Marinas</div>
+<a href="https://lore.kernel.org/r/au2-GegBg8kRmBs0@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: acknowledges fix needed, suggests revision</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-3">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Breno Leitao</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="review-tag-badge">Signed-off-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Breno Leitao pointed out that he intended to add a Signed-off-by: tag in the cover letter but since there was none, he added it to the second patch instead.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Right. I was planning to do it in the cover letter, but, there was no
+tags there (such as Signed-off-by:) so, I did it on the second one.</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/au2_ZaHK0gpqPIFR@gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4" id="2026-11-06">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Author is clarifying the scope of a &#x27;Tested-by&#x27; tag, asking if it applies to the entire patch series.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Thanks for testing!
+
+Just to clarify, does your Tested-by apply for whole series, right?
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Breno Leitao</div>
+<a href="https://lore.kernel.org/r/au27CSJbg2Wdqh42@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, question</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-4">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Catalin Marinas</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Catalin Marinas applied the patch to arm64 (for-next/fixes) and thanked Kiryl Shutsemau for the submission.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Applied to arm64 (for-next/fixes), thanks!
+
+[1/2] arm64: sdei: Run the event handler on the kernel vectors
+      https://git.kernel.org/arm64/c/9bf6ee7952c7
+[2/2] arm64: sdei: Preserve the interrupted context&#x27;s exception registers
+      https://git.kernel.org/arm64/c/58c1eb84e977</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl Shutsemau</div>
+<a href="https://lore.kernel.org/r/179399019204.2520879.14405140378460696016.b4-ty@b4" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
 </div>
 </div>
 </div>

@@ -238,6 +238,36 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series proposes a change to how Linux handles page cache reads, allowing multiple CPUs to read from the same folio without taking a reference. This is done by introducing a new flag PG_rcu_free and deferring the freeing of folios until an RCU grace period. The goal is to reduce contention between readers and improve performance in scenarios where many threads are reading the same pages. The patch series includes 18 patches that implement this change, including modifications to filemap_read(), shmem, and other related functions."
+    },
+    "2026-11-06": {
+      "report_file": "2026-11-06_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau (author)",
+          "summary": "The author agreed to modify the help text to describe what this patch does and will add a second symbol with a prompt, rather than making both symbols def_bool.\n\nAuthor agrees that introducing a new flag is necessary to address the issue of folio locking on every read, proposes adding __PG_RCU_FREE to an existing preparatory patch.\n\nThe author addressed David's concern that not all page cache folios are freed through __folio_put(), explaining that reclaim frees them directly and providing a patch to update the flags in huge_memory.c to include PG_RCU_FREE.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "agreed_to_modify_help_text",
+            "added_second_symbol",
+            "acknowledges fix needed",
+            "proposes additional patch",
+            "clarifying explanation",
+            "patch provided"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I will make the help describe what this patch does.  The page cache is\nthe only user, and both symbols would be def_bool without a prompt, so\nI would rather add the second one with a second user.\n\nDoes that work for you?\n\n---\n\nMakes sense.  Something like the diff below, on top of this patch.\nIntroducing split_copy_flags would be a preparatory patch, and this one\nwould only add __PG_RCU_FREE to it.\n\n---\n\nNot all page cache folios are freed through __folio_put().  Reclaim\nfrees them with free_unref_folios() directly (shrink_folio_list(),\nmove_folios_to_lru()), and so do folios_put_refs() and the LRU batches.\n__free_pages_prepare() is the one place they all pass.\n\ndiff --git a/include/linux/page-flags.h b/include/linux/page-flags.h\nindex a1e52a1f8a52..6d4e534c9ccc 100644\n--- a/include/linux/page-flags.h\n+++ b/include/linux/page-flags.h\n@@ -1185,6 +1185,18 @@ static __always_inline void __ClearPageAnonExclusive(struct page *page)\n #define __PG_MLOCKED\t\t0\n #endif\n \n+#ifdef CONFIG_ARCH_USES_PG_ARCH_2\n+#define __PG_ARCH_2\t\tBIT(PG_arch_2)\n+#else\n+#define __PG_ARCH_2\t\t0\n+#endif\n+\n+#ifdef CONFIG_ARCH_USES_PG_ARCH_3\n+#define __PG_ARCH_3\t\tBIT(PG_arch_3)\n+#else\n+#define __PG_ARCH_3\t\t0\n+#endif\n+\n /*\n  * Flags checked when a page is freed.  Pages being freed should not have\n  * these flags set.  If they are, there is a problem.\ndiff --git a/mm/huge_memory.c b/mm/huge_memory.c\nindex 25082949a4ca..44a1aaa3f834 100644\n--- a/mm/huge_memory.c\n+++ b/mm/huge_memory.c\n@@ -3689,6 +3689,23 @@ static void __split_folio_to_order(struct folio *folio, int old_order,\n \tconst bool handle_hwpoison = folio_test_has_hwpoisoned(folio) && new_order;\n \tlong new_nr_pages = 1 << new_order;\n \tlong nr_pages = 1 << old_order;\n+\tconst unsigned long split_copy_flags =\n+\t\tBIT(PG_referenced) |\n+\t\tBIT(PG_swapbacked) |\n+\t\tBIT(PG_swapcache) |\n+\t\t__PG_MLOCKED |\n+\t\tBIT(PG_uptodate) |\n+\t\tBIT(PG_active) |\n+\t\tBIT(PG_workingset) |\n+\t\tBIT(PG_locked) |\n+\t\tBIT(PG_unevictable) |\n+\t\t__PG_ARCH_2 |\n+\t\t__PG_ARCH_3 |\n+\t\tBIT(PG_dirty) |\n+\t\tBIT(PG_dropbehind) |\n+\t\t__PG_RCU_FREE |\n+\t\tLRU_GEN_MASK |\n+\t\tLRU_REFS_MASK;\n \tlong i;\n \n \tfolio_clear_has_hwpoisoned(folio);\n@@ -3725,26 +3742,7 @@ static void __split_folio_to_order(struct folio *folio, int old_order,\n \t\t * PG_anon_exclusive (-> PG_mappedtodisk) for these here.\n \t\t */\n \t\tnew_folio->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;\n-\t\tnew_folio->flags.f |= (folio->flags.f &\n-\t\t\t\t((1L << PG_referenced) |\n-\t\t\t\t (1L << PG_swapbacked) |\n-\t\t\t\t (1L << PG_swapcache) |\n-\t\t\t\t (1L << PG_mlocked) |\n-\t\t\t\t (1L << PG_uptodate) |\n-\t\t\t\t (1L << PG_active) |\n-\t\t\t\t (1L << PG_workingset) |\n-\t\t\t\t (1L << PG_locked) |\n-\t\t\t\t (1L << PG_unevictable) |\n-#ifdef CONFIG_ARCH_USES_PG_ARCH_2\n-\t\t\t\t (1L << PG_arch_2) |\n-#endif\n-#ifdef CONFIG_ARCH_USES_PG_ARCH_3\n-\t\t\t\t (1L << PG_arch_3) |\n-#endif\n-\t\t\t\t (1L << PG_dirty) |\n-\t\t\t\t (1L << PG_dropbehind) |\n-\t\t\t\t __PG_RCU_FREE |\n-\t\t\t\t LRU_GEN_MASK | LRU_REFS_MASK));\n+\t\tnew_folio->flags.f |= folio->flags.f & split_copy_flags;\n \n \t\tnew_folio->mapping = folio->mapping;\n \t\tnew_folio->index = folio->index + i;\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "David (Arm)",
+          "message_date": "2026-11-06",
+          "message_id": "au2lsbDkyWt-To0C@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series proposes a change to how Linux handles page cache reads, allowing multiple CPUs to read from the same folio without taking a reference. This is done by introducing a new flag PG_rcu_free and deferring the freeing of folios until an RCU grace period. The goal is to reduce contention between readers and improve performance in scenarios where many threads are reading the same pages. The patch series includes 18 patches that implement this change, including modifications to filemap_read(), shmem, and other related functions."
     }
   }
 }

@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH v2 00/18] mm: read the page cache without folio references</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261104130118.2507513-1-kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-04</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-05</strong><div class="date-range-nav">Active on: <a href="#2026-11-05">2026-11-05</a> &bull; <a href="#2026-11-04">2026-11-04</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-11-04</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-06</strong><div class="date-range-nav">Active on: <a href="#2026-11-06">2026-11-06</a> &bull; <a href="#2026-11-05">2026-11-05</a> &bull; <a href="#2026-11-04">2026-11-04</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series proposes a change to how Linux handles page cache reads, allowing multiple CPUs to read from the same folio without taking a reference. This is done by introducing a new flag PG_rcu_free and deferring the freeing of folios until an RCU grace period. The goal is to reduce contention between readers and improve performance in scenarios where many threads are reading the same pages. The patch series includes 18 patches that implement this change, including modifications to filemap_read(), shmem, and other related functions.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-11-04">
@@ -688,6 +688,127 @@ the copy hurt them?
 <div class="reply-to-label">&#8627; replying to David (Arm)</div>
 <a href="https://lore.kernel.org/r/auyYdqQBxdnBuM0N@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: asking_for_clarification, requesting_input</div>
+</div>
+</div>
+<div class="thread-node depth-2" id="2026-11-06">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl Shutsemau (author)</span>
+<a class="date-chip" href="../2026-11-06_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-06">2026-11-06</a>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author agreed to modify the help text to describe what this patch does and will add a second symbol with a prompt, rather than making both symbols def_bool.
+
+Author agrees that introducing a new flag is necessary to address the issue of folio locking on every read, proposes adding __PG_RCU_FREE to an existing preparatory patch.
+
+The author addressed David&#x27;s concern that not all page cache folios are freed through __folio_put(), explaining that reclaim frees them directly and providing a patch to update the flags in huge_memory.c to include PG_RCU_FREE.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">I will make the help describe what this patch does.  The page cache is
+the only user, and both symbols would be def_bool without a prompt, so
+I would rather add the second one with a second user.
+
+Does that work for you?
+
+---
+
+Makes sense.  Something like the diff below, on top of this patch.
+Introducing split_copy_flags would be a preparatory patch, and this one
+would only add __PG_RCU_FREE to it.
+
+---
+
+Not all page cache folios are freed through __folio_put().  Reclaim
+frees them with free_unref_folios() directly (shrink_folio_list(),
+move_folios_to_lru()), and so do folios_put_refs() and the LRU batches.
+__free_pages_prepare() is the one place they all pass.
+
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index a1e52a1f8a52..6d4e534c9ccc 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -1185,6 +1185,18 @@ static __always_inline void __ClearPageAnonExclusive(struct page *page)
+ #define __PG_MLOCKED		0
+ #endif
+ 
++#ifdef CONFIG_ARCH_USES_PG_ARCH_2
++#define __PG_ARCH_2		BIT(PG_arch_2)
++#else
++#define __PG_ARCH_2		0
++#endif
++
++#ifdef CONFIG_ARCH_USES_PG_ARCH_3
++#define __PG_ARCH_3		BIT(PG_arch_3)
++#else
++#define __PG_ARCH_3		0
++#endif
++
+ /*
+  * Flags checked when a page is freed.  Pages being freed should not have
+  * these flags set.  If they are, there is a problem.
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 25082949a4ca..44a1aaa3f834 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3689,6 +3689,23 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
+ 	const bool handle_hwpoison = folio_test_has_hwpoisoned(folio) &amp;&amp; new_order;
+ 	long new_nr_pages = 1 &lt;&lt; new_order;
+ 	long nr_pages = 1 &lt;&lt; old_order;
++	const unsigned long split_copy_flags =
++		BIT(PG_referenced) |
++		BIT(PG_swapbacked) |
++		BIT(PG_swapcache) |
++		__PG_MLOCKED |
++		BIT(PG_uptodate) |
++		BIT(PG_active) |
++		BIT(PG_workingset) |
++		BIT(PG_locked) |
++		BIT(PG_unevictable) |
++		__PG_ARCH_2 |
++		__PG_ARCH_3 |
++		BIT(PG_dirty) |
++		BIT(PG_dropbehind) |
++		__PG_RCU_FREE |
++		LRU_GEN_MASK |
++		LRU_REFS_MASK;
+ 	long i;
+ 
+ 	folio_clear_has_hwpoisoned(folio);
+@@ -3725,26 +3742,7 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
+ 		 * PG_anon_exclusive (-&gt; PG_mappedtodisk) for these here.
+ 		 */
+ 		new_folio-&gt;flags.f &amp;= ~PAGE_FLAGS_CHECK_AT_PREP;
+-		new_folio-&gt;flags.f |= (folio-&gt;flags.f &amp;
+-				((1L &lt;&lt; PG_referenced) |
+-				 (1L &lt;&lt; PG_swapbacked) |
+-				 (1L &lt;&lt; PG_swapcache) |
+-				 (1L &lt;&lt; PG_mlocked) |
+-				 (1L &lt;&lt; PG_uptodate) |
+-				 (1L &lt;&lt; PG_active) |
+-				 (1L &lt;&lt; PG_workingset) |
+-				 (1L &lt;&lt; PG_locked) |
+-				 (1L &lt;&lt; PG_unevictable) |
+-#ifdef CONFIG_ARCH_USES_PG_ARCH_2
+-				 (1L &lt;&lt; PG_arch_2) |
+-#endif
+-#ifdef CONFIG_ARCH_USES_PG_ARCH_3
+-				 (1L &lt;&lt; PG_arch_3) |
+-#endif
+-				 (1L &lt;&lt; PG_dirty) |
+-				 (1L &lt;&lt; PG_dropbehind) |
+-				 __PG_RCU_FREE |
+-				 LRU_GEN_MASK | LRU_REFS_MASK));
++		new_folio-&gt;flags.f |= folio-&gt;flags.f &amp; split_copy_flags;
+ 
+ 		new_folio-&gt;mapping = folio-&gt;mapping;
+ 		new_folio-&gt;index = folio-&gt;index + i;
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to David (Arm)</div>
+<a href="https://lore.kernel.org/r/au2lsbDkyWt-To0C@thinkstation" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: agreed_to_modify_help_text, added_second_symbol, acknowledges fix needed</div>
 </div>
 </div>
 </div>
