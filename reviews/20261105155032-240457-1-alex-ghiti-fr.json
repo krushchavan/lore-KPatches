@@ -62,6 +62,50 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch addresses a performance regression in the Linux kernel, specifically related to swap I/O operations on synchronous devices like NVMe partitions. The issue arises from two commits: one that prefers non-full clusters over free ones and another that frees swap slots on exclusive write faults. This leads to scattered writes and increased read requests, resulting in decreased throughput. The patch proposes a solution by only preferring non-full clusters on synchronous devices, which improves performance metrics such as device read and write requests per transaction and throughput."
+    },
+    "2026-11-09": {
+      "report_file": "2026-11-09_ollama_llama3.1-8b.html",
+      "developer": "Alexandre Ghiti",
+      "reviews": [
+        {
+          "author": "Alexandre Ghiti",
+          "summary": "Reviewer noted that the patch only prefers nonfull clusters on synchronous devices like zram, but this may not be sufficient to address the issue of scattered I/O requests, and suggested reverting commit 3cedb745d354 as an alternative solution.\n\nReviewer Alexandre Ghiti suggested the patch should be sent to stable since it was merged in 7.3 and added a Reviewed-by tag.\n\nReviewer noted that the patch's behavior of preferring nonfull clusters on synchronous devices may not be sufficient, as it does not address the issue of holes in full clusters being filled by reclaim, leading to scattered writes and increased I/O requests.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Kairui,\n\nOn Sat, Nov 7, 2026 at 11:59 AM Kairui Song <ryncsn@gmail.com> wrote:\n\n---\n\nI think it should go to stable since it was merged in 7.3, I'm adding\nthe tag below (if it works that way in mm):\n\nCc: stable@vger.kernel.org\n\n---\n\nThanks,\n\nAlex",
+          "reply_to": "Kairui Song",
+          "message_date": "2026-11-09",
+          "message_id": "CAEmasaWMKsBSQ_LrewZc3f6a2u15WARAk25AKWjS4oFy8yciCA@mail.gmail.com",
+          "email": "alexghiti@meta.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Andrew Morton",
+          "summary": "Andrew Morton requested that the patch series be presented as a unified singleton instead of multiple patches.",
+          "sentiment": "neutral",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Thanks all.\n\nPlease avoid single-patch patch series?  Present them as a unified\nsingleton.\n\nHere's what I ended up with.  Please check.\n\n\nFrom: Alexandre Ghiti <alex@ghiti.fr>\nSubject: mm, swap: only prefer nonfull clusters on synchronous devices\nDate: Mon, 09 Nov 2026 15:18:32 -0800\n\nCommit 9a42aed48421 (\"mm, swap: prefer nonfull over free clusters\") made\nthe allocator fill nonfull clusters before taking free ones on swap\ndevices without discard.  Commit 3cedb745d354 (\"mm: clarify the\nfolio_free_swap() for do_swap_page()\") frees the swap slot on an exclusive\nwrite fault.  Such faults now leave holes in formerly full clusters,\nputting those clusters back on the nonfull list.  Reclaim allocates slots\none folio at a time, scattering a batch across the holes instead of\nproducing mergeable writes.  Later swapin can also require more read\nrequests.\n\nOn a mysql/sysbench workload in a 256 MiB memcg swapping to an NVMe\npartition, 7.3 compared with the previous version produced 59% more device\nread requests and 27% more write requests per transaction.  Throughput was\nunchanged without iocost and fell 19% with iocost.\n\nPrefer free clusters first on nonsynchronous devices, preserving\ncontiguous swap slots for merging I/O.  Keep nonfull-first on synchronous\ndevices such as zram: they do not merge I/O, and filling holes saves free\nclusters for large folios.  Keep free-cluster preference on discard\ndevices to spread writes.\n\nIn the same workload, v2 reduced read requests per transaction by 14% and\nwrite requests by 48% against its base kernel.  Throughput was unchanged\nwithout iocost and improved 33% with iocost.  The RFC's batch-aware\nallocator also improved this workload, but this policy needs no batch\ninformation from reclaim.  Reverting the slot-freeing change would keep\nswap space pinned under dirty pages; a proposed 50% swap-usage cutoff for\nfree-cluster preference was arbitrary and would stop helping as swap\nfilled.\n\nThe 7.0 to 7.2 kernels retained the swap slot after a write fault as a\nside effect of 4b34f1d82c65 (\"mm, swap: free the swap cache after folio is\nmapped\").  The observed regression requires both 9a42aed48421 and\n3cedb745d354; stable backports should target trees containing both.\n\nLink: https://lore.kernel.org/r/20261105155032.240457-1-alex@ghiti.fr\nLink: https://lore.kernel.org/r/20261105155032.240457-2-alex@ghiti.fr\nLink: https://lore.kernel.org/r/20261022145615.2184343-1-alex@ghiti.fr\nLink: https://lore.kernel.org/r/CAMgjq7BFbXEKEt9faj_rg5AStfLkpJ0j57EQOOJ+L3-w2xRvtg@mail.gmail.com\nFixes: 9a42aed48421 (\"mm, swap: prefer nonfull over free clusters\")\nSigned-off-by: Alexandre Ghiti <alex@ghiti.fr>\nSigned-off-by: Andrew Morton <akpm@linux-foundation.org>\nSuggested-by: Kairui Song <kasong@tencent.com>\nAcked-by: Kairui Song <kasong@tencent.com>\nReviewed-by: Nhat Pham <nphamcs@gmail.com>\nCc: <stable@vger.kernel.org>\n---\n\n mm/swapfile.c |   19 +++++++++++++------\n 1 file changed, 13 insertions(+), 6 deletions(-)\n\n--- a/mm/swapfile.c~mm-swap-only-prefer-nonfull-clusters-on-synchronous-devices\n+++ a/mm/swapfile.c\n@@ -973,6 +973,17 @@ static bool __swap_cluster_alloc_entries\n \treturn true;\n }\n \n+/*\n+ * Prefer a new cluster over a nonfull one if the device needs discard, to\n+ * spread out the writes, or if it is not synchronous, to keep the slots\n+ * of a swapout batch contiguous so that its writes can be merged.\n+ */\n+static bool swap_prefer_free_cluster(struct swap_info_struct *si)\n+{\n+\treturn (si->flags & SWP_PAGE_DISCARD) ||\n+\t       !(si->flags & SWP_SYNCHRONOUS_IO);\n+}\n+\n /* Try use a new cluster for current CPU and allocate from it. */\n static unsigned int alloc_swap_scan_cluster(struct swap_info_struct *si,\n \t\t\t\t\t    struct swap_cluster_info *ci,\n@@ -1143,11 +1154,7 @@ static unsigned long cluster_alloc_swap_\n \t}\n \n new_cluster:\n-\t/*\n-\t * If the device need discard, prefer new cluster over nonfull\n-\t * to spread out the writes.\n-\t */\n-\tif (si->flags & SWP_PAGE_DISCARD) {\n+\tif (swap_prefer_free_cluster(si)) {\n \t\tfound = alloc_swap_scan_list(si, &si->free_clusters, folio, false);\n \t\tif (found)\n \t\t\tgoto done;\n@@ -1159,7 +1166,7 @@ new_cluster:\n \t\t\tgoto done;\n \t}\n \n-\tif (!(si->flags & SWP_PAGE_DISCARD)) {\n+\tif (!swap_prefer_free_cluster(si)) {\n \t\tfound = alloc_swap_scan_list(si, &si->free_clusters, folio, false);\n \t\tif (found)\n \t\t\tgoto done;\n_",
+          "reply_to": "Alexandre Ghiti",
+          "message_date": "2026-11-09",
+          "message_id": "20261109152415.f7bb160e4089a17f15c8f42c@linux-foundation.org",
+          "email": "akpm@linux-foundation.org",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses a performance regression in the Linux kernel, specifically related to swap I/O operations on synchronous devices like NVMe partitions. The issue arises from two commits: one that prefers non-full clusters over free ones and another that frees swap slots on exclusive write faults. This leads to scattered writes and increased read requests, resulting in decreased throughput. The patch proposes a solution by only preferring non-full clusters on synchronous devices, which improves performance metrics such as device read and write requests per transaction and throughput."
     }
   }
 }
