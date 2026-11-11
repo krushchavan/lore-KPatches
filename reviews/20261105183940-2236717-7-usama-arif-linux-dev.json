@@ -9,6 +9,32 @@
       "reviews": [],
       "analysis_source": "llm-chunked-no-replies",
       "patch_summary": "This patch adds helpers for managing PMD-mapped anonymous THPs on the s390 architecture, specifically for handling swap operations. It introduces a new bit in the RSTE (Region/Segment Table Entry) layout to mark swap entries as exclusive, allowing them to survive across swap round-trips. The patch also updates the pgtable.h file to include these new helpers and modify the RSTE swap layout documentation."
+    },
+    "2026-11-10": {
+      "report_file": "2026-11-10_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Gerald Schaefer",
+          "summary": "Verified the functionality of the patch series on s390 and found no problems. Suggested that it could have a positive system-wide impact by saving IPTEs for each 1MB THP.",
+          "sentiment": "POSITIVE",
+          "sentiment_signals": [
+            "LGTM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by",
+            "Tested-by"
+          ],
+          "raw_body": "On Thu,  5 Nov 2026 10:38:50 -0800\nUsama Arif <usama.arif@linux.dev> wrote:\n\n> Prepare for keeping a PMD-mapped anonymous THP mapped by a PMD across the\n> swap round-trip, which makes PG_anon_exclusive have to survive in a swap\n> PMD and not just in a swap PTE.\n> \n> s390 is the one architecture where a swap PMD is not a swap PTE in\n> disguise: it is an RSTE with its own layout, converted to a fake PTE swap\n> entry for the common code. Give it its own exclusive bit rather than\n> borrowing the PTE-format macro, and document it in the RSTE swap layout,\n> where bit 52 was listed as unused.\n> \n> Cc: Alexander Gordeev <agordeev@linux.ibm.com>\n> Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>\n> Cc: Heiko Carstens <hca@linux.ibm.com>\n> Cc: Vasily Gorbik <gor@linux.ibm.com>\n> Cc: linux-s390@vger.kernel.org\n> Signed-off-by: Usama Arif <usama.arif@linux.dev>\n> ---\n>  arch/s390/include/asm/pgtable.h | 20 ++++++++++++++++++--\n>  1 file changed, 18 insertions(+), 2 deletions(-)\n> \n> diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h\n> index 2d5c2ab06de98..2c6b5205ee3bc 100644\n> --- a/arch/s390/include/asm/pgtable.h\n> +++ b/arch/s390/include/asm/pgtable.h\n> @@ -333,6 +333,7 @@ void setup_protection_map(void);\n>  /* Common bits in region and segment table entries, for swap entries */\n>  #define _RST_ENTRY_COMM\t\t0x0010\t/* Common-Region/Segment, marks swap entry */\n>  #define _RST_ENTRY_INVALID\t0x0020\t/* invalid region/segment table entry */\n> +#define _RST_ENTRY_SWP_EXCLUSIVE 0x0800\t/* SW exclusive swap bit, see mk_swap_rste() */\n>  \n>  #define _CRST_ENTRIES\t2048\t/* number of region/segment table entries */\n>  #define _PAGE_ENTRIES\t256\t/* number of page table entries\t*/\n> @@ -893,6 +894,21 @@ static inline pmd_t pmd_clear_soft_dirty(pmd_t pmd)\n>  }\n>  \n>  #ifdef CONFIG_ARCH_HAS_PMD_SOFTLEAVES\n> +static inline bool pmd_swp_exclusive(pmd_t pmd)\n> +{\n> +\treturn pmd_val(pmd) & _RST_ENTRY_SWP_EXCLUSIVE;\n> +}\n> +\n> +static inline pmd_t pmd_swp_mkexclusive(pmd_t pmd)\n> +{\n> +\treturn set_pmd_bit(pmd, __pgprot(_RST_ENTRY_SWP_EXCLUSIVE));\n> +}\n> +\n> +static inline pmd_t pmd_swp_clear_exclusive(pmd_t pmd)\n> +{\n> +\treturn clear_pmd_bit(pmd, __pgprot(_RST_ENTRY_SWP_EXCLUSIVE));\n> +}\n> +\n>  #define pmd_swp_soft_dirty(pmd)\t\tpmd_soft_dirty(pmd)\n>  #define pmd_swp_mksoft_dirty(pmd)\tpmd_mksoft_dirty(pmd)\n>  #define pmd_swp_clear_soft_dirty(pmd)\tpmd_clear_soft_dirty(pmd)\n> @@ -1900,15 +1916,15 @@ static inline swp_entry_t __swp_entry(unsigned long type, unsigned long offset)\n>   * Bits 59 and 63 are used to indicate the swap entry. Bit 58 marks the rste\n>   * as invalid.\n>   * A swap entry is indicated by bit pattern (rste & 0x011) == 0x010\n> - * |\t\t\t  offset\t\t\t|Xtype |11TT|S0|\n> + * |\t\t\t  offset\t\t\t|Etype |11TT|S0|\n>   * |0000000000111111111122222222223333333333444444444455|555555|5566|66|\n>   * |0123456789012345678901234567890123456789012345678901|234567|8901|23|\n>   *\n>   * Bits 0-51 store the offset.\n> + * Bit 52 (E) is used to remember PG_anon_exclusive (_RST_ENTRY_SWP_EXCLUSIVE).\n>   * Bits 53-57 store the type.\n>   * Bit 62 (S) is used for softdirty tracking.\n>   * Bits 60-61 (TT) indicate the table type: 0x01 for REGION3 and 0x00 for SEGMENT.\n> - * Bit 52 (X) is unused.\n>   */\n>  \n>  #define __SWP_OFFSET_MASK_RSTE\t((1UL << 52) - 1)\n\nNice, you found the last free bit in s390 RST swap entry, and made good\nuse of it. Bit 52 would also be free in regular RST entries, but as far\nas I remember from PTE SWP_EXCLUSIVE, this will only ever be checked or\nset for swap entries, right? Otherwise we should also document and\nreserve for regular RST entries, but it should be safe for now in any\ncase.\n\nAlso did some basic tests with your series on s390. Couldn't see an\nincrease in throughput yet, but my swap device was way too slow an a\nbottleneck itself. Verified that thp_swpout_pmd counter was increased,\nsystem runs stable, found no problems so far.\n\nI think this series could give s390 some considerable benefit, besides\nswap throughput, by saving the 256 IPTEs (PTE invalidations) for each\n1MB THP that doesn't need to get split before unmap and swap out. This\ncould have a positive system-wide impact, not just for one guest.\n\nGreat job, thanks for the effort!\n\nReviewed-by: Gerald Schaefer <gerald.schaefer@linux.ibm.com>\nTested-by: Gerald Schaefer <gerald.schaefer@linux.ibm.com>\n\n",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-10",
+          "message_id": "",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series adds support for PMD-mapped anonymous huge pages (THPs) on the s390 architecture, allowing them to be kept mapped across swap round-trips. This is achieved by introducing a new exclusive bit in the RSTE swap layout, which is used to indicate whether a THP has been swapped out or not."
     }
   }
 }

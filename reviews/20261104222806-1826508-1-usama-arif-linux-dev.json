@@ -59,6 +59,182 @@
       "reviews": [],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch optimizes large memory copies on ERMS CPUs without FSRM by using the REP MOVSB instruction from 2048 bytes onwards, reducing execution time by up to 66.8%. The patch also folds memcpy_orig() into __memcpy() and makes adjustments for FSRM CPUs. Smaller copies continue to use a scalar loop for performance reasons."
+    },
+    "2026-11-10": {
+      "report_file": "2026-11-10_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Reviewer Kiryl Shutsemau questioned whether any RET in a replacement needs to be aligned, and suggested comparing Linus' layout which keeps the RET out of the replacement, potentially avoiding an ITS problem.\n\nReviewer noted that the RCX/RDX swap in the patch only saves one MOV on copies of 2K and up, and suggested an alternative implementation to replace the swap with a conditional jump based on ERMS feature",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested alternative",
+            "alternative implementation",
+            "suggested change"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Does this mean any RET in a replacement needs the same alignment? Would\nanything catch it if the next one doesn't have it?\n\nLinus' layout keeps the RET out of the replacement, with no padding:\n\n\tmovq %rdi, %rax\n\tmovq %rdx, %rcx\n\tALTERNATIVE \"jmp memcpy_orig\", \"rep movsb\", X86_FEATURE_FSRM\n\tRET\n\nNon-FSRM takes the same jump it takes today. Does that avoid the ITS\nproblem? Why not this layout?\n\n---\n\nThe RCX/RDX swap is most of the diff, and all it saves is one MOV on\ncopies of 2K and up.\n\nWhat about something like this? Untested.\n\ndiff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S\n--- a/arch/x86/lib/memcpy_64.S\n+++ b/arch/x86/lib/memcpy_64.S\n@@ -31,11 +31,9 @@\n  * which the compiler could/should do much better anyway.\n  */\n SYM_TYPED_FUNC_START(__memcpy)\n-\tALTERNATIVE \"jmp memcpy_orig\", \"\", X86_FEATURE_FSRM\n-\n \tmovq %rdi, %rax\n \tmovq %rdx, %rcx\n-\trep movsb\n+\tALTERNATIVE \"jmp memcpy_orig\", \"rep movsb\", X86_FEATURE_FSRM\n \tRET\n SYM_FUNC_END(__memcpy)\n EXPORT_SYMBOL(__memcpy)\n@@ -45,11 +43,11 @@ SYM_PIC_ALIAS(memcpy)\n EXPORT_SYMBOL(memcpy)\n\n SYM_FUNC_START_LOCAL(memcpy_orig)\n-\tmovq %rdi, %rax\n-\n \tcmpq $0x20, %rdx\n \tjb .Lhandle_tail\n\n+\tALTERNATIVE \"\", __stringify(shrq $11, %rcx; jnz .Lerms), X86_FEATURE_ERMS\n+\n \t/*\n \t * We check whether memory false dependence could occur,\n \t * then jump to corresponding copy mode.\n@@ -169,5 +167,10 @@ SYM_FUNC_START_LOCAL(memcpy_orig)\n\n .Lend:\n \tRET\n+\n+.Lerms:\n+\tmovq %rdx, %rcx\n+\trep movsb\n+\tRET\n SYM_FUNC_END(memcpy_orig)\n\nIf you keep the swap, please make it a separate patch with no functional\nchange.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-10",
+          "message_id": "avNEZ6Zz5IhN2Zao@thinkstation",
+          "email": "kas@kernel.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the patch does not handle the case where the length is a power of two, which can result in slower performance due to the shift operation used for ERMS CPUs.\n\nReviewer David Laight expressed concern about the alignment of the FSRM replacement, suggesting it should be aligned to avoid performance issues when the RET instruction is in the first half of a cache line.\n\nThe reviewer expressed concern about the added jump instruction on non-FSRM CPUs, suggesting it could have a measurable impact on performance in cold cache scenarios, but noted that this would only be an issue if RET is not always 0xc3.\n\nReviewer David Laight suggested that the patch could be improved by avoiding unnecessary register-register moves and instead using a simple backtrack to get the value where it is needed, criticizing GCC for being bad at this optimization.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "patch needs additional consideration",
+            "requested changes",
+            "performance",
+            "cold cache",
+            "lack of attention detail",
+            "compiler really ought to do a lot better"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 10 Nov 2026 16:25:54 +0000\nKiryl Shutsemau <kas@kernel.org> wrote:\n\n---\n\nMy suspicion is that ideally 'yes'.\nBut someone said (in this thread) that it is worse for RET in the first\nhalf a cache line - so aligning the replacement that way is better.)\n\n---\n\nIt adds a jump to the non-FSRM path.\nCold cache that is likely to be measurable.\n(But not if RET ends up being anything other than 0xc3 -  that will\njust kill everything.)\n\n---\n\nRegister-register moves don't cost much (they can even be done my the\nregister renaming logic rather than the alu - but still have to be\nfetched and decoded), but needing them is a bit of 'lack of attention\ndetail' when a simple backtrack can get the value where it is needed.\ngcc is very bad at it, a compiler really ought to do a lot better.\n\nDavid",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-11-10",
+          "message_id": "20261110170655.35a7c439@pumpkin",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Linus Torvalds",
+          "summary": "Reviewer Linus Torvalds strongly disagrees with the patch, citing concerns about the use of 'RET' in assembly code alternatives, which he believes is a bad practice.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "strong disagreement",
+            "NACK"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Let's not do that.\n\nPutting magic things like RET in alternatives is just a bad bad idea.\n\n               Linus",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-10",
+          "message_id": "CAHk-=whPF8CD9zC960jPUi2rMrJ_pq9ytdSYqWoef-R6AHsfXg@mail.gmail.com",
+          "email": "torvalds@linux-foundation.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight pointed out that the ERMS check should be done after the 32-byte check to avoid unnecessary reloads, and suggested keeping the count in RCX for REP MOVSB\n\nReviewer David Laight suggested that the RET instruction in the FSRM replacement should be left in the code and then overwritten, expressing concern about the functionality of the code patching process.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvement"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 10 Nov 2026 09:53:07 -0800\nLinus Torvalds <torvalds@linux-foundation.org> wrote:\n\n---\n\nYou'd definitely want the RET in the code itself, and then overwrite\nit with something else.\nWhen I suggested it I did wonder whether the code patching really had\nthe right functionality.\n\nSomeone should try to measure it [1], but I actually suspect that the only\ncost in following a 'rep movs' with an unconditional 'jmp' would be\nfor an I-cache load (or, worse, a TLB miss).\nI expect the pipeline front end (which handles the jmp) will do all its\nwork while the setup for rep movs is happening (even for FSRM).\n\nThat would mean you could pair the \"cmpq $0x20, %rcx; jb .Lhandle_tail\"\nwith \"rep movsb; jmps do_RET; nop\".\n\nDavid\n\n[1] I need to dig out my 'rep movs' performance measuring code and run\nit on a few different cpu types.\nBut I not got anything newer than an i7-7 or a zen[1-4].",
+          "reply_to": "Linus Torvalds",
+          "message_date": "2026-11-10",
+          "message_id": "20261110193316.7ad9d7bc@pumpkin",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "H. Anvin",
+          "summary": "Reviewer H. Anvin questioned the use of REP MOVSB in assembly code, suggesting that it's a bad practice due to potential portability issues.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "portability",
+            "assembly"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Why is that, *given that it is in assembly*?\n\nFor C (or Rust, or C++, ...) it is obviously bad chicken.",
+          "reply_to": "Linus Torvalds",
+          "message_date": "2026-11-10",
+          "message_id": "719584E3-A730-474D-9061-BFF35EA4B02B@zytor.com",
+          "email": "hpa@zytor.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Linus Torvalds",
+          "summary": "Reviewer Linus Torvalds expressed concerns about the use of magic in assembly code, specifically in the alternatives section, and suggested avoiding it to prevent issues with relocations. He noted that a similar pattern is already used in memmove_64.S but acknowledged that it's not ideal.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "concerns about magic in assembly code"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "It's assembly, but it's assembly that potentially gets rewritten.\nobjtool already knows about __x86_return_thunk being special (although\nI think it's the _target_, not the call site, it cares about).\n\nI would like to not have magic in stuff that is in the alternatives\nsection. We've had issues with relocations etc before.\n\nThat said, grepping a bit for this, it turns out we already seem to be\ndoing that in memmove_64.S, although it was hidden from my first grep:\n\n  #define CHECK_LEN     cmp $0x20, %rdx; jb 1f\n  #define MEMMOVE_BYTES movq %rdx, %rcx; rep movsb; RET\n  .Lmemmove_begin_forward:\n        ALTERNATIVE_2 __stringify(CHECK_LEN), \\\n                      __stringify(CHECK_LEN; MEMMOVE_BYTES), X86_FEATURE_ERMS, \\\n                      __stringify(MEMMOVE_BYTES), X86_FEATURE_FSRM\n\nwhich is pretty disgusting. But I guess that train has passed..\n\n           Linus",
+          "reply_to": "H. Anvin",
+          "message_date": "2026-11-10",
+          "message_id": "CAHk-=wjXc16n7ppqhuCDXj3WZMiACupW63+BQh0x0OQFTBpf-A@mail.gmail.com",
+          "email": "torvalds@linux-foundation.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the patch does not handle the case where the length is a power of two, which can cause REP MOVSB to be slower than the scalar loop.\n\nReviewer David Laight expressed concern about using RET in the FSRM replacement due to its potential for multiple speculative execution issues, suggesting that if it were just a single opcode byte (0xc3), it wouldn't be an issue.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "length",
+            "power of two",
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 10 Nov 2026 12:17:51 -0800\n\"H. Peter Anvin\" <hpa@zytor.com> wrote:\n\n---\n\nBecause RET is a horrid sequence subject to a lot of patching\nto avoid multiple speculative execution issues.\nIf is were just the 0xc3 opcode byte it wouldn't be an issue.\n\nDavid",
+          "reply_to": "H. Anvin",
+          "message_date": "2026-11-10",
+          "message_id": "20261110210055.0ca9fc07@pumpkin",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the patch's ERMS check should be done after the 32-byte check, so copies below 32 bytes skip it, and suggested keeping the count in RCX to avoid reloading for REP MOVSB.\n\nReviewer David Laight pointed out that on ERMS CPUs, the RET instruction in the FSRM replacement is likely to be a 5-byte JMP instruction, which would cause issues when checking for replacement by (0xcc)*4 due to misaligned addresses.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "potential bug",
+            "misaligned address"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 10 Nov 2026 12:59:02 -0800\nLinus Torvalds <torvalds@linux-foundation.org> wrote:\n\n---\n\nOr no one has realised it ran straight through the buffers :-)\nRET is likely to be a 5 byte jmp instruction.\nOne of the checks for letting it be replaced by 0xc3,(0xcc)*4 is (addr & 0x20).\nThat will be wrong for the alternatives (half the time) so a quarter\nof the time the train will go straight through the buffers.\n\nDavid",
+          "reply_to": "Linus Torvalds",
+          "message_date": "2026-11-10",
+          "message_id": "20261110223505.160ad6a3@pumpkin",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch optimizes large memory copies on ERMS CPUs without FSRM by using the REP MOVSB instruction from 2048 bytes onwards, reducing execution time by up to 66.8%. The patch also folds memcpy_orig() into __memcpy() and makes adjustments for FSRM CPUs. Smaller copies continue to use a scalar loop for performance reasons."
     }
   }
 }

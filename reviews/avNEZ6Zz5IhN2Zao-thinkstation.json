@@ -1,0 +1,49 @@
+{
+  "thread_id": "avNEZ6Zz5IhN2Zao@thinkstation",
+  "subject": "[PATCH v2] x86/lib: Use REP MOVSB for large memcpy() on ERMS CPUs without FSRM",
+  "url": "https://lore.kernel.org/all/avNEZ6Zz5IhN2Zao@thinkstation/",
+  "dates": {
+    "2026-11-10": {
+      "report_file": "2026-11-10_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "Kiryl Shutsemau",
+          "summary": "Raised questions about alignment requirements for RET instructions in replacement code, suggesting a possible solution to avoid ITS problems. Proposed an alternative layout with a swap of RCX and RDX registers.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "NEEDS_WORK"
+          ],
+          "has_inline_review": true,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Laight",
+          "summary": "Expressed concerns about the patch's proposal, citing potential issues with alignment and performance. Suggested that a simple backtrack could improve register usage.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "CONTROVERSIAL"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, 10 Nov 2026 16:25:54 +0000\nKiryl Shutsemau <kas@kernel.org> wrote:\n\n> On Wed, Nov 04, 2026 at 02:28:06PM -0800, Usama Arif wrote:\n> > +#ifdef CONFIG_MITIGATION_ITS\n> > +\t/*\n> > +\t * Returns are patched before alternatives. Align the replacement\n> > +\t * source so its return is in the first half of a cache line and ITS\n> > +\t * retains its thunk. The copied return can then execute in either\n> > +\t * half of a cache line.\n> > +\t */\n> > +\t.pushsection .altinstr_replacement, \"ax\"\n> > +\t.balign 64\n> > +\t.popsection\n> > +#endif\n> > +\tALTERNATIVE __stringify(cmpq $0x20, %rcx; jb .Lhandle_tail), \\\n> > +\t\t    __stringify(rep movsb; RET), X86_FEATURE_FSRM  \n> \n> Does this mean any RET in a replacement needs the same alignment? Would\n> anything catch it if the next one doesn't have it?\n\nMy suspicion is that ideally 'yes'.\nBut someone said (in this thread) that it is worse for RET in the first\nhalf a cache line - so aligning the replacement that way is better.)\n\n> Linus' layout keeps the RET out of the replacement, with no padding:\n> \n> \tmovq %rdi, %rax\n> \tmovq %rdx, %rcx\n> \tALTERNATIVE \"jmp memcpy_orig\", \"rep movsb\", X86_FEATURE_FSRM\n> \tRET\n> \n> Non-FSRM takes the same jump it takes today. Does that avoid the ITS\n> problem? Why not this layout?\n\nIt adds a jump to the non-FSRM path.\nCold cache that is likely to be measurable.\n(But not if RET ends up being anything other than 0xc3 -  that will\njust kill everything.)\n\n> \n> > +\t/*\n> > +\t * RCX holds the count for REP MOVSB and scalar copying; RDX is scratch.\n> > +\t * Shift RDX to check length >= 2048 without destroying the REP count.\n> > +\t * The 10-byte alternative fits a NOP without ERMS.\n> > +\t */\n> > +\tALTERNATIVE \"\", __stringify(shrq $11, %rdx; jnz .Lerms), X86_FEATURE_ERMS  \n> \n> The RCX/RDX swap is most of the diff, and all it saves is one MOV on\n> copies of 2K and up.\n\nRegister-register moves don't cost much (they can even be done my the\nregister renaming logic rather than the alu - but still have to be\nfetched and decoded), but needing them is a bit of 'lack of attention\ndetail' when a simple backtrack can get the value where it is needed.\ngcc is very bad at it, a compiler really ought to do a lot better.\n\nDavid\n\n> \n> What about something like this? Untested.\n> \n> diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S\n> --- a/arch/x86/lib/memcpy_64.S\n> +++ b/arch/x86/lib/memcpy_64.S\n> @@ -31,11 +31,9 @@\n>   * which the compiler could/should do much better anyway.\n>   */\n>  SYM_TYPED_FUNC_START(__memcpy)\n> -\tALTERNATIVE \"jmp memcpy_orig\", \"\", X86_FEATURE_FSRM\n> -\n>  \tmovq %rdi, %rax\n>  \tmovq %rdx, %rcx\n> -\trep movsb\n> +\tALTERNATIVE \"jmp memcpy_orig\", \"rep movsb\", X86_FEATURE_FSRM\n>  \tRET\n>  SYM_FUNC_END(__memcpy)\n>  EXPORT_SYMBOL(__memcpy)\n> @@ -45,11 +43,11 @@ SYM_PIC_ALIAS(memcpy)\n>  EXPORT_SYMBOL(memcpy)\n> \n>  SYM_FUNC_START_LOCAL(memcpy_orig)\n> -\tmovq %rdi, %rax\n> -\n>  \tcmpq $0x20, %rdx\n>  \tjb .Lhandle_tail\n> \n> +\tALTERNATIVE \"\", __stringify(shrq $11, %rcx; jnz .Lerms), X86_FEATURE_ERMS\n> +\n>  \t/*\n>  \t * We check whether memory false dependence could occur,\n>  \t * then jump to corresponding copy mode.\n> @@ -169,5 +167,10 @@ SYM_FUNC_START_LOCAL(memcpy_orig)\n> \n>  .Lend:\n>  \tRET\n> +\n> +.Lerms:\n> +\tmovq %rdx, %rcx\n> +\trep movsb\n> +\tRET\n>  SYM_FUNC_END(memcpy_orig)\n> \n> If you keep the swap, please make it a separate patch with no functional\n> change.\n> \n\n",
+          "reply_to": "Kiryl Shutsemau",
+          "message_date": "2026-11-10",
+          "message_id": "",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "Patch proposes using REP MOVSB for large memcpy() on ERMS CPUs without FSRM, providing an alternative to the existing implementation."
+    }
+  }
+}
