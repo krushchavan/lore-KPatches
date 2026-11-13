@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[RFC PATCH v2 00/18] mm: read the page cache without folio references</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261104130118.2507513-1-kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-04</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-09</strong><div class="date-range-nav">Active on: <a href="#2026-11-10">2026-11-10</a> &bull; <a href="#2026-11-09">2026-11-09</a> &bull; <a href="#2026-11-06">2026-11-06</a> &bull; <a href="#2026-11-05">2026-11-05</a> &bull; <a href="#2026-11-04">2026-11-04</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-11-04</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-11</strong><div class="date-range-nav">Active on: <a href="#2026-11-12">2026-11-12</a> &bull; <a href="#2026-11-11">2026-11-11</a> &bull; <a href="#2026-11-10">2026-11-10</a> &bull; <a href="#2026-11-09">2026-11-09</a> &bull; <a href="#2026-11-06">2026-11-06</a> &bull; <a href="#2026-11-05">2026-11-05</a> &bull; <a href="#2026-11-04">2026-11-04</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series proposes a change to how Linux handles page cache reads, allowing multiple CPUs to read from the same folio without taking a reference. This is done by introducing a new flag PG_rcu_free and deferring the freeing of folios until an RCU grace period. The goal is to reduce contention between readers and improve performance in scenarios where many threads are reading the same pages. The patch series includes 18 patches that implement this change, including modifications to filemap_read(), shmem, and other related functions.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-11-04">
@@ -2892,6 +2892,173 @@ freeing side).
 </details>
 <a href="https://lore.kernel.org/r/CAHk-=whnH5qLJH3Wd3bOxv--Ei6674Jo4iifGD_MqzyJg2Jm4g@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: strong disagreement, NACK</div>
+</div>
+</div>
+<div class="thread-node depth-0" id="2026-11-11">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">David (Arm)</span>
+<a class="date-chip" href="../2026-11-12_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-11">2026-11-11</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer David (Arm) noted that the proposed RCU-freeing of pages is already a thing in the TLB shootdown code, which has grown complex due to architecture-specific requirements and would be painful to convert to a new order. He pointed out that page tables will have separately allocated memdescs, which need to be kept alive during RCU freeing, and suggested that memdescs might get RCU-freed first, taking the physical page with them.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On 11/9/26 19:01, Linus Torvalds wrote:
+&gt; On Mon, 9 Nov 2026 at 09:24, David Hildenbrand (Arm) &lt;david@kernel.org&gt; wrote:
+&gt;&gt;&gt;
+&gt;&gt;&gt; I think trying to corral it into some special case is the last thing
+&gt;&gt;&gt; we want to do. It only makes things less potentially useful and more
+&gt;&gt;&gt; fragile.
+&gt;&gt; Let me wrap my head around how this would look when we decouple pages from
+&gt;&gt; folios, where pages might not have a -&gt;lru anymore, or not even a refcount.
+&gt; 
+&gt; So for an example of a place that already does RCU freeing of pages -
+&gt; *not* folios - look at the TLB shootdown.
+
+Yes, I am well aware of that handling. Unfortunately. :)
+
+&gt; 
+&gt; It&#x27;s very round-about and hard to tell, but it&#x27;s using
+&gt; 
+&gt;   tlb_remove_table_free
+&gt;     call_rcu(&amp;batch-&gt;rcu, tlb_remove_table_rcu);
+&gt; 
+&gt; and that then does
+&gt; 
+&gt;   tlb_remove_table_rcu -&gt;
+&gt;     __tlb_remove_table_free -&gt;
+&gt;       __tlb_remove_table -&gt;
+&gt;         pagetable_dtor_free -&gt;
+&gt;           pagetable_free -&gt;
+&gt;             __pagetable_free -&gt;
+&gt;                __free_pages(page, compound_order(page))
+&gt; 
+&gt; (and I might have messed this up - this really is a rats nest of
+&gt; nested inline functions).
+&gt; 
+&gt; And in order to do this all, it sets up *another* page just to contain
+&gt; the batching (which is also RCU-free&#x27;d)
+
+Yeah, I recall some details about -&gt;lru not being usable (as reused for other
+purposes by some architectures) and some things about multiple page tables
+residing in a single physical page on some architectures (at least powerpc),
+which makes using ptdesc / -&gt;lru impossible as well, as we might only be freeing
+parts of a page instead of full pages.
+
+And some page tables today might already be allocated from slab (I think at
+least sparc64 and m68k do that).
+
+So that&#x27;s one of the reason why tlb_remove_table() consumes a void * pointer
+instead of a page/ptdesc pointer. It&#x27;s all linked to
+CONFIG_HAVE_ARCH_TLB_REMOVE_TABLE IIRC.
+
+&gt; 
+&gt; Now, the batching is probably a very good thing in that context, so
+&gt; I&#x27;m not actually suggesting this should be converted to some common
+&gt; RCU-freeing thing.
+&gt; 
+&gt; Rather, I&#x27;m pointing out that we have existing hacks in this area that
+&gt; have grown up over time and would have been a *lot* less hacky if we
+&gt; had had a proper RCU-freeing page allocator back when that whole TLB
+&gt; freeing code was written.
+
+See, I am not sure about that given the challenge with
+CONFIG_HAVE_ARCH_TLB_REMOVE_TABLE. And apparently powerpc is using that, which
+is not quite the museum piece (compared to m68k and sparc64 :) )
+
+In a perfect world without these corner cases that make our life hard, possibly.
+
+&gt; 
+&gt; So I&#x27;m not saying &quot;we should unify this&quot;. But I *am* saying &quot;look, RCU
+&gt; freeing of pages is _already_ a thing, and we have complicated hacky
+&gt; things in place for it&quot;.
+&gt; 
+&gt; And they are complicated not because they necessarily should be
+&gt; complicated, but because we solved the TLB shootdown after we already
+&gt; had tons of complex architecture-specific code in place, and we
+&gt; basically ended up adding that RCU phase on top of that existing
+&gt; per-architecture complexity and abstraction.
+
+Jup.
+
+&gt; 
+&gt; *NOW* it would be actually fairly painful to try to convert the TLB
+&gt; shootdown to a new order. But originally, it would have been very nice
+&gt; if we had just had a &quot;Oh, mark this page for RCU freeing&quot;.
+&gt; 
+&gt; (In all fairness, we also did it that way because some architectures
+&gt; don&#x27;t need the RCU delay simply because they have some other hardware
+&gt; page walking infrastructure than the actual page tables the kernel
+&gt; builds up. Not that those architectures *matter* today, but some of
+&gt; that per-architecture inline function stuff is required to basically
+&gt; isolate these kinds of decisions from the MM code - that deep inline
+&gt; function indirection has a reason that is entirely independent of the
+&gt; freeing side).
+
+There are some dirty details when it comes to the upcoming page vs. folio split
+that I am still unclear about.
+
+The page table example you mention above is another prime example of the
+challenges we&#x27;ll face: page tables will have a separately allocated memdesc
+(&quot;ptdesc&quot;), just like folios will have their memdesc (&quot;folio&quot;) separately allocated.
+
+When RCU freeing, we&#x27;ll really have to keep the allocated memdesc alive as well.
+RCU-freeing the page only is not sufficient.
+
+There was even talk about allocating page tables from slab later, as long as we
+can adjust a &quot;struct ptdesc&quot; to it. Which would solve the problem of powerpc
+etc. that don&#x27;t operate on full pages for page tables.
+
+So I might be completely off, but what I imagine is that the memdescs will get
+RCU-freed (these are not pages), and once they are then getting freed, they will
+probably take the physical page with them.
+
+And freeing memdescs through RCU will likely be memdesc specific.
+
+I really don&#x27;t know, Willy might know more about these plans.
+
+But I am overloaded with all the Fixes, so my brain doesn&#x27;t work quite right.
+
+-- 
+Cheers,
+
+David
+
+---
+
+On 11/12/26 13:26, Kiryl Shutsemau wrote:
+&gt; On Wed, Nov 11, 2026 at 11:03:38AM +0100, David Hildenbrand (Arm) wrote:
+&gt;&gt; So I might be completely off, but what I imagine is that the memdescs will get
+&gt;&gt; RCU-freed (these are not pages), and once they are then getting freed, they will
+&gt;&gt; probably take the physical page with them.
+&gt;&gt;
+&gt;&gt; And freeing memdescs through RCU will likely be memdesc specific.
+&gt;&gt;
+&gt;&gt; I really don&#x27;t know, Willy might know more about these plans.
+&gt; 
+&gt; Right: once the folio is allocated separately, the lockless read
+&gt; dereferences it too, so it has to wait for the grace period along with
+&gt; its pages.  The per-CPU batching and the waits in the allocator later
+&gt; in the series do not depend on where the check sits.
+&gt; 
+&gt; Until then the folio is the struct page, and __free_pages_prepare() is
+&gt; the one place every page cache folio passes, so v3 keeps the check
+&gt; there. 
+
+If we go that way, don&#x27;t make it effectively folio-centric in the
+implementation. That&#x27;s what triggered my response in the first place.
+
+-- 
+Cheers,
+
+David</pre>
+</details>
+<a href="https://lore.kernel.org/r/f39a0ec3-be81-43f0-91e8-145ec139b1bc@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: NEEDS_WORK, CONCERN</div>
 </div>
 </div>
 </div>
