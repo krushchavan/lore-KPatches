@@ -1,0 +1,78 @@
+{
+  "thread_id": "20261113141137.1113517-1-usama.arif@linux.dev",
+  "subject": "[PATCH v3 2/2] x86/lib: Use REP MOVSB for large memcpy() on ERMS CPUs without FSRM",
+  "url": "https://lore.kernel.org/all/20261113141137.1113517-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-11-13": {
+      "report_file": "2026-11-13_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight requested that the patch be revised to use a more maintainable approach, specifically suggesting the use of tail jumps instead of adding a helper CALL/RET to every path.\n\nReviewer David Laight suggested an alternative implementation of memcpy() that uses a single assembly instruction for all CPUs, and provided example code to illustrate the approach. He also made some minor suggestions for optimization.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "alternative implementation",
+            "minor suggestions"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Fri, 13 Nov 2026 06:11:36 -0800\nUsama Arif <usama.arif@linux.dev> wrote:\n\n---\n\nI was thinking more of something like:\n(written in the email so untested)\n\nstatic always_inline void *memcpy(void *dst, const void *src, size_t len)\n{\n\tvoid *orig_dst = dst;\n\n\tasm volatile(\t\".pushsection \".memcpy_calls\\n\"\n\t\t\t\"\\t.long . - 1f\\n\"\n\t\t\t\".popsection\\n\"\n\t\t\t\"1:\\trep movsb\\n\"\n\t\t\t\"\\tnop; nop\"\n\t\t\t: \"+c (len), \"+D\" (dst), \"+S\" (src)\n\t\t\t:: ASM_CALL_CONSTRAINT);\n\n\treturn orig_dst;\n}\n\nAn unused return value will be optimised away at all the call sites.\n\nThat will work (maybe slowly) on all cpu.\nThen some code reads all the addresses from .memcpy_calls and, if necessary,\npatches the 5 bytes to a call to the appropriate function.\n\nIt might be worth giving the code one or two scratch registers so that\na short copy loop doesn't need to spill to stack (perhaps %rax and %rdx).\nIt'll matter less for a longer copy loop.\n\nSo you might have:\n_memcpy_erms:\n\tcmp $nnnn, %rcx\n\tjb  _memcpy_words\n\trep movsb\n\tRET\n\n_memcpy_words:\n\tcmpb $nnnn %rcx\n\tjb  _memcpy_bytes\n\tmov %rax,%rcx\n\tor  %rcx,%rdi\n\tor  %rcx,%rsi\n\ttest $7,%rcx\n\tjnz _memcpy_misaligned\n\tsub $8,%rax\n1:\tmov %rcx,[%rsi]\n\tmov %rdx,8[%rsi]\n\tmov [%rdi],%rcx\n\tmov 8[%rdi],%rdx\n\tadd $16,%rdi\n\tadd $16,%rsi\n\tsub $16,%rax\n\tjnc 1b:\n\tjz  2f\n\tmov %rax,[%si]\n\tmov [%rdi]%rax]\n2:\tRET\n\nThat isn't the best 2-word loop by any means.\nAnd you may not care about misaligned pointers.\n\t\netc\n\nDavid",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-13",
+          "message_id": "20261113160300.3f0d0a37@pumpkin",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Linus Torvalds",
+          "summary": "Linus Torvalds noted that many memcpy() calls are not actual function calls on a C level and should be handled by the compiler, which can turn small copies into loads and stores. He also stated that hiding 'memcpy()' from the compiler for performance reasons is inefficient and cannot catch all cases.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "compiler support",
+            "performance reasons"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The problem with this approach two-fold:\n\n - many memcpy() calls aren't actually memcpy() calls on a C level\n\n - many memcpy() that *are* calls on a C level should never be calls\nin the generated code\n\nThat first case is for things like structure copies etc. And it's\ncommon, and it's important, although for the kernel it's usually a\nnon-issue because it's *typicay* a small constant-sized copy, which\nbrings us to the second case...\n\nThe second case is hugely important. The compiler needs to turn small\nmemcpy() calls into just loads and stores. Calling \"memcpy()\" for a\nknown 64-byte copy is hugely inefficient.\n\nWe used to - long ago - do that \"constant small sizes\" thing by hand.\nIt was a huge pain. We now rely on the compiler to do it.\n\nEnd result: we must *not* hide 'memcpy()' from the compiler for\nperformance reasons, and we cannot catch all cases anyway because the\ncompiler generates implicit memcpy calls.\n\nThis is why I really wish we had the compiler just generate a\ndifferent sequence for 'call memcpy'. One that used a different\ncallign convention - preferably just the 'rep movs' one so that we\ncould just rewrite the call with 'rep movsb' in place.\n\nWithout compiler support, we're kind of screwed.\n\n              Linus\n\n              Linus",
+          "reply_to": "David Laight",
+          "message_date": "2026-11-13",
+          "message_id": "CAHk-=wjmnpCmhyOta1EBR6D8_JFgLNz7Jb2s_PgbPq6cBiQ0wg@mail.gmail.com",
+          "email": "torvalds@linux-foundation.org",
+          "is_maintainer": false
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight pointed out that the alternative code path for ERMS CPUs without FSRM should use a cmp immediate of 32 bytes instead of 2048, as changing it from 2048 to 32 made aligned warmed copies 16.5% slower.\n\nReviewer suggested that instead of using REP MOVSB for large memcpy() on ERMS CPUs without FSRM, the patch could detect small constant sizes and call the real memcpy() function, which would allow the compiler to inline them as a series of moves.\n\nReviewer David Laight expressed concern that the use of REP MOVSB in memcpy_erms function may not be optimal due to its non-standard calling convention, which could lead to issues on certain architectures.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested change",
+            "requested changes",
+            "concern about maintainability",
+            "potential for future problems"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "On Fri, 13 Nov 2026 09:34:26 -0800\nLinus Torvalds <torvalds@linux-foundation.org> wrote:\n\n---\n\nActually you could detect the 'small constant sizes' and call the real\nmemcpy for them.\nThe compiler would then (hopefully) inline them as a series of moves.\n\n---\n\nI knew you had wished that in the past.\nIt isn't as though it doesn't have other calls with (annoying)\nnon-standard calling conventions.\nFor one arch we optimise 'shift by count' with a jump table, and fall\nfoul of needing a scratch register - so have to spill to stack.\n\nDavid",
+          "reply_to": "Linus Torvalds",
+          "message_date": "2026-11-13",
+          "message_id": "20261113194258.22d39d95@pumpkin",
+          "email": "david.laight.linux@gmail.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the x86 memcpy function to use REP MOVSB for large memory copies on ERMS CPUs without FSRM support. The patch introduces a new helper function, memcpy_erms, which uses REP MOVSB when the copy size is greater than or equal to 2048 bytes. This approach aims to improve performance by taking advantage of the optimized instruction set available on ERMS CPUs. The patch also includes alternative implementations for different CPU features and provides a fallback to the original memcpy implementation when necessary."
+    }
+  }
+}
