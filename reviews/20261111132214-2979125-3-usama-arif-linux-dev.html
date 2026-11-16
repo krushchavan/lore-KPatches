@@ -245,15 +245,41 @@
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Peter Zijlstra</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-11">2026-11-11</a>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-11">2026-11-11</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Peter Zijlstra suggested merging memcpy and rep_movs_alternative, as it makes little sense to maintain divergent copies of similar code.</div>
+<div class="review-comment-text">Reviewer Peter Zijlstra noted that the patches introduce a divergence between memcpy and rep_movs_alternative, suggesting it would be beneficial to merge these two functions for consistency.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">So no real objection to these patches from me.
+<pre class="raw-body-text">On Wed, Nov 11, 2026 at 05:20:53AM -0800, Usama Arif wrote:
+&gt; Since commit 68674f94ffc9 (&quot;x86: don&#x27;t use REP_GOOD or ERMS for small
+&gt; memory copies&quot;), memcpy() uses REP MOVSB only on FSRM CPUs, so ERMS CPUs
+&gt; without FSRM, such as Skylake and Cooper Lake, copy every size with
+&gt; the scalar loop. Large copies matter there: in Meta&#x27;s x86 fleet, about a
+&gt; third of the time in memcpy_orig() is btrfs zstd decompression copying
+&gt; pages into and out of zstd&#x27;s buffers.
+&gt; 
+&gt; Use REP MOVSB from 2048 bytes on ERMS CPUs. On a 1.4 GHz Cooper Lake, an
+&gt; aligned, cache-hot 4 KiB memcpy() then takes 66.8% less time (123.3 ns
+&gt; instead of 371.6 ns). In a single-vCPU guest, reading a synthetic
+&gt; 512 MiB btrfs zstd file takes 14.8% less time (median of five kernel
+&gt; pairs). Smaller copies keep the scalar loop: using REP MOVSB from
+&gt; 32 bytes made 32/64/128/256-byte copies
+&gt; 111.8%/68.0%/63.2%/15.6% slower.
+&gt; 
+&gt; Prepare the return value and RCX count before the FSRM alternative. On
+&gt; FSRM CPUs, REP MOVSB replaces the jump to memcpy_orig(), followed by a
+&gt; RET in ordinary text. ITS then selects return handling using the RET&#x27;s
+&gt; execution address.
+&gt; 
+&gt; For ERMS CPUs, shift the scratch copy of the length in RDX after the
+&gt; 32-byte check. RCX already holds the count, so large copies need no
+&gt; reload. Copies below 32 bytes skip the check, which is a single NOP
+&gt; without ERMS.
+
+So no real objection to these patches from me.
 
 However, it did remind me of something I have on the TODO list for a
 rainy afternoon, namely merge memcpy and rep_movs_alternative.
@@ -261,25 +287,64 @@ rainy afternoon, namely merge memcpy and rep_movs_alternative.
 It makes very little sense to me that we have two (divergent) copies of
 what is basically the same thing.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
 <a href="https://lore.kernel.org/r/20261111135626.GK2668564@noisy.programming.kicks-ass.net" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: no real objection</div>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Borislav Petkov</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-11">2026-11-11</a>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-11">2026-11-11</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Borislav Petkov expressed strong disagreement (CONTENTIOUS) with the patch, arguing that it adds unnecessary complexity and makes the code &#x27;unmaintainable&#x27; by introducing more JMPs in conditional alternatives. He suggested using alternative_call* or a static key to avoid duplicated code, but rejected the current approach.</div>
+<div class="review-comment-text">Reviewer Borislav Petkov expressed concerns that the patch introduces more JMPs in conditional alternatives, making the code a bigger and unmaintainable mess. He suggested using alternative_call* to avoid duplicated code or exploring other options like static keys or stop_machine_nmi() to keep the code readable and sane.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Sorry, this is adding more JMPs in &quot;conditional&quot; alternatives code and thus
+<pre class="raw-body-text">On Wed, Nov 11, 2026 at 05:20:53AM -0800, Usama Arif wrote:
+&gt; diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S
+&gt; index 7bb146c811029..5320862e0274e 100644
+&gt; --- a/arch/x86/lib/memcpy_64.S
+&gt; +++ b/arch/x86/lib/memcpy_64.S
+&gt; @@ -27,15 +27,13 @@
+&gt;   *
+&gt;   * The &#x27;rep movsb&#x27; itself is small enough to replace the call, but the
+&gt;   * two register moves blow up the code. And one of them is &quot;needed&quot;
+&gt; - * only for the return value that is the same as the source input,
+&gt; + * only for the return value that is the same as the destination input,
+&gt;   * which the compiler could/should do much better anyway.
+&gt;   */
+&gt;  SYM_TYPED_FUNC_START(__memcpy)
+&gt; -	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;&quot;, X86_FEATURE_FSRM
+&gt; -
+&gt;  	movq %rdi, %rax
+&gt;  	movq %rdx, %rcx
+&gt; -	rep movsb
+&gt; +	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;rep movsb&quot;, X86_FEATURE_FSRM
+&gt;  	RET
+&gt;  SYM_FUNC_END(__memcpy)
+&gt;  EXPORT_SYMBOL(__memcpy)
+&gt; @@ -45,12 +43,16 @@ SYM_PIC_ALIAS(memcpy)
+&gt;  EXPORT_SYMBOL(memcpy)
+&gt;  
+&gt;  SYM_FUNC_START_LOCAL(memcpy_orig)
+&gt; -	movq %rdi, %rax
+&gt; -	movq %rdx, %rcx
+&gt; -
+&gt;  	cmpq $0x20, %rcx
+&gt;  	jb .Lhandle_tail
+&gt;  
+&gt; +	/*
+&gt; +	 * RCX holds the count for REP MOVSB and scalar copying; RDX is scratch.
+&gt; +	 * Shift RDX to check length &gt;= 2048 without destroying the REP count.
+&gt; +	 * The 10-byte alternative fits a NOP without ERMS.
+&gt; +	 */
+&gt; +	ALTERNATIVE &quot;&quot;, __stringify(shrq $11, %rdx; jnz .Lerms), X86_FEATURE_ERMS
+
+Sorry, this is adding more JMPs in &quot;conditional&quot; alternatives code and thus
 turns this into a bigger and unmaintainable mess than it already is.
 
 The 2K limit looks like something conjured out of a thin air as it seems it
@@ -302,32 +367,91 @@ Sorry.
 Regards/Gruss,
     Boris.
 
+https://people.kernel.org/tglx/notes-about-netiquette
+
+---
+
+On Fri, Nov 13, 2026 at 10:36:30AM -0800, H. Peter Anvin wrote:
+&gt; Well, we can put a request in for compiler support. This equally applies to
+&gt; other compiler runtime functions, for that matter...
+
+I was going to suggest that too. Lemme know if I should ping my gcc folks...
+
+-- 
+Regards/Gruss,
+    Boris.
+
 https://people.kernel.org/tglx/notes-about-netiquette</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
 <a href="https://lore.kernel.org/r/20261111234608.GAavT-QFRo6EtvoL0y@fat_crate.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: strong disagreement, makes the code unmaintainable</div>
+<div class="review-comment-signals">Signals: requested changes, concerns about maintainability</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-1" id="2026-11-12">
+</div>
+<div class="thread-node depth-0" id="2026-11-12">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">David Laight</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-12">2026-11-12</a>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-12">2026-11-12</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer David Laight noted that the patch does not handle the case where the length is less than or equal to 2047 bytes on ERMS CPUs, and suggested adding a check for this condition.
-
-Reviewer suggested using a non-standard calling convention to patch the call sites with &#x27;rep movsb; nop3&#x27; and proposed creating a special function for this purpose, also suggesting that a similar approach could be applied to memmove().</div>
+<div class="review-comment-text">Reviewer David Laight expressed concerns that the patch is adding more JMPs in conditional alternatives, making the code a bigger and unmaintainable mess. He suggested using alternative_call* to avoid duplicated code, or having a function with a non-standard calling convention to patch the call sites.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
 <pre class="raw-body-text">On Wed, 11 Nov 2026 15:46:08 -0800
 Borislav Petkov &lt;bp@alien8.de&gt; wrote:
 
----
+&gt; On Wed, Nov 11, 2026 at 05:20:53AM -0800, Usama Arif wrote:
+&gt; &gt; diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S
+&gt; &gt; index 7bb146c811029..5320862e0274e 100644
+&gt; &gt; --- a/arch/x86/lib/memcpy_64.S
+&gt; &gt; +++ b/arch/x86/lib/memcpy_64.S
+&gt; &gt; @@ -27,15 +27,13 @@
+&gt; &gt;   *
+&gt; &gt;   * The &#x27;rep movsb&#x27; itself is small enough to replace the call, but the
+&gt; &gt;   * two register moves blow up the code. And one of them is &quot;needed&quot;
+&gt; &gt; - * only for the return value that is the same as the source input,
+&gt; &gt; + * only for the return value that is the same as the destination input,
+&gt; &gt;   * which the compiler could/should do much better anyway.
+&gt; &gt;   */
+&gt; &gt;  SYM_TYPED_FUNC_START(__memcpy)
+&gt; &gt; -	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;&quot;, X86_FEATURE_FSRM
+&gt; &gt; -
+&gt; &gt;  	movq %rdi, %rax
+&gt; &gt;  	movq %rdx, %rcx
+&gt; &gt; -	rep movsb
+&gt; &gt; +	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;rep movsb&quot;, X86_FEATURE_FSRM
+&gt; &gt;  	RET
+&gt; &gt;  SYM_FUNC_END(__memcpy)
+&gt; &gt;  EXPORT_SYMBOL(__memcpy)
+&gt; &gt; @@ -45,12 +43,16 @@ SYM_PIC_ALIAS(memcpy)
+&gt; &gt;  EXPORT_SYMBOL(memcpy)
+&gt; &gt;  
+&gt; &gt;  SYM_FUNC_START_LOCAL(memcpy_orig)
+&gt; &gt; -	movq %rdi, %rax
+&gt; &gt; -	movq %rdx, %rcx
+&gt; &gt; -
+&gt; &gt;  	cmpq $0x20, %rcx
+&gt; &gt;  	jb .Lhandle_tail
+&gt; &gt;  
+&gt; &gt; +	/*
+&gt; &gt; +	 * RCX holds the count for REP MOVSB and scalar copying; RDX is scratch.
+&gt; &gt; +	 * Shift RDX to check length &gt;= 2048 without destroying the REP count.
+&gt; &gt; +	 * The 10-byte alternative fits a NOP without ERMS.
+&gt; &gt; +	 */
+&gt; &gt; +	ALTERNATIVE &quot;&quot;, __stringify(shrq $11, %rdx; jnz .Lerms), X86_FEATURE_ERMS  
+&gt; 
+&gt; Sorry, this is adding more JMPs in &quot;conditional&quot; alternatives code and thus
+&gt; turns this into a bigger and unmaintainable mess than it already is.
+&gt; 
+&gt; The 2K limit looks like something conjured out of a thin air as it seems it
+&gt; work for your particular case. I&#x27;m sure we will have to whack it in the future
+&gt; because someone else will complain of the opposite.
+&gt; 
+&gt; This needs to be done with alternative_call*, even at the price of some
+&gt; duplicated code but without turning what already is a mess, into a bigger one.
 
 Multiple functions seems like a good idea.
 
@@ -355,131 +479,26 @@ The same calling convention might make sense for memmove().
 Although it probably wants a scratch register for the (dst - src &lt; len)
 check (it might want dst in the scratch register!).
 
-David</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Borislav Petkov</div>
-<a href="https://lore.kernel.org/r/20261112093729.065afd6c@pumpkin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes</div>
-</div>
-</div>
-<div class="thread-node depth-1" id="2026-11-13">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">Usama Arif (author)</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Author suggests an alternative implementation to improve maintainability, asking if it&#x27;s acceptable
+David
 
-Author acknowledged that the threshold of 2048 bytes was chosen based on experiments and explained that changing this value to 32 bytes resulted in slower performance for aligned copies of certain sizes, suggesting that a fix is needed but not specifying one.
-
-Author responded to feedback about adding a CALL/RET pair for every path, including FSRM, by trying an alternative approach using tail jumps to keep REP inline on FSRM CPUs.
-
-Author acknowledged the need for a more maintainable patch and provided an updated version in response to reviewer feedback.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">How about something like what I have added at the end, would that be more
-acceptable in terms of maintainability?
+&gt; 
+&gt; Or a static key or even with stop_machine_nmi() (currently in review) which
+&gt; patches the kernel even later, when it is convenient to do so.
+&gt; 
+&gt; Whatever it takes to keep this code readable and sane.
+&gt; 
+&gt; But not this.
+&gt; 
+&gt; Sorry.
+&gt;
 
 ---
 
-As mentioned in the commit message as well as [1], 2K came from experiments.
-
-Changing the cmp immediate from 2048 to 32 bytes made aligned warmed
-32/64/128/256-byte copies 101.2%/69.5%/53.5%/16.5% slower.
-
-This is usecase driven, as Linus said in [2]: &quot;let&#x27;s see if somebody finds a
-case where the kernel memory copies also care&quot;.
-
-If someone finds a case where less than 2K is used and it doesnt cause a
-regression for CPUs, they can try lowering it.
-
----
-
-I tried alternative_call_2() from a C entry with separate helpers. It
-adds a helper CALL/RET to every path, including FSRM. The attached
-version uses tail jumps, so each helper returns directly to the original
-caller and FSRM keeps REP inline. I am hoping this is acceptable?
-
----
-
-No worries! Hopefully the version below is more maintainable and acceptable
-for everyone?
-
-Thanks for the review!
-Usama
-
-[1] https://lore.kernel.org/all/20261017192727.2760919-1-usama.arif@linux.dev/
-[2] https://git.kernel.org/linus/47ee3f1dd93bcbe031539b1ecdaafb44b661c772
-
-diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S
-index 7bb146c811029..8a398edf6e160 100644
---- a/arch/x86/lib/memcpy_64.S
-+++ b/arch/x86/lib/memcpy_64.S
-@@ -27,15 +27,15 @@
-  *
-  * The &#x27;rep movsb&#x27; itself is small enough to replace the call, but the
-  * two register moves blow up the code. And one of them is &quot;needed&quot;
-- * only for the return value that is the same as the source input,
-+ * only for the return value that is the same as the destination input,
-  * which the compiler could/should do much better anyway.
-  */
- SYM_TYPED_FUNC_START(__memcpy)
--       ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;&quot;, X86_FEATURE_FSRM
--
-        movq %rdi, %rax
-        movq %rdx, %rcx
--       rep movsb
-+       /* FSRM takes precedence. Keep RET outside replacements for ITS. */
-+       ALTERNATIVE_2 &quot;jmp memcpy_orig&quot;, &quot;jmp memcpy_erms&quot;, \
-+                     X86_FEATURE_ERMS, &quot;rep movsb&quot;, X86_FEATURE_FSRM
-        RET
- SYM_FUNC_END(__memcpy)
- EXPORT_SYMBOL(__memcpy)
-@@ -44,10 +44,15 @@ SYM_FUNC_ALIAS_MEMFUNC(memcpy, __memcpy)
- SYM_PIC_ALIAS(memcpy)
- EXPORT_SYMBOL(memcpy)
-
--SYM_FUNC_START_LOCAL(memcpy_orig)
--       movq %rdi, %rax
--       movq %rdx, %rcx
-+/* The entry prepares RAX as the return value and RCX as the count. */
-+SYM_FUNC_START_LOCAL(memcpy_erms)
-+       cmpq $2048, %rcx
-+       jb memcpy_orig
-+       rep movsb
-+       RET
-+SYM_FUNC_END(memcpy_erms)
-
-+SYM_FUNC_START_LOCAL(memcpy_orig)
-        cmpq $0x20, %rcx
-        jb .Lhandle_tail</pre>
-</details>
-<div class="reply-to-label">&#8627; replying to Borislav Petkov</div>
-<a href="https://lore.kernel.org/r/20261113141137.1113517-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: asking for feedback, proposing a change, acknowledged need for further investigation</div>
-</div>
-<div class="thread-children">
-<div class="thread-node depth-2">
-<div class="review-comment">
-<div class="review-comment-header">
-<span class="review-author">David Laight</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
-<span class="inline-review-badge">Inline Review</span>
-<span class="review-tag-badge">Reviewed-by</span>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
-<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
-</div>
-<div class="review-comment-text">Reviewer David Laight pointed out that the patch does not handle the case where the length is exactly 2048 bytes, which would cause a misaligned shift operation in the ERMS alternative.
-
-Reviewer David Laight suggested an alternative implementation of memcpy() that uses REP MOVSB on all CPUs, including ERMS and FSRM, by using inline assembly to create a jump table for different copy sizes and handling misaligned pointers.</div>
-<details class="raw-body-toggle">
-<summary>Show original comment</summary>
-<pre class="raw-body-text">On Fri, 13 Nov 2026 06:11:36 -0800
+On Fri, 13 Nov 2026 06:11:36 -0800
 Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
 
----
+&gt; How about something like what I have added at the end, would that be more
+&gt; acceptable in terms of maintainability?
 
 I was thinking more of something like:
 (written in the email so untested)
@@ -543,33 +562,442 @@ And you may not care about misaligned pointers.
 	
 etc
 
-David</pre>
+David
+
+---
+
+On Fri, 13 Nov 2026 09:34:26 -0800
+Linus Torvalds &lt;torvalds@linux-foundation.org&gt; wrote:
+
+&gt; On Fri, 13 Nov 2026 at 08:03, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt; &gt;
+&gt; &gt; I was thinking more of something like:
+&gt; &gt; (written in the email so untested)
+&gt; &gt;
+&gt; &gt; static always_inline void *memcpy(void *dst, const void *src, size_t len)  
+&gt; 
+&gt; The problem with this approach two-fold:
+&gt; 
+&gt;  - many memcpy() calls aren&#x27;t actually memcpy() calls on a C level
+&gt; 
+&gt;  - many memcpy() that *are* calls on a C level should never be calls
+&gt; in the generated code
+&gt; 
+&gt; That first case is for things like structure copies etc. And it&#x27;s
+&gt; common, and it&#x27;s important, although for the kernel it&#x27;s usually a
+&gt; non-issue because it&#x27;s *typicay* a small constant-sized copy, which
+&gt; brings us to the second case...
+&gt; 
+&gt; The second case is hugely important. The compiler needs to turn small
+&gt; memcpy() calls into just loads and stores. Calling &quot;memcpy()&quot; for a
+&gt; known 64-byte copy is hugely inefficient.
+&gt; 
+&gt; We used to - long ago - do that &quot;constant small sizes&quot; thing by hand.
+&gt; It was a huge pain. We now rely on the compiler to do it.
+
+Actually you could detect the &#x27;small constant sizes&#x27; and call the real
+memcpy for them.
+The compiler would then (hopefully) inline them as a series of moves.
+
+&gt; End result: we must *not* hide &#x27;memcpy()&#x27; from the compiler for
+&gt; performance reasons, and we cannot catch all cases anyway because the
+&gt; compiler generates implicit memcpy calls.
+
+I had remembered about those, even if I didn&#x27;t mention them.
+
+&gt; This is why I really wish we had the compiler just generate a
+&gt; different sequence for &#x27;call memcpy&#x27;. One that used a different
+&gt; callign convention - preferably just the &#x27;rep movs&#x27; one so that we
+&gt; could just rewrite the call with &#x27;rep movsb&#x27; in place.
+
+I knew you had wished that in the past.
+It isn&#x27;t as though it doesn&#x27;t have other calls with (annoying)
+non-standard calling conventions.
+For one arch we optimise &#x27;shift by count&#x27; with a jump table, and fall
+foul of needing a scratch register - so have to spill to stack.
+
+David
+
+&gt; 
+&gt; Without compiler support, we&#x27;re kind of screwed.
+&gt; 
+&gt;               Linus
+&gt; 
+&gt;               Linus
+
+---
+
+On Fri, 13 Nov 2026 18:21:23 -0800
+&quot;H. Peter Anvin&quot; &lt;hpa@zytor.com&gt; wrote:
+
+&gt; On November 13, 2026 3:37:03 PM PST, Borislav Petkov &lt;bp@alien8.de&gt; wrote:
+&gt; &gt;On Fri, Nov 13, 2026 at 10:36:30AM -0800, H. Peter Anvin wrote:  
+&gt; &gt;&gt; Well, we can put a request in for compiler support. This equally applies to
+&gt; &gt;&gt; other compiler runtime functions, for that matter...  
+&gt; &gt;
+&gt; &gt;I was going to suggest that too. Lemme know if I should ping my gcc folks...
+&gt; &gt;  
+&gt; 
+&gt; Seems like a good idea to me. Presumably it would be using the rep movsb convention.
+
+You probably want at least two scratch registers and to leave any value in
+rdi, rsi and rcx.
+Otherwise you&#x27;ll need to spill to stack for even a simple byte copy loop.
+But yes, you want to be able to patch &#x27;rep movsb; nop; nop&#x27; over the call.
+
+Two registers might even be enough, one to hold a &#x27;remainder&#x27; length and
+one for the value being copied.
+I think this loop should run at 1 write per clock (two clocks per
+iteration):
+void _memcpy(void *dst, const void *src, u64 len)
+{
+	u64 val, rem = len &amp; 15;
+	len &amp;= ~15;
+	if (len == 0)
+		goto short_copy;
+	dst += len;
+	src += len;
+	len = -len;
+	do {
+		val = src[len];
+		dst[len] = val;
+		val = src[len + 8];
+		dst[len + 8] = val;
+	} while (len += 16);
+	/* copy trailing bytes */
+	val = src[rem - 16];
+	dst[rem - 16] = val;
+	val = src[rem - 8];
+	dst[rem - 8] = val;
+	return;
+short_copy:
+	...
+}
+
+I really need to dig out my memcpy() cycle counting code again.
+
+David
+
+---
+
+On Sat, 14 Nov 2026 16:56:16 -0800
+Linus Torvalds &lt;torvalds@linux-foundation.org&gt; wrote:
+
+&gt; On Sat, 14 Nov 2026 at 14:45, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt; &gt;
+&gt; &gt; Otherwise you&#x27;ll need to spill to stack for even a simple byte copy loop.  
+&gt; 
+&gt; I think the optimization should be for the inline case.
+&gt; 
+&gt; Once you do a call, having a couple of push/pop instructions in the
+&gt; target is a complete no-op.
+
+You certainly don&#x27;t want to have a lot of available registers.
+But even with a call I&#x27;d have thought a push/pop would be noticeable
+for short copies.
+If you need extra registers to unroll a longer copy loop, then I agree
+that the push/pop will be noise.
+
+&gt; But having extra registers free could help at the call-site,
+
+There isn&#x27;t much you can put at the call site instead of a 5 byte call.
+
+&gt; and if the &#x27;rep movs&#x27; is inlined you only modify rcx/rsi/rdi.
+&gt; I think the calling convention should mirror that.
+
+I think I&#x27;d go for rax/rdx being scratch and the final values
+of rcx/tsi/rdi being undefined.
+What you don&#x27;t want to do is have to preserve the destination address.
+That is always better done at the call site.
+
+I&#x27;d guess the compiler option could have a option to say whether ax/dx
+are scratch or not.
+
+I&#x27;m not sure whether the loop I posted runs as fast as I hoped.
+It might need interleaving to get a read and write executed on the
+same clock - but the AVX xor loop didn&#x27;t need it.
+
+All needs some real experiments.
+
+David
+ 
+&gt; 
+&gt;              Linus
+
+---
+
+On Sun, 15 Nov 2026 10:45:22 -0800
+Linus Torvalds &lt;torvalds@linux-foundation.org&gt; wrote:
+
+&gt; On Sun, 15 Nov 2026 at 04:42, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt; &gt;  
+&gt; &gt; &gt; But having extra registers free could help at the call-site,  
+&gt; &gt;
+&gt; &gt; There isn&#x27;t much you can put at the call site instead of a 5 byte call.  
+&gt; 
+&gt; You misunderstand.
+&gt; 
+&gt; Avoiding call-clobbered registers means that the caller has more
+&gt; registers live and can do better code generation.
+
+I missed that was what you were thinking of.
+Clearly you definitely want as few registers clobbered as possible.
+It is a compromise, but current &#x27;standard C calling convention
+is horrid here&#x27;.
+
+&gt; Making the calling convention clobber registers that aren&#x27;t useful is
+&gt; *bad*. And if you do a loop - which you know is either large or
+&gt; unknown size - and take the I$ hit, adding a couple of push/pop
+&gt; instructions really doesn&#x27;t hurt AT ALL.
+
+When I get around to some memcpy() performance measurements I&#x27;ll
+include it.
+
+&gt; It has nothing to do with the 5-byte &quot;&#x27;call&#x27; or &#x27;rep movsb&#x27;&quot; instruction.
+&gt; 
+&gt; (And I realize that &#x27;rep movsb&#x27; is only two bytes. You&#x27;d add a 3-byte
+&gt; nop or harmless prefixes to it depending on which decodes better)
+
+I&#x27;m not sure why I mentioned a two byte nop, I&#x27;ve been writing x86 asm
+since 1982 and really should get it right.
+
+David
+
+&gt; 
+&gt;              Linus
+&gt;</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/20261113160300.3f0d0a37@pumpkin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: patch needs additional handling for specific edge case, requested changes</div>
+<a href="https://lore.kernel.org/r/20261112093729.065afd6c@pumpkin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, concerns about maintainability</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-3">
+</div>
+<div class="thread-node depth-0" id="2026-11-13">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Usama Arif (author)</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Author suggests deferring the introduction of REP MOVSB for large memcpy() on ERMS CPUs without FSRM until a specific use case is identified, indicating that no fix is planned at this time.
-
-Author acknowledges a potential issue with replacing the CALL instruction in __memcpy() with REP MOVSB, but explains it&#x27;s not as simple as just patching the caller&#x27;s code; instead, they propose adding a helper call and return to handle the existing public ABI.
-
-Author agrees that CPU model and alignment can inform a better policy, but suggests going ahead with the current approach in the patch and refining it later based on further testing or user feedback.</div>
+<div class="review-comment-text">Author addressed reviewer concerns about maintainability and code duplication in the patch, proposing a revised version that uses alternative_call_2() to reduce duplicated code and improve readability.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">I think it might be a good idea to start with just a constant and if
+<pre class="raw-body-text">On Wed, 11 Nov 2026 15:46:08 -0800 Borislav Petkov &lt;bp@alien8.de&gt; wrote:
+
+&gt; On Wed, Nov 11, 2026 at 05:20:53AM -0800, Usama Arif wrote:
+&gt; &gt; diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S
+&gt; &gt; index 7bb146c811029..5320862e0274e 100644
+&gt; &gt; --- a/arch/x86/lib/memcpy_64.S
+&gt; &gt; +++ b/arch/x86/lib/memcpy_64.S
+&gt; &gt; @@ -27,15 +27,13 @@
+&gt; &gt;   *
+&gt; &gt;   * The &#x27;rep movsb&#x27; itself is small enough to replace the call, but the
+&gt; &gt;   * two register moves blow up the code. And one of them is &quot;needed&quot;
+&gt; &gt; - * only for the return value that is the same as the source input,
+&gt; &gt; + * only for the return value that is the same as the destination input,
+&gt; &gt;   * which the compiler could/should do much better anyway.
+&gt; &gt;   */
+&gt; &gt;  SYM_TYPED_FUNC_START(__memcpy)
+&gt; &gt; -	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;&quot;, X86_FEATURE_FSRM
+&gt; &gt; -
+&gt; &gt;  	movq %rdi, %rax
+&gt; &gt;  	movq %rdx, %rcx
+&gt; &gt; -	rep movsb
+&gt; &gt; +	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;rep movsb&quot;, X86_FEATURE_FSRM
+&gt; &gt;  	RET
+&gt; &gt;  SYM_FUNC_END(__memcpy)
+&gt; &gt;  EXPORT_SYMBOL(__memcpy)
+&gt; &gt; @@ -45,12 +43,16 @@ SYM_PIC_ALIAS(memcpy)
+&gt; &gt;  EXPORT_SYMBOL(memcpy)
+&gt; &gt;  
+&gt; &gt;  SYM_FUNC_START_LOCAL(memcpy_orig)
+&gt; &gt; -	movq %rdi, %rax
+&gt; &gt; -	movq %rdx, %rcx
+&gt; &gt; -
+&gt; &gt;  	cmpq $0x20, %rcx
+&gt; &gt;  	jb .Lhandle_tail
+&gt; &gt;  
+&gt; &gt; +	/*
+&gt; &gt; +	 * RCX holds the count for REP MOVSB and scalar copying; RDX is scratch.
+&gt; &gt; +	 * Shift RDX to check length &gt;= 2048 without destroying the REP count.
+&gt; &gt; +	 * The 10-byte alternative fits a NOP without ERMS.
+&gt; &gt; +	 */
+&gt; &gt; +	ALTERNATIVE &quot;&quot;, __stringify(shrq $11, %rdx; jnz .Lerms), X86_FEATURE_ERMS
+&gt; 
+&gt; Sorry, this is adding more JMPs in &quot;conditional&quot; alternatives code and thus
+&gt; turns this into a bigger and unmaintainable mess than it already is.
+&gt;
+
+How about something like what I have added at the end, would that be more
+acceptable in terms of maintainability?
+ 
+&gt; The 2K limit looks like something conjured out of a thin air as it seems it
+&gt; work for your particular case. I&#x27;m sure we will have to whack it in the future
+&gt; because someone else will complain of the opposite.
+&gt; 
+
+As mentioned in the commit message as well as [1], 2K came from experiments.
+
+Changing the cmp immediate from 2048 to 32 bytes made aligned warmed
+32/64/128/256-byte copies 101.2%/69.5%/53.5%/16.5% slower.
+
+This is usecase driven, as Linus said in [2]: &quot;let&#x27;s see if somebody finds a
+case where the kernel memory copies also care&quot;.
+
+If someone finds a case where less than 2K is used and it doesnt cause a
+regression for CPUs, they can try lowering it.
+
+&gt; This needs to be done with alternative_call*, even at the price of some
+&gt; duplicated code but without turning what already is a mess, into a bigger one.
+&gt; 
+
+I tried alternative_call_2() from a C entry with separate helpers. It
+adds a helper CALL/RET to every path, including FSRM. The attached
+version uses tail jumps, so each helper returns directly to the original
+caller and FSRM keeps REP inline. I am hoping this is acceptable?
+
+&gt; Or a static key or even with stop_machine_nmi() (currently in review) which
+&gt; patches the kernel even later, when it is convenient to do so.
+&gt; 
+&gt; Whatever it takes to keep this code readable and sane.
+&gt; 
+&gt; But not this.
+&gt; 
+&gt; Sorry.
+&gt; 
+
+No worries! Hopefully the version below is more maintainable and acceptable
+for everyone?
+
+Thanks for the review!
+Usama
+
+[1] https://lore.kernel.org/all/20261017192727.2760919-1-usama.arif@linux.dev/
+[2] https://git.kernel.org/linus/47ee3f1dd93bcbe031539b1ecdaafb44b661c772
+
+diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S
+index 7bb146c811029..8a398edf6e160 100644
+--- a/arch/x86/lib/memcpy_64.S
++++ b/arch/x86/lib/memcpy_64.S
+@@ -27,15 +27,15 @@
+  *
+  * The &#x27;rep movsb&#x27; itself is small enough to replace the call, but the
+  * two register moves blow up the code. And one of them is &quot;needed&quot;
+- * only for the return value that is the same as the source input,
++ * only for the return value that is the same as the destination input,
+  * which the compiler could/should do much better anyway.
+  */
+ SYM_TYPED_FUNC_START(__memcpy)
+-       ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;&quot;, X86_FEATURE_FSRM
+-
+        movq %rdi, %rax
+        movq %rdx, %rcx
+-       rep movsb
++       /* FSRM takes precedence. Keep RET outside replacements for ITS. */
++       ALTERNATIVE_2 &quot;jmp memcpy_orig&quot;, &quot;jmp memcpy_erms&quot;, \
++                     X86_FEATURE_ERMS, &quot;rep movsb&quot;, X86_FEATURE_FSRM
+        RET
+ SYM_FUNC_END(__memcpy)
+ EXPORT_SYMBOL(__memcpy)
+@@ -44,10 +44,15 @@ SYM_FUNC_ALIAS_MEMFUNC(memcpy, __memcpy)
+ SYM_PIC_ALIAS(memcpy)
+ EXPORT_SYMBOL(memcpy)
+
+-SYM_FUNC_START_LOCAL(memcpy_orig)
+-       movq %rdi, %rax
+-       movq %rdx, %rcx
++/* The entry prepares RAX as the return value and RCX as the count. */
++SYM_FUNC_START_LOCAL(memcpy_erms)
++       cmpq $2048, %rcx
++       jb memcpy_orig
++       rep movsb
++       RET
++SYM_FUNC_END(memcpy_erms)
+
++SYM_FUNC_START_LOCAL(memcpy_orig)
+        cmpq $0x20, %rcx
+        jb .Lhandle_tail
+
+---
+
+On Thu, 12 Nov 2026 09:37:29 +0000 David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+
+&gt; On Wed, 11 Nov 2026 15:46:08 -0800
+&gt; Borislav Petkov &lt;bp@alien8.de&gt; wrote:
+&gt; 
+&gt; &gt; On Wed, Nov 11, 2026 at 05:20:53AM -0800, Usama Arif wrote:
+&gt; &gt; &gt; diff --git a/arch/x86/lib/memcpy_64.S b/arch/x86/lib/memcpy_64.S
+&gt; &gt; &gt; index 7bb146c811029..5320862e0274e 100644
+&gt; &gt; &gt; --- a/arch/x86/lib/memcpy_64.S
+&gt; &gt; &gt; +++ b/arch/x86/lib/memcpy_64.S
+&gt; &gt; &gt; @@ -27,15 +27,13 @@
+&gt; &gt; &gt;   *
+&gt; &gt; &gt;   * The &#x27;rep movsb&#x27; itself is small enough to replace the call, but the
+&gt; &gt; &gt;   * two register moves blow up the code. And one of them is &quot;needed&quot;
+&gt; &gt; &gt; - * only for the return value that is the same as the source input,
+&gt; &gt; &gt; + * only for the return value that is the same as the destination input,
+&gt; &gt; &gt;   * which the compiler could/should do much better anyway.
+&gt; &gt; &gt;   */
+&gt; &gt; &gt;  SYM_TYPED_FUNC_START(__memcpy)
+&gt; &gt; &gt; -	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;&quot;, X86_FEATURE_FSRM
+&gt; &gt; &gt; -
+&gt; &gt; &gt;  	movq %rdi, %rax
+&gt; &gt; &gt;  	movq %rdx, %rcx
+&gt; &gt; &gt; -	rep movsb
+&gt; &gt; &gt; +	ALTERNATIVE &quot;jmp memcpy_orig&quot;, &quot;rep movsb&quot;, X86_FEATURE_FSRM
+&gt; &gt; &gt;  	RET
+&gt; &gt; &gt;  SYM_FUNC_END(__memcpy)
+&gt; &gt; &gt;  EXPORT_SYMBOL(__memcpy)
+&gt; &gt; &gt; @@ -45,12 +43,16 @@ SYM_PIC_ALIAS(memcpy)
+&gt; &gt; &gt;  EXPORT_SYMBOL(memcpy)
+&gt; &gt; &gt;  
+&gt; &gt; &gt;  SYM_FUNC_START_LOCAL(memcpy_orig)
+&gt; &gt; &gt; -	movq %rdi, %rax
+&gt; &gt; &gt; -	movq %rdx, %rcx
+&gt; &gt; &gt; -
+&gt; &gt; &gt;  	cmpq $0x20, %rcx
+&gt; &gt; &gt;  	jb .Lhandle_tail
+&gt; &gt; &gt;  
+&gt; &gt; &gt; +	/*
+&gt; &gt; &gt; +	 * RCX holds the count for REP MOVSB and scalar copying; RDX is scratch.
+&gt; &gt; &gt; +	 * Shift RDX to check length &gt;= 2048 without destroying the REP count.
+&gt; &gt; &gt; +	 * The 10-byte alternative fits a NOP without ERMS.
+&gt; &gt; &gt; +	 */
+&gt; &gt; &gt; +	ALTERNATIVE &quot;&quot;, __stringify(shrq $11, %rdx; jnz .Lerms), X86_FEATURE_ERMS  
+&gt; &gt; 
+&gt; &gt; Sorry, this is adding more JMPs in &quot;conditional&quot; alternatives code and thus
+&gt; &gt; turns this into a bigger and unmaintainable mess than it already is.
+&gt; &gt; 
+&gt; &gt; The 2K limit looks like something conjured out of a thin air as it seems it
+&gt; &gt; work for your particular case. I&#x27;m sure we will have to whack it in the future
+&gt; &gt; because someone else will complain of the opposite.
+&gt; &gt; 
+&gt; &gt; This needs to be done with alternative_call*, even at the price of some
+&gt; &gt; duplicated code but without turning what already is a mess, into a bigger one.
+&gt; 
+&gt; Multiple functions seems like a good idea.
+&gt;
+
+Hopefully the version in [1] is acceptable!
+ 
+&gt; In some cases you can patch the constant in the instruction.
+&gt; That is safe here even if a multi-byte constant crosses a cache line
+&gt; because it is only an optimisation.
+&gt; 
+
+I think it might be a good idea to start with just a constant and if
 someone can comeup with a usecase that needs it patched, we can then
 look at this? Basically prefer to keep it usecase driven.
 
----
+&gt; Patching the call sites would certainly be cleaner.
+&gt; More interesting would be having a function with a non-standard calling
+&gt; convention (%rdi, %rsi, %rcx, everything else preserved, void result)
+&gt; so that the 5 byte call can be patched with &quot;rep movsb; nop3&quot;.
+&gt; I can&#x27;t see anywhere that uses the result.
+&gt; Maybe start with &quot;rep movsb; nop3&quot; and patch with the call?
+&gt; You&#x27;d still need a normal memcpy() for the calls gcc makes and if the
+&gt; address is taken.
+&gt; 
 
 Replacing the caller&#x27;s CALL with REP MOVSB could remove actual call
 overhead. The C wrapper I tried patches a CALL inside __memcpy() and
@@ -587,33 +1015,55 @@ entry must still return the original destination in RAX and support
 compiler-generated and address-taken calls, as you point out. The
 current revision preserves that ABI and its aliases.
 
----
+
+&gt; A special function to do the patching would also make sense.
+&gt; All Intel non-atom cpu since sandy bridge run &#x27;rep movsb&#x27; as fast
+&gt; as &#x27;rep movsq&#x27; - so you only need to worry about short copies.
+&gt; Whereas some of the older Zen cpu run misaligned copies slowly.
+&gt; So you could pick/patch the most appropriate code using more complex
+&gt; logic than just whether one of the X86_FEATURE_xxx bits is set.
+&gt;
 
 I agree that CPU model and alignment can inform a better policy.
 
 I think to do this, we need access to many different CPUs to test.
 I am confident that the 2K cmp will not regress other CPUs and is a good
 start. Would it make sense to go ahead with the apprach in the current
-patch and develop later on it if someone comes up with a usecase?</pre>
+patch and develop later on it if someone comes up with a usecase?
+ 
+&gt; The same calling convention might make sense for memmove().
+&gt; Although it probably wants a scratch register for the (dst - src &lt; len)
+&gt; check (it might want dst in the scratch register!).
+&gt; 
+&gt; David
+&gt; 
+
+[1] https://lore.kernel.org/all/20261113141137.1113517-1-usama.arif@linux.dev/</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to David Laight</div>
-<a href="https://lore.kernel.org/r/20261113143124.1454967-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: deferring implementation, usecase driven approach, clarification</div>
+<a href="https://lore.kernel.org/r/20261113141137.1113517-1-usama.arif@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: author proposed a fix, author acknowledged reviewer&#x27;s feedback</div>
 </div>
 </div>
-<div class="thread-node depth-3">
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Linus Torvalds</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Linus Torvalds pointed out that many memcpy() calls are not actual function calls on a C level and that the compiler should be relied upon to optimize small memcpy() calls into loads and stores, making it inefficient to hide &#x27;memcpy()&#x27; from the compiler for performance reasons.</div>
+<div class="review-comment-text">Reviewer noted that the patch&#x27;s approach of modifying the memcpy() function call for large copies may not be effective, as many memcpy() calls are not actual function calls at the C level and compilers can already optimize small memcpy() calls into loads and stores. Linus suggested that a better optimization would be to modify the calling convention to use &#x27;rep movs&#x27; instead of a function call, which could then be replaced with &#x27;rep movsb&#x27;.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">The problem with this approach two-fold:
+<pre class="raw-body-text">On Fri, 13 Nov 2026 at 08:03, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt;
+&gt; I was thinking more of something like:
+&gt; (written in the email so untested)
+&gt;
+&gt; static always_inline void *memcpy(void *dst, const void *src, size_t len)
+
+The problem with this approach two-fold:
 
  - many memcpy() calls aren&#x27;t actually memcpy() calls on a C level
 
@@ -645,63 +1095,127 @@ Without compiler support, we&#x27;re kind of screwed.
 
               Linus
 
-              Linus</pre>
+              Linus
+
+---
+
+On Sat, 14 Nov 2026 at 14:45, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt;
+&gt; Otherwise you&#x27;ll need to spill to stack for even a simple byte copy loop.
+
+I think the optimization should be for the inline case.
+
+Once you do a call, having a couple of push/pop instructions in the
+target is a complete no-op.
+
+But having extra registers free could help at the call-site, and if
+the &#x27;rep movs&#x27; is inlined you only modify rcx/rsi/rdi. I think the
+calling convention should mirror that.
+
+             Linus
+
+---
+
+On Sun, 15 Nov 2026 at 04:42, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt;
+&gt; &gt; But having extra registers free could help at the call-site,
+&gt;
+&gt; There isn&#x27;t much you can put at the call site instead of a 5 byte call.
+
+You misunderstand.
+
+Avoiding call-clobbered registers means that the caller has more
+registers live and can do better code generation.
+
+Making the calling convention clobber registers that aren&#x27;t useful is
+*bad*. And if you do a loop - which you know is either large or
+unknown size - and take the I$ hit, adding a couple of push/pop
+instructions really doesn&#x27;t hurt AT ALL.
+
+It has nothing to do with the 5-byte &quot;&#x27;call&#x27; or &#x27;rep movsb&#x27;&quot; instruction.
+
+(And I realize that &#x27;rep movsb&#x27; is only two bytes. You&#x27;d add a 3-byte
+nop or harmless prefixes to it depending on which decodes better)
+
+             Linus</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to David Laight</div>
 <a href="https://lore.kernel.org/r/CAHk-=wjmnpCmhyOta1EBR6D8_JFgLNz7Jb2s_PgbPq6cBiQ0wg@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: compiler, optimization</div>
+<div class="review-comment-signals">Signals: compiler-optimization, calling-convention</div>
 </div>
-<div class="thread-children">
-<div class="thread-node depth-4">
+</div>
+<div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">David Laight</span>
-<a class="date-chip" href="../2026-11-14_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
-<span class="inline-review-badge">Inline Review</span>
+<span class="review-author">H. Anvin</span>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-13">2026-11-13</a>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that the patch does not handle the case where the length is less than 2048 bytes correctly, as it uses REP MOVSB for lengths greater than or equal to 2048 bytes without considering the ERMS feature.
-
-Reviewer suggested using a small-constant-size threshold to detect when to use the scalar loop instead of REP MOVSB, allowing the compiler to potentially inline smaller copies
-
-The reviewer expressed frustration that the patch does not address non-standard calling conventions in other functions, citing an example where a jump table optimization requires spilling to the stack.</div>
+<div class="review-comment-text">Reviewer H. Anvin noted that hiding &#x27;memcpy()&#x27; from the compiler can lead to inefficient code generation, particularly for small copies, and suggested requesting compiler support for a different calling convention, such as using the &#x27;rep movs&#x27; sequence directly.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">On Fri, 13 Nov 2026 09:34:26 -0800
-Linus Torvalds &lt;torvalds@linux-foundation.org&gt; wrote:
+<pre class="raw-body-text">On November 13, 2026 9:34:26 AM PST, Linus Torvalds &lt;torvalds@linux-foundation.org&gt; wrote:
+&gt;On Fri, 13 Nov 2026 at 08:03, David Laight &lt;david.laight.linux@gmail.com&gt; wrote:
+&gt;&gt;
+&gt;&gt; I was thinking more of something like:
+&gt;&gt; (written in the email so untested)
+&gt;&gt;
+&gt;&gt; static always_inline void *memcpy(void *dst, const void *src, size_t len)
+&gt;
+&gt;The problem with this approach two-fold:
+&gt;
+&gt; - many memcpy() calls aren&#x27;t actually memcpy() calls on a C level
+&gt;
+&gt; - many memcpy() that *are* calls on a C level should never be calls
+&gt;in the generated code
+&gt;
+&gt;That first case is for things like structure copies etc. And it&#x27;s
+&gt;common, and it&#x27;s important, although for the kernel it&#x27;s usually a
+&gt;non-issue because it&#x27;s *typicay* a small constant-sized copy, which
+&gt;brings us to the second case...
+&gt;
+&gt;The second case is hugely important. The compiler needs to turn small
+&gt;memcpy() calls into just loads and stores. Calling &quot;memcpy()&quot; for a
+&gt;known 64-byte copy is hugely inefficient.
+&gt;
+&gt;We used to - long ago - do that &quot;constant small sizes&quot; thing by hand.
+&gt;It was a huge pain. We now rely on the compiler to do it.
+&gt;
+&gt;End result: we must *not* hide &#x27;memcpy()&#x27; from the compiler for
+&gt;performance reasons, and we cannot catch all cases anyway because the
+&gt;compiler generates implicit memcpy calls.
+&gt;
+&gt;This is why I really wish we had the compiler just generate a
+&gt;different sequence for &#x27;call memcpy&#x27;. One that used a different
+&gt;callign convention - preferably just the &#x27;rep movs&#x27; one so that we
+&gt;could just rewrite the call with &#x27;rep movsb&#x27; in place.
+&gt;
+&gt;Without compiler support, we&#x27;re kind of screwed.
+&gt;
+&gt;              Linus
+&gt;
+&gt;              Linus
+
+Well, we can put a request in for compiler support. This equally applies to other compiler runtime functions, for that matter...
 
 ---
 
-Actually you could detect the &#x27;small constant sizes&#x27; and call the real
-memcpy for them.
-The compiler would then (hopefully) inline them as a series of moves.
+On November 13, 2026 3:37:03 PM PST, Borislav Petkov &lt;bp@alien8.de&gt; wrote:
+&gt;On Fri, Nov 13, 2026 at 10:36:30AM -0800, H. Peter Anvin wrote:
+&gt;&gt; Well, we can put a request in for compiler support. This equally applies to
+&gt;&gt; other compiler runtime functions, for that matter...
+&gt;
+&gt;I was going to suggest that too. Lemme know if I should ping my gcc folks...
+&gt;
 
----
-
-I knew you had wished that in the past.
-It isn&#x27;t as though it doesn&#x27;t have other calls with (annoying)
-non-standard calling conventions.
-For one arch we optimise &#x27;shift by count&#x27; with a jump table, and fall
-foul of needing a scratch register - so have to spill to stack.
-
-David</pre>
+Seems like a good idea to me. Presumably it would be using the rep movsb convention.</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Linus Torvalds</div>
-<a href="https://lore.kernel.org/r/20261113194258.22d39d95@pumpkin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, frustration, example</div>
+<a href="https://lore.kernel.org/r/E9C129F6-61F5-49CE-8948-064DAE86EF4F@zytor.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: compiler, performance</div>
 </div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-<div class="thread-node depth-0" id="2026-11-14">
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-11-14">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">David Laight</span>
@@ -764,7 +1278,7 @@ David</pre>
 <div class="review-comment-signals">Signals: patch needs adjustment, requested changes</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1">
+<div class="thread-node depth-2">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Linus Torvalds</span>
@@ -791,6 +1305,8 @@ calling convention should mirror that.
 <div class="reply-to-label">&#8627; replying to David Laight</div>
 <a href="https://lore.kernel.org/r/CAHk-=wj0MtJpBbwNr=NGh4kFPM__Wf9Hq+LZ1Qv1Yv1SCpjaLQ@mail.gmail.com" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 </div>
 </div>
 </div>

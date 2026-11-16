@@ -238,9 +238,103 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH v2 3/3] mm/swap: skip relocation of tableless clusters</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261110151407.789960-4-nphamcs@gmail.com/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-10</strong><div class="date-range-nav">Active on: <a href="#2026-11-10">2026-11-10</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch prevents a stale reclaimer from freeing a tableless swap cluster while an allocator is still populating its table. This occurs when the allocator drops its locks to populate the table, allowing the reclaimer to reach the relocation code and potentially dereference NULL in the DEBUG_VM empty check. The patch adds a check to skip relocation of tableless clusters, leaving them for the allocator under the cluster&#x27;s lock. This prevents a FREE-to-NONE state cycle and ensures that the table population is completed before the cluster is freed.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-11-10</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-15</strong><div class="date-range-nav">Active on: <a href="#2026-11-15">2026-11-15</a> &bull; <a href="#2026-11-10">2026-11-10</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses a bug in the swap cluster relocation logic, where a stale reclaimer can free a tableless cluster while another allocator is still populating its table. The fix involves skipping relocation of clusters without tables to prevent dereferencing NULL pointers and potential FREE-to-NONE state cycles.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-11-15">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kairui Song</span>
+<a class="date-chip" href="../2026-11-15_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-15">2026-11-15</a>
+<span class="review-tag-badge">Acked-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Agreed with the fix and acknowledged it as a valid solution to prevent dereferencing NULL pointers. Suggested that the patch is similar in intent to the &#x27;discarding&#x27; status comment.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Nov 10, 2026 at 11:14 PM Nhat Pham &lt;nphamcs@gmail.com&gt; wrote:
+&gt;
+&gt; A stale reclaimer can reach relocate_cluster() after another allocator
+&gt; re-isolates an emptied cluster and drops its locks to populate the table.
+&gt; The cluster has zero count, CLUSTER_FLAG_NONE and no table, so relocation
+&gt; can free it again and dereference NULL in the DEBUG_VM empty check.
+&gt;
+&gt;     CPU0                                    CPU1
+&gt;     Reclaimer                               Allocator
+&gt;     alloc_swap_scan_cluster()
+&gt;       cluster_reclaim_range()
+&gt;         spin_unlock(&amp;ci-&gt;lock)
+&gt;         __try_to_reclaim_swap()
+&gt;           swap_cache_del_folio()
+&gt;             __swap_cache_del_folio()
+&gt;               __swap_cache_do_del_folio()
+&gt;                 __swap_cluster_free_entries()
+&gt;                   free_cluster()
+&gt;                     __free_cluster()
+&gt;                       swap_cluster_free_table()
+&gt;             swap_cluster_unlock(ci)
+&gt;                                             isolate_lock_cluster()
+&gt;                                               swap_cluster_populate()
+&gt;                                                 drop ci and outer locks
+&gt;                                                 swap_cluster_alloc_table()
+&gt;         spin_lock(&amp;ci-&gt;lock)
+&gt;       relocate_cluster()
+&gt;         free_cluster()
+&gt;           __free_cluster()
+&gt;             swap_cluster_assert_empty()
+&gt;               __swap_table_get()  /* NULL table */
+&gt;
+&gt; Leave tableless clusters to the allocator under ci-&gt;lock. This also stops
+&gt; a stale reclaimer from returning a cluster to the free list while table
+&gt; population is pending, avoiding the resulting FREE-to-NONE state cycle.
+&gt; The existing cluster lock serializes the table check and relocation with
+&gt; population.
+&gt;
+&gt; Reported-by: Sashiko &lt;sashiko-bot@kernel.org&gt;
+&gt; Link: https://lore.kernel.org/all/sashiko-outbox-203018@kernel.org/
+&gt; Fixes: 07adc4cf1ecd (&quot;mm, swap: implement dynamic allocation of swap table&quot;)
+&gt; Cc: stable@vger.kernel.org
+&gt; Signed-off-by: Nhat Pham &lt;nphamcs@gmail.com&gt;
+&gt; ---
+&gt;  mm/swapfile.c | 7 +++++++
+&gt;  1 file changed, 7 insertions(+)
+&gt;
+&gt; diff --git a/mm/swapfile.c b/mm/swapfile.c
+&gt; index 32639f65f13c..9fd62e4ca7a0 100644
+&gt; --- a/mm/swapfile.c
+&gt; +++ b/mm/swapfile.c
+&gt; @@ -815,6 +815,13 @@ static void relocate_cluster(struct swap_info_struct *si,
+&gt;         if (cluster_is_discard(ci))
+&gt;                 return;
+&gt;
+&gt; +       /*
+&gt; +        * An allocator may still be preparing the table.
+&gt; +        * Leave the cluster to it.
+
+It&#x27;s more like the cluster is in an &quot;isolated&quot; state so we shouldn&#x27;t
+touch it, similar to the &quot;discarding&quot; status above, this comment also
+looks to me. Huge thanks for fixing this!
+
+&gt; +        */
+&gt; +       if (!cluster_table_is_alloced(ci))
+&gt; +               return;
+&gt; +
+&gt;         if (!ci-&gt;count) {
+&gt;                 if (ci-&gt;flags != CLUSTER_FLAG_FREE)
+&gt;                         free_cluster(si, ci);
+&gt; --
+&gt; 2.53.0-Meta
+&gt;
+
+Acked-by: Kairui Song &lt;kasong@tencent.com&gt;
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Nhat Pham</div>
+<div class="review-comment-signals">Signals: ACKED</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>
