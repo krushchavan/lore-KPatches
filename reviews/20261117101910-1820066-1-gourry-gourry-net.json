@@ -1,0 +1,68 @@
+{
+  "thread_id": "20261117101910.1820066-1-gourry@gourry.net",
+  "subject": "[PATCH] mm/mempolicy: limit compat bitmap reads to the source nodemask",
+  "url": "https://lore.kernel.org/all/20261117101910.1820066-1-gourry@gourry.net/",
+  "dates": {
+    "2026-11-17": {
+      "report_file": "2026-11-17_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "David Hildenbrand (Arm)",
+          "summary": "LGTM, but suggested reworking compat_put_bitmap() to handle bits instead of words for better alignment with copy_to_user().",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "LGTM"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "",
+          "reply_to": "",
+          "message_date": "",
+          "message_id": "",
+          "email": "",
+          "is_maintainer": false
+        },
+        {
+          "author": "Arnd Bergmann",
+          "summary": "Identified an off-by-one error in the calculation of copy bytes, which affects both native and compat syscalls. Suggested fixing this by aligning maxnode to 64 bits instead of 64 words.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "off-by-one error"
+          ],
+          "has_inline_review": true,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Nov 17, 2026, at 11:19, Gregory Price (Meta) wrote:\n> A 32-bit get_mempolicy() call can read past the kernel's stack nodemask.\n> With 64 possible nodes and maxnode=65, copy_nodes_to_user() computes an\n> eight-byte copy, but compat_put_bitmap() reads two native words.\n\nI don't quite follow the explanation yet:\n\nif maxnode=65, shouldn't that result in copying 16 bytes on x86-64\nand 12 bytes on compat mode?\n\nIt looks like compat mode adjusts the wrong variable and we should\nbe doing this instead:\n\ndiff --git a/mm/mempolicy.c b/mm/mempolicy.c\nindex 6d662a9a8c74..f9a7be9f4432 100644\n--- a/mm/mempolicy.c\n+++ b/mm/mempolicy.c\n@@ -1749,12 +1749,12 @@ static int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,\n static int copy_nodes_to_user(unsigned long __user *mask, unsigned long maxnode,\n \t\t\t      nodemask_t *nodes)\n {\n-\tunsigned long copy = ALIGN(maxnode-1, 64) / 8;\n+\tunsigned long copy = ALIGN(maxnode-1, BITS_PER_LONG) / 8;\n \tunsigned int nbytes = BITS_TO_LONGS(nr_node_ids) * sizeof(long);\n \tbool compat = in_compat_syscall();\n \n \tif (compat)\n-\t\tnbytes = BITS_TO_COMPAT_LONGS(nr_node_ids) * sizeof(compat_long_t);\n+\t\tcopy = ALIGN(maxnode-1, BITS_PER_COMPAT_LONG) / 8;\n \n \tif (copy > nbytes) {\n \t\tif (copy > PAGE_SIZE)\n\nNow in the maxnode=65 example, it should clear 4 bytes and put copy\nthe 8 byte bitmap.\n\n      Arnd\n",
+          "reply_to": "David Hildenbrand (Arm)",
+          "message_date": "2026-11-17",
+          "message_id": "",
+          "email": "arnd@arndb.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "Arnd Bergmann",
+          "summary": "Raised concerns about the ABI implications of changing the behavior for 32-bit userspace asking for maxnum that results in an odd number of 32-bit words.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "ABI implications"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "On Tue, Nov 17, 2026, at 13:44, Arnd Bergmann wrote:\n> On Tue, Nov 17, 2026, at 11:19, Gregory Price (Meta) wrote:\n>> A 32-bit get_mempolicy() call can read past the kernel's stack nodemask.\n>> With 64 possible nodes and maxnode=65, copy_nodes_to_user() computes an\n>> eight-byte copy, but compat_put_bitmap() reads two native words.\n>\n> I don't quite follow the explanation yet:\n>\n> if maxnode=65, shouldn't that result in copying 16 bytes on x86-64\n> and 12 bytes on compat mode?\n>\n> It looks like compat mode adjusts the wrong variable and we should\n> be doing this instead:\n>\n> diff --git a/mm/mempolicy.c b/mm/mempolicy.c\n> index 6d662a9a8c74..f9a7be9f4432 100644\n> --- a/mm/mempolicy.c\n> +++ b/mm/mempolicy.c\n> @@ -1749,12 +1749,12 @@ static int get_nodes(nodemask_t *nodes, const \n> unsigned long __user *nmask,\n>  static int copy_nodes_to_user(unsigned long __user *mask, unsigned \n> long maxnode,\n>  \t\t\t      nodemask_t *nodes)\n>  {\n> -\tunsigned long copy = ALIGN(maxnode-1, 64) / 8;\n> +\tunsigned long copy = ALIGN(maxnode-1, BITS_PER_LONG) / 8;\n\nI guess this would be an ABI change for 32-bit userspace asking for\nmaxnum that results in an odd number of 32-bit words. The man\npage documents this as \"The value specified by maxnode is always\nrounded to a multiple of sizeof(unsigned long)*8\", while the\ncode here has always rounded it up to a multiple of 64 in\nboth native (no longer supported on 32-bit) and compat syscalls.\n\nnumactl (1) always uses 128 or 2048 bit masks and won't notice\nit either way, so we can possibly change the ABI here and\ndo what the man page says, or keep the current behavior and update\nthe man page.\n\nIt looks like the other part of the problem is the off-by-one\nerror: the \"ALIGN(maxnode-1, 64) / 8\" rounds down maxnode=65\nto copy=8 which is the same as nbytes, but the compat_put_bitmap()\ntreats it as a 65-bit map that needs 96 bytes. \n\nThis means we have a related bug on native syscalls as well:\nasking for a 65 bit mask in mempolicy only returns 8 bytes\nwithout clearing the next word like it would for a 66 bit mask.\nIf we just fix the off-by-one and keep the 64 bit alignment\n(with a manpage update), the version below be should be sufficient.\n\n   Arnd\n\n--- a/mm/mempolicy.c\n+++ b/mm/mempolicy.c\n@@ -1749,13 +1749,10 @@ static int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,\n static int copy_nodes_to_user(unsigned long __user *mask, unsigned long maxnode,\n                              nodemask_t *nodes)\n {\n-       unsigned long copy = ALIGN(maxnode-1, 64) / 8;\n+       unsigned long copy = ALIGN(maxnode, 64) / 8;\n        unsigned int nbytes = BITS_TO_LONGS(nr_node_ids) * sizeof(long);\n        bool compat = in_compat_syscall();\n \n-       if (compat)\n-               nbytes = BITS_TO_COMPAT_LONGS(nr_node_ids) * sizeof(compat_long_t);\n-\n        if (copy > nbytes) {\n                if (copy > PAGE_SIZE)\n                        return -EINVAL;\n\n\n",
+          "reply_to": "",
+          "message_date": "2026-11-17",
+          "message_id": "",
+          "email": "arnd@arndb.de",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch addresses a bug in the compat bitmap read for get_mempolicy() calls on 32-bit systems, where it can read past the kernel's stack nodemask due to an incorrect calculation of the number of bytes to copy. The fix bounds the compat bitmap read by MAX_NUMNODES and maintains existing behavior when the kernel nodemask is large enough."
+    }
+  }
+}
