@@ -8,23 +8,409 @@
       "developer": "Gregory Price",
       "reviews": [
         {
-          "author": "Gregory Price (Meta)",
-          "summary": "No substantive comments or reviews have been made on the patch series so far.",
-          "sentiment": "neutral",
-          "sentiment_signals": [],
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about the lack of explicit node eligibility filtering in MM walkers by adding helper functions/macros to select node eligibility explicitly, and iterators for nodemask intersection and state iteration without allocating temporary nodemasks.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "acknowledged",
+            "agreed"
+          ],
           "has_inline_review": false,
           "tags_given": [],
           "analysis_source": "llm",
-          "raw_body": "",
+          "raw_body": "Add node-state-filter helper functions/macros so MM walkers can select\ntheir node eligibility explicitly.\n\nAdd nodemask intersection and nodemask/state iterators using the bitmap\nintersection helpers, without allocating a temporary nodemask.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n include/linux/mmzone.h   | 46 ++++++++++++++++++++++++++++++++++++++++\n include/linux/nodemask.h | 28 ++++++++++++++++++++----\n 2 files changed, 70 insertions(+), 4 deletions(-)\n\ndiff --git a/include/linux/mmzone.h b/include/linux/mmzone.h\nindex c161d563ce8fd..5ff190d870830 100644\n--- a/include/linux/mmzone.h\n+++ b/include/linux/mmzone.h\n@@ -1845,6 +1845,13 @@ extern struct zone *next_zone(struct zone *zone);\n \t\t\t; /* do nothing */\t\t\\\n \t\telse\n \n+/* Populated zones on nodes in @state. */\n+#define for_each_populated_zone_state(zone, state)\t\\\n+\tfor_each_populated_zone(zone)\t\t\t\\\n+\t\tif (!node_state(zone_to_nid(zone), state))\t\\\n+\t\t\t; /* do nothing */\t\t\\\n+\t\telse\n+\n static inline struct zone *zonelist_zone(struct zoneref *zoneref)\n {\n \treturn zoneref->zone;\n@@ -1937,6 +1944,45 @@ static inline struct zoneref *first_zones_zonelist(struct zonelist *zonelist,\n \t\t\tzone = zonelist_zone(z))\n \n \n+static inline struct zoneref *\n+next_zones_zonelist_state(struct zoneref *z, enum zone_type highest_zoneidx,\n+\t\t\t  const nodemask_t *nodes, enum node_states state)\n+{\n+\tz = next_zones_zonelist(z, highest_zoneidx, nodes);\n+\twhile (zonelist_zone(z) && !node_state(zonelist_node_idx(z), state))\n+\t\tz = next_zones_zonelist(++z, highest_zoneidx, nodes);\n+\treturn z;\n+}\n+\n+static inline struct zoneref *\n+first_zones_zonelist_state(struct zonelist *zonelist,\n+\t\t\t   enum zone_type highest_zoneidx,\n+\t\t\t   const nodemask_t *nodes, enum node_states state)\n+{\n+\treturn next_zones_zonelist_state(zonelist->_zonerefs, highest_zoneidx,\n+\t\t\t\t\t nodes, state);\n+}\n+\n+/**\n+ * for_each_zone_node_state - iterate zones in intersect(nodemask, node_state(state))\n+ * @zone: The current zone in the iterator\n+ * @z: The current pointer within zonelist->_zonerefs being iterated\n+ * @zlist: The zonelist being iterated\n+ * @highidx: The zone index of the highest zone to return\n+ * @nodemask: Nodemask allowed by the allocator\n+ * @state: The node state the zone's node must be in\n+ *\n+ * The state filter is part of the iteration rather than a trailing if, so that\n+ * this expands to a single for statement: a macro ending in an unbraced if\n+ * silently steals a following else from the caller.\n+ */\n+#define for_each_zone_node_state(zone, z, zlist, highidx, nodemask, state)\t\\\n+\tfor (z = first_zones_zonelist_state(zlist, highidx, nodemask, state),\t\\\n+\t\tzone = zonelist_zone(z);\t\t\t\t\t\\\n+\t\tzone;\t\t\t\t\t\t\t\t\\\n+\t\tz = next_zones_zonelist_state(++z, highidx, nodemask, state),\t\\\n+\t\tzone = zonelist_zone(z))\n+\n /**\n  * for_each_zone_zonelist - helper macro to iterate over valid zones in a zonelist at or below a given zone index\n  * @zone: The current zone in the iterator\ndiff --git a/include/linux/nodemask.h b/include/linux/nodemask.h\nindex 607373bd83ee6..28a456c3f5964 100644\n--- a/include/linux/nodemask.h\n+++ b/include/linux/nodemask.h\n@@ -386,6 +386,10 @@ static __always_inline void __nodes_fold(nodemask_t *dstp, const nodemask_t *ori\n \tfor ((node) = 0; (node) < 1 && !nodes_empty(mask); (node)++)\n #endif /* MAX_NUMNODES */\n \n+/* Iterate the nodes present in both masks without a temporary nodemask. */\n+#define for_each_node_mask_and(node, mask1, mask2) \\\n+\tfor_each_and_bit(node, nodes_addr(mask1), nodes_addr(mask2), MAX_NUMNODES)\n+\n /*\n  * Bitmasks that are kept for all the nodes.\n  */\n@@ -411,6 +415,10 @@ enum node_states {\n \n extern nodemask_t node_states[NR_NODE_STATES];\n \n+/* Iterate the nodes in a mask that also belong to the specified state. */\n+#define for_each_node_mask_state(node, mask, state) \\\n+\tfor_each_node_mask_and(node, mask, node_states[state])\n+\n #if MAX_NUMNODES > 1\n static __always_inline int node_state(int node, enum node_states state)\n {\n@@ -435,15 +443,21 @@ static __always_inline int num_node_state(enum node_states state)\n #define for_each_node_state(__node, __state) \\\n \tfor_each_node_mask((__node), node_states[__state])\n \n-#define first_online_node\tfirst_node(node_states[N_ONLINE])\n-#define first_memory_node\tfirst_node(node_states[N_MEMORY])\n+#define first_node_state(state)\tfirst_node(node_states[state])\n+static __always_inline unsigned int next_node_state(int nid, enum node_states state)\n+{\n+\treturn next_node(nid, node_states[state]);\n+}\n+\n+#define first_online_node\tfirst_node_state(N_ONLINE)\n+#define first_memory_node\tfirst_node_state(N_MEMORY)\n static __always_inline unsigned int next_online_node(int nid)\n {\n-\treturn next_node(nid, node_states[N_ONLINE]);\n+\treturn next_node_state(nid, N_ONLINE);\n }\n static __always_inline unsigned int next_memory_node(int nid)\n {\n-\treturn next_node(nid, node_states[N_MEMORY]);\n+\treturn next_node_state(nid, N_MEMORY);\n }\n \n static __always_inline void node_set_online(int nid)\n@@ -481,6 +495,12 @@ static __always_inline int num_node_state(enum node_states state)\n #define for_each_node_state(node, __state) \\\n \tfor ( (node) = 0; (node) == 0; (node) = 1)\n \n+#define first_node_state(state)\t0\n+static __always_inline unsigned int next_node_state(int nid, enum node_states state)\n+{\n+\treturn MAX_NUMNODES;\n+}\n+\n #define first_online_node\t0\n #define first_memory_node\t0\n #define next_online_node(nid)\t(MAX_NUMNODES)\n-- \n2.53.1-Meta",
           "reply_to": "",
-          "message_date": "",
-          "message_id": "",
-          "email": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-2-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author is addressing a concern about the inconsistent setting of N_MEMORY, N_NORMAL_MEMORY, and N_HIGH_MEMORY flags in various places. They are centralizing these updates in node_set/clear_memory_state() to make the code more consistent and easier to maintain. The behavior remains unchanged.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "centralized updates"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "N_MEMORY, N_NORMAL_MEMORY and N_HIGH_MEMORY are set separately in\nfree_area_init(), check_for_memory() and online_pages(), and cleared\nin offline_pages().\n\nCentralize those updates in node_set/clear_memory_state().\n\nBehavior is unchanged.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/internal.h       |  3 +++\n mm/memory_hotplug.c | 11 ++++-------\n mm/mm_init.c        | 14 ++++++--------\n mm/page_alloc.c     | 15 +++++++++++++++\n 4 files changed, 28 insertions(+), 15 deletions(-)\n\ndiff --git a/mm/internal.h b/mm/internal.h\nindex cd3675c044e0a..608a83c34c224 100644\n--- a/mm/internal.h\n+++ b/mm/internal.h\n@@ -62,6 +62,9 @@ void lru_add_drain_cpu_zone(struct zone *zone);\n void folio_deactivate(struct folio *folio);\n void folio_mark_lazyfree(struct folio *folio);\n \n+void node_set_memory_state(int nid, bool high, bool normal);\n+void node_clear_memory_state(int nid);\n+\n /* mm/vmscan.c */\n unsigned long zone_reclaimable_pages(struct zone *zone);\n unsigned long try_to_free_pages(struct zonelist *zonelist, int order,\ndiff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c\nindex f04a248d8adaf..490f400498f14 100644\n--- a/mm/memory_hotplug.c\n+++ b/mm/memory_hotplug.c\n@@ -1184,14 +1184,11 @@ int online_pages(unsigned long pfn, unsigned long nr_pages,\n \tonline_pages_range(pfn, nr_pages);\n \tadjust_present_page_count(pfn_to_page(pfn), group, nr_pages);\n \n-\tif (node_arg.nid >= 0)\n-\t\tnode_set_state(nid, N_MEMORY);\n \t/*\n-\t * Check whether we are adding normal memory to the node for the first\n-\t * time.\n+\t * Publish this node's memory states, including any newly-normal zone.\n+\t * Hotplug never adds highmem.\n \t */\n-\tif (!node_state(nid, N_NORMAL_MEMORY) && zone_idx(zone) <= ZONE_NORMAL)\n-\t\tnode_set_state(nid, N_NORMAL_MEMORY);\n+\tnode_set_memory_state(nid, false, zone_idx(zone) <= ZONE_NORMAL);\n \n \tif (need_zonelists_rebuild)\n \t\tbuild_all_zonelists(NULL);\n@@ -2146,7 +2143,7 @@ int offline_pages(unsigned long start_pfn, unsigned long nr_pages,\n \t * list. Otherwise this node would still appear in the fallback lists.\n \t */\n \tif (node_arg.nid >= 0)\n-\t\tnode_clear_state(node, N_MEMORY);\n+\t\tnode_clear_memory_state(node);\n \tif (!populated_zone(zone)) {\n \t\tzone_pcp_reset(zone);\n \t\tbuild_all_zonelists(NULL);\ndiff --git a/mm/mm_init.c b/mm/mm_init.c\nindex a9d848c92678b..b4c4dba93652d 100644\n--- a/mm/mm_init.c\n+++ b/mm/mm_init.c\n@@ -1763,21 +1763,21 @@ static void __init free_area_init_node(int nid)\n \tlru_gen_init_pgdat(pgdat);\n }\n \n-/* Any regular or high memory on that node? */\n+/* Publish the memory states of a node that has present pages. */\n static void __init check_for_memory(pg_data_t *pgdat)\n {\n \tenum zone_type zone_type;\n+\tbool high = false, normal = false;\n \n \tfor (zone_type = 0; zone_type <= ZONE_MOVABLE - 1; zone_type++) {\n \t\tstruct zone *zone = &pgdat->node_zones[zone_type];\n \t\tif (populated_zone(zone)) {\n-\t\t\tif (IS_ENABLED(CONFIG_HIGHMEM))\n-\t\t\t\tnode_set_state(pgdat->node_id, N_HIGH_MEMORY);\n-\t\t\tif (zone_type <= ZONE_NORMAL)\n-\t\t\t\tnode_set_state(pgdat->node_id, N_NORMAL_MEMORY);\n+\t\t\thigh = IS_ENABLED(CONFIG_HIGHMEM);\n+\t\t\tnormal = zone_type <= ZONE_NORMAL;\n \t\t\tbreak;\n \t\t}\n \t}\n+\tnode_set_memory_state(pgdat->node_id, high, normal);\n }\n \n #if MAX_NUMNODES > 1\n@@ -1924,10 +1924,8 @@ static void __init free_area_init(void)\n \t\t *memory-less node. The pgdat will get fully initialized by\n \t\t *hotadd_init_pgdat() when memory is hotplugged into this node.\n \t\t */\n-\t\tif (pgdat->node_present_pages) {\n-\t\t\tnode_set_state(nid, N_MEMORY);\n+\t\tif (pgdat->node_present_pages)\n \t\t\tcheck_for_memory(pgdat);\n-\t\t}\n \t}\n \n \tcalc_nr_kernel_pages();\ndiff --git a/mm/page_alloc.c b/mm/page_alloc.c\nindex 8532af052d74b..834d199ff8429 100644\n--- a/mm/page_alloc.c\n+++ b/mm/page_alloc.c\n@@ -208,6 +208,21 @@ nodemask_t node_states[NR_NODE_STATES] __read_mostly = {\n };\n EXPORT_SYMBOL(node_states);\n \n+void __meminit node_set_memory_state(int nid, bool high, bool normal)\n+{\n+\tnode_set_state(nid, N_MEMORY);\n+\tif (high)\n+\t\tnode_set_state(nid, N_HIGH_MEMORY);\n+\tif (normal)\n+\t\tnode_set_state(nid, N_NORMAL_MEMORY);\n+}\n+\n+void __meminit node_clear_memory_state(int nid)\n+{\n+\tnode_clear_state(nid, N_NORMAL_MEMORY);\n+\tnode_clear_state(nid, N_MEMORY);\n+}\n+\n gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;\n \n #ifdef CONFIG_HUGETLB_PAGE_SIZE_VARIABLE\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-3-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about the overloaded meaning of N_MEMORY by clarifying that it should only mean a node has memory, and introducing N_MEMORY_COMMON to mean a node's memory is reachable via ordinary allocation or MM service. The author explained that every node with memory is common, so N_MEMORY_COMMON equals N_MEMORY and there is no behavioral change.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "N_MEMORY is overloaded with two meanings:\n  1) a node has memory.\n  2) a node's memory is reachable via ordinary allocation or\n     an arbitrary MM service may use that memory.\n\nAllow N_MEMORY to mean #1, and introduce N_MEMORY_COMMON to mean #2.\n\nN_MEMORY_COMMON nodes contain \"common memory\" capable of being managed\narbitrarily by the kernel MM based solely on zone membership. Following\ncommits convert relevant N_MEMORY users to N_MEMORY_COMMON.\n\nAdd folio_is_common_memory() and page_is_common_memory() for MM services\nthat walk folios. Following commits convert folio_is_zone_device() and\npage_is_zone_device() callers accordingly.\n\nExpose the state via `has_common_memory` so userspace can identify\nthe memory available to ordinary allocations and common MM services.\n\nAdd has_memory to the docs while we're here.\n\nEvery node with memory is common, so N_MEMORY_COMMON equals N_MEMORY\nand there is no behavioral change.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n Documentation/ABI/stable/sysfs-devices-node | 16 ++++++++++++++++\n Documentation/mm/physical_memory.rst        |  8 +++++++-\n drivers/base/node.c                         |  2 ++\n include/linux/nodemask.h                    |  9 ++++++++-\n mm/internal.h                               | 15 +++++++++++++++\n mm/page_alloc.c                             |  3 +++\n 6 files changed, 51 insertions(+), 2 deletions(-)\n\ndiff --git a/Documentation/ABI/stable/sysfs-devices-node b/Documentation/ABI/stable/sysfs-devices-node\nindex 2d0e023f22a71..a93de328f8fe8 100644\n--- a/Documentation/ABI/stable/sysfs-devices-node\n+++ b/Documentation/ABI/stable/sysfs-devices-node\n@@ -10,6 +10,15 @@ Contact:\tLinux Memory Management list <linux-mm@kvack.org>\n Description:\n \t\tNodes that are online.\n \n+What:\t\t/sys/devices/system/node/has_memory\n+Date:\t\tDecember 2012\n+Contact:\tLinux Memory Management list <linux-mm@kvack.org>\n+Description:\n+\t\tNodes that have memory.\n+\n+\t\tThis memory may or may not be reachable via standard\n+\t\tallocations, see has_common_memory for details.\n+\n What:\t\t/sys/devices/system/node/has_normal_memory\n Date:\t\tOctober 2002\n Contact:\tLinux Memory Management list <linux-mm@kvack.org>\n@@ -29,6 +38,13 @@ Description:\n \t\tNodes that have regular or high memory.\n \t\tDepends on CONFIG_HIGHMEM.\n \n+What:\t\t/sys/devices/system/node/has_common_memory\n+Date:\t\tNovember 2026\n+Contact:\tLinux Memory Management list <linux-mm@kvack.org>\n+Description:\n+\t\tNodes whose memory ordinary allocations may use without\n+\t\trequesting the node explicitly.\n+\n What:\t\t/sys/devices/system/node/nodeX\n Date:\t\tOctober 2002\n Contact:\tLinux Memory Management list <linux-mm@kvack.org>\ndiff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\nindex 2e67e8b23a994..fd5c5d136180f 100644\n--- a/Documentation/mm/physical_memory.rst\n+++ b/Documentation/mm/physical_memory.rst\n@@ -168,7 +168,12 @@ nodes with particular properties as defined by ``enum node_states``:\n   The node has regular or high memory. When ``CONFIG_HIGHMEM`` is disabled\n   aliased to ``N_NORMAL_MEMORY``.\n ``N_MEMORY``\n-  The node has memory(regular, high, movable)\n+  The node has online memory (regular, high, movable).  This is a topology and\n+  accounting state. Presence in this mask does not mean ordinary allocations\n+  can use the node's memory; see ``N_MEMORY_COMMON``.\n+``N_MEMORY_COMMON``\n+  The node is on the page allocator's fallback zonelists, so an allocation\n+  that named no node can be satisfied from it.\n ``N_CPU``\n   The node has one or more CPUs\n ``N_GENERIC_INITIATOR``\n@@ -184,6 +189,7 @@ For example, for node 2 with normal memory and CPUs, bit 2 will be set in ::\n   node_states[N_NORMAL_MEMORY]\n   node_states[N_HIGH_MEMORY]\n   node_states[N_MEMORY]\n+  node_states[N_MEMORY_COMMON]\n   node_states[N_CPU]\n \n For various operations possible with nodemasks please refer to\ndiff --git a/drivers/base/node.c b/drivers/base/node.c\nindex dcdc8626627a8..cc6696d1390f3 100644\n--- a/drivers/base/node.c\n+++ b/drivers/base/node.c\n@@ -965,6 +965,7 @@ static struct node_attr node_state_attr[] = {\n \t[N_HIGH_MEMORY] = _NODE_ATTR(has_high_memory, N_HIGH_MEMORY),\n #endif\n \t[N_MEMORY] = _NODE_ATTR(has_memory, N_MEMORY),\n+\t[N_MEMORY_COMMON] = _NODE_ATTR(has_common_memory, N_MEMORY_COMMON),\n \t[N_CPU] = _NODE_ATTR(has_cpu, N_CPU),\n \t[N_GENERIC_INITIATOR] = _NODE_ATTR(has_generic_initiator,\n \t\t\t\t\t   N_GENERIC_INITIATOR),\n@@ -978,6 +979,7 @@ static struct attribute *node_state_attrs[] = {\n \t&node_state_attr[N_HIGH_MEMORY].attr.attr,\n #endif\n \t&node_state_attr[N_MEMORY].attr.attr,\n+\t&node_state_attr[N_MEMORY_COMMON].attr.attr,\n \t&node_state_attr[N_CPU].attr.attr,\n \t&node_state_attr[N_GENERIC_INITIATOR].attr.attr,\n \tNULL\ndiff --git a/include/linux/nodemask.h b/include/linux/nodemask.h\nindex 28a456c3f5964..7ace610bdd654 100644\n--- a/include/linux/nodemask.h\n+++ b/include/linux/nodemask.h\n@@ -402,7 +402,14 @@ enum node_states {\n #else\n \tN_HIGH_MEMORY = N_NORMAL_MEMORY,\n #endif\n-\tN_MEMORY,\t\t/* The node has memory(regular, high, movable) */\n+\t/*\n+\t * N_MEMORY indicates online memory exists on the node - it is used\n+\t * to manage per-node meta-data and topology decisions.\n+\t * N_MEMORY_COMMON indicates whether the node can satisfy arbitrary\n+\t * allocations and whether a service should manage that node's folios.\n+\t */\n+\tN_MEMORY,\t\t/* the node has memory */\n+\tN_MEMORY_COMMON,\t/* common pool (fallback zonelist) */\n \tN_CPU,\t\t/* The node has one or more cpus */\n \tN_GENERIC_INITIATOR,\t/* The node has one or more Generic Initiators */\n \tNR_NODE_STATES\ndiff --git a/mm/internal.h b/mm/internal.h\nindex 608a83c34c224..af6fc27a9fc98 100644\n--- a/mm/internal.h\n+++ b/mm/internal.h\n@@ -65,6 +65,21 @@ void folio_mark_lazyfree(struct folio *folio);\n void node_set_memory_state(int nid, bool high, bool normal);\n void node_clear_memory_state(int nid);\n \n+/*\n+ * Common memory is available to generic MM services. ZONE_DEVICE folios do\n+ * not qualify even when their NUMA node is common.\n+ */\n+static inline bool folio_is_common_memory(struct folio *folio)\n+{\n+\treturn !folio_is_zone_device(folio) &&\n+\t       node_state(folio_nid(folio), N_MEMORY_COMMON);\n+}\n+\n+static inline bool page_is_common_memory(struct page *page)\n+{\n+\treturn folio_is_common_memory(page_folio(page));\n+}\n+\n /* mm/vmscan.c */\n unsigned long zone_reclaimable_pages(struct zone *zone);\n unsigned long try_to_free_pages(struct zonelist *zonelist, int order,\ndiff --git a/mm/page_alloc.c b/mm/page_alloc.c\nindex 834d199ff8429..6ffa972811462 100644\n--- a/mm/page_alloc.c\n+++ b/mm/page_alloc.c\n@@ -203,6 +203,7 @@ nodemask_t node_states[NR_NODE_STATES] __read_mostly = {\n \t[N_HIGH_MEMORY] = { { [0] = 1UL } },\n #endif\n \t[N_MEMORY] = { { [0] = 1UL } },\n+\t[N_MEMORY_COMMON] = { { [0] = 1UL } },\n \t[N_CPU] = { { [0] = 1UL } },\n #endif\t/* NUMA */\n };\n@@ -215,10 +216,12 @@ void __meminit node_set_memory_state(int nid, bool high, bool normal)\n \t\tnode_set_state(nid, N_HIGH_MEMORY);\n \tif (normal)\n \t\tnode_set_state(nid, N_NORMAL_MEMORY);\n+\tnode_set_state(nid, N_MEMORY_COMMON);\n }\n \n void __meminit node_clear_memory_state(int nid)\n {\n+\tnode_clear_state(nid, N_MEMORY_COMMON);\n \tnode_clear_state(nid, N_NORMAL_MEMORY);\n \tnode_clear_state(nid, N_MEMORY);\n }\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-4-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about the zonelists deciding which nodes an allocation can reach, explaining that build_local_zonelist() refactor allows reusing code to build local-only zonelists for nodes outside N_MEMORY_COMMON set. The author confirmed that every node with memory is common and that the zonelists are unchanged.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "acknowledged a concern",
+            "confirmed the approach"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Zonelists decide which nodes an allocation can reach.\n\nThe fallback lists hold every node in N_MEMORY, and a node's\n__GFP_THISNODE list holds its own zones whatever the node's state.\n\nOrdinary allocations should reach only common (general purpose) memory.\n\nBuild the fallback zonelists from N_MEMORY_COMMON, and __GFP_THISNODE\nzonelists only for a common node.\n\nThe build_local_zonelist() refactor lets use reuse the code to build\na local-only zonelist for nodes outside the N_MEMORY_COMMON set later.\n\nEvery node with memory is common, and a memoryless node has no zones to\nlist, so the zonelists are unchanged.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/page_alloc.c | 23 ++++++++++++-----------\n 1 file changed, 12 insertions(+), 11 deletions(-)\n\ndiff --git a/mm/page_alloc.c b/mm/page_alloc.c\nindex 6ffa972811462..580feeb608b7a 100644\n--- a/mm/page_alloc.c\n+++ b/mm/page_alloc.c\n@@ -5906,17 +5906,14 @@ int find_next_best_node_in(int node, nodemask_t *used_node_mask,\n }\n \n \n-/*\n- * Build __GFP_THISNODE zonelists\n- */\n-static void build_thisnode_zonelists(pg_data_t *pgdat)\n+/* Build a local-only zonelist when this node is eligible. */\n+static void build_local_zonelist(pg_data_t *pgdat, int zlidx, bool eligible)\n {\n-\tstruct zoneref *zonerefs;\n-\tint nr_zones;\n+\tstruct zoneref *zonerefs =\n+\t\tpgdat->node_zonelists[zlidx]._zonerefs;\n \n-\tzonerefs = pgdat->node_zonelists[ZONELIST_NOFALLBACK]._zonerefs;\n-\tnr_zones = build_zonerefs_node(pgdat, zonerefs);\n-\tzonerefs += nr_zones;\n+\tif (eligible)\n+\t\tzonerefs += build_zonerefs_node(pgdat, zonerefs);\n \tzonerefs->zone = NULL;\n \tzonerefs->zone_idx = 0;\n }\n@@ -5960,8 +5957,12 @@ static void build_node_zonelist(pg_data_t *pgdat, const nodemask_t *candidates,\n \n static void build_zonelists(pg_data_t *pgdat)\n {\n-\tbuild_node_zonelist(pgdat, &node_states[N_MEMORY], ZONELIST_FALLBACK);\n-\tbuild_thisnode_zonelists(pgdat);\n+\tint nid = pgdat->node_id;\n+\n+\tbuild_node_zonelist(pgdat, &node_states[N_MEMORY_COMMON],\n+\t\t\t    ZONELIST_FALLBACK);\n+\tbuild_local_zonelist(pgdat, ZONELIST_NOFALLBACK,\n+\t\t\t     node_state(nid, N_MEMORY_COMMON));\n }\n \n #ifdef CONFIG_HAVE_MEMORYLESS_NODES\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-5-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about the boot mempolicy calculations and their per-node sysfs entries, which were using N_MEMORY instead of N_MEMORY_COMMON. The author agreed to change this in the patch by restricting the node set mpol_set_nodemask() applies to set_mempolicy() and mbind() masks to N_MEMORY_COMMON nodes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Use N_MEMORY_COMMON for boot mempolicy calculations and their per-node\nsysfs entries (weighted interleave weights). \n\nRestrict the node set mpol_set_nodemask() applies to set_mempolicy()\nand mbind() masks to N_MEMORY_COMMON nodes.\n\nLater when an N_MEMORY node is omitted frmo the N_MEMORY_COMMON set,\nthey will be stripped from mempolicy nodemasks as they're not eligible\n(similar to memoryless nodes today).\n\nAll memory is common at this point, no behavior change at this point.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/mempolicy.c | 28 ++++++++++++++--------------\n 1 file changed, 14 insertions(+), 14 deletions(-)\n\ndiff --git a/mm/mempolicy.c b/mm/mempolicy.c\nindex b10c098e9c2a3..662ab420fe03c 100644\n--- a/mm/mempolicy.c\n+++ b/mm/mempolicy.c\n@@ -213,10 +213,10 @@ static void reduce_interleave_weights(unsigned int *bw, u8 *new_iw)\n \tint nid;\n \n \t/*\n-\t * N_MEMORY can change while wi_state_lock is held. Remember the\n-\t * nodes contributing to sum_bw so all passes use the same set.\n+\t * N_MEMORY_COMMON can change while wi_state_lock is held. Remember\n+\t * the nodes contributing to sum_bw so all passes use the same set.\n \t */\n-\tfor_each_node_state(nid, N_MEMORY) {\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\tnode_set(nid, nodes);\n \t\tsum_bw += bw[nid];\n \t}\n@@ -439,9 +439,9 @@ static int mpol_set_nodemask(struct mempolicy *pol,\n \tif (!pol || pol->mode == MPOL_LOCAL)\n \t\treturn 0;\n \n-\t/* Check N_MEMORY */\n+\t/* Check N_MEMORY_COMMON */\n \tnodes_and(nsc->mask1,\n-\t\t  cpuset_current_mems_allowed, node_states[N_MEMORY]);\n+\t\t  cpuset_current_mems_allowed, node_states[N_MEMORY_COMMON]);\n \n \tVM_BUG_ON(!nodes);\n \n@@ -3400,11 +3400,11 @@ void __init numa_policy_init(void)\n \n \t/*\n \t * Set interleaving policy for system init. Interleaving is only\n-\t * enabled across suitably sized nodes (default is >= 16MB), or\n-\t * fall back to the largest node if they're all smaller.\n+\t * enabled across suitably sized common memory nodes (default is\n+\t * >= 16MB), or fall back to the largest node if they're all smaller.\n \t */\n \tnodes_clear(interleave_nodes);\n-\tfor_each_node_state(nid, N_MEMORY) {\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\tunsigned long total_pages = node_present_pages(nid);\n \n \t\t/* Preserve the largest node */\n@@ -3476,7 +3476,7 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)\n \t\t*nodelist++ = '\\0';\n \t\tif (nodelist_parse(nodelist, nodes))\n \t\t\tgoto out;\n-\t\tif (!nodes_subset(nodes, node_states[N_MEMORY]))\n+\t\tif (!nodes_subset(nodes, node_states[N_MEMORY_COMMON]))\n \t\t\tgoto out;\n \t} else\n \t\tnodes_clear(nodes);\n@@ -3508,7 +3508,7 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)\n \t\t * Default to online nodes with memory if no nodelist\n \t\t */\n \t\tif (!nodelist)\n-\t\t\tnodes = node_states[N_MEMORY];\n+\t\t\tnodes = node_states[N_MEMORY_COMMON];\n \t\tbreak;\n \tcase MPOL_LOCAL:\n \t\t/*\n@@ -3903,6 +3903,9 @@ static int wi_node_notifier(struct notifier_block *nb,\n \n \tswitch (action) {\n \tcase NODE_ADDED_FIRST_MEMORY:\n+\t\t/* Weighted interleave spans only common memory. */\n+\t\tif (!node_state(nid, N_MEMORY_COMMON))\n+\t\t\tbreak;\n \t\terr = sysfs_wi_node_add(nid);\n \t\tif (err)\n \t\t\tpr_err(\"failed to add sysfs for node%d during hotplug: %d\\n\",\n@@ -3934,10 +3937,7 @@ static int __init add_weighted_interleave_group(struct kobject *mempolicy_kobj)\n \tif (err)\n \t\tgoto err_put_kobj;\n \n-\tfor_each_online_node(nid) {\n-\t\tif (!node_state(nid, N_MEMORY))\n-\t\t\tcontinue;\n-\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\terr = sysfs_wi_node_add(nid);\n \t\tif (err) {\n \t\t\tpr_err(\"failed to add sysfs for node%d during init: %d\\n\",\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-6-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author is addressing a concern about the single-node optimization in hashdist, explaining that it should count N_MEMORY_COMMON nodes instead of N_MEMORY nodes. They confirm that all memory is common as of now and behavior remains unchanged.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "hashdist is useful when large kernel hash tables can be allocated across\nmultiple NUMA nodes. The tables come from ordinary allocations, which\nonly N_MEMORY_COMMON nodes serve.\n\nCount N_MEMORY_COMMON nodes when applying the single-node optimization.\n\nAll memory is common as of now, so behavior is unchanged.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/mm_init.c | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/mm/mm_init.c b/mm/mm_init.c\nindex b4c4dba93652d..0c076bf5bf380 100644\n--- a/mm/mm_init.c\n+++ b/mm/mm_init.c\n@@ -685,7 +685,7 @@ __setup(\"hashdist=\", set_hashdist);\n \n static inline void fixup_hashdist(void)\n {\n-\tif (num_node_state(N_MEMORY) == 1)\n+\tif (num_node_state(N_MEMORY_COMMON) == 1)\n \t\thashdist = false;\n }\n #else\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-7-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about migration targets being set to N_MEMORY instead of N_MEMORY_COMMON, which can lead to unusable destination nodes during partial offlining. The author agreed that the hot-unplug migration target-list should be restricted to N_MEMORY_COMMON and provided a patch with the necessary changes.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged a fix is needed",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "do_migrate_range() / alloc_migration_target() is only capable of\nallocating memory on N_MEMORY_COMMON nodes. The destination nodemask\npresently starts with N_MEMORY and removes the source-node.\n\nIn the current code, if the destination mask becomes empty, the source\nnode is restored to allow migration during partial offlining.\n\nConsider this configuration:\n  Node0 = N_MEMORY_COMMON\n  Node1 = N_MEMORY, not N_MEMORY_COMMON\n\nNode 1 keeps the destination mask non-empty, despite being unreachable.\nThis leaves migration with no usable destination because the source\nnode is not an eligible allocation target.\n\nRestrict the hot-unplug migration target-list to N_MEMORY_COMMON so it\nreflects the nodes the allocator can reach.\n\nAll memory is common at this point - behavior is unchanged.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/memory_hotplug.c | 8 ++++----\n 1 file changed, 4 insertions(+), 4 deletions(-)\n\ndiff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c\nindex 490f400498f14..29ff2c46499b3 100644\n--- a/mm/memory_hotplug.c\n+++ b/mm/memory_hotplug.c\n@@ -1904,7 +1904,7 @@ static void do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)\n \t\tfolio_put(folio);\n \t}\n \tif (!list_empty(&source)) {\n-\t\tnodemask_t nmask = node_states[N_MEMORY];\n+\t\tnodemask_t nmask = node_states[N_MEMORY_COMMON];\n \t\tstruct migration_target_control mtc = {\n \t\t\t.nmask = &nmask,\n \t\t\t.gfp_mask = GFP_KERNEL | __GFP_MOVABLE | __GFP_RETRY_MAYFAIL,\n@@ -1919,9 +1919,9 @@ static void do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)\n \t\tmtc.nid = folio_nid(list_first_entry(&source, struct folio, lru));\n \n \t\t/*\n-\t\t * try to allocate from a different node but reuse this node\n-\t\t * if there are no other online nodes to be used (e.g. we are\n-\t\t * offlining a part of the only existing node)\n+\t\t * try to allocate from a different common node but reuse this\n+\t\t * node if there are no other common nodes to be used (e.g. we\n+\t\t * are offlining a part of the only common node)\n \t\t */\n \t\tnode_clear(mtc.nid, nmask);\n \t\tif (nodes_empty(nmask))\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-8-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about the memory demotion paths and default DRAM performance reference being based on every node that has memory, rather than just N_MEMORY_COMMON. The author explained that this is already the case in the current implementation, where all memory nodes carry N_MEMORY_COMMON, so behavior remains unchanged.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Memory outside N_MEMORY_COMMON is outside the ordinary allocation pool\nand cannot be a generic demotion source or destination.\n\nBuild demotion paths and the default DRAM performance reference from\nN_MEMORY_COMMON rather than every node that has memory, and do not\nassign other nodes to a memory tier through the generic hotplug path.\n\nRemoving a node's memory already resets its demotion targets, so a node\nthat unplugs and returns outside N_MEMORY_COMMON keeps none.\n\nAll memory nodes currently carry N_MEMORY_COMMON, behavior is unchanged.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/memory-tiers.c | 23 ++++++++++++-----------\n 1 file changed, 12 insertions(+), 11 deletions(-)\n\ndiff --git a/mm/memory-tiers.c b/mm/memory-tiers.c\nindex 7fc56a8c66518..97d5ecefd89f3 100644\n--- a/mm/memory-tiers.c\n+++ b/mm/memory-tiers.c\n@@ -370,7 +370,8 @@ int next_demotion_node(int node, const nodemask_t *allowed_mask)\n \t * closest demotion target.\n \t */\n \tnodes_complement(mask, *allowed_mask);\n-\treturn find_next_best_node_in(node, &mask, &node_states[N_MEMORY]);\n+\treturn find_next_best_node_in(node, &mask,\n+\t\t\t\t      &node_states[N_MEMORY_COMMON]);\n }\n \n static void disable_all_demotion_targets(void)\n@@ -405,7 +406,7 @@ static void dump_demotion_targets(void)\n {\n \tint node;\n \n-\tfor_each_node_state(node, N_MEMORY) {\n+\tfor_each_node_state(node, N_MEMORY_COMMON) {\n \t\tstruct memory_tier *memtier = __node_get_memory_tier(node);\n \t\tnodemask_t preferred = node_demotion[node].preferred;\n \n@@ -441,7 +442,7 @@ static void establish_demotion_targets(void)\n \n \tdisable_all_demotion_targets();\n \n-\tfor_each_node_state(node, N_MEMORY) {\n+\tfor_each_node_state(node, N_MEMORY_COMMON) {\n \t\tbest_distance = -1;\n \t\tnd = &node_demotion[node];\n \n@@ -459,7 +460,7 @@ static void establish_demotion_targets(void)\n \t\t * nodelist to skip list so that we find the best node from the\n \t\t * memtier nodelist.\n \t\t */\n-\t\tnodes_andnot(tier_nodes, node_states[N_MEMORY], tier_nodes);\n+\t\tnodes_andnot(tier_nodes, node_states[N_MEMORY_COMMON], tier_nodes);\n \n \t\t/*\n \t\t * Find all the nodes in the memory tier node list of same best distance.\n@@ -468,7 +469,7 @@ static void establish_demotion_targets(void)\n \t\t */\n \t\tdo {\n \t\t\ttarget = find_next_best_node_in(node, &tier_nodes,\n-\t\t\t\t\t\t\t&node_states[N_MEMORY]);\n+\t\t\t\t\t\t\t&node_states[N_MEMORY_COMMON]);\n \t\t\tif (target == NUMA_NO_NODE)\n \t\t\t\tbreak;\n \n@@ -507,7 +508,7 @@ static void establish_demotion_targets(void)\n \t * allocation to a set of nodes that is closer the above selected\n \t * preferred node.\n \t */\n-\tlower_tier = node_states[N_MEMORY];\n+\tlower_tier = node_states[N_MEMORY_COMMON];\n \tlist_for_each_entry(memtier, &memory_tiers, list) {\n \t\t/*\n \t\t * Keep removing current tier from lower_tier nodes,\n@@ -554,7 +555,7 @@ static struct memory_tier *set_node_memory_tier(int node)\n \n \tlockdep_assert_held_once(&memory_tier_lock);\n \n-\tif (!node_state(node, N_MEMORY))\n+\tif (!node_state(node, N_MEMORY_COMMON))\n \t\treturn ERR_PTR(-EINVAL);\n \n \tmt_calc_adistance(node, &adist);\n@@ -706,8 +707,8 @@ static int __init memory_tier_late_init(void)\n \tget_online_mems();\n \tguard(mutex)(&memory_tier_lock);\n \n-\t/* Assign each uninitialized N_MEMORY node to a memory tier. */\n-\tfor_each_node_state(nid, N_MEMORY) {\n+\t/* Assign each uninitialized common memory node to a memory tier. */\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\t/*\n \t\t * Some device drivers may have initialized\n \t\t * memory tiers, potentially bringing memory nodes\n@@ -929,8 +930,8 @@ static int __init memory_tier_init(void)\n \tif (IS_ERR(default_dram_type))\n \t\tpanic(\"%s() failed to allocate default DRAM tier\\n\", __func__);\n \n-\t/* Record nodes with memory and CPU to set default DRAM performance. */\n-\tnodes_and(default_dram_nodes, node_states[N_MEMORY],\n+\t/* Record common-memory nodes with CPUs for default DRAM performance. */\n+\tnodes_and(default_dram_nodes, node_states[N_MEMORY_COMMON],\n \t\t  node_states[N_CPU]);\n \n \thotplug_node_notifier(memtier_hotplug_callback, MEMTIER_HOTPLUG_PRI);\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-9-gourry@gourry.net",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author addressed a concern about KSM's behavior on memory outside the ordinary pool, explaining that it already avoids ZONE_DEVICE folios and should use folio_is_common_memory() instead of folio_is_zone_device().",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "acknowledged",
+            "agreed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "KSM is an opportunistic MM service and should leave memory outside\nthe ordinary memory pool alone - as it already does for ZONE_DEVICE\nfolios at each acquisition point.\n\nUse folio_is_common_memory() at those same sites, which still rejects\nZONE_DEVICE folios.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/ksm.c | 8 +++++---\n 1 file changed, 5 insertions(+), 3 deletions(-)\n\ndiff --git a/mm/ksm.c b/mm/ksm.c\nindex 623a2cdb39242..25b2c2f944862 100644\n--- a/mm/ksm.c\n+++ b/mm/ksm.c\n@@ -831,7 +831,7 @@ static struct page *get_mergeable_page(struct ksm_rmap_item *rmap_item)\n \n \tfolio = folio_walk_start(&fw, vma, addr, 0);\n \tif (folio) {\n-\t\tif (!folio_is_zone_device(folio) &&\n+\t\tif (folio_is_common_memory(folio) &&\n \t\t    folio_test_anon(folio)) {\n \t\t\tfolio_get(folio);\n \t\t\tpage = fw.page;\n@@ -2571,7 +2571,8 @@ static int ksm_next_page_pmd_entry(pmd_t *pmdp, unsigned long addr, unsigned lon\n \t\t\t\tgoto not_found_unlock;\n \t\t\tfolio = page_folio(page);\n \n-\t\t\tif (folio_is_zone_device(folio) || !folio_test_anon(folio))\n+\t\t\tif (!folio_is_common_memory(folio) ||\n+\t\t\t    !folio_test_anon(folio))\n \t\t\t\tgoto not_found_unlock;\n \n \t\t\tpage += ((addr & (PMD_SIZE - 1)) >> PAGE_SHIFT);\n@@ -2595,7 +2596,8 @@ static int ksm_next_page_pmd_entry(pmd_t *pmdp, unsigned long addr, unsigned lon\n \t\t\tcontinue;\n \t\tfolio = page_folio(page);\n \n-\t\tif (folio_is_zone_device(folio) || !folio_test_anon(folio))\n+\t\tif (!folio_is_common_memory(folio) ||\n+\t\t    !folio_test_anon(folio))\n \t\t\tcontinue;\n \t\tgoto found_unlock;\n \t}\n-- \n2.53.1-Meta",
+          "reply_to": "",
+          "message_date": "2026-11-14",
+          "message_id": "20261114070959.3490008-10-gourry@gourry.net",
+          "email": "gourry@gourry.net",
           "is_maintainer": false
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series introduces N_MEMORY_COMMON, a new concept for general-purpose memory separate from node memory (N_MEMORY). It creates a baseline to ensure private node memory is default opted-out of being touched by the MM, similar to ZONE_DEVICE. The series consists of three phases: introducing N_MEMORY_COMMON, defining memory not part of the general pool (N_MEMORY_PRIVATE), and adding feature bits for userland management."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces the concept of 'common memory' as a separate entity from NUMA nodes that have memory, allowing for private node memory to be isolated from the main memory management system. The patch creates a new flag N_MEMORY_COMMON and converts existing users of N_MEMORY to use this new flag instead. This is the first phase of a series that aims to introduce private NUMA nodes and allow userland to manage them via mbind() and migrate_pages()."
+    },
+    "2026-11-18": {
+      "report_file": "2026-11-18_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Richard Cheng",
+          "summary": "Reviewer Richard Cheng noted that there are two mechanisms to enforce the 'common memory only' rule: zonelists built from N_MEMORY_COMMON and checks at call sites using node_state() or folio_is_common_memory(). However, he found inconsistencies where some paths use both mechanisms, while others use only one. He requested clarification on which mechanism is responsible for each path, particularly when a non-common node gets its own zonelist.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "inconsistency",
+            "unclear"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Hi Gregory,\n\nI've browsed through the serie, I'll go into detail in each patch\nin the following days, for now I have one general question.\n\nI wonder how the \"common memory only\" rule is enforced ?\n\nAs far as I read it, there're 2 ways:\n1. The zonelist, you build them from N_MEMORY_COMMON, so non-common\n   node isn't in any zonelist.\n2. A check at the call site, e.g. node_state(nid, N_MEMORY_COMMON) or\n   folio_is_common_memory()\n\n\nCode reaches a node's memory in 3 ways: zonelist, node id, or by folio.\nI couldn't find a statement of which mechanism is responsible for which\nkind of path.\n\nI see some consistent issues,\n1. zonelist paths are covered by way number 1. Some of them also carry\n   way number 2, some don't\n2. node id and folio paths can only be covered by way number 2. Some entry\n   points have the check, and some do not.\n\nI can't tell when a call site has no check is deliberate or missed.\nThis matters once non-common node gets its own zonelist, as patch 4 metioned I think?\n\nCould you clarify the rule ? e.g. which zonelist users must filter on N_MEMORY_COMMON\nthemselves? and why the zonelist alone is not enough for them ?\nWhether every path that takes a node id or a folio must check N_MEMORY_COMMON, and\nwhich ones are left for the feature bits in phase 3 ?\n\nLet's get the rule settled down and make it as the foundation as well as phase 2 and\nphase 3 ?\n\nBest regards,\nRichard Cheng.",
+          "reply_to": "Gregory (Meta)",
+          "message_date": "2026-11-18",
+          "message_id": "av1DvCQd_OvkGgLU@MWDK4CY14F",
+          "email": "icheng@nvidia.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Richard Cheng",
+          "summary": "Reviewer Richard Cheng noted that the new code may lead to uneven or smaller-than-requested huge page pools due to delayed node addition, and suggested placing nodes_and() inside the loop to restore the original behavior.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "potential performance issue",
+            "requested change"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "For a global request the caller passes &node_states[N_MEMORY], so before this patch\nthe grow loop read the live mask on every alloc_pool_huge_folio().\nNow the mask is sampled once, before the loop.\n\nThe loop drops hugetlb_lock and can run for a long time. If a node gets its first\nmemoroy in that window, the old code would start using it. The new code won't, until\nthe next write to nr_hugepages.\n\nSo the pool can end up uneven, or smaller than requested if the other nodes are full.\n\nI think the nodes_and() should be placed inside the loop to keep the old behavior ?\n\nBest regards,\nRichard Cheng.",
+          "reply_to": "",
+          "message_date": "2026-11-18",
+          "message_id": "av1PyBvUVJcy_Psd@MWDK4CY14F",
+          "email": "icheng@nvidia.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Richard Cheng",
+          "summary": "reviewer questioned whether the patch introduces significant cache pressure and noted that the new code writes to node_states[] multiple times for each onlined block, suggesting a potential optimization opportunity",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "cache pressure",
+            "optimization opportunity"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Um, so I am not sure how much cache pressure this will add, I assume it's small ?\n\nJust want to point out that the old code only wrote these bits for a node's first\nmemory. THis now does up to 3 set_bit() calls on node_states[] for every onlined block.\nThe result is the same, but node_states[] is __read_mostly. A test-before-set in the helper\nwould keep the old behavior, or if you would like to keep it, please address in commit message.\n\nBest regards,\nRichard Cheng.",
+          "reply_to": "Gregory (Meta)",
+          "message_date": "2026-11-18",
+          "message_id": "av1ZBTpLpJC6DJqA@MWDK4CY14F",
+          "email": "icheng@nvidia.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Richard Cheng",
+          "summary": "Reviewer Richard Cheng noted that the patch uses two helper functions for_each_common_node and for_each_non_common_node, whereas another function for_each_populated_zone_state in the same patch uses a single 'if (!cond) ; else' form instead. He questioned whether this difference is due to avoiding -Wdangling-else warnings or if it should be consistent with for_each_populated_zone_state.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "questioning consistency",
+            "requesting clarification"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "A question on consistency. This one is a single for statement, with 2 new helper functions.\nfor_each_populated_zone_state() in the same patch uses \"if (!cond) ; else\" form instead.\n\nBoth forms keep a caller's else correct. The only difference I can find is that the if/else\nform give a -Wdangling-else warning when the loop is the unbraced body of an if.\n\nIs that the reason for the 2 helper function here? If the warning doesn't matter, this could\nuse the same short form and drop the 2 functions. If it does matter, should\nfor_each_populated_zone_state() be a single statement too ?\n\nBest regards,\nRichard Cheng.",
+          "reply_to": "Gregory (Meta)",
+          "message_date": "2026-11-18",
+          "message_id": "av1hKrtcATVjCnCM@MWDK4CY14F",
+          "email": "icheng@nvidia.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "The author acknowledged that the existing code already handles the two cases mentioned by Richard Cheng and explained that the series largely modifies these locations to use N_MEMORY_COMMON instead.\n\nThe author is addressing concerns about how to reach a node's folios/pages, specifically in the context of page allocator freelists and pfn walks. They provided three categories of methods: kernel structures (page tables, VMAs, etc.), pfn walks (memory hot-unplug, contiguous allocation, DAMON), and the page allocator itself (freelists).\n\nThe author acknowledged that some filtering is already done by existing code and agreed to add additional filtering in a later patch to reduce complexity.\n\nThe author is addressing concerns about premature changes in the patch series. They acknowledge that some code should be moved to later phases (N_MEMORY_PRIVATE and N_MEMORY_FEATURE) and will restructure the current phase to handle cases for walking zonelists, nodelists, folios, and private zonelists in order.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledged existing code",
+            "explained modifications",
+            "clarification",
+            "explanation",
+            "acknowledged",
+            "agreed",
+            "acknowledges fix is needed",
+            "promises restructuring"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Those are essentially the two cases, which are already present in the\ncode in one shape or another in the existing shape:\n\n   node_state(nid, N_MEMORY);\n        or\n   folio_is_zone_device(folio)\n\nWith the exception of one or two places, the series largely modifies\nthese locations to use N_MEMORY_COMMON instead (or in addition, in the\ncase of zone device).  There are a few places we add common checks where\nzone device checks were not already present (because they were missing\nor did not apply, usually PMD scenarios).\n\n---\n\nBeing a bit more precise: How do we reach a node's folios/pages?\n\n 1) through some kernel structure, obvious examples:\n    - page tables\n    - VMAs / pagemaps / xarrays\n    - LRUs\n\n 2) pfn walks\n    - memory hot-unplug\n    - contiguous allocation\n    - DAMON\n\n 3) page allocator\n    - freelists (page allocator)\n    Sort of its own category since you ask it for folios from a node\n\n---\n\nSome of this is obfuscated by the fact that the existing code already\ndoes this filtering for you.\n\nI suppose I have some premature changes to add additional filtering\nwhere it isn't needed yet to reduce the complexity of later patches,\nbut I can see why this is confusing when introduced by itself.\n\nConsider this:\n\n-       for_each_zone_zonelist_nodemask(zone, z, zonelist,\n-                                       gfp_zone(gfp_mask), nodemask) {\n+       for_each_zone_node_state(zone, z, zonelist, gfp_zone(gfp_mask),\n+                                nodemask, N_MEMORY_COMMON) {\n\nThis is a bit of a preparatory change to later convert this to:\n\n+       for_each_zone_node_state(zone, z, zonelist, gfp_zone(gfp_mask),\n+                                nodemask, N_MEMORY_RECLAIM) {\n\nIt looks like we're filtering by N_MEMORY_COMMON, but we're actually\niterating the fallback zonelist (constructed from N_MEMORY_COMMON)\n\n  struct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);\n\nLater we update this node_zonelist() call to determine whether the\nprivate nodelist should be walked, at which point you do have to filter\nfor service support.\n\n---\n\nSo:\n  1) If you're walking the normal zonelists, you're already filtered\n\n  2) If you're walking nodelists, you need to filter on N_MEMORY_COMMON\n\n  3) If you're operating on folios, you need to check common_memory()\n\n  4) If you're walking the private zonelist, filter on N_MEMORY_COMMON\n\n\nSo let me do this:\n  1) i'll restructure this phase to omit premature changes like above\n     (they'll move into N_MEMORY_PRIVATE and N_MEMORY_<FEATURE> commits).\n\n  2) I'll restructure N_MEMORY_COMMON commits here to handle cases 1-3\n     above in that order, and that'll hopefully clear up the confusion.\n\n-- \n~Gregory",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-11-18",
+          "message_id": "179501479267.1206716.268867271510310543.b4-reply@b4",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "Author acknowledges that there is an issue with their code, specifically a warning from various checks, and plans to re-examine and potentially refactor it.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges issue",
+            "plans to fix"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Yeah I was getting that warning from various checks. I'd convinced\nbyself this was a false-positive, but it does look very funky indeed.\n\nLet me look into this again, it's possible I can massage this better to\nuse the short form still.  It's also possible that I should just use a\ndifferent shape entirely than trying to use the existing pattern.\n\n-- \n~Gregory",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-11-18",
+          "message_id": "179501507729.1206716.6880334614636468959.b4-reply@b4",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "Author acknowledged that hotplug is not on a critical path, but agreed to test N_MEMORY before setting new state and early-out if necessary.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "acknowledged feedback",
+            "agreed to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Hotplug isn't on a particular hot path, but I can test N_MEMORY before\nsetting any new state and just early-out.  That would keep the behavior.\n\n-- \n~Gregory",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-11-18",
+          "message_id": "179501525661.1206716.17622543796948053737.b4-reply@b4",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Richard Cheng",
+          "summary": "Reviewer Richard Cheng noted that the patch description does not clearly distinguish between common memory (N_MEMORY_COMMON) and private memory, requesting a clearer distinction.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested clarification",
+            "concerned about clarity"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "This sentense kind of blurred me, you state that N_MEMORY_COMMON is meant\nto isolate the concept of #2 from N_MEMORY, I expect something\nmaking clear distinction between common memory and private memory ?",
+          "reply_to": "Gregory (Meta)",
+          "message_date": "2026-11-18",
+          "message_id": "av2_8Z2sdM_9zUEL@MWDK4CY14F",
+          "email": "icheng@nvidia.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "Author acknowledges a potential issue with hugepage distribution when there's a race between hugetlb allocation and memory hotplug, but considers it an innocuous corner case and is willing to retain the old behavior if necessary.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges potential issue",
+            "willing to retain old behavior"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "I can make the adjustment, but the concern is that previously we'd\nstart spreading the distribution of hugepages differently when there's a\nrace between hugetlb allocation and memory hotplug?\n\nThat seems like a pretty innocuous corner case to be worried about.\n\nI can see about retaining the old behavior, but i'm not sure what you're\ndescribing is reliable behavior already.\n\n-- \n~Gregory",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-11-18",
+          "message_id": "179501552287.1206716.17381960047395782233.b4-reply@b4",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Richard Cheng",
+          "summary": "reviewer questioned whether common memory nodes are guaranteed to be online before using them",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "assumption",
+            "guaranteed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Maybe I overlooked or somehow, but when do we have the assumption\nthat common memory is definitely onlined ?\n\nBest regards,\nRichard Cheng.",
+          "reply_to": "Gregory (Meta)",
+          "message_date": "2026-11-18",
+          "message_id": "av3EGWuHX2JDdlrx@MWDK4CY14F",
+          "email": "icheng@nvidia.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "Author acknowledges that N_MEMORY and N_MEMORY_COMMON are currently equivalent, agrees to restructure in a later series (v6) and will post the entire v6 of private nodes with suggested reworks.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "acknowledges fix needed",
+            "agrees to restructure"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Sorry, basically as of this set:\n  node_state[N_MEMORY] == node_state[N_MEMORY_COMMON]\n\nLater, we'll introduce N_MEMORY_PRIVATE and the sets become disjoint.\n\nI realize posting this series in isolation was a mistake now, and I am\ngoing to post the entire v6 of private nodes with the reworks you\nsuggested instead.\n\n-- \n~Gregory",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-11-18",
+          "message_id": "179501707902.1206716.2408532904937875068.b4-reply@b4",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        },
+        {
+          "author": "Gregory (Meta) (author)",
+          "summary": "Author dismissed a concern about checking for N_MEMORY instead of N_MEMORY_COMMON at init time, stating that the code only runs once and the result is the same; no fix planned.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "dismissed_concern",
+            "no_fix_planned"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "For this particular case it's not particularly relevant.\n\nThis code only runs at init time, so it's either got memory or it\ndoesn't.  If the memory is present but offline, it still wants weights.\n\nThere isn't really a bug here, but the existing code could also just\ncheck N_MEMORY and end up with the same result.  If the memory is\nhotplugged later, it still gets weights accordingly.\n\n-- \n~Gregory",
+          "reply_to": "Richard Cheng",
+          "message_date": "2026-11-18",
+          "message_id": "179501737390.1206716.11014097946405277594.b4-reply@b4",
+          "email": "gourry@gourry.net",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch introduces the concept of 'common memory' as a separate entity from NUMA nodes that have memory, allowing for private node memory to be isolated from the main memory management system. The patch creates a new flag N_MEMORY_COMMON and converts existing users of N_MEMORY to use this new flag instead. This is the first phase of a series that aims to introduce private NUMA nodes and allow userland to manage them via mbind() and migrate_pages()."
     }
   }
 }
