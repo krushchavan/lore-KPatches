@@ -1,0 +1,33 @@
+{
+  "thread_id": "20261120-private_nodes_v6-v1-5-74f5f9a115c2@gourry.net",
+  "subject": "[PATCH 05/60] mm/mempolicy: keep interleave and tmpfs mount policies on common memory",
+  "url": "https://lore.kernel.org/all/20261120-private_nodes_v6-v1-5-74f5f9a115c2@gourry.net/",
+  "dates": {
+    "2026-11-20": {
+      "report_file": "2026-11-20_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Gregory Relay",
+          "summary": "Reviewer Gregory Relay noted that the patch incorrectly uses N_MEMORY_COMMON instead of N_MEMORY in several places, including for_each_node_state() loops and node_states[] checks, which could lead to incorrect behavior when dealing with non-common memory nodes.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "incorrect usage",
+            "potential bug"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "From: \"Gregory Price (Meta)\" <gourry@gourry.net>\n\nUse N_MEMORY_COMMON for boot mempolicy calculations and their per-node\nsysfs entries (weighted interleave weights).\n\nRestrict the node set mpol_set_nodemask() applies to set_mempolicy()\nand mbind() masks to N_MEMORY_COMMON nodes.\n\nA tmpfs mpol= nodelist must name only N_MEMORY_COMMON nodes, and an\ninterleave policy without a nodelist defaults to them.\n\nLater when an N_MEMORY node is omitted from the N_MEMORY_COMMON set,\nthey will be stripped from mempolicy nodemasks as they're not eligible\n(similar to memoryless nodes today).\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/mempolicy.c | 30 +++++++++++++++---------------\n 1 file changed, 15 insertions(+), 15 deletions(-)\n\ndiff --git a/mm/mempolicy.c b/mm/mempolicy.c\nindex 6f800fb961ae..806577e1d48b 100644\n--- a/mm/mempolicy.c\n+++ b/mm/mempolicy.c\n@@ -213,10 +213,10 @@ static void reduce_interleave_weights(unsigned int *bw, u8 *new_iw)\n \tint nid;\n \n \t/*\n-\t * N_MEMORY can change while wi_state_lock is held. Remember the\n-\t * nodes contributing to sum_bw so all passes use the same set.\n+\t * N_MEMORY_COMMON can change while wi_state_lock is held. Remember\n+\t * the nodes contributing to sum_bw so all passes use the same set.\n \t */\n-\tfor_each_node_state(nid, N_MEMORY) {\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\tnode_set(nid, nodes);\n \t\tsum_bw += bw[nid];\n \t}\n@@ -439,9 +439,9 @@ static int mpol_set_nodemask(struct mempolicy *pol,\n \tif (!pol || pol->mode == MPOL_LOCAL)\n \t\treturn 0;\n \n-\t/* Check N_MEMORY */\n+\t/* Check N_MEMORY_COMMON */\n \tnodes_and(nsc->mask1,\n-\t\t  cpuset_current_mems_allowed, node_states[N_MEMORY]);\n+\t\t  cpuset_current_mems_allowed, node_states[N_MEMORY_COMMON]);\n \n \tVM_BUG_ON(!nodes);\n \n@@ -2104,7 +2104,7 @@ bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone)\n \t * if policy->nodes has movable memory only,\n \t * we apply policy when gfp_zone(gfp) = ZONE_MOVABLE only.\n \t *\n-\t * policy->nodes is intersect with node_states[N_MEMORY].\n+\t * policy->nodes is intersect with node_states[N_MEMORY_COMMON].\n \t * so if the following test fails, it implies\n \t * policy->nodes has movable memory only.\n \t */\n@@ -3398,11 +3398,11 @@ void __init numa_policy_init(void)\n \n \t/*\n \t * Set interleaving policy for system init. Interleaving is only\n-\t * enabled across suitably sized nodes (default is >= 16MB), or\n-\t * fall back to the largest node if they're all smaller.\n+\t * enabled across suitably sized common memory nodes (default is\n+\t * >= 16MB), or fall back to the largest node if they're all smaller.\n \t */\n \tnodes_clear(interleave_nodes);\n-\tfor_each_node_state(nid, N_MEMORY) {\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\tunsigned long total_pages = node_present_pages(nid);\n \n \t\t/* Preserve the largest node */\n@@ -3474,7 +3474,7 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)\n \t\t*nodelist++ = '\\0';\n \t\tif (nodelist_parse(nodelist, nodes))\n \t\t\tgoto out;\n-\t\tif (!nodes_subset(nodes, node_states[N_MEMORY]))\n+\t\tif (!nodes_subset(nodes, node_states[N_MEMORY_COMMON]))\n \t\t\tgoto out;\n \t} else\n \t\tnodes_clear(nodes);\n@@ -3506,7 +3506,7 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)\n \t\t * Default to online nodes with memory if no nodelist\n \t\t */\n \t\tif (!nodelist)\n-\t\t\tnodes = node_states[N_MEMORY];\n+\t\t\tnodes = node_states[N_MEMORY_COMMON];\n \t\tbreak;\n \tcase MPOL_LOCAL:\n \t\t/*\n@@ -3901,6 +3901,9 @@ static int wi_node_notifier(struct notifier_block *nb,\n \n \tswitch (action) {\n \tcase NODE_ADDED_FIRST_MEMORY:\n+\t\t/* Weighted interleave spans only common memory. */\n+\t\tif (!node_state(nid, N_MEMORY_COMMON))\n+\t\t\tbreak;\n \t\terr = sysfs_wi_node_add(nid);\n \t\tif (err)\n \t\t\tpr_err(\"failed to add sysfs for node%d during hotplug: %d\\n\",\n@@ -3932,10 +3935,7 @@ static int __init add_weighted_interleave_group(struct kobject *mempolicy_kobj)\n \tif (err)\n \t\tgoto err_put_kobj;\n \n-\tfor_each_online_node(nid) {\n-\t\tif (!node_state(nid, N_MEMORY))\n-\t\t\tcontinue;\n-\n+\tfor_each_node_state(nid, N_MEMORY_COMMON) {\n \t\terr = sysfs_wi_node_add(nid);\n \t\tif (err) {\n \t\t\tpr_err(\"failed to add sysfs for node%d during init: %d\\n\",\n\n-- \n2.56.1",
+          "reply_to": "",
+          "message_date": "2026-11-20",
+          "message_id": "20261120-private_nodes_v6-v1-5-74f5f9a115c2@gourry.net",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the Linux kernel's memory policy module to use a new concept called N_MEMORY_COMMON when calculating boot policies and their per-node sysfs entries. It restricts the node set for mpol_set_nodemask() and mbind() masks to only include nodes that are part of N_MEMORY_COMMON. Additionally, it updates tmpfs and interleave policies to default to common memory nodes if no specific nodelist is provided. This change aims to simplify policy management by limiting the scope of certain policies to a smaller set of nodes."
+    }
+  }
+}

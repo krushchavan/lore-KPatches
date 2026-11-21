@@ -1,0 +1,30 @@
+{
+  "thread_id": "20261120-private_nodes_v6-v1-49-74f5f9a115c2@gourry.net",
+  "subject": "[PATCH 49/60] mm/vmscan: reclaim private nodes for memcg",
+  "url": "https://lore.kernel.org/all/20261120-private_nodes_v6-v1-49-74f5f9a115c2@gourry.net/",
+  "dates": {
+    "2026-11-20": {
+      "report_file": "2026-11-20_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Gregory Relay",
+          "summary": "Reviewer noted that the patch does not cover private nodes in memcg reclaim, and suggested visiting these nodes after the zonelist to give them the same refault snapshot and congestion reset.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "From: \"Gregory Price (Meta)\" <gourry@gourry.net>\n\nMemcg reclaim does not serve one allocation, so it should cover every\nnode that permits reclaim. It walks the current node's fallback\nzonelist, which holds no private node, so a private node that permits\nreclaim is never scanned for a cgroup over its limit.\n\nAfter the zonelist, visit the nodes that permit reclaim and that the\nzonelist did not cover, and give them the same refault snapshot and\ncongestion reset. The zonelist keeps setting the order, which matters\nbecause memcg reclaim stops once it has freed enough.\n\nDirect reclaim for an allocation still walks only that allocation's\nzonelist. A private allocation's zonelist covers its own node, and\nreclaiming private memory cannot satisfy a common allocation.\n\nWithout private nodes the zonelist covers every node that permits\nreclaim, so behavior is unchanged.\n\nAnother way to do this would be to implement a reclaim zonelist that\nonly reclaim uses, but this implementation does not carry the static\nper-node size overhead that adding another zonelist does.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n mm/vmscan.c | 43 ++++++++++++++++++++++++++++++++++++++++++-\n 1 file changed, 42 insertions(+), 1 deletion(-)\n\ndiff --git a/mm/vmscan.c b/mm/vmscan.c\nindex 03d0919d11be..49ec85ed00e0 100644\n--- a/mm/vmscan.c\n+++ b/mm/vmscan.c\n@@ -6636,6 +6636,21 @@ static void consider_reclaim_throttle(pg_data_t *pgdat, struct scan_control *sc)\n \t\treclaim_throttle(pgdat, VMSCAN_THROTTLE_NOPROGRESS);\n }\n \n+/* Whether shrink_zones() reaches @nid through @zonelist. */\n+static bool zonelist_reaches_node(struct zonelist *zonelist, int nid,\n+\t\t\t\t  struct scan_control *sc)\n+{\n+\tstruct zoneref *z;\n+\tstruct zone *zone;\n+\n+\tfor_each_zone_zonelist_nodemask(zone, z, zonelist, sc->reclaim_idx,\n+\t\t\t\t\tsc->nodemask) {\n+\t\tif (zone_to_nid(zone) == nid)\n+\t\t\treturn true;\n+\t}\n+\treturn false;\n+}\n+\n /*\n  * This is the direct reclaim path, for page-allocating processes.  We only\n  * try to reclaim pages from zones which will satisfy the caller's allocation\n@@ -6651,6 +6666,7 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)\n \tgfp_t orig_mask;\n \tpg_data_t *last_pgdat = NULL;\n \tpg_data_t *first_pgdat = NULL;\n+\tint nid;\n \n \t/*\n \t * If the number of buffer_heads in the machine exceeds the maximum\n@@ -6706,6 +6722,14 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)\n \t\tshrink_node(zone->zone_pgdat, sc);\n \t}\n \n+\t/* A cgroup's memory may be on nodes that are not on the zonelist. */\n+\tif (cgroup_reclaim(sc)) {\n+\t\tfor_each_node_state(nid, N_MEMORY_RECLAIM) {\n+\t\t\tif (!zonelist_reaches_node(zonelist, nid, sc))\n+\t\t\t\tshrink_node(NODE_DATA(nid), sc);\n+\t\t}\n+\t}\n+\n \tif (first_pgdat)\n \t\tconsider_reclaim_throttle(first_pgdat, sc);\n \n@@ -6754,6 +6778,7 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,\n \tpg_data_t *last_pgdat;\n \tstruct zoneref *z;\n \tstruct zone *zone;\n+\tint nid;\n retry:\n \tdelayacct_freepages_start();\n \n@@ -6792,6 +6817,21 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,\n \t\t}\n \t}\n \n+\t/*\n+\t * Also cover the nodes shrink_zones() reclaimed beyond the zonelist.\n+\t * Finishing a zonelist node again is harmless.\n+\t */\n+\tif (cgroup_reclaim(sc)) {\n+\t\tfor_each_node_state(nid, N_MEMORY_RECLAIM) {\n+\t\t\tstruct lruvec *lruvec;\n+\n+\t\t\tsnapshot_refaults(sc->target_mem_cgroup, NODE_DATA(nid));\n+\t\t\tlruvec = mem_cgroup_lruvec(sc->target_mem_cgroup,\n+\t\t\t\t\t\t   NODE_DATA(nid));\n+\t\t\tclear_bit(LRUVEC_CGROUP_CONGESTED, &lruvec->flags);\n+\t\t}\n+\t}\n+\n \tdelayacct_freepages_end();\n \n \tif (sc->nr_reclaimed)\n@@ -7038,7 +7078,8 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n \t/*\n \t * Traverse the ZONELIST_FALLBACK zonelist of the current node to put\n \t * equal pressure on all the nodes. This is based on the assumption that\n-\t * the reclaim does not bail out early.\n+\t * the reclaim does not bail out early. shrink_zones() also visits the\n+\t * nodes that permit reclaim and are not on the zonelist.\n \t */\n \tstruct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);\n \n\n-- \n2.56.1",
+          "reply_to": "",
+          "message_date": "2026-11-20",
+          "message_id": "20261120-private_nodes_v6-v1-49-74f5f9a115c2@gourry.net",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch addresses an issue in the memcg (memory cgroup) reclaim mechanism, where private nodes that permit reclaim are not being scanned for memory usage over their limit. The patch introduces a new function `zonelist_reaches_node` to check if a node is reachable through the zonelist, and uses this function to identify private nodes that need to be reclaimed. This ensures that memcg reclaim covers all nodes that permit reclaim, including those not covered by the zonelist. The patch modifies the `shrink_zones` function to include these additional nodes in the reclaim process."
+    }
+  }
+}

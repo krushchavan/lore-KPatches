@@ -4,27 +4,266 @@
   "url": "https://lore.kernel.org/all/20261119213147.1094488-3-usama.arif@linux.dev/",
   "dates": {
     "2026-11-19": {
-      "report_file": "2026-11-19_ollama_llama3.1-8b.html",
+      "report_file": "2026-11-20_ollama_llama3.1-8b.html",
       "developer": "Usama Arif",
       "reviews": [
         {
           "author": "Nick Desaulniers",
-          "summary": "Raised a concern about the use of REP STOSQ being potentially duplicated elsewhere in the codebase, specifically mentioning memset64 in arch/x86/include/asm/string_64.h.",
+          "summary": "The reviewer noted that REP STOSQ is used elsewhere in the kernel, specifically in memset64 of arch/x86/include/asm/string_64.h, and requested to consider consistency across all uses.",
           "sentiment": "NEUTRAL",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "request for consistency"
           ],
           "has_inline_review": false,
           "tags_given": [],
-          "raw_body": "On Thu, Nov 19, 2026 at 1:32 PM Usama Arif <usama.arif@linux.dev> wrote:\n>\n> With KSTACK_ERASE, every return to user space poisons the part of the\n> task stack that was used since the previous return. The generic\n> __stackleak_poison() does that one word per loop iteration, so a syscall\n> that went 1-2 KiB deep pays for 128-256 separate stores. On Meta hosts\n> running many small VMs, stackleak_erase() accounts for about 1.5% of\n> non-idle host kernel cycles.\n>\n> Override __stackleak_poison() on x86-64, as s390 already does, through\n> the hook added by commit 491a78663e03 (\"stackleak: allow to specify arch\n> specific stackleak poison function\"). Fill spans larger than 512 bytes\n> with REP STOSQ and keep the word loop for shorter ones, where the fixed\n> startup cost of REP STOSQ does not pay off. REP STOSQ starts to win at\n> about 300-400 bytes on Zen 5c and Cooper Lake, so on both no span gets\n> slower.\n>\n> The fill is inline asm, so the noinstr function still makes no calls.\n> memset64() would be the same instruction, but it is only static inline,\n> and with KMSAN it is an out-of-line function.\n>\n> In a Zen 5c KVM guest, stackleak_erase() got about 35% cheaper per return\n> to user space (71 ns to 46 ns, scan included) over a futex, epoll, procfs\n> and Unix socket syscall mix. Same-vCPU futex wake/wait and Unix socket\n> sendmsg()/recvmsg() ping-pong round trips got 5-8% faster.\n>\n> Signed-off-by: Usama Arif <usama.arif@linux.dev>\n> ---\n>  arch/x86/include/asm/processor.h | 25 +++++++++++++++++++++++++\n>  1 file changed, 25 insertions(+)\n>\n> diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h\n> index 77488ff5eb8c7c..049231d484ad0e 100644\n> --- a/arch/x86/include/asm/processor.h\n> +++ b/arch/x86/include/asm/processor.h\n> @@ -580,6 +580,31 @@ static __always_inline bool on_thread_stack(void)\n>                                current_stack_pointer) < THREAD_SIZE;\n>  }\n>\n> +#ifdef CONFIG_X86_64\n> +#define __stackleak_poison __stackleak_poison\n> +static __always_inline void __stackleak_poison(unsigned long erase_low,\n> +                                              unsigned long erase_high,\n> +                                              unsigned long poison)\n> +{\n> +       unsigned long count;\n> +\n> +       /* Short spans do not amortize the startup cost of REP STOSQ. */\n> +       if (erase_high <= erase_low + 512) {\n> +               while (erase_low < erase_high) {\n> +                       *(unsigned long *)erase_low = poison;\n> +                       erase_low += sizeof(unsigned long);\n> +               }\n> +               return;\n> +       }\n> +\n> +       count = (erase_high - erase_low) / sizeof(unsigned long);\n> +       asm volatile(\"rep stosq\"\n> +                    : \"+D\" (erase_low), \"+c\" (count)\n> +                    : \"a\" (poison)\n> +                    : \"memory\");\n\nSurely this isn't the only place using `rep stosq` in the tree, right?\nIt's not, see memset64 in arch/x86/include/asm/string_64.h.\n\n> +}\n> +#endif\n> +\n>  #ifdef CONFIG_PARAVIRT_XXL\n>  #include <asm/paravirt.h>\n>  #else\n> --\n> 2.53.1-Meta\n>\n\n\n-- \nThanks,\n~Nick Desaulniers\n",
+          "raw_body": "Surely this isn't the only place using `rep stosq` in the tree, right?\nIt's not, see memset64 in arch/x86/include/asm/string_64.h.",
           "reply_to": "Usama Arif",
           "message_date": "2026-11-19",
-          "message_id": "",
+          "message_id": "CAKwvOdnzNU_xtLeb4vXSFe3DLN9QmdNSSReUmQahsLX+1pZxCw@mail.gmail.com",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series optimizes the stack erasure mechanism on x86-64 architectures by using REP STOSQ for large stack fills, reducing the number of stores required and improving performance."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch optimizes the stack erasure process on x86-64 architecture by using REP STOSQ instruction to fill large spans of memory, which is more efficient than the generic __stackleak_poison() function that uses a word loop. The patch introduces an inline assembly implementation for __stackleak_poison() on x86-64, which fills spans larger than 512 bytes with REP STOSQ and falls back to the word loop for shorter spans. This change reduces the overhead of stack erasure by up to 35% in certain scenarios, making it a performance improvement."
+    },
+    "2026-11-20": {
+      "report_file": "2026-11-20_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Peter Zijlstra",
+          "summary": "Reviewer Peter Zijlstra questioned the REP STOSQ setup cost, suggesting that 16-32 words would be sufficient to amortize it, and proposed an unrolled loop for smaller counts, also recommending making memset64() __always_inline.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvements"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Gemini seems to suggest 16-32 words would be sufficient to amortize the\nREP STOS setup. It was also adamant I try and unroll that earlier loop.\n\nHow about something like so, does that make sense? Also, I suppose we\nshould make memset64() __always_inline if we use it here. I'm not at all\nsold on the unroll here, the asm is pretty horrid for what it does.\n\n---\n--- a/arch/x86/include/asm/processor.h\n+++ b/arch/x86/include/asm/processor.h\n@@ -28,6 +28,7 @@ struct vm86;\n #include <asm/vmxfeatures.h>\n #include <asm/vdso/processor.h>\n #include <asm/shstk.h>\n+#include <asm/string.h>\n \n #include <linux/personality.h>\n #include <linux/cache.h>\n@@ -580,6 +581,33 @@ static __always_inline bool on_thread_st\n \t\t\t       current_stack_pointer) < THREAD_SIZE;\n }\n \n+#ifdef CONFIG_X86_64\n+#define __stackleak_poison __stackleak_poison\n+static __always_inline void __stackleak_poison(unsigned long erase_low,\n+\t\t\t\t\t       unsigned long erase_high,\n+\t\t\t\t\t       unsigned long poison)\n+{\n+\tunsigned long count = (erase_high - erase_low) / sizeof(unsigned long);\n+\n+\t/* Amortize the startup cost of REP STOSQ. */\n+\tif (count < 32) {\n+\t\tunsigned long *ptr = (unsigned long *)erase_low;\n+\n+\t\twhile (count) {\n+\t\t\tswitch ((count-1) % 4) {\n+\t\t\tcase 3: ptr[--count] = poison; fallthrough;\n+\t\t\tcase 2: ptr[--count] = poison; fallthrough;\n+\t\t\tcase 1: ptr[--count] = poison; fallthrough;\n+\t\t\tcase 0: ptr[--count] = poison; break;\n+\t\t\t}\n+\t\t}\n+\t\treturn;\n+\t}\n+\n+\tmemset64((void *)erase_low, poison, count);\n+}\n+#endif\n+\n #ifdef CONFIG_PARAVIRT_XXL\n #include <asm/paravirt.h>\n #else",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-20",
+          "message_id": "20261120104534.GO2668564@noisy.programming.kicks-ass.net",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the REP STOSQ instruction is not properly aligned for 64-bit accesses, which could lead to incorrect stack poisoning and requested the use of a different alignment.\n\nReviewer David Laight pointed out that recent GCC versions have issues optimizing the REP STOSQ loop, and suggested unrolling the loop 4 times for better performance on newer CPUs. However, he also noted that this approach may not work due to potential pipeline stalls.\n\nReviewer David Laight questioned the usefulness of the patch, noting that memset_p() and memset_l() have almost no users.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "alignment issue",
+            "potential bug",
+            "requested changes",
+            "performance optimization",
+            "usefulness",
+            "low usage"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Thu, 19 Nov 2026 14:28:04 -0800\nNick Desaulniers <ndesaulniers@google.com> wrote:\n\n---\n\ngcc 13 onwards makes a meal of that - https://godbolt.org/z/KPP4h8xz6\nIt does manage to unroll the loop once - which is good because the intel\ncpu (I've got) won't execute a 'one clock loop' (the zen5 will); but the\nsetup code is horrid.\nBut I also think some of the more recent cpu can execute more than\none write per clock.\nIf you unroll the loop 4 times it may run a lot faster.\nPerhaps:\n\tlong count = (erase_high - erase_low) / sizeof(unsigned long);\n\tif (count <= 64) {\n\t\twhile ((count -= 4) >= 0) {\n\t\t\t*(unsigned long *)erase_low = poison;\n\t\t\t*(unsigned long *)(erase_low + 8) = poison;\n\t\t\t*(unsigned long *)(erase_low + 16) = poison;\n\t\t\t*(unsigned long *)(erase_low + 24) = poison;\n\t\t\terase_low += 32;\n\t\t}\n\t\tif (count & 2) {\n\t\t\t*(unsigned long *)erase_low = poison;\n\t\t\t*(unsigned long *)(erase_low + 8) = poison;\n\t\t\terase_low += 16;\n\t\t}\n\t\tif (count & 1)\n\t\t\t*(unsigned long *)erase_low = poison;\n\t} else {\n\t\t...\n\t}\n\nExcept that gcc makes a mess of it again.\nI don't think the 'erase_low += 32' is going to execute at the\nsame time as the last (two probably) writes so costs a clock.\nSo it may need to be asm.\n\n---\n\nWhich seems to have very few users.\nmemset_p() and memset_l() have almost no users.\n\nDavid",
+          "reply_to": "Nick Desaulniers",
+          "message_date": "2026-11-20",
+          "message_id": "20261120113825.234bee1c@pumpkin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Peter Zijlstra",
+          "summary": "Reviewer Peter Zijlstra suggested an optimization to the __stackleak_poison function, replacing the REP STOSQ instruction for large stack fills with a call to memset64 when the count is less than 32, to amortize the startup cost of REP STOSQ.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "This one is much improved:\n\n--- a/arch/x86/include/asm/processor.h\n+++ b/arch/x86/include/asm/processor.h\n@@ -28,6 +28,7 @@ struct vm86;\n #include <asm/vmxfeatures.h>\n #include <asm/vdso/processor.h>\n #include <asm/shstk.h>\n+#include <asm/string.h>\n \n #include <linux/personality.h>\n #include <linux/cache.h>\n@@ -580,6 +581,35 @@ static __always_inline bool on_thread_st\n \t\t\t       current_stack_pointer) < THREAD_SIZE;\n }\n \n+#ifdef CONFIG_X86_64\n+#define __stackleak_poison __stackleak_poison\n+static __always_inline void __stackleak_poison(unsigned long erase_low,\n+\t\t\t\t\t       unsigned long erase_high,\n+\t\t\t\t\t       unsigned long poison)\n+{\n+\tunsigned long count = (erase_high - erase_low) / sizeof(unsigned long);\n+\n+\t/* Amortize the startup cost of REP STOSQ. */\n+\tif (count < 32) {\n+\t\tunsigned long *ptr = (unsigned long *)erase_low;\n+\n+\t\twhile (count) {\n+\t\t\tunsigned long mod = (count-1) % 4;\n+\t\t\tcount -= mod+1;\n+\t\t\tswitch (mod) {\n+\t\t\tcase 3: ptr[count+3] = poison; fallthrough;\n+\t\t\tcase 2: ptr[count+2] = poison; fallthrough;\n+\t\t\tcase 1: ptr[count+1] = poison; fallthrough;\n+\t\t\tcase 0: ptr[count+0] = poison; break;\n+\t\t\t}\n+\t\t}\n+\t\treturn;\n+\t}\n+\n+\tmemset64((void *)erase_low, poison, count);\n+}\n+#endif\n+\n #ifdef CONFIG_PARAVIRT_XXL\n #include <asm/paravirt.h>\n #else",
+          "reply_to": "",
+          "message_date": "2026-11-20",
+          "message_id": "20261120122635.GJ2669272@noisy.programming.kicks-ass.net",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight pointed out that the REP STOSQ instruction used in __stackleak_poison() may not be optimal for all CPU architectures, as it relies on the CPU's ability to execute a REP prefix followed by an STOSQ instruction. He suggested considering alternative instructions or approaches that are more portable across different CPUs.\n\nReviewer David Laight pointed out that the addition of `erase_low += 32` should be placed within a specific section of code, likely to adjust the loop counter for REP STOSQ instruction\n\nReviewer David Laight noted that the REP STOSQ instruction may not be optimal for CPUs that can perform two writes per clock cycle, suggesting a loop that uses two movq instructions to write 32 bytes at a time would be more efficient. He also provided an example of how this could be achieved using OPTIMIZER_HIDE_VAR() and demonstrated the generated assembly code on godbolt.org.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "portability concern",
+            "instruction dependency",
+            "requested correction",
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Fri, 20 Nov 2026 11:38:25 +0000\nDavid Laight <david.laight.linux@gmail.com> wrote:\n\n---\n\nThe add (probably) needs to be in the middle...\n \t\t\terase_low += 32;\n\n---\n\nI threw in enough OPTIMIZER_HIDE_VAR() to stop the optimiser breaking\nthe code. https://godbolt.org/z/nx477T4M1\ngcc then generates:\n        movq    %rdx, (%rdi)\n        movq    %rdx, 8(%rdi)\n        addq    $32, %rdi\n        movq    %rdx, -16(%rdi)\n        movq    %rdx, -8(%rdi)\n.L32:\n        subq    $4, %rcx\n        jns     .L22\nfor the code loop (clang is a bit worse - but should be ok).\nI think that will be a 'two clock loop' on cpu that can do\ntwo writes/clock; zen3 and ice lake).\nFor 'stack splatting' rounding up to a multiple of 32 bytes\nwill save all the 'remainder' code.\n\nDavid",
+          "reply_to": "",
+          "message_date": "2026-11-20",
+          "message_id": "20261120124252.14ff8a74@pumpkin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight pointed out that the REP STOSQ instruction is not properly aligned for 64-bit accesses, which could lead to a data corruption issue.\n\nReviewer David Laight expressed skepticism about the performance benefits of using REP STOSQ for large stack fills, suggesting that it may not be effective across all CPU architectures.\n\nThe reviewer, David Laight, expressed strong disagreement with the patch's inline assembly code, citing performance concerns and suggesting optimizations to reduce instruction count, loop control code, and register dependency chain length. He also asked if the length of the stores can be a multiple of 32 and noted that REP STOS might be faster when the destination is 64-byte aligned.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "alignment",
+            "data corruption",
+            "skepticism",
+            "questioning",
+            "performance",
+            "optimization"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Fri, 20 Nov 2026 11:45:34 +0100\nPeter Zijlstra <peterz@infradead.org> wrote:\n\n---\n\nThat really does sound like wishful thinking.\nEspecially if you go back a few generations on the cpu architecture.\n\n---\n\nThat looks horrid to me.\nYou want as few instructions (especially conditionals) inside the\nloop as possible.\nThe Intel cpu will execute a two clock loop and the later ones will\ndo two writes per clock\n(zen5 will execute a one clock loop and do two writes/clock).\nSo you want a loop with just 4 writes and the loop control code.\nThe 'pointer add' just needs to execute at the same time as some\nof the stores - to avoid lengthening the register dependency chain.\n\nFor this code, can the length be a multiple of 32?\nAlso on some cpu the 'rep stos' might be twice as fast (per byte) if\nthe destination in 64 byte aligned - true for 'rep movsb'.\n\nDavid",
+          "reply_to": "Peter Zijlstra",
+          "message_date": "2026-11-20",
+          "message_id": "20261120140200.53ec2557@pumpkin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Peter Zijlstra",
+          "summary": "Reviewer Peter Zijlstra questioned the relevance of optimizing for Interlagos, an older CPU model, and suggested that Nehalem and later CPUs should be sufficient to benefit from the REP STOSQ optimization.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "questioning relevance",
+            "suggesting alternative focus"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "How old? I mean, Interlagos old, sure, but nobody should care about\nperformance there I think.\n\nAFAICT Nehalem and later should be good with the 16-32 words. As would\nall the various Zen chips.",
+          "reply_to": "David Laight",
+          "message_date": "2026-11-20",
+          "message_id": "20261120153539.GW2668564@noisy.programming.kicks-ass.net",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight pointed out that the REP STOSQ instruction is not properly aligned for 64-bit accesses, which could lead to incorrect results or crashes.\n\nReviewer David Laight questioned the accuracy of the setup costs for REP STOSQ and REP MOVQ instructions on various architectures, citing a lack of reliable sources and potential issues with alignment and I-cache misses.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "alignment issue",
+            "potential crash",
+            "requested changes",
+            "lacking information"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Fri, 20 Nov 2026 16:35:39 +0100\nPeter Zijlstra <peterz@infradead.org> wrote:\n\n---\n\nHave you got an accurate source for the setup costs for 'rep stos/movs'\nfor the various architectures?\nI didn't find one last time I looked.\nLast time I measured rep movs I was using mfence to synchronise with rdpmc\nand that takes even longer - so you only get the per-byte costs.\n(You can use data-dependencies which have minimal overhead unless you\ngo back to to some pre-zen amd cpu.)\n\nYou get 16 bytes/clock until Haswell which will do 32 if rdi is aligned.\nIcelake might increase that to 64 bytes/clock.\nAgner has zen2 onwards at 32 bytes/clock.\n\nAgner also has zen3 and Icelake being able to do 2 writes per clock.\nIf that is achievable for the writes being done (the loop isn't a\nproblem) then it also takes a while for the 'rep stos' to catch up.\n(Then you have the cost of the I-cache misses ...)\n\nDavid",
+          "reply_to": "Peter Zijlstra",
+          "message_date": "2026-11-20",
+          "message_id": "20261120161850.5b5fec5e@pumpkin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author acknowledges that REP STOSQ does not provide a performance benefit for stackleak_erase() and prefers v2.1 over v2.2, but is willing to send v2.2 if reviewers strongly prefer it.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "willingness to consider alternative",
+            "acknowledgment of no performance benefit"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "Hello Nick, Peter and David,\n\nThanks for the reviews! I should have used memset64 from the get go :)\n\nI have tested 2 possible revisions now as well as this one from Peter,\nhave added both of them at the end of the reply.\n\n- v2.1 where you loop upto 512B and then memset\n- v2.2: 4 stores per loop up to 512 B, then 64-byte aligned memset64()\n\nI timed stackleak_erase() in a Zen 5c guest over a futex/epoll/procfs/unix\nsyscall:\n\n  No patch                             68.3 ns per erase\n  v1 (loop up to 512 B, then REP)           46.6 ns\n  v2.1 (loop up to 512 B, memset64())       46.6 ns\n  this version                              46.4 ns\n  v2.2 (4 stores/iteration, aligned REP)    43.7 ns\n\n\nThe switch doesn't seem to help.\n\nEither way I kept 512 bytes: REP STOSQ only wins from ~430 bytes on Zen\n5c against the plain loop (~850 against the unrolled one), and from ~320\non Cooper Lake.\n\n\nMy personal preference is v2.1, as its much simpler code and the difference\nin performance between v2.1 and v2.2 isn't actually that much. But if there is\na stronger preference for v2.2, I can send that as it is faster.\n\n\nv2.1:\n\ndiff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h\nindex 77488ff5eb8c7c..3d205ae8566114 100644\n--- a/arch/x86/include/asm/processor.h\n+++ b/arch/x86/include/asm/processor.h\n@@ -28,6 +28,7 @@ struct vm86;\n #include <asm/vmxfeatures.h>\n #include <asm/vdso/processor.h>\n #include <asm/shstk.h>\n+#include <asm/string.h>\n\n #include <linux/personality.h>\n #include <linux/cache.h>\n@@ -580,6 +581,26 @@ static __always_inline bool on_thread_stack(void)\n                               current_stack_pointer) < THREAD_SIZE;\n }\n\n+#if defined(CONFIG_X86_64) && !defined(CONFIG_KMSAN)\n+#define __stackleak_poison __stackleak_poison\n+static __always_inline void __stackleak_poison(unsigned long erase_low,\n+                                              unsigned long erase_high,\n+                                              unsigned long poison)\n+{\n+       /* Short spans do not amortize the startup cost of REP STOSQ. */\n+       if (erase_high <= erase_low + 512) {\n+               while (erase_low < erase_high) {\n+                       *(unsigned long *)erase_low = poison;\n+                       erase_low += sizeof(unsigned long);\n+               }\n+               return;\n+       }\n+\n+       memset64((u64 *)erase_low, poison,\n+                (erase_high - erase_low) / sizeof(u64));\n+}\n+#endif\n+\n #ifdef CONFIG_PARAVIRT_XXL\n #include <asm/paravirt.h>\n #else\ndiff --git a/arch/x86/include/asm/string_64.h b/arch/x86/include/asm/string_64.h\nindex 2dae70c2b01465..73cc91254b1381 100644\n--- a/arch/x86/include/asm/string_64.h\n+++ b/arch/x86/include/asm/string_64.h\n@@ -54,7 +54,7 @@ static inline void *memset32(uint32_t *s, uint32_t v, size_t n)\n }\n\n #define __HAVE_ARCH_MEMSET64\n-static inline void *memset64(uint64_t *s, uint64_t v, size_t n)\n+static __always_inline void *memset64(uint64_t *s, uint64_t v, size_t n)\n {\n        const auto s0 = s;\n        asm volatile (\n\n\n\n\n\nv2.2:\n\ndiff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h\nindex 77488ff5eb8c7c..5e76e1140908d7 100644\n--- a/arch/x86/include/asm/processor.h\n+++ b/arch/x86/include/asm/processor.h\n@@ -28,7 +28,9 @@ struct vm86;\n #include <asm/vmxfeatures.h>\n #include <asm/vdso/processor.h>\n #include <asm/shstk.h>\n+#include <asm/string.h>\n\n+#include <linux/align.h>\n #include <linux/personality.h>\n #include <linux/cache.h>\n #include <linux/threads.h>\n@@ -580,6 +582,48 @@ static __always_inline bool on_thread_stack(void)\n                               current_stack_pointer) < THREAD_SIZE;\n }\n\n+#if defined(CONFIG_X86_64) && !defined(CONFIG_KMSAN)\n+#define __stackleak_poison __stackleak_poison\n+static __always_inline void __stackleak_poison(unsigned long erase_low,\n+                                              unsigned long erase_high,\n+                                              unsigned long poison)\n+{\n+       unsigned long *p = (unsigned long *)erase_low;\n+       unsigned long *end = (unsigned long *)erase_high;\n+       unsigned long i;\n+\n+       /* Fewer than four words, or nothing to do. */\n+       if (erase_high < erase_low + 4 * sizeof(*p)) {\n+               while (p < end)\n+                       *p++ = poison;\n+               return;\n+       }\n+\n+       /* Four stores per iteration; the last four may overlap. */\n+       if (erase_high - erase_low <= 512) {\n+               end -= 4;\n+               while (p < end) {\n+                       p[0] = poison;\n+                       p[1] = poison;\n+                       p[2] = poison;\n+                       p[3] = poison;\n+                       p += 4;\n+               }\n+               end[0] = poison;\n+               end[1] = poison;\n+               end[2] = poison;\n+               end[3] = poison;\n+               return;\n+       }\n+\n+       /* REP STOSQ is faster from a 64-byte aligned destination. */\n+       for (i = 0; i < 8; i++)\n+               p[i] = poison;\n+       p = (unsigned long *)ALIGN(erase_low + 1, 64);\n+       memset64((u64 *)p, poison, end - p);\n+}\n+#endif\n+\n #ifdef CONFIG_PARAVIRT_XXL\n #include <asm/paravirt.h>\n #else\ndiff --git a/arch/x86/include/asm/string_64.h b/arch/x86/include/asm/string_64.h\nindex 2dae70c2b01465..73cc91254b1381 100644\n--- a/arch/x86/include/asm/string_64.h\n+++ b/arch/x86/include/asm/string_64.h\n@@ -54,7 +54,7 @@ static inline void *memset32(uint32_t *s, uint32_t v, size_t n)\n }\n\n #define __HAVE_ARCH_MEMSET64\n-static inline void *memset64(uint64_t *s, uint64_t v, size_t n)\n+static __always_inline void *memset64(uint64_t *s, uint64_t v, size_t n)\n {\n        const auto s0 = s;\n        asm volatile (",
+          "reply_to": "Peter Zijlstra",
+          "message_date": "2026-11-20",
+          "message_id": "bad389b1-f4a6-43d4-9531-54b75e067c7a@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "The author addressed a concern about rounding up or down the erase_high value, explaining that it must be exact due to alignment requirements and potential corruption of live stack data or STACK_END_MAGIC.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "clarification",
+            "explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "The range can't be rounded: erase_low is wherever the poison search\nstopped, and erase_high is the stack pointer or the bottom of pt_regs\n(168 bytes, so only 8-byte aligned). Rounding up writes live stack,\nrounding down can write STACK_END_MAGIC when the stack was used to the\nend.",
+          "reply_to": "David Laight",
+          "message_date": "2026-11-20",
+          "message_id": "97e94491-ce19-45a1-8737-b30b49e997e8@linux.dev",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the inline asm in __stackleak_poison() uses the 'c' constraint, which is not valid for REP STOSQ instructions, and requested a change to use the 'D' constraint instead.\n\nReviewer David Laight questioned the performance measurement and suggested using 'rep stos' for all lengths to avoid branch misprediction penalties, noting that it may still be beneficial even if slightly slower for short lengths.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "constraint mismatch",
+            "instruction usage",
+            "performance_measurement",
+            "branch_misprediction_penalty"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Thu, 19 Nov 2026 13:31:08 -0800\nUsama Arif <usama.arif@linux.dev> wrote:\n\n---\n\nAs a matter of interest (and separately from the exact code) how did you\nmeasure the performance to get the 300-400 byte gain point?\n\nIf the count is variable - likely in real life, you'll get a branch\nmisprediction penalty (about 20 clocks on zen5) every time you change\nbetween the two choices.\nThe copy loop will have another mispredict penalty for the loop itself.\n\nSo you are likely to get an overall improvement if you use 'rep stos'\nfor all lengths - even the ones for with it is slightly slower.\nUnless, that is, you know at compile time that most of the length\nwill be short.\n\nDavid",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-20",
+          "message_id": "20261120185513.0445f0b1@pumpkin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the REP STOSQ instruction may not be optimal for all CPU architectures, and requested further investigation to ensure it is the best choice for x86-64.\n\nReviewer David Laight questioned the effectiveness of the code, pointing out that task_low_bound() could return an aligned address and suggesting rounding down the length to avoid leaving the last few words alone. He also wondered if STACK_END_MAGIC and STACK_ERASE_POISON need different values, given the presence of a guard page in modern stack allocation.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested further investigation",
+            "requested changes",
+            "suggested improvements"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Fri, 20 Nov 2026 18:46:01 +0000\nUsama Arif <usama.arif@linux.dev> wrote:\n\n---\n\nIf the stack down by STACK_END_MAGIC has been written you are almost in\n'deep do-do land' so task_low_bound() could return an aligned address\nand that would let you align down the low address.\n(So leaving the very last few words alone.)\nIt also probably doesn't really matter about the top few words.\nSo the length could be rounded down.\n\nAlternatively, do STACK_END_MAGIC and STACK_ERASE_POISON even need\nto have different values?\n(And aren't stacks now allocated with a guard page - so you get a\nfault on overflow much earlier than any check for STACK_END_MAGIC.)\n\nBut does this code even work in a useful manner.\nIt seems to stop scanning after finding 128 bytes of KSTACK_ERASE_POISON.\nIsn't that going to stop on a function with a large on-stack buffer\n(especially since one is likely to be on the deepest part of the stack).\nI'd have thought you'd jump down the stack in larger lumps than that\njust looking for an unwritten word before even trying to decide if it\nwas the boundary.\n\nDavid",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-20",
+          "message_id": "20261120214415.060e8375@pumpkin",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "David Laight",
+          "summary": "Reviewer David Laight noted that the REP STOSQ instruction may not be optimal for all x86-64 CPUs, as it relies on the CPU's ability to execute REP instructions in a single clock cycle, which is not guaranteed across all CPUs.\n\nReviewer David Laight requested specific information about the lengths of stack erases and questioned the source of a performance metric, suggesting that the code loop and REP STOSQ instructions be timed separately.\n\nReviewer David Laight suggested an alternative implementation for the stackleak poison function, proposing to use a switch statement with Duff's device to reduce the number of conditions in the loop.\n\nReviewer David Laight noted that on Zen5, the REP STOSQ instruction can execute a loop in one clock cycle and suggested unrolling the loop only once to avoid unnecessary overhead, potentially improving performance.\n\nReviewer David Laight suggested testing the patch on older Intel CPUs, noting that the setup costs of REP STOSQ may be higher due to features like Fast Return from Interrupt (FRMS)",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "CPU-specific optimization",
+            "instruction-level dependency",
+            "requested clarification",
+            "questioned data",
+            "alternative implementation",
+            "Duff's device",
+            "performance improvement",
+            "compiler optimization",
+            "suggested additional testing"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "On Fri, 20 Nov 2026 18:43:38 +0000\nUsama Arif <usama.arif@linux.dev> wrote:\n\n---\n\nWhat are the lengths of those erases?\n(and where does the 46ns come from??)\nI'd definitely time 'just the code loop  - various loops' and\n'just rep stos'.\n\n---\n\nTo many conditions in the loop.\nYou could do it this way:\n\tswitch (count & 3) {\n\tcase 0: do { *ptr++ = poison;\n\tcase 3:      *ptr++ = poison;\n\tcase 2:      *ptr++ = poison;\n\tcase 1:      *ptr++ = poison;\n\t\t} while ((count -= 4) > 0);\n\t}\n(give or take some off-by-one here and there).\nBut I suspect that using Duff's device is frowned up.\n\n---\n\nFor zen5 you should only need to unroll the loop once (two writes per iteration).\nIn my experiments it can execute a loop in one clock.\nUnless the compiler unrolled it for you (and got it right!) the original\nloop would be half the speed\n\n---\n\nI'd also try some older Intel cpu.\nThe setup costs are likely to be higher with FRMS and friends.\n\nDavid",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-20",
+          "message_id": "20261120222211.2f0d5cbc@pumpkin",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch optimizes the stack erasure process on x86-64 architecture by using REP STOSQ instruction to fill large spans of memory, which is more efficient than the generic __stackleak_poison() function that uses a word loop. The patch introduces an inline assembly implementation for __stackleak_poison() on x86-64, which fills spans larger than 512 bytes with REP STOSQ and falls back to the word loop for shorter spans. This change reduces the overhead of stack erasure by up to 35% in certain scenarios, making it a performance improvement."
     }
   }
 }

@@ -238,9 +238,128 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 4/6] kernfs: don&#x27;t take kernfs_iattr_rwsem to publish KERNFS_REMOVING</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261118220154.2965621-5-shakeel.butt@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-18</strong><div class="date-range-nav">Active on: <a href="#2026-11-18">2026-11-18</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the kernfs subsystem to remove unnecessary locking when marking a subtree as KERNFS_REMOVING. The lock was previously taken to prevent new usage of the subtree, but since the refresh no longer sets the i_nlink of directories being removed, the lock is not needed. The patch updates the __kernfs_remove function and the kernfs_dir_nlink function to reflect this change, resulting in a performance improvement of around 10-20% for certain workloads.</div></div>
-    <div class="no-reviews">No review comments yet.</div>
+    <div class="date-range">Submitted: <strong>2026-11-18</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-20</strong><div class="date-range-nav">Active on: <a href="#2026-11-20">2026-11-20</a> &bull; <a href="#2026-11-18">2026-11-18</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series aims to optimize kernfs by reducing the number of lock acquisitions in the kernfs_iattr_rwsem semaphore. Specifically, it removes the need for this lock when publishing KERNFS_REMOVING, allowing for more concurrent access and improving performance. The patch also includes code changes to kernfs_dir_nlink() to read the flags once instead of acquiring the lock.</div></div>
+    <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-11-20">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">T.J. Mercier</span>
+<a class="date-chip" href="../2026-11-20_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-20">2026-11-20</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Requested additional code comments and documentation to clarify the rules for stable flags in kernfs_node-&gt;flags, particularly regarding KERNFS_HIDDEN and KERNFS_SUICIDAL/SUICIDED.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Wed, Nov 18, 2026 at 2:02 PM Shakeel Butt &lt;shakeel.butt@linux.dev&gt; wrote:
+&gt;
+&gt; __kernfs_remove() takes kernfs_iattr_rwsem for writing while it marks
+&gt; a subtree KERNFS_REMOVING, inside kernfs_rwsem.  Commit 507d8ce13f5b
+&gt; (&quot;kernfs: Don&#x27;t set_nlink for directories being removed&quot;) added it so
+&gt; that a refresh would not set the i_nlink of a directory whose removal
+&gt; has started.  The refresh no longer sets i_nlink, so the lock is not
+&gt; needed.
+&gt;
+&gt; The flag is only set here, under kernfs_rwsem.  Inode setup reads it
+&gt; under kernfs_rwsem.  getattr reads it without and reports the old link
+&gt; count or 0, either of which is right for a stat() racing the removal.
+&gt;
+&gt; Drop the lock, mark the store and the load, and read the flags once in
+&gt; kernfs_dir_nlink(), as the type bits share the word.
+&gt;
+&gt; kernfs_iattr_rwsem write acquisitions (lock_stat), before -&gt; after:
+&gt;
+&gt;   5 dummy netdevs created and removed     1110 -&gt;  740
+&gt;   100 cgroup mkdirs and 100 rmdirs        4500 -&gt; 3000
+&gt;
+&gt; Signed-off-by: Shakeel Butt &lt;shakeel.butt@linux.dev&gt;
+&gt; ---
+&gt;  fs/kernfs/dir.c   | 10 ++++++----
+&gt;  fs/kernfs/inode.c |  7 +++++--
+&gt;  2 files changed, 11 insertions(+), 6 deletions(-)
+&gt;
+&gt; diff --git a/fs/kernfs/dir.c b/fs/kernfs/dir.c
+&gt; index ef23eac684c6..890aca5d8d70 100644
+&gt; --- a/fs/kernfs/dir.c
+&gt; +++ b/fs/kernfs/dir.c
+&gt; @@ -1604,15 +1604,17 @@ static void __kernfs_remove(struct kernfs_node *kn)
+&gt;
+&gt;         pr_debug(&quot;kernfs %s: removing\n&quot;, kernfs_rcu_name(kn));
+&gt;
+&gt; -       /* prevent new usage by marking all nodes removing and deactivating */
+&gt; -       down_write(&amp;kernfs_root(kn)-&gt;kernfs_iattr_rwsem);
+&gt; +       /*
+&gt; +        * Prevent new usage by marking all nodes removing and deactivating.
+&gt; +        * KERNFS_REMOVING is only set here, under kernfs_rwsem.
+&gt; +        * kernfs_dir_nlink() reads it without that lock.
+&gt; +        */
+&gt;         pos = NULL;
+&gt;         while ((pos = kernfs_next_descendant_post(pos, kn))) {
+&gt; -               pos-&gt;flags |= KERNFS_REMOVING;
+&gt; +               WRITE_ONCE(pos-&gt;flags, pos-&gt;flags | KERNFS_REMOVING);
+&gt;                 if (kernfs_active(pos))
+&gt;                         atomic_add(KN_DEACTIVATED_BIAS, &amp;pos-&gt;active);
+&gt;         }
+&gt; -       up_write(&amp;kernfs_root(kn)-&gt;kernfs_iattr_rwsem);
+&gt;
+&gt;         /* deactivate and unlink the subtree node-by-node */
+&gt;         do {
+&gt; diff --git a/fs/kernfs/inode.c b/fs/kernfs/inode.c
+&gt; index 2f463c0354a5..ca234f69882b 100644
+&gt; --- a/fs/kernfs/inode.c
+&gt; +++ b/fs/kernfs/inode.c
+&gt; @@ -165,9 +165,12 @@ static inline void set_inode_attr(struct inode *inode,
+&gt;   */
+&gt;  static bool kernfs_dir_nlink(struct kernfs_node *kn, unsigned int *nlink)
+&gt;  {
+&gt; -       if (kernfs_type(kn) != KERNFS_DIR)
+&gt; +       /* KERNFS_REMOVING can be set concurrently; read the flags once. */
+&gt; +       unsigned short flags = READ_ONCE(kn-&gt;flags);
+
+Hi Shakeel,
+
+I&#x27;d like to ask for some code comments / documentation.
+
+This lockless read relies on two rules for kn-&gt;flags... the type bits
+and flags set before publication never change, and the other flags are
+only changed with kernfs_rwsem held for write (except KERNFS_NS).
+
+Parts of this are explained in a comment in kernfs_dop_revalidate()
+but not on the field, and that comment doesn&#x27;t cover KERNFS_HIDDEN or
+KERNFS_SUICIDAL/SUICIDED.
+
+Since this series adds a lockless reader that depends on these rules,
+how about a comment on kernfs_node-&gt;flags like:
+
+/*
+ * Type bits, flags set before publication, and KERNFS_NS are stable;
+the rest change under
+ * kernfs_rwsem (write).  Lockless readers of changing flags must use
+READ_ONCE(), taking
+ * one snapshot if they also test stable bits.
+ */
+
+
+&gt; +
+&gt; +       if ((flags &amp; KERNFS_TYPE_MASK) != KERNFS_DIR)
+&gt;                 return false;
+&gt; -       *nlink = (kn-&gt;flags &amp; KERNFS_REMOVING) ? 0 :
+&gt; +       *nlink = (flags &amp; KERNFS_REMOVING) ? 0 :
+&gt;                  READ_ONCE(kn-&gt;dir.subdirs) + 2;
+&gt;         return true;
+&gt;  }
+&gt; --
+&gt; 2.53.1-Meta
+&gt;
+</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Shakeel Butt</div>
+<div class="review-comment-signals">Signals: NEUTRAL</div>
+</div>
+</div>
+</div>
 
     <footer>LKML Daily Activity Tracker</footer>
     <script>

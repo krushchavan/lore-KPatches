@@ -1,0 +1,33 @@
+{
+  "thread_id": "20261120-private_nodes_v6-v1-46-74f5f9a115c2@gourry.net",
+  "subject": "[PATCH 46/60] mm: add N_MEMORY_RECLAIM node state",
+  "url": "https://lore.kernel.org/all/20261120-private_nodes_v6-v1-46-74f5f9a115c2@gourry.net/",
+  "dates": {
+    "2026-11-20": {
+      "report_file": "2026-11-20_ollama_llama3.1-8b.html",
+      "developer": "Gregory Price",
+      "reviews": [
+        {
+          "author": "Gregory Relay",
+          "summary": "Reviewer noted that the addition of N_MEMORY_RECLAIM node state and NODE_MEMORY_FEAT_RECLAIM feature does not account for lock ordering between reclaim paths and compaction, suggesting that the per-vswap spinlock should be dropped before calling try_to_unmap().",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "lock ordering",
+            "reclaim paths"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "From: \"Gregory Price (Meta)\" <gourry@gourry.net>\n\nAdd N_MEMORY_RECLAIM as an internal state for the nodes page reclaim\nmay operate on, and NODE_MEMORY_FEAT_RECLAIM for memory providers to\nselect it.\n\nReclaim frees order-0 pages and leaves high-order requests to\ncompaction, so a private node that permits reclaim must permit\ncompaction too.\n\nSigned-off-by: Gregory Price (Meta) <gourry@gourry.net>\n---\n Documentation/mm/physical_memory.rst |  4 ++++\n include/linux/nodemask.h             | 11 +++++++++--\n mm/page_alloc.c                      |  4 ++++\n 3 files changed, 17 insertions(+), 2 deletions(-)\n\ndiff --git a/Documentation/mm/physical_memory.rst b/Documentation/mm/physical_memory.rst\nindex 5d0a69f6c23c..1bafe8c085a3 100644\n--- a/Documentation/mm/physical_memory.rst\n+++ b/Documentation/mm/physical_memory.rst\n@@ -187,6 +187,9 @@ The following states are internal and not exported through sysfs:\n ``N_MEMORY_COMPACTION``\n   The kernel compacts the node on its own initiative (kcompactd, proactive\n   and explicit compaction).\n+``N_MEMORY_RECLAIM``\n+  The kernel reclaims the node on its own initiative (kswapd, memcg and\n+  explicit reclaim).\n \n For each node that has a property described above, the bit corresponding to the\n node ID in the ``node_states[<property>]`` bitmask is set.\n@@ -201,6 +204,7 @@ For example, for node 2 with normal memory and CPUs, bit 2 will be set in ::\n   node_states[N_MEMORY_COMMON]\n   node_states[N_CPU]\n   node_states[N_MEMORY_COMPACTION]\n+  node_states[N_MEMORY_RECLAIM]\n \n For various operations possible with nodemasks please refer to\n ``include/linux/nodemask.h``.\ndiff --git a/include/linux/nodemask.h b/include/linux/nodemask.h\nindex 2757acffff2b..be5edbee2b22 100644\n--- a/include/linux/nodemask.h\n+++ b/include/linux/nodemask.h\n@@ -413,6 +413,7 @@ enum node_states {\n \tN_GENERIC_INITIATOR,\t/* The node has one or more Generic Initiators */\n \t/* Internal states, not exported through sysfs */\n \tN_MEMORY_COMPACTION,\t/* mm compaction may operate on the node */\n+\tN_MEMORY_RECLAIM,\t/* mm reclaim may operate on the node */\n \tNR_NODE_STATES\n };\n \n@@ -550,12 +551,15 @@ static __always_inline int node_random(const nodemask_t *maskp)\n  */\n #define NODE_MEMORY_FEAT_COMMON\t\tBIT(0) /* add to fallback zonelist */\n #define NODE_MEMORY_FEAT_COMPACTION\tBIT(1) /* mm compaction */\n+#define NODE_MEMORY_FEAT_RECLAIM\tBIT(2) /* mm reclaim */\n #define NODE_MEMORY_FEAT_ALL\t\t(NODE_MEMORY_FEAT_COMMON | \\\n-\t\t\t\t\t NODE_MEMORY_FEAT_COMPACTION)\n+\t\t\t\t\t NODE_MEMORY_FEAT_COMPACTION | \\\n+\t\t\t\t\t NODE_MEMORY_FEAT_RECLAIM)\n \n /*\n  * Common memory carries every feature. Private memory needs NUMA: node 0\n- * holds all memory without it.\n+ * holds all memory without it. Reclaim leaves high-order requests to\n+ * compaction, so it requires compaction.\n  */\n static inline bool node_memory_features_valid(unsigned long features)\n {\n@@ -563,6 +567,9 @@ static inline bool node_memory_features_valid(unsigned long features)\n \t\treturn false;\n \tif (features & NODE_MEMORY_FEAT_COMMON)\n \t\treturn features == NODE_MEMORY_FEAT_ALL;\n+\tif ((features & NODE_MEMORY_FEAT_RECLAIM) &&\n+\t    !(features & NODE_MEMORY_FEAT_COMPACTION))\n+\t\treturn false;\n \treturn IS_ENABLED(CONFIG_NUMA);\n }\n \ndiff --git a/mm/page_alloc.c b/mm/page_alloc.c\nindex 335ce73e645e..864da908a59b 100644\n--- a/mm/page_alloc.c\n+++ b/mm/page_alloc.c\n@@ -205,6 +205,7 @@ nodemask_t node_states[NR_NODE_STATES] __read_mostly = {\n \t[N_MEMORY] = { { [0] = 1UL } },\n \t[N_MEMORY_COMMON] = { { [0] = 1UL } },\n \t[N_MEMORY_COMPACTION] = { { [0] = 1UL } },\n+\t[N_MEMORY_RECLAIM] = { { [0] = 1UL } },\n \t[N_CPU] = { { [0] = 1UL } },\n #endif\t/* NUMA */\n };\n@@ -221,10 +222,13 @@ void __meminit node_set_memory_state(int nid, unsigned long features)\n \t\tnode_set_state(nid, N_MEMORY_PRIVATE);\n \tif (features & NODE_MEMORY_FEAT_COMPACTION)\n \t\tnode_set_state(nid, N_MEMORY_COMPACTION);\n+\tif (features & NODE_MEMORY_FEAT_RECLAIM)\n+\t\tnode_set_state(nid, N_MEMORY_RECLAIM);\n }\n \n void __meminit node_clear_memory_state(int nid)\n {\n+\tnode_clear_state(nid, N_MEMORY_RECLAIM);\n \tnode_clear_state(nid, N_MEMORY_COMPACTION);\n \tnode_clear_state(nid, N_MEMORY_PRIVATE);\n \tnode_clear_state(nid, N_MEMORY_COMMON);\n\n-- \n2.56.1",
+          "reply_to": "",
+          "message_date": "2026-11-20",
+          "message_id": "20261120-private_nodes_v6-v1-46-74f5f9a115c2@gourry.net",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch adds a new internal state for Linux nodes called N_MEMORY_RECLAIM, which indicates that the kernel can reclaim memory from the node on its own initiative. It also introduces a new feature flag NODE_MEMORY_FEAT_RECLAIM for memory providers to select this capability. The patch ensures that private nodes that permit reclaim must also permit compaction, as reclaim frees order-0 pages and leaves high-order requests to compaction."
+    }
+  }
+}
