@@ -86,6 +86,52 @@
       ],
       "analysis_source": "llm-per-reviewer",
       "patch_summary": "This patch series fixes two bugs in the Linux kernel's perf/core module related to software event sample data. The first bug, present since v6.3, occurs when a sampling event inherits an uninitialized sample ID and timestamp from a previous event, causing issues with concurrent 'perf record' sessions. The second bug, introduced in v6.1, allows BPF programs to read uninitialized stack contents through the bpf_perf_event_data::addr field. The patches initialize the struct for each matching event, prevent BPF programs from reading uninitialized data, and stop zero-initializing the struct in do_perf_sw_event(). These changes improve performance by reducing the time it takes to handle context switches."
+    },
+    "2026-11-22": {
+      "report_file": "2026-11-22_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "tip-bot2 Arif",
+          "summary": "Reviewer Arif noted that the perf_swevent_match() function's 'data' argument is unused and requested it be dropped, while also initializing the struct perf_sample_data for each matching event to prevent sample ID reuse across software events.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The following commit has been merged into the perf/urgent branch of tip:\n\nCommit-ID:     a3c976da55a8da3b5759bcca94832f757763059d\nGitweb:        https://git.kernel.org/tip/a3c976da55a8da3b5759bcca94832f757763059d\nAuthor:        Usama Arif <usama.arif@linux.dev>\nAuthorDate:    Thu, 19 Nov 2026 13:10:44 -08:00\nCommitter:     Ingo Molnar <mingo@kernel.org>\nCommitterDate: Sun, 22 Nov 2026 16:07:42 +01:00\n\nperf/core: Fix perf_sample_data reuse across software events\n\ndo_perf_sw_event() passes one on-stack struct perf_sample_data to every\nmatching event. perf_prepare_sample() fills in the fields an event\nsamples, marks them in data->sample_flags and skips fields that are\nalready marked, and those marks survive from one event to the next.\n\nSo a sampling event later in the list emits the sample ID, timestamp,\npid/tid and callchain prepared for an earlier one. Its record size is\ncomputed from the earlier event's dynamic fields as well and can come\nout smaller than what is written, in which case the kernel writes past\nits ring-buffer reservation over the records that follow.\n\nTwo \"perf record -e page-faults,context-switches -c 1 -a\" sessions\nrunning at the same time hit this: the one started first gets the\nother's sample IDs and fails with \"Bad address\".\n\nCommit:\n\n   1d1bfe30dad5 (\"perf/core: Fix perf_sample_data not properly initialized for different swevents in perf_tp_event()\")\n\nfixed the same problem for tracepoints. Do the same here: initialize\nthe struct for each matching event. While at it, drop the unused 'data'\nargument of perf_swevent_match().\n\nFixes: bb447c27a467 (\"perf/core: Set data->sample_flags in perf_prepare_sample()\")\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\nSigned-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>\nSigned-off-by: Ingo Molnar <mingo@kernel.org>\nCc: stable@vger.kernel.org\nLink: https://patch.msgid.link/20261119211235.99805-2-usama.arif@linux.dev\n---\n kernel/events/core.c | 17 +++++++----------\n 1 file changed, 7 insertions(+), 10 deletions(-)\n\ndiff --git a/kernel/events/core.c b/kernel/events/core.c\nindex 51c251c..42bd8ad 100644\n--- a/kernel/events/core.c\n+++ b/kernel/events/core.c\n@@ -11142,7 +11142,6 @@ int perf_exclude_event(struct perf_event *event, struct pt_regs *regs)\n static int perf_swevent_match(struct perf_event *event,\n \t\t\t\tenum perf_type_id type,\n \t\t\t\tu32 event_id,\n-\t\t\t\tstruct perf_sample_data *data,\n \t\t\t\tstruct pt_regs *regs)\n {\n \tif (event->attr.type != type)\n@@ -11207,11 +11206,10 @@ find_swevent_head(struct swevent_htable *swhash, struct perf_event *event)\n }\n \n static void do_perf_sw_event(enum perf_type_id type, u32 event_id,\n-\t\t\t\t    u64 nr,\n-\t\t\t\t    struct perf_sample_data *data,\n-\t\t\t\t    struct pt_regs *regs)\n+\t\t\t\t    u64 nr, struct pt_regs *regs, u64 addr)\n {\n \tstruct swevent_htable *swhash = this_cpu_ptr(&swevent_htable);\n+\tstruct perf_sample_data data;\n \tstruct perf_event *event;\n \tstruct hlist_head *head;\n \n@@ -11221,8 +11219,10 @@ static void do_perf_sw_event(enum perf_type_id type, u32 event_id,\n \t\tgoto end;\n \n \thlist_for_each_entry_rcu(event, head, hlist_entry) {\n-\t\tif (perf_swevent_match(event, type, event_id, data, regs))\n-\t\t\tperf_swevent_event(event, nr, data, regs);\n+\t\tif (perf_swevent_match(event, type, event_id, regs)) {\n+\t\t\tperf_sample_data_init(&data, addr, 0);\n+\t\t\tperf_swevent_event(event, nr, &data, regs);\n+\t\t}\n \t}\n end:\n \trcu_read_unlock();\n@@ -11243,13 +11243,10 @@ void perf_swevent_put_recursion_context(int rctx)\n \n void ___perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)\n {\n-\tstruct perf_sample_data data;\n-\n \tif (WARN_ON_ONCE(!regs))\n \t\treturn;\n \n-\tperf_sample_data_init(&data, addr, 0);\n-\tdo_perf_sw_event(PERF_TYPE_SOFTWARE, event_id, nr, &data, regs);\n+\tdo_perf_sw_event(PERF_TYPE_SOFTWARE, event_id, nr, regs, addr);\n }\n \n void __perf_sw_event(u32 event_id, u64 nr, struct pt_regs *regs, u64 addr)",
+          "reply_to": "",
+          "message_date": "2026-11-22",
+          "message_id": "179538775038.92412.1181985385445483116.tip-bot2@tip-bot2",
+          "email": "tip-bot2@linutronix.de",
+          "is_maintainer": false
+        },
+        {
+          "author": "tip-bot2 Arif",
+          "summary": "The reviewer noted that the patch does not address the issue of BPF programs reading uninitialized sample addresses in perf_sample_data, and suggested clearing the address before running the program if nobody filled it in.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "The following commit has been merged into the perf/urgent branch of tip:\n\nCommit-ID:     91a18ff192c68329fcfdd4ed0a6d37dcac45ef50\nGitweb:        https://git.kernel.org/tip/91a18ff192c68329fcfdd4ed0a6d37dcac45ef50\nAuthor:        Usama Arif <usama.arif@linux.dev>\nAuthorDate:    Thu, 19 Nov 2026 13:10:45 -08:00\nCommitter:     Ingo Molnar <mingo@kernel.org>\nCommitterDate: Sun, 22 Nov 2026 16:09:06 +01:00\n\nperf/core: Don't let BPF programs read an uninitialized sample address\n\nA BPF program attached to a perf event gets a struct\nbpf_perf_event_data, and reading its addr field turns into a load from\nthe perf_sample_data the sample is being assembled in. The verifier\nallows that load no matter which fields the event samples.\n\nperf_sample_data_init() used to store the address unconditionally, so\nthe program read 0 when there was none. To touch fewer cachelines, it\nnow stores the address only when it is non-zero, and\nperf_prepare_sample() fills it in only when the event samples it\n(PERF_SAMPLE_ADDR, PHYS_ADDR or DATA_PAGE_SIZE). For all other events,\nincluding context switches, cpu-clock and hardware counters like\ncycles, the program reads whatever was left in that stack slot, often a\nkernel pointer.\n\nKernels built with CONFIG_INIT_STACK_ALL_ZERO, the default when the\ncompiler supports it, mostly hide this by clearing the struct on\nfunction entry. With INIT_STACK_ALL_PATTERN the program reads the fill\npattern instead.\n\nClear the address before running the program if nobody filled it in,\nthe same way the SIGTRAP path already checks PERF_SAMPLE_ADDR before\nusing it. Events without a BPF program are not affected.\n\nFixes: 7b0846301531 (\"perf: Use sample_flags for addr\")\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\nSigned-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>\nSigned-off-by: Ingo Molnar <mingo@kernel.org>\nCc: stable@vger.kernel.org\nLink: https://patch.msgid.link/20261119211235.99805-3-usama.arif@linux.dev\n---\n kernel/events/core.c | 3 +++\n 1 file changed, 3 insertions(+)\n\ndiff --git a/kernel/events/core.c b/kernel/events/core.c\nindex 42bd8ad..ee51134 100644\n--- a/kernel/events/core.c\n+++ b/kernel/events/core.c\n@@ -10819,6 +10819,9 @@ static int bpf_overflow_handler(struct perf_event *event,\n \tprog = READ_ONCE(event->prog);\n \tif (prog) {\n \t\tperf_prepare_sample(data, event, regs);\n+\t\t/* bpf_perf_event_data::addr is readable without PERF_SAMPLE_ADDR */\n+\t\tif (!(data->sample_flags & PERF_SAMPLE_ADDR))\n+\t\t\tdata->addr = 0;\n \t\tret = bpf_prog_run(prog, &ctx);\n \t}\n \trcu_read_unlock();",
+          "reply_to": "",
+          "message_date": "2026-11-22",
+          "message_id": "179538774870.92412.3260123976447022124.tip-bot2@tip-bot2",
+          "email": "tip-bot2@linutronix.de",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch series fixes two bugs in the Linux kernel's perf/core module related to software event sample data. The first bug, present since v6.3, occurs when a sampling event inherits an uninitialized sample ID and timestamp from a previous event, causing issues with concurrent 'perf record' sessions. The second bug, introduced in v6.1, allows BPF programs to read uninitialized stack contents through the bpf_perf_event_data::addr field. The patches initialize the struct for each matching event, prevent BPF programs from reading uninitialized data, and stop zero-initializing the struct in do_perf_sw_event(). These changes improve performance by reducing the time it takes to handle context switches."
     }
   }
 }
