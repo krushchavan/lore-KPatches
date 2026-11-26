@@ -1,0 +1,80 @@
+{
+  "thread_id": "20261124152842.2634495-1-usama.arif@linux.dev",
+  "subject": "[PATCH] KVM: arm64: Reduce the stage-2 page cache on 64 KiB hosts",
+  "url": "https://lore.kernel.org/all/20261124152842.2634495-1-usama.arif@linux.dev/",
+  "dates": {
+    "2026-11-25": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Leonardo Bras",
+          "summary": "Reviewer Leonardo Bras noted that the stage-2 page cache does not receive freed pages back in, and suggested simplifying it to have a capacity about the same as the minimum, which is always topped up before mapping.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "requested changes",
+            "suggested improvement"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "Right,\n\nI took a look in the cache workings, and it does not seem to receive freed \npages back in. It gets filled by topup and used by map, so IIUC it is used \nonly to avoid failing an allocation during the mapping walk.\n\nMaybe it could be the case to simplify this cache to have the capacity \nabout the same as the minimum (since it always topup before mapping) and \navoid the waste altogether.\n\nMaymbe having something like this should be enough?\n \n#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE (KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)\n\nThanks!\nLeo",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-25",
+          "message_id": "awcoCklLOKeuXPhh@LeoBrasDK",
+          "email": "leo.bras@arm.com",
+          "is_maintainer": false
+        },
+        {
+          "author": "Usama Arif (author)",
+          "summary": "Author agrees that the revised patch works and releases more memory, plans to send a new version (v2) for review\n\nThe author is addressing Leonardo's concern that the patch does not fix the issue of unused pages staying in the cache until a vCPU is destroyed, which leads to high memory usage. The author explains that they are shrinking the stage-2 memcache to the page-table depth, which will reduce the number of pages allocated and thus decrease memory usage. They also move the level definitions to asm/kvm_types.h so that the generic top-up code can see them.",
+          "sentiment": "needs_work",
+          "sentiment_signals": [
+            "agreement",
+            "commitment_to_revision",
+            "acknowledges a fix is needed"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "That sounds good to me. I tested and it works (and releases even more memory :))\n\nI had to move #defines around to make it work, the current patch sits\nlike below. If this seems acceptable, I can send it as v2 for review.\n\n---\n\nFrom: Usama Arif <usama.arif@linux.dev>\nDate: Wed, 25 Nov 2026 12:55:15 -0800\nSubject: [PATCH] KVM: arm64: Shrink the stage-2 memcache to the page-table\n depth\n\nWhen a stage-2 fault may need new page tables, KVM first tops up the\nvCPU's memcache: if it holds fewer pages than the fault might need, it\nis refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to\n40. Pages never return to the cache, and unused ones stay there until\nthe vCPU is destroyed.\n\nThe cache only has to cover a single map: every fault that can allocate\ntables tops it up first, and a map allocates at most one table per\nlevel below the preallocated root (kvm_mmu_cache_min_pages()). That is\nat most three pages with 4 KiB and 16 KiB pages, and two with 64 KiB\npages.\n\nWith 64 KiB pages, the 40-page cache is 2.5 MiB per vCPU. As every\nlast-level table covers 512 MiB, an 8 GiB guest needs just 17 table\npages to map all of its memory, while its four vCPU caches get filled\nwith 160. On a production host with 64 KiB pages running 101 VMs with\nfour vCPUs each, the caches were still 86% full. The memory used:\n\n                        before      after\n  per-vCPU capacity     2.5 MiB     256 KiB\n  all 404 vCPUs         869 MiB     <= 101 MiB\n\nLet's size the cache to KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL,\nwhich is 4 pages and covers the deepest walk with one page to spare. On\nthe host above, it frees at least 768 MiB. Refills get more frequent,\nbut no more than four pages per vCPU ever sit unused. With 4 KiB pages,\nthe cache shrinks from 160 KiB to 16 KiB per vCPU.\n\nMove the two level definitions to asm/kvm_types.h, so that the generic\ntop-up code in kvm_main.c can see them. kvm_pgtable.h still gets them\nthrough linux/kvm_types.h.\n\nThe temporary cache in kvm_phys_addr_ioremap() uses the same capacity,\nbut it is topped up before every page it maps. The pKVM hypervisor\nmemcache and the eager split cache don't use this capacity.\n\nSuggested-by: Leonardo Bras <leo.bras@arm.com>\nSigned-off-by: Usama Arif <usama.arif@linux.dev>\n---\n arch/arm64/include/asm/kvm_pgtable.h | 3 ---\n arch/arm64/include/asm/kvm_types.h   | 7 ++++++-\n 2 files changed, 6 insertions(+), 4 deletions(-)\n\ndiff --git a/arch/arm64/include/asm/kvm_pgtable.h b/arch/arm64/include/asm/kvm_pgtable.h\nindex eda440354a55ec..691e2eb63939f5 100644\n--- a/arch/arm64/include/asm/kvm_pgtable.h\n+++ b/arch/arm64/include/asm/kvm_pgtable.h\n@@ -19,9 +19,6 @@\n \n struct kvm_s2_mmu;\n \n-#define KVM_PGTABLE_FIRST_LEVEL\t\t-1\n-#define KVM_PGTABLE_LAST_LEVEL\t\t3\n-\n /*\n  * The largest supported block sizes for KVM (no 52-bit PA support):\n  *  - 4K (level 1):\t1GB\ndiff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h\nindex 9a126b9e2d7c99..5b61285d317e28 100644\n--- a/arch/arm64/include/asm/kvm_types.h\n+++ b/arch/arm64/include/asm/kvm_types.h\n@@ -2,7 +2,12 @@\n #ifndef _ASM_ARM64_KVM_TYPES_H\n #define _ASM_ARM64_KVM_TYPES_H\n \n-#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40\n+#define KVM_PGTABLE_FIRST_LEVEL\t\t-1\n+#define KVM_PGTABLE_LAST_LEVEL\t\t3\n+\n+/* One page per level below the root covers kvm_mmu_cache_min_pages(). */\n+#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE\t\\\n+\t(KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)\n \n #endif /* _ASM_ARM64_KVM_TYPES_H */\n \n-- \n2.53.1-Meta",
+          "reply_to": "Leonardo Bras",
+          "message_date": "2026-11-25",
+          "message_id": "e7bdcfa9-bbd8-4649-8318-2f6dc236db15@linux.dev",
+          "email": "usama.arif@linux.dev",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch reduces the size of the stage-2 page cache on arm64 hosts with 64 KiB pages, which can be quite large and wasteful. The current implementation tops up the cache to 40 pages, but this is not necessary for most use cases. By sizing the cache to only cover the deepest walk in the page table hierarchy, the patch reduces memory usage by at least 768 MiB on a production host running 101 VMs with four vCPUs each. The change also makes the code more generic and easier to maintain by moving level definitions to a common header file."
+    },
+    "2026-11-26": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Usama Arif",
+      "reviews": [
+        {
+          "author": "Wei-Lin Chang",
+          "summary": "Reviewer noted that reducing the stage-2 page cache size can lead to less frequent top-up allocations, which may save time, but also introduces a trade-off between memory usage and allocation frequency.",
+          "sentiment": "neutral",
+          "sentiment_signals": [
+            "trade-off",
+            "consider"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "analysis_source": "llm",
+          "raw_body": "Well the more you reserve the less frequent you'd need to actually allocate at\ntopup, which saves time, so there's this trade-off to consider.\n\nThanks,\nWei-Lin Chang",
+          "reply_to": "Usama Arif",
+          "message_date": "2026-11-26",
+          "message_id": "4jxdf2pkuu2f7dftvf6ltpv27jctfuvvrfcrbfxudsgnp3hdfk@taur55wftexq",
+          "email": "weilin.chang@arm.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch reduces the size of the stage-2 page cache on arm64 hosts with 64 KiB pages, which can be quite large and wasteful. The current implementation tops up the cache to 40 pages, but this is not necessary for most use cases. By sizing the cache to only cover the deepest walk in the page table hierarchy, the patch reduces memory usage by at least 768 MiB on a production host running 101 VMs with four vCPUs each. The change also makes the code more generic and easier to maintain by moving level definitions to a common header file."
+    }
+  }
+}

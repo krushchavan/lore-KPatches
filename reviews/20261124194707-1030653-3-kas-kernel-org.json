@@ -4,27 +4,51 @@
   "url": "https://lore.kernel.org/all/20261124194707.1030653-3-kas@kernel.org/",
   "dates": {
     "2026-11-24": {
-      "report_file": "2026-11-24_ollama_llama3.1-8b.html",
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
-          "author": "Kiryl Shutsemau (Meta)",
-          "summary": "The patch series addresses an issue where CPUs with SDEI masked are not sending backtraces due to the regular IPI being blocked. The fix involves modifying the sdei_nmi_fire function to send an IPI to these CPUs instead, allowing them to participate in the backtrace process.",
+          "author": "Kiryl (Meta) (author)",
+          "summary": "The author acknowledged that the patch needs to handle CPUs with SDEI masked by sending them a regular backtrace IPI, and explained how this is already implemented in the code.",
           "sentiment": "NEUTRAL",
           "sentiment_signals": [
-            "WAITING_FOR_REVIEW"
+            "clarification",
+            "explanation"
           ],
           "has_inline_review": false,
           "tags_given": [],
-          "raw_body": "",
+          "raw_body": "sdei_event_signal() refuses a CPU that has SDEI masked. An NMI\nbacktrace then gets nothing from such a CPU and, after 10 seconds,\nreports it as not responding.\n\nThe CPU is in a power-down idle state or going offline, and the regular\nbacktrace IPI wakes it. Send that IPI to the CPUs SDEI refused; every\nother CPU still gets event 0.\n\nA stop needs nothing extra: smp_send_stop() has sent its IPIs before it\nsignals SDEI, and a CPU still online after that is reported as not\nstopped.\n\nFixes: 0c2c56598cc1 (\"drivers/firmware: add SDEI cross-CPU NMI service for arm64\")\nCc: stable@vger.kernel.org\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n arch/arm64/include/asm/nmi.h    |  7 +++++++\n arch/arm64/kernel/smp.c         |  2 +-\n drivers/firmware/arm_sdei_nmi.c | 21 ++++++++++++++++++---\n 3 files changed, 26 insertions(+), 4 deletions(-)\n\ndiff --git a/arch/arm64/include/asm/nmi.h b/arch/arm64/include/asm/nmi.h\nindex 2e8974ff8d63..447d681a5475 100644\n--- a/arch/arm64/include/asm/nmi.h\n+++ b/arch/arm64/include/asm/nmi.h\n@@ -45,4 +45,11 @@ static inline void sdei_nmi_stop_cpus(const cpumask_t *mask) { }\n  */\n void __noreturn arm64_nmi_cpu_stop(struct pt_regs *regs, bool die_on_crash);\n \n+/*\n+ * Send the regular backtrace IPI (an NMI with pseudo-NMI) to @mask. The\n+ * SDEI provider uses it for the CPUs it cannot signal. Defined in\n+ * arch/arm64/kernel/smp.c.\n+ */\n+void arm64_backtrace_ipi(cpumask_t *mask);\n+\n #endif /* __ASM_NMI_H */\ndiff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c\nindex 014b163ce658..8369a4cd3e32 100644\n--- a/arch/arm64/kernel/smp.c\n+++ b/arch/arm64/kernel/smp.c\n@@ -946,7 +946,7 @@ static void arm64_send_ipi(const cpumask_t *mask, unsigned int nr)\n \t\t\t__ipi_send_single(get_ipi_desc(cpu, nr), cpu);\n }\n \n-static void arm64_backtrace_ipi(cpumask_t *mask)\n+void arm64_backtrace_ipi(cpumask_t *mask)\n {\n \tarm64_send_ipi(mask, IPI_CPU_BACKTRACE);\n }\ndiff --git a/drivers/firmware/arm_sdei_nmi.c b/drivers/firmware/arm_sdei_nmi.c\nindex edea68ef881e..b8ebb97caf18 100644\n--- a/drivers/firmware/arm_sdei_nmi.c\n+++ b/drivers/firmware/arm_sdei_nmi.c\n@@ -124,7 +124,7 @@ static int sdei_nmi_handler(u32 event, struct pt_regs *regs, void *arg)\n }\n NOKPROBE_SYMBOL(sdei_nmi_handler);\n \n-static void sdei_nmi_fire(unsigned int target_cpu)\n+static int sdei_nmi_fire(unsigned int target_cpu)\n {\n \tint err = sdei_event_signal(SDEI_NMI_EVENT, target_cpu);\n \n@@ -133,8 +133,13 @@ static void sdei_nmi_fire(unsigned int target_cpu)\n \t\tpr_warn(\"SDEI_EVENT_SIGNAL to CPU %u failed: %d\\n\",\n \t\t\ttarget_cpu, err);\n \t}\n+\n+\treturn err;\n }\n \n+/* CPUs to IPI instead; nmi_trigger_cpumask_backtrace() serialises its users */\n+static cpumask_t sdei_nmi_ipi_mask;\n+\n /*\n  * Raise callback for nmi_trigger_cpumask_backtrace(): signal event 0\n  * at every CPU still pending in @mask. The framework excludes the local\n@@ -151,8 +156,18 @@ static void sdei_nmi_raise_backtrace(cpumask_t *mask)\n \t */\n \tdsb(ishst);\n \n-\tfor_each_cpu(cpu, mask)\n-\t\tsdei_nmi_fire(cpu);\n+\tcpumask_clear(&sdei_nmi_ipi_mask);\n+\tfor_each_cpu(cpu, mask) {\n+\t\tif (sdei_nmi_fire(cpu) == -EAGAIN)\n+\t\t\tcpumask_set_cpu(cpu, &sdei_nmi_ipi_mask);\n+\t}\n+\n+\t/*\n+\t * A CPU with SDEI masked is in a power-down idle state or going\n+\t * offline. The IPI wakes it and it reports like any other.\n+\t */\n+\tif (!cpumask_empty(&sdei_nmi_ipi_mask))\n+\t\tarm64_backtrace_ipi(&sdei_nmi_ipi_mask);\n }\n \n /*\n-- \n2.54.0",
           "reply_to": "",
-          "message_date": "",
-          "message_id": "",
+          "message_date": "2026-11-24",
+          "message_id": "20261124194707.1030653-3-kas@kernel.org",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series addresses an issue where CPUs with SDEI masked are not sending backtraces due to the regular IPI being blocked. The fix involves modifying the sdei_nmi_fire function to send an IPI to these CPUs instead, allowing them to participate in the backtrace process."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the SDEI (System Description Event Interface) NMI handler to send a backtrace IPI to CPUs that have SDEI masked, allowing them to be included in the backtrace even if they are in a power-down idle state or going offline. The patch also introduces a new function `arm64_backtrace_ipi` to send the regular backtrace IPI to a given mask of CPUs. This change fixes an issue where such CPUs were reported as not responding after 10 seconds."
+    },
+    "2026-11-25": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "YinFengwei",
+          "summary": "The reviewer requested the Reviewed-by tag and did not provide any specific technical feedback or concerns.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Reviewed-by: Yin Fengwei <fengwei_yin@linux.alibaba.com>\n\n\nRegards\nYin, Fengwei",
+          "reply_to": "Kiryl (Meta)",
+          "message_date": "2026-11-25",
+          "message_id": "awavp9a_33NX7rtJ@U-V2QX163P-2032.local",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch modifies the SDEI (System Description Event Interface) NMI handler to send a backtrace IPI to CPUs that have SDEI masked, allowing them to be included in the backtrace even if they are in a power-down idle state or going offline. The patch also introduces a new function `arm64_backtrace_ipi` to send the regular backtrace IPI to a given mask of CPUs. This change fixes an issue where such CPUs were reported as not responding after 10 seconds."
     }
   }
 }

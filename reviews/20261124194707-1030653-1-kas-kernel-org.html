@@ -238,7 +238,7 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 0/2] firmware: arm_sdei: Fix NMI backtrace lockups on idle CPUs</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261124194707.1030653-1-kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-24</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-25</strong><div class="date-range-nav">Active on: <a href="#2026-11-25">2026-11-25</a> &bull; <a href="#2026-11-24">2026-11-24</a></div></div>
+    <div class="date-range">Submitted: <strong>2026-11-24</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-26</strong><div class="date-range-nav">Active on: <a href="#2026-11-26">2026-11-26</a> &bull; <a href="#2026-11-25">2026-11-25</a> &bull; <a href="#2026-11-24">2026-11-24</a></div></div>
     <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series fixes a lockup issue on idle CPUs caused by SDEI NMI backtraces. The problem occurs when an event is signaled to all CPUs, including those in a power-down state where SDEI is masked. To fix this, the patches prevent event 0 from being sent to masked PEs and send regular backtrace IPIs to these CPUs instead. This approach ensures that the system remains responsive even during idle states.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-11-24">
@@ -297,12 +297,99 @@ base-commit: b6a9fa34ce4187cb69d3c588a4bbffc31ce5db8f
 <a href="https://lore.kernel.org/r/20261124194707.1030653-1-kas@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
 <div class="review-comment-signals">Signals: clarification, request for further testing</div>
 </div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">YinFengwei</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer noted that the patch does not handle the case where a CPU is in an idle state and SDEI is masked, which can cause lockups
+
+Reviewer YinFengwei questioned whether the lock should be acquired in a specific scenario where the panic doesn&#x27;t take the lock, suggesting that it should be handled similarly to the &#x27;else&#x27; path.
+
+Reviewer YinFengwei suggested using READ_ONCE() to ensure that the masked PE&#x27;s SDEI status is not updated while accessing it</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Hi Kirill,
+
+On Tue, Nov 24, 2026 at 07:47:04PM +0000, Kiryl Shutsemau (Meta) wrote:
+
+---
+
+If the panic didn&#x27;t take the lock, should lock be taken
+just like &quot;else&quot; path?
+
+---
+
+I am wondering whether READ_ONCE() should be used here?
+
+
+Regards
+Yin, Fengwei</pre>
+</details>
+<a href="https://lore.kernel.org/r/awavUsKX4XLRMbUq@U-V2QX163P-2032.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, requested change</div>
+</div>
 <div class="thread-children">
-<div class="thread-node depth-1" id="2026-11-25">
+<div class="thread-node depth-1">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Kiryl (Meta) (author)</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The author addressed YinFengwei&#x27;s concern that the patch may cause a deadlock when another CPU holds the sdei_lock at the end of smp_send_stop(). The author explained that if another CPU is stopped in the middle of signalling, it will never drop the lock, but if nobody holds the lock, there is nothing for it to keep out. The author stated that telling the two apart takes a trylock and on failure, they would go ahead without the lock anyway.
+
+The author is addressing a concern about the potential for a race condition when reading and writing to the pe-&gt;unmasked flag, specifically in the context of the notifier running with IRQs off. The author explains that no store can race with this load due to the IRQs being off, but acknowledges that other types of interrupts (stop or panic from an SDEI event or pseudo-NMI) could still interrupt it. No fix is planned.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">If another CPU holds it at this point, that CPU was stopped in the
+middle of signalling this one, and it will never drop the lock. The
+panic would hang on it.
+
+If nobody holds it, there is nothing for it to keep out. This runs at
+the end of smp_send_stop(), after the other CPUs have been stopped. A
+sender stopped after it took the lock has either counted its signal,
+which sdei_wait_in_flight() waits for, or never sent one.
+
+Telling the two apart takes a trylock, and on failure we would go ahead
+without the lock anyway.
+
+---
+
+No.
+
+We read the flag of this CPU, and only this CPU writes pe-&gt;unmasked.
+The notifier runs with IRQs off, so no store can race with this load.
+
+What can still interrupt it, a stop or a panic from an SDEI event or a
+pseudo-NMI, does not return here.
+
+READ_ONCE()/WRITE_ONCE() are for sdei_event_signal(), which reads the
+flag from another CPU.
+
+Left plain, KCSAN will report it if that ever changes. See item 5 under
+&quot;Use of Plain C-Language Accesses&quot; in
+tools/memory-model/Documentation/access-marking.txt.
+
+-- 
+  Kiryl Shutsemau / Kirill A. Shutemov</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to YinFengwei</div>
+<a href="https://lore.kernel.org/r/awblcOnI8JVhpmPK@shutemov.name" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation, acknowledged a potential issue</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-2" id="2026-11-25">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Jinjie Ruan</span>
-<a class="date-chip" href="../2026-11-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
 <span class="review-tag-badge">Tested-by</span>
 <span class="badge" style="color:#155724;background:#d4edda">Positive</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
@@ -329,6 +416,57 @@ Jinjie</pre>
 <div class="review-comment-signals">Signals: no lockups, no failures</div>
 </div>
 </div>
+<div class="thread-node depth-2" id="2026-11-26">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">YinFengwei</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-26">2026-11-26</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer noted that the patch does not handle the case where a panic occurs and sdei_block_signal() is called, which leads to a call to smp_send_stop(), and requested further explanation.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Ah. Yes. This is the key point. If it&#x27;s panic and trying to do
+sdei_block_siganl(), it&#x27;s in smp_send_stop() on panic path. Thanks a
+lot for detail explaination.
+
+Reviewed-by: Yin Fengwei &lt;fengwei_yin@linux.alibaba.com&gt;
+
+
+Regards
+Yin Fengwei</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl (Meta)</div>
+<a href="https://lore.kernel.org/r/aweC4_pzRjo9V0zz@U-V2QX163P-2032.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes, further explanation</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="thread-node depth-0">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">YinFengwei</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">reviewer noted that the patch does not handle the case where SDEI is masked and then unmasked on a CPU before sending the backtrace IPI</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Reviewed-by: Yin Fengwei &lt;fengwei_yin@linux.alibaba.com&gt;
+
+
+Regards
+Yin, Fengwei</pre>
+</details>
+<a href="https://lore.kernel.org/r/awavp9a_33NX7rtJ@U-V2QX163P-2032.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
 </div>
 </div>
 </div>

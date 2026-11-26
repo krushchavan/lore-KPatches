@@ -238,19 +238,147 @@
     <div class="home-link"><a href="../index.html">&larr; Back to reports</a></div>
     <h1>[PATCH 2/2] firmware: arm_sdei_nmi: Send the backtrace IPI to CPUs with SDEI masked</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261124194707.1030653-3-kas@kernel.org/" target="_blank">View on lore.kernel.org &rarr;</a></div>
-    <div class="date-range">Submitted: <strong>2026-11-24</strong><div class="date-range-nav">Active on: <a href="#2026-11-24">2026-11-24</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch series addresses an issue where CPUs with SDEI masked are not sending backtraces due to the regular IPI being blocked. The fix involves modifying the sdei_nmi_fire function to send an IPI to these CPUs instead, allowing them to participate in the backtrace process.</div></div>
+    <div class="date-range">Submitted: <strong>2026-11-24</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-25</strong><div class="date-range-nav">Active on: <a href="#2026-11-25">2026-11-25</a> &bull; <a href="#2026-11-24">2026-11-24</a></div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch modifies the SDEI (System Description Event Interface) NMI handler to send a backtrace IPI to CPUs that have SDEI masked, allowing them to be included in the backtrace even if they are in a power-down idle state or going offline. The patch also introduces a new function `arm64_backtrace_ipi` to send the regular backtrace IPI to a given mask of CPUs. This change fixes an issue where such CPUs were reported as not responding after 10 seconds.</div></div>
     <div class="thread-tree">
 <div class="thread-node depth-0" id="2026-11-24">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Kiryl Shutsemau (Meta)</span>
-<a class="date-chip" href="../2026-11-24_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-24">2026-11-24</a>
+<span class="review-author">Kiryl (Meta) (author)</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-24">2026-11-24</a>
 <span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">The patch series addresses an issue where CPUs with SDEI masked are not sending backtraces due to the regular IPI being blocked. The fix involves modifying the sdei_nmi_fire function to send an IPI to these CPUs instead, allowing them to participate in the backtrace process.</div>
-<div class="review-comment-signals">Signals: WAITING_FOR_REVIEW</div>
+<div class="review-comment-text">The author acknowledged that the patch needs to handle CPUs with SDEI masked by sending them a regular backtrace IPI, and explained how this is already implemented in the code.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">sdei_event_signal() refuses a CPU that has SDEI masked. An NMI
+backtrace then gets nothing from such a CPU and, after 10 seconds,
+reports it as not responding.
+
+The CPU is in a power-down idle state or going offline, and the regular
+backtrace IPI wakes it. Send that IPI to the CPUs SDEI refused; every
+other CPU still gets event 0.
+
+A stop needs nothing extra: smp_send_stop() has sent its IPIs before it
+signals SDEI, and a CPU still online after that is reported as not
+stopped.
+
+Fixes: 0c2c56598cc1 (&quot;drivers/firmware: add SDEI cross-CPU NMI service for arm64&quot;)
+Cc: stable@vger.kernel.org
+Signed-off-by: Kiryl Shutsemau (Meta) &lt;kas@kernel.org&gt;
+---
+ arch/arm64/include/asm/nmi.h    |  7 +++++++
+ arch/arm64/kernel/smp.c         |  2 +-
+ drivers/firmware/arm_sdei_nmi.c | 21 ++++++++++++++++++---
+ 3 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/include/asm/nmi.h b/arch/arm64/include/asm/nmi.h
+index 2e8974ff8d63..447d681a5475 100644
+--- a/arch/arm64/include/asm/nmi.h
++++ b/arch/arm64/include/asm/nmi.h
+@@ -45,4 +45,11 @@ static inline void sdei_nmi_stop_cpus(const cpumask_t *mask) { }
+  */
+ void __noreturn arm64_nmi_cpu_stop(struct pt_regs *regs, bool die_on_crash);
+ 
++/*
++ * Send the regular backtrace IPI (an NMI with pseudo-NMI) to @mask. The
++ * SDEI provider uses it for the CPUs it cannot signal. Defined in
++ * arch/arm64/kernel/smp.c.
++ */
++void arm64_backtrace_ipi(cpumask_t *mask);
++
+ #endif /* __ASM_NMI_H */
+diff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c
+index 014b163ce658..8369a4cd3e32 100644
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -946,7 +946,7 @@ static void arm64_send_ipi(const cpumask_t *mask, unsigned int nr)
+ 			__ipi_send_single(get_ipi_desc(cpu, nr), cpu);
+ }
+ 
+-static void arm64_backtrace_ipi(cpumask_t *mask)
++void arm64_backtrace_ipi(cpumask_t *mask)
+ {
+ 	arm64_send_ipi(mask, IPI_CPU_BACKTRACE);
+ }
+diff --git a/drivers/firmware/arm_sdei_nmi.c b/drivers/firmware/arm_sdei_nmi.c
+index edea68ef881e..b8ebb97caf18 100644
+--- a/drivers/firmware/arm_sdei_nmi.c
++++ b/drivers/firmware/arm_sdei_nmi.c
+@@ -124,7 +124,7 @@ static int sdei_nmi_handler(u32 event, struct pt_regs *regs, void *arg)
+ }
+ NOKPROBE_SYMBOL(sdei_nmi_handler);
+ 
+-static void sdei_nmi_fire(unsigned int target_cpu)
++static int sdei_nmi_fire(unsigned int target_cpu)
+ {
+ 	int err = sdei_event_signal(SDEI_NMI_EVENT, target_cpu);
+ 
+@@ -133,8 +133,13 @@ static void sdei_nmi_fire(unsigned int target_cpu)
+ 		pr_warn(&quot;SDEI_EVENT_SIGNAL to CPU %u failed: %d\n&quot;,
+ 			target_cpu, err);
+ 	}
++
++	return err;
+ }
+ 
++/* CPUs to IPI instead; nmi_trigger_cpumask_backtrace() serialises its users */
++static cpumask_t sdei_nmi_ipi_mask;
++
+ /*
+  * Raise callback for nmi_trigger_cpumask_backtrace(): signal event 0
+  * at every CPU still pending in @mask. The framework excludes the local
+@@ -151,8 +156,18 @@ static void sdei_nmi_raise_backtrace(cpumask_t *mask)
+ 	 */
+ 	dsb(ishst);
+ 
+-	for_each_cpu(cpu, mask)
+-		sdei_nmi_fire(cpu);
++	cpumask_clear(&amp;sdei_nmi_ipi_mask);
++	for_each_cpu(cpu, mask) {
++		if (sdei_nmi_fire(cpu) == -EAGAIN)
++			cpumask_set_cpu(cpu, &amp;sdei_nmi_ipi_mask);
++	}
++
++	/*
++	 * A CPU with SDEI masked is in a power-down idle state or going
++	 * offline. The IPI wakes it and it reports like any other.
++	 */
++	if (!cpumask_empty(&amp;sdei_nmi_ipi_mask))
++		arm64_backtrace_ipi(&amp;sdei_nmi_ipi_mask);
+ }
+ 
+ /*
+-- 
+2.54.0</pre>
+</details>
+<a href="https://lore.kernel.org/r/20261124194707.1030653-3-kas@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
+</div>
+<div class="thread-children">
+<div class="thread-node depth-1" id="2026-11-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">YinFengwei</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">The reviewer requested the Reviewed-by tag and did not provide any specific technical feedback or concerns.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">Reviewed-by: Yin Fengwei &lt;fengwei_yin@linux.alibaba.com&gt;
+
+
+Regards
+Yin, Fengwei</pre>
+</details>
+<div class="reply-to-label">&#8627; replying to Kiryl (Meta)</div>
+<a href="https://lore.kernel.org/r/awavp9a_33NX7rtJ@U-V2QX163P-2032.local" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+</div>
+</div>
 </div>
 </div>
 </div>

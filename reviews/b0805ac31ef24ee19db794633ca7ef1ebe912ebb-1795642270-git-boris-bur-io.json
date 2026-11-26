@@ -1,0 +1,41 @@
+{
+  "thread_id": "b0805ac31ef24ee19db794633ca7ef1ebe912ebb.1795642270.git.boris@bur.io",
+  "subject": "[PATCH 1/4] btrfs: scrub: release the commit root paths before pausing",
+  "url": "https://lore.kernel.org/all/b0805ac31ef24ee19db794633ca7ef1ebe912ebb.1795642270.git.boris@bur.io/",
+  "dates": {
+    "2026-11-26": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [
+        {
+          "author": "Qu Wenruo",
+          "summary": "Approved the patch with a Reviewed-by tag, indicating that it looks good to them and they're willing to vouch for its quality.",
+          "sentiment": "positive",
+          "sentiment_signals": [
+            "APPROVED"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "analysis_source": "llm",
+          "raw_body": "\n\n\\u5728 2026/11/26 08:04, Boris Burkov \\u5199\\u9053:\n> Since commit 1dc4888e725d (\"btrfs: scrub: avoid unnecessary extent tree\n> search preparing stripes\") scrub keeps sctx->extent_path and\n> sctx->csum_path across the stripes of a block group, so the paths are\n> also held across the implementation of scrub pause in scrub_simple_mirror()\n> and scrub_raid56_parity_stripe().\n> \n> Both use searches that set search_commit_root and skip_locking to true.\n> Meanwhile, the transaction critical section is exactly what issues a pause.\n> So if we populate sctx->extent_path/csum_path with nodes from a commit root,\n> then pause, then complete a commit critical section, those nodes refer\n> to the previous commit root, by construction.\n> \n> These nodes could have been cowed and thus unpinned by the conclusion\n> of the transaction. It is generally not safe to refer to nodes from old\n> commit roots.\n> \n> Therefore, we must drop these paths across pauses to ensure that after a\n> pause we do a new search in the current commit root. Otherwise we would\n> need to block the commit on the scrub which is obviously unacceptable.\n> \n> This issue becomes particularly nasty with dev-replace scrubs which can\n> then try to use an invalid reallocated eb to populate the new device.\n> \n> Fixes: 1dc4888e725d (\"btrfs: scrub: avoid unnecessary extent tree search preparing stripes\")\n> Signed-off-by: Boris Burkov <boris@bur.io>\n\nReviewed-by: Qu Wenruo <wqu@suse.com>\n\nThanks,\nQu\n\n> ---\n>   fs/btrfs/scrub.c | 24 ++++++++++++++++--------\n>   1 file changed, 16 insertions(+), 8 deletions(-)\n> \n> diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c\n> index c8da03e14094..1a721623813f 100644\n> --- a/fs/btrfs/scrub.c\n> +++ b/fs/btrfs/scrub.c\n> @@ -418,8 +418,16 @@ static void __scrub_blocked_if_needed(struct btrfs_fs_info *fs_info)\n>   \t}\n>   }\n>   \n> -static void scrub_pause_on(struct btrfs_fs_info *fs_info)\n> +static void scrub_pause_on(struct scrub_ctx *sctx)\n>   {\n> +\tstruct btrfs_fs_info *fs_info = sctx->fs_info;\n> +\n> +\t/*\n> +\t * These paths are populated from the commit root without using\n> +\t * commit_root_sem so they are not valid across pauses.\n> +\t */\n> +\tbtrfs_release_path(&sctx->extent_path);\n> +\tbtrfs_release_path(&sctx->csum_path);\n>   \tatomic_inc(&fs_info->scrubs_paused);\n>   \twake_up(&fs_info->scrub_pause_wait);\n>   }\n> @@ -434,10 +442,10 @@ static void scrub_pause_off(struct btrfs_fs_info *fs_info)\n>   \twake_up(&fs_info->scrub_pause_wait);\n>   }\n>   \n> -static void scrub_blocked_if_needed(struct btrfs_fs_info *fs_info)\n> +static void scrub_blocked_if_needed(struct scrub_ctx *sctx)\n>   {\n> -\tscrub_pause_on(fs_info);\n> -\tscrub_pause_off(fs_info);\n> +\tscrub_pause_on(sctx);\n> +\tscrub_pause_off(sctx->fs_info);\n>   }\n>   \n>   static noinline_for_stack void scrub_free_ctx(struct scrub_ctx *sctx)\n> @@ -2204,7 +2212,7 @@ static int scrub_raid56_parity_stripe(struct scrub_ctx *sctx,\n>   \t\treturn ret;\n>   \n>   \tif (atomic_read(&fs_info->scrub_pause_req))\n> -\t\tscrub_blocked_if_needed(fs_info);\n> +\t\tscrub_blocked_if_needed(sctx);\n>   \n>   \tspin_lock(&bg->lock);\n>   \tif (test_bit(BLOCK_GROUP_FLAG_REMOVED, &bg->runtime_flags)) {\n> @@ -2350,7 +2358,7 @@ static int scrub_simple_mirror(struct scrub_ctx *sctx,\n>   \t\t\tbreak;\n>   \n>   \t\tif (atomic_read(&fs_info->scrub_pause_req))\n> -\t\t\tscrub_blocked_if_needed(fs_info);\n> +\t\t\tscrub_blocked_if_needed(sctx);\n>   \n>   \t\tspin_lock(&bg->lock);\n>   \t\tif (test_bit(BLOCK_GROUP_FLAG_REMOVED, &bg->runtime_flags)) {\n> @@ -2492,7 +2500,7 @@ static noinline_for_stack int scrub_stripe(struct scrub_ctx *sctx,\n>   \t/* Extent_path should be released by now. */\n>   \tASSERT(sctx->extent_path.nodes[0] == NULL);\n>   \n> -\tscrub_blocked_if_needed(fs_info);\n> +\tscrub_blocked_if_needed(sctx);\n>   \n>   \tif (sctx->is_dev_replace &&\n>   \t    btrfs_dev_is_sequential(sctx->wr_tgtdev, physical)) {\n> @@ -2837,7 +2845,7 @@ int scrub_enumerate_chunks(struct scrub_ctx *sctx,\n>   \t\t * -> btrfs_commit_transaction()\n>   \t\t * -> btrfs_scrub_pause()\n>   \t\t */\n> -\t\tscrub_pause_on(fs_info);\n> +\t\tscrub_pause_on(sctx);\n>   \n>   \t\t/*\n>   \t\t * Don't do chunk preallocation for scrub.\n\n",
+          "reply_to": "Boris Burkov",
+          "message_date": "2026-11-26",
+          "message_id": "",
+          "email": "wqu@suse.com",
+          "is_maintainer": false
+        }
+      ],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series addresses a bug in the Btrfs scrub process where it fails to release commit root paths before pausing, leading to potential issues with dev-replace scrubs. The fix involves releasing these paths across pauses to ensure that after a pause, a new search is done in the current commit root."
+    },
+    "2026-11-25": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Boris Burkov",
+      "reviews": [],
+      "analysis_source": "llm",
+      "patch_summary": "This patch series addresses a bug in the Btrfs scrub process where it fails to release commit root paths before pausing, leading to potential issues with dev-replace scrubs. The fix involves releasing these paths across pauses to ensure that after a pause, a new search is done in the current commit root."
+    }
+  }
+}

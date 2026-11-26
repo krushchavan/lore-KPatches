@@ -4,27 +4,99 @@
   "url": "https://lore.kernel.org/all/20261124194707.1030653-2-kas@kernel.org/",
   "dates": {
     "2026-11-24": {
-      "report_file": "2026-11-24_ollama_llama3.1-8b.html",
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
       "developer": "Kiryl Shutsemau",
       "reviews": [
         {
-          "author": "Kiryl Shutsemau (Meta)",
-          "summary": "The patch series addresses a critical issue with SDEI NMI backtrace signals and masked PEs. The fix involves modifying sdei_event_signal() to only signal a PE if it's unmasked and adding checks for masked PEs in the cpu_pm notifier.",
+          "author": "Kiryl (Meta) (author)",
+          "summary": "The author is addressing a concern about the implementation of sdei_event_signal() and how it handles event 0 signals to masked PEs. They explain that senders signal a PE only under its lock, and if the PE is masked, they wait for any pending signals to arrive before masking. The author also provides code changes to implement this behavior.",
           "sentiment": "NEUTRAL",
           "sentiment_signals": [
-            "no clear signals"
+            "clarification",
+            "explanation"
           ],
           "has_inline_review": false,
           "tags_given": [],
-          "raw_body": "",
+          "raw_body": "The SDEI NMI backtrace signals event 0 to every other CPU, idle ones\nincluded. The kernel masks SDEI on a PE around power-down idle states,\non its way offline and when it stops.\n\nTF-A raises event 0 with an SGI. On a masked PE it acknowledges the SGI\nand never ends it; the event should stay pending until SDEI_PE_UNMASK.\nTF-A v2.13 and later refuse to signal a masked PE, but a target that masks\njust after the check still takes the SGI. A fix is under review [1].\n\nThe PE keeps running at the SDEI priority and takes no Non-secure\ninterrupt again, even after SDEI_PE_UNMASK. Other CPUs hang in\ncsd_lock_wait() on their next cross-call to it. One sysrq-l locked up a\n384-CPU machine.\n\nKeep event 0 away from masked PEs. Each PE gets a lock, an unmasked flag\nand a count of signals raised at it. sdei_event_signal() signals a PE\nonly under its lock with the flag set, and returns -EAGAIN otherwise.\nBefore it masks, a PE clears the flag under the lock and waits for the\nsignals already raised to arrive, which SDEI delivers whatever the PE's\ninterrupt masks. The wait is limited to a millisecond: a signal raised\nwhile another is pending merges into it, and the count never drains.\n\nSenders can run from an SDEI event or a pseudo-NMI, so they only try the\nlock. A panicking CPU skips it, as a panic from such a context may have\nleft it held by that CPU.\n\nThe cpu_pm notifier also runs on a PE that is masked already: before\nsdei_cpuhp_up(), and between sdei_cpuhp_down() and CPU_OFF. Make it\nunmask only what it masked itself, or the PE comes back from CPU_OFF\nmasked while the kernel takes it as unmasked.\n\nsdei_event_signal() now takes a logical CPU number.\n\n[1] https://review.trustedfirmware.org/c/TF-A/trusted-firmware-a/+/55414\n\nFixes: 9141eda9eec7 (\"firmware: arm_sdei: add SDEI_EVENT_SIGNAL support\")\nCc: stable@vger.kernel.org\nReported-by: Jinjie Ruan <ruanjinjie@huawei.com>\nCloses: https://lore.kernel.org/r/17149b32-6b9c-4364-b664-5789f0633e9d@huawei.com\nSigned-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>\n---\n drivers/firmware/arm_sdei.c     | 130 ++++++++++++++++++++++++++++++--\n drivers/firmware/arm_sdei_nmi.c |   9 ++-\n include/linux/arm_sdei.h        |   4 +-\n 3 files changed, 131 insertions(+), 12 deletions(-)\n\ndiff --git a/drivers/firmware/arm_sdei.c b/drivers/firmware/arm_sdei.c\nindex e8dd2f0f3919..47f36efdc04e 100644\n--- a/drivers/firmware/arm_sdei.c\n+++ b/drivers/firmware/arm_sdei.c\n@@ -12,6 +12,7 @@\n #include <linux/cpuhotplug.h>\n #include <linux/cpu.h>\n #include <linux/cpu_pm.h>\n+#include <linux/delay.h>\n #include <linux/errno.h>\n #include <linux/hardirq.h>\n #include <linux/kernel.h>\n@@ -32,6 +33,8 @@\n #include <linux/smp.h>\n #include <linux/spinlock.h>\n \n+#include <asm/smp_plat.h>\n+\n /*\n  * The call to use to reach the firmware.\n  */\n@@ -299,10 +302,78 @@ static int sdei_api_get_version(u64 *version)\n \treturn invoke_sdei_fn(SDEI_1_0_FN_SDEI_VERSION, 0, 0, 0, 0, 0, version);\n }\n \n+/*\n+ * Event 0 must not reach a PE that has SDEI masked. Firmware may\n+ * acknowledge the SGI behind it and never end it, and the PE then takes\n+ * no Non-secure interrupt at all.\n+ *\n+ * A sender signals a PE only with the PE's lock held, and only if the PE\n+ * is unmasked. The PE takes its lock to mark itself masked: no sender gets\n+ * through after that, and a sender that got through before has counted\n+ * its signal in @raised and raised it. The PE lets its signals arrive\n+ * before it masks: each event 0 takes one off @raised. @pm_masked records\n+ * what the cpu_pm notifier masked.\n+ */\n+struct sdei_pe {\n+\traw_spinlock_t\tlock;\n+\tatomic_t\traised;\n+\tbool\t\tunmasked;\n+\tbool\t\tpm_masked;\n+};\n+\n+static DEFINE_PER_CPU(struct sdei_pe, sdei_pe) = {\n+\t.lock = __RAW_SPIN_LOCK_UNLOCKED(sdei_pe.lock),\n+};\n+\n+/* Wait for event 0 signals in flight to this PE to arrive */\n+static void sdei_wait_in_flight(struct sdei_pe *pe)\n+{\n+\tint i;\n+\n+\t/* Bounded: a signal that never arrives must not hold up masking */\n+\tfor (i = 0; i < USEC_PER_MSEC && atomic_read(&pe->raised) > 0; i++)\n+\t\tudelay(1);\n+\n+\tif (atomic_read(&pe->raised) > 0) {\n+\t\tpr_warn_once(\"event 0 to CPU[%u] did not arrive within 1ms\\n\",\n+\t\t\t     smp_processor_id());\n+\t}\n+\n+\t/*\n+\t * A signal raised while an earlier one is still pending merges into\n+\t * it, and the count stays high with nothing on its way: drop it. A\n+\t * signal that arrives after this finds the count at zero and leaves it.\n+\t */\n+\tatomic_set(&pe->raised, 0);\n+}\n+\n+/* Stop event 0 signals to this PE, waiting for the senders under the lock */\n+static void sdei_block_signal(void)\n+{\n+\tstruct sdei_pe *pe = this_cpu_ptr(&sdei_pe);\n+\tunsigned long flags;\n+\n+\t/*\n+\t * A panic from an SDEI event or a pseudo-NMI may have left the lock\n+\t * held by this CPU. The CPUs that could signal it are stopped by now.\n+\t */\n+\tif (panic_on_this_cpu()) {\n+\t\tWRITE_ONCE(pe->unmasked, false);\n+\t} else {\n+\t\traw_spin_lock_irqsave(&pe->lock, flags);\n+\t\tWRITE_ONCE(pe->unmasked, false);\n+\t\traw_spin_unlock_irqrestore(&pe->lock, flags);\n+\t}\n+\n+\tsdei_wait_in_flight(pe);\n+}\n+\n int sdei_mask_local_cpu(void)\n {\n \tint err;\n \n+\tsdei_block_signal();\n+\n \terr = invoke_sdei_fn(SDEI_1_0_FN_SDEI_PE_MASK, 0, 0, 0, 0, 0, NULL);\n \tif (err && err != -EIO) {\n \t\tpr_warn_once(\"failed to mask CPU[%u]: %d\\n\",\n@@ -330,6 +401,8 @@ int sdei_unmask_local_cpu(void)\n \t\treturn err;\n \t}\n \n+\t/* No lock: a sender that misses this only refuses an unmasked PE */\n+\tWRITE_ONCE(this_cpu_ptr(&sdei_pe)->unmasked, true);\n \treturn 0;\n }\n \n@@ -340,14 +413,34 @@ static void _ipi_unmask_cpu(void *ignored)\n }\n \n /*\n- * Signal the software-signalled event (event 0) to @mpidr. Does nothing\n- * but the SMC -- no locks, no event lookup -- so it is safe from NMI /\n- * crash context (e.g. the cross-CPU NMI service).\n+ * Signal the software-signalled event (event 0) to @cpu. It waits for no\n+ * lock and looks up no event, so it is safe from NMI / crash context (e.g.\n+ * the cross-CPU NMI service).\n+ *\n+ * Returns -EAGAIN without signalling if @cpu has SDEI masked or is masking.\n  */\n-int sdei_event_signal(u32 event_num, u64 mpidr)\n+int sdei_event_signal(u32 event_num, unsigned int cpu)\n {\n-\treturn invoke_sdei_fn(SDEI_1_0_FN_SDEI_EVENT_SIGNAL, event_num,\n-\t\t\t      mpidr, 0, 0, 0, NULL);\n+\tstruct sdei_pe *pe = per_cpu_ptr(&sdei_pe, cpu);\n+\tu64 mpidr = cpu_logical_map(cpu);\n+\tunsigned long flags;\n+\tint err = -EAGAIN;\n+\n+\t/* IRQs off: the PE may be waiting for the lock to mask */\n+\tif (!raw_spin_trylock_irqsave(&pe->lock, flags))\n+\t\treturn -EAGAIN;\n+\n+\tif (READ_ONCE(pe->unmasked)) {\n+\t\tatomic_inc(&pe->raised);\n+\t\terr = invoke_sdei_fn(SDEI_1_0_FN_SDEI_EVENT_SIGNAL, event_num,\n+\t\t\t\t     mpidr, 0, 0, 0, NULL);\n+\t\t/* A late signal may have taken this count already */\n+\t\tif (err)\n+\t\t\tatomic_dec_if_positive(&pe->raised);\n+\t}\n+\n+\traw_spin_unlock_irqrestore(&pe->lock, flags);\n+\treturn err;\n }\n NOKPROBE_SYMBOL(sdei_event_signal);\n \n@@ -680,6 +773,9 @@ static int sdei_cpuhp_down(unsigned int cpu)\n \tstruct sdei_event *event;\n \tint err;\n \n+\t/* A signal must arrive while event 0 is still registered here */\n+\tsdei_block_signal();\n+\n \t/* un-register private events */\n \tspin_lock(&sdei_list_lock);\n \tlist_for_each_entry(event, &sdei_list, list) {\n@@ -733,16 +829,30 @@ static int sdei_cpuhp_up(unsigned int cpu)\n static int sdei_pm_notifier(struct notifier_block *nb, unsigned long action,\n \t\t\t    void *data)\n {\n+\tstruct sdei_pe *pe = this_cpu_ptr(&sdei_pe);\n \tint rv;\n \n \tWARN_ON_ONCE(preemptible());\n \n \tswitch (action) {\n \tcase CPU_PM_ENTER:\n+\t\t/*\n+\t\t * Leave alone a PE that is masked already: before\n+\t\t * sdei_cpuhp_up(), or after sdei_cpuhp_down(), as cpuidle runs\n+\t\t * until CPU_OFF. CPU_PM_EXIT must not unmask it.\n+\t\t */\n+\t\tif (!pe->unmasked)\n+\t\t\treturn NOTIFY_DONE;\n \t\trv = sdei_mask_local_cpu();\n+\t\tif (!rv)\n+\t\t\tpe->pm_masked = true;\n \t\tbreak;\n \tcase CPU_PM_EXIT:\n \tcase CPU_PM_ENTER_FAILED:\n+\t\t/* Unmask only what CPU_PM_ENTER masked */\n+\t\tif (!pe->pm_masked)\n+\t\t\treturn NOTIFY_DONE;\n+\t\tpe->pm_masked = false;\n \t\trv = sdei_unmask_local_cpu();\n \t\tbreak;\n \tdefault:\n@@ -1114,6 +1224,14 @@ int sdei_event_handler(struct pt_regs *regs,\n \tint err;\n \tu32 event_num = arg->event_num;\n \n+\t/*\n+\t * One signal raised at this PE has arrived. If the PE gave up waiting\n+\t * for it and dropped the count, leave the count at zero: below zero,\n+\t * the PE would not wait for the next signal raised here.\n+\t */\n+\tif (!event_num)\n+\t\tatomic_dec_if_positive(&this_cpu_ptr(&sdei_pe)->raised);\n+\n \terr = arg->callback(event_num, regs, arg->callback_arg);\n \tif (err)\n \t\tpr_err_ratelimited(\"event %u on CPU %u failed with error: %d\\n\",\ndiff --git a/drivers/firmware/arm_sdei_nmi.c b/drivers/firmware/arm_sdei_nmi.c\nindex 038eb79e28ac..edea68ef881e 100644\n--- a/drivers/firmware/arm_sdei_nmi.c\n+++ b/drivers/firmware/arm_sdei_nmi.c\n@@ -36,7 +36,7 @@\n  *\n  * Delivery uses the standard SDEI software-signalled event (event 0) and\n  * SDEI_EVENT_SIGNAL. We register a handler for event 0, enable it, and\n- * poke a target CPU with sdei_event_signal(0, mpidr): firmware makes\n+ * poke a target CPU with sdei_event_signal(0, cpu): firmware makes\n  * event 0 pending on that PE and dispatches the handler NMI-like,\n  * regardless of the target's DAIF.\n  * Availability is simply whether event 0 registers and enables -- if SDEI\n@@ -58,7 +58,6 @@\n #include <linux/types.h>\n \n #include <asm/nmi.h>\n-#include <asm/smp_plat.h>\n \n static bool sdei_nmi_available;\n \n@@ -127,11 +126,13 @@ NOKPROBE_SYMBOL(sdei_nmi_handler);\n \n static void sdei_nmi_fire(unsigned int target_cpu)\n {\n-\tint err = sdei_event_signal(SDEI_NMI_EVENT, cpu_logical_map(target_cpu));\n+\tint err = sdei_event_signal(SDEI_NMI_EVENT, target_cpu);\n \n-\tif (err)\n+\t/* -EAGAIN: the CPU has SDEI masked and is not signalled */\n+\tif (err && err != -EAGAIN) {\n \t\tpr_warn(\"SDEI_EVENT_SIGNAL to CPU %u failed: %d\\n\",\n \t\t\ttarget_cpu, err);\n+\t}\n }\n \n /*\ndiff --git a/include/linux/arm_sdei.h b/include/linux/arm_sdei.h\nindex b9dc21c241be..a63ab4774783 100644\n--- a/include/linux/arm_sdei.h\n+++ b/include/linux/arm_sdei.h\n@@ -39,9 +39,9 @@ int sdei_event_disable(u32 event_num);\n \n /*\n  * Signal the software-signalled event (event 0) to another PE, NMI-like.\n- * @mpidr is the target's MPIDR affinity.\n+ * Returns -EAGAIN if @cpu has SDEI masked.\n  */\n-int sdei_event_signal(u32 event_num, u64 mpidr);\n+int sdei_event_signal(u32 event_num, unsigned int cpu);\n \n /* Was SDEI firmware probed and usable? */\n bool sdei_is_present(void);\n-- \n2.54.0",
           "reply_to": "",
-          "message_date": "",
-          "message_id": "",
+          "message_date": "2026-11-24",
+          "message_id": "20261124194707.1030653-2-kas@kernel.org",
           "analysis_source": "llm"
         }
       ],
-      "analysis_source": "llm",
-      "patch_summary": "This patch series addresses an issue where the SDEI NMI backtrace signals event 0 to all CPUs, including idle ones, when a PE is masked. The fix involves modifying sdei_event_signal() to only signal a PE if it's unmasked and adding checks for masked PEs in the cpu_pm notifier."
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch prevents event 0 from being signaled to a masked Performance Extension (PE) in the ARM SDEI firmware driver. When a PE is masked, it should not receive event 0 signals, which can cause other CPUs to hang. The patch introduces a lock and flag system to ensure that event 0 is only signaled to unmasked PEs. It also updates the cpu_pm notifier to correctly handle masking and unmasking of PEs. This fix addresses issues with CPU hangs and panics caused by event 0 signals being sent to masked PEs."
+    },
+    "2026-11-25": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "YinFengwei",
+          "summary": "Reviewer YinFengwei pointed out that the patch does not handle the case where a PE is masked due to SDEI_PE_MASKED, and suggested adding a check for this condition in sdei_event_signal()\n\nThe reviewer questioned whether the lock should be taken in a specific scenario where the panic did not acquire the lock, suggesting that it should be handled similarly to the 'else' path.\n\nReviewer YinFengwei questioned the use of a specific read operation in the patch and suggested replacing it with READ_ONCE() to ensure memory ordering",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "requested changes",
+            "lock ordering",
+            "panic handling",
+            "suggested improvement",
+            "memory ordering concern"
+          ],
+          "has_inline_review": true,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Hi Kirill,\n\nOn Tue, Nov 24, 2026 at 07:47:04PM +0000, Kiryl Shutsemau (Meta) wrote:\n\n---\n\nIf the panic didn't take the lock, should lock be taken\njust like \"else\" path?\n\n---\n\nI am wondering whether READ_ONCE() should be used here?\n\n\nRegards\nYin, Fengwei",
+          "reply_to": "Kiryl (Meta)",
+          "message_date": "2026-11-25",
+          "message_id": "awavUsKX4XLRMbUq@U-V2QX163P-2032.local",
+          "analysis_source": "llm"
+        },
+        {
+          "author": "Kiryl (Meta) (author)",
+          "summary": "The author addressed YinFengwei's concern that sdei_event_signal() could hang if another CPU holds the lock when it tries to signal a masked PE, explaining that in this scenario the other CPU was stopped and would never drop the lock. The author concluded that there is no need for a trylock because the sender has either counted its signal or never sent one.\n\nAuthor responded to feedback about the potential for a race condition between loading and storing the unmasked flag, explaining that the notifier runs with IRQs off and only this CPU writes the flag, making it safe.",
+          "sentiment": "NEUTRAL",
+          "sentiment_signals": [
+            "acknowledged a concern",
+            "provided explanation"
+          ],
+          "has_inline_review": false,
+          "tags_given": [],
+          "raw_body": "If another CPU holds it at this point, that CPU was stopped in the\nmiddle of signalling this one, and it will never drop the lock. The\npanic would hang on it.\n\nIf nobody holds it, there is nothing for it to keep out. This runs at\nthe end of smp_send_stop(), after the other CPUs have been stopped. A\nsender stopped after it took the lock has either counted its signal,\nwhich sdei_wait_in_flight() waits for, or never sent one.\n\nTelling the two apart takes a trylock, and on failure we would go ahead\nwithout the lock anyway.\n\n---\n\nNo.\n\nWe read the flag of this CPU, and only this CPU writes pe->unmasked.\nThe notifier runs with IRQs off, so no store can race with this load.\n\nWhat can still interrupt it, a stop or a panic from an SDEI event or a\npseudo-NMI, does not return here.\n\nREAD_ONCE()/WRITE_ONCE() are for sdei_event_signal(), which reads the\nflag from another CPU.\n\nLeft plain, KCSAN will report it if that ever changes. See item 5 under\n\"Use of Plain C-Language Accesses\" in\ntools/memory-model/Documentation/access-marking.txt.\n\n-- \n  Kiryl Shutsemau / Kirill A. Shutemov",
+          "reply_to": "YinFengwei",
+          "message_date": "2026-11-25",
+          "message_id": "awblcOnI8JVhpmPK@shutemov.name",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch prevents event 0 from being signaled to a masked Performance Extension (PE) in the ARM SDEI firmware driver. When a PE is masked, it should not receive event 0 signals, which can cause other CPUs to hang. The patch introduces a lock and flag system to ensure that event 0 is only signaled to unmasked PEs. It also updates the cpu_pm notifier to correctly handle masking and unmasking of PEs. This fix addresses issues with CPU hangs and panics caused by event 0 signals being sent to masked PEs."
+    },
+    "2026-11-26": {
+      "report_file": "2026-11-25_ollama_llama3.1-8b.html",
+      "developer": "Kiryl Shutsemau",
+      "reviews": [
+        {
+          "author": "YinFengwei",
+          "summary": "The reviewer noted that the patch does not handle the case where a CPU is panicking and trying to send an SDEI signal, which can lead to unexpected behavior.",
+          "sentiment": "NEEDS_WORK",
+          "sentiment_signals": [
+            "lock ordering issue",
+            "panic path"
+          ],
+          "has_inline_review": false,
+          "tags_given": [
+            "Reviewed-by"
+          ],
+          "raw_body": "Ah. Yes. This is the key point. If it's panic and trying to do\nsdei_block_siganl(), it's in smp_send_stop() on panic path. Thanks a\nlot for detail explaination.\n\nReviewed-by: Yin Fengwei <fengwei_yin@linux.alibaba.com>\n\n\nRegards\nYin Fengwei",
+          "reply_to": "Kiryl (Meta)",
+          "message_date": "2026-11-26",
+          "message_id": "aweC4_pzRjo9V0zz@U-V2QX163P-2032.local",
+          "analysis_source": "llm"
+        }
+      ],
+      "analysis_source": "llm-per-reviewer",
+      "patch_summary": "This patch prevents event 0 from being signaled to a masked Performance Extension (PE) in the ARM SDEI firmware driver. When a PE is masked, it should not receive event 0 signals, which can cause other CPUs to hang. The patch introduces a lock and flag system to ensure that event 0 is only signaled to unmasked PEs. It also updates the cpu_pm notifier to correctly handle masking and unmasking of PEs. This fix addresses issues with CPU hangs and panics caused by event 0 signals being sent to masked PEs."
     }
   }
 }
