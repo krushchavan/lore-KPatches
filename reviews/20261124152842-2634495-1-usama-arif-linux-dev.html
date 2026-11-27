@@ -239,28 +239,716 @@
     <h1>[PATCH] KVM: arm64: Reduce the stage-2 page cache on 64 KiB hosts</h1>
     <div class="lore-link"><a href="https://lore.kernel.org/all/20261124152842.2634495-1-usama.arif@linux.dev/" target="_blank">View on lore.kernel.org &rarr;</a></div>
     <div class="date-range">Submitted: <strong>2026-11-25</strong>&nbsp;&nbsp;&middot;&nbsp;&nbsp;Last comment: <strong>2026-11-26</strong><div class="date-range-nav">Active on: <a href="#2026-11-26">2026-11-26</a> &bull; <a href="#2026-11-25">2026-11-25</a></div></div>
-    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch reduces the size of the stage-2 page cache on arm64 hosts with 64 KiB pages, which can be quite large and wasteful. The current implementation tops up the cache to 40 pages, but this is not necessary for most use cases. By sizing the cache to only cover the deepest walk in the page table hierarchy, the patch reduces memory usage by at least 768 MiB on a production host running 101 VMs with four vCPUs each. The change also makes the code more generic and easier to maintain by moving level definitions to a common header file.</div></div>
+    <div class="patch-summary-block"><div class="patch-summary-label">Patch summary</div><div class="patch-summary-text">This patch reduces the stage-2 page cache on arm64 hosts, specifically for 64 KiB pages, to improve memory efficiency and performance in virtualized environments. The current implementation allocates a large number of pages ahead of time, which can lead to significant memory waste. The patch introduces a new capacity calculation that takes into account the largest minimum page size required by the stage-2 MMU, resulting in a reduction of up to 89% of kernel memory charged to virtual machine cgroups. This change is motivated by the need to optimize memory usage for large-scale virtualization workloads and aligns with industry recommendations for arm64 hosts.</div></div>
     <div class="thread-tree">
+<div class="thread-node depth-0" id="2026-11-25">
+<div class="review-comment">
+<div class="review-comment-header">
+<span class="review-author">Leonardo Bras</span>
+<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
+</div>
+<div class="review-comment-text">Reviewer Leonardo Bras asked if the issue of high memory usage by vCPU page caches on 64 KiB hosts had been reproduced in newer kernel versions, specifically v7.4-rc1 or later, and suggested that a change introduced by Lorenzo Stoakes might improve the situation.</div>
+<details class="raw-body-toggle">
+<summary>Show original comment</summary>
+<pre class="raw-body-text">On Tue, Nov 24, 2026 at 07:28:42AM -0800, Usama Arif wrote:
+&gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt; vCPU&#x27;s page cache: if it holds fewer pages than the fault might need, it
+&gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt; 40. Unused pages stay in the cache until the vCPU is destroyed.
+&gt; 
+&gt; With 64 KiB pages, that is 2.5 MiB per vCPU, and most of it is never
+&gt; used. Stage-2 has at most three levels and the root is preallocated, so
+&gt; a fault needs at most two new table pages (kvm_mmu_cache_min_pages()).
+&gt; As every last-level table covers 512 MiB, an 8 GiB guest needs just 17
+&gt; table pages to map all of its memory, while its four vCPU caches get
+&gt; filled with 160.
+&gt; 
+&gt; On a production host with 64 KiB pages running 101 VMs with four vCPUs
+&gt; each, the caches were still 86% full. The memory used:
+&gt; 
+&gt;                         before      after
+&gt;   per-vCPU capacity     2.5 MB     512 KB
+&gt;   all 404 vCPUs         869 MB     &lt;= 202 MB
+&gt; 
+&gt; Let&#x27;s lower the capacity to 8 with 64 KiB pages, In the production
+&gt; usecase above, it frees at least 667 MB. That still covers the two-page
+&gt; minimum and leaves room for several table allocations per refill. 4 KB
+&gt; and 16 KB pages keep 40.
+&gt; 
+&gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt; but it is topped up before every page it maps, so 8 is sufficient there
+&gt; as well. The pKVM hypervisor memcache and the eager split cache don&#x27;t
+&gt; use this capacity.
+&gt; 
+&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; ---
+&gt;  arch/arm64/include/asm/kvm_types.h | 5 +++++
+&gt;  1 file changed, 5 insertions(+)
+&gt; 
+&gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt; index 9a126b9e2d7c99..28568da9ea4a7b 100644
+&gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt; @@ -2,7 +2,12 @@
+&gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt;  
+&gt; +/* Must cover kvm_mmu_cache_min_pages(), at most 2 with 64 KiB pages. */
+&gt; +#ifdef CONFIG_ARM64_64K_PAGES
+&gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 8
+&gt; +#else
+&gt;  #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt; +#endif
+&gt;  
+&gt;  #endif /* _ASM_ARM64_KVM_TYPES_H */
+&gt;  
+&gt; -- 
+&gt; 2.53.1-Meta
+&gt; 
+
+Hi Usama,
+
+Have you tried to reproduce this issue in v7.4-rc1 or newer?
+
+IIUC Lorenzo Stoakes introduced a change that would cause the memcache to 
+skip topup if the cache contains a minimum of ~4 pages, so it can possibly 
+improve that issue.
+
+Although I can see that when it&#x27;s below that minimum it fills the whole 
+capacity (40) of the cache.
+
+In any case, Lorenzo, could you advise?
+
+CC:Lorenzo Stoakes (ARM) (ljs@kernel.org) 
+
+Thanks,
+Leo
+
+---
+
+On Wed, Nov 25, 2026 at 05:55:29PM +0000, Usama Arif wrote:
+&gt; 
+&gt; 
+&gt; On 25/11/2026 09:14, Leonardo Bras wrote:
+&gt; &gt; On Tue, Nov 24, 2026 at 07:28:42AM -0800, Usama Arif wrote:
+&gt; &gt;&gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt; &gt;&gt; vCPU&#x27;s page cache: if it holds fewer pages than the fault might need, it
+&gt; &gt;&gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt; &gt;&gt; 40. Unused pages stay in the cache until the vCPU is destroyed.
+&gt; &gt;&gt;
+&gt; &gt;&gt; With 64 KiB pages, that is 2.5 MiB per vCPU, and most of it is never
+&gt; &gt;&gt; used. Stage-2 has at most three levels and the root is preallocated, so
+&gt; &gt;&gt; a fault needs at most two new table pages (kvm_mmu_cache_min_pages()).
+&gt; &gt;&gt; As every last-level table covers 512 MiB, an 8 GiB guest needs just 17
+&gt; &gt;&gt; table pages to map all of its memory, while its four vCPU caches get
+&gt; &gt;&gt; filled with 160.
+&gt; &gt;&gt;
+&gt; &gt;&gt; On a production host with 64 KiB pages running 101 VMs with four vCPUs
+&gt; &gt;&gt; each, the caches were still 86% full. The memory used:
+&gt; &gt;&gt;
+&gt; &gt;&gt;                         before      after
+&gt; &gt;&gt;   per-vCPU capacity     2.5 MB     512 KB
+&gt; &gt;&gt;   all 404 vCPUs         869 MB     &lt;= 202 MB
+&gt; &gt;&gt;
+&gt; &gt;&gt; Let&#x27;s lower the capacity to 8 with 64 KiB pages, In the production
+&gt; &gt;&gt; usecase above, it frees at least 667 MB. That still covers the two-page
+&gt; &gt;&gt; minimum and leaves room for several table allocations per refill. 4 KB
+&gt; &gt;&gt; and 16 KB pages keep 40.
+&gt; &gt;&gt;
+&gt; &gt;&gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt; &gt;&gt; but it is topped up before every page it maps, so 8 is sufficient there
+&gt; &gt;&gt; as well. The pKVM hypervisor memcache and the eager split cache don&#x27;t
+&gt; &gt;&gt; use this capacity.
+&gt; &gt;&gt;
+&gt; &gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; &gt;&gt; ---
+&gt; &gt;&gt;  arch/arm64/include/asm/kvm_types.h | 5 +++++
+&gt; &gt;&gt;  1 file changed, 5 insertions(+)
+&gt; &gt;&gt;
+&gt; &gt;&gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt; &gt;&gt; index 9a126b9e2d7c99..28568da9ea4a7b 100644
+&gt; &gt;&gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt; &gt;&gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt; &gt;&gt; @@ -2,7 +2,12 @@
+&gt; &gt;&gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt; &gt;&gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt; &gt;&gt;  
+&gt; &gt;&gt; +/* Must cover kvm_mmu_cache_min_pages(), at most 2 with 64 KiB pages. */
+&gt; &gt;&gt; +#ifdef CONFIG_ARM64_64K_PAGES
+&gt; &gt;&gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 8
+&gt; &gt;&gt; +#else
+&gt; &gt;&gt;  #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt; &gt;&gt; +#endif
+&gt; &gt;&gt;  
+&gt; &gt;&gt;  #endif /* _ASM_ARM64_KVM_TYPES_H */
+&gt; &gt;&gt;  
+&gt; &gt;&gt; -- 
+&gt; &gt;&gt; 2.53.1-Meta
+&gt; &gt;&gt;
+&gt; &gt; 
+&gt; &gt; Hi Usama,
+&gt; &gt; 
+&gt; 
+&gt; Hello Leonardo,
+&gt; 
+&gt; &gt; Have you tried to reproduce this issue in v7.4-rc1 or newer?
+&gt; 
+&gt; Yes. The patch is against kvmarm/next (v7.4-rc3), which includes
+&gt; Lorenzo&#x27;s pre-fault series, and I A/B tested it there.
+&gt; 
+&gt; On unpatched v7.4-rc3 with 64 KiB pages, a VM whose 16 vCPUs each fault
+&gt; in one page needs a single stage-2 table page, yet the vCPU caches hold
+&gt; 640 pages (40 MiB). With the patch they hold 127 pages.
+&gt; 
+&gt; &gt; 
+&gt; &gt; IIUC Lorenzo Stoakes introduced a change that would cause the memcache to 
+&gt; &gt; skip topup if the cache contains a minimum of ~4 pages, so it can possibly 
+&gt; &gt; improve that issue.
+&gt; 
+&gt; I don&#x27;t think that part is new. __kvm_mmu_topup_memory_cache() has
+&gt; returned early when mc-&gt;nobjs &gt;= min since commit 6926f95accee (&quot;KVM:
+&gt; Move x86&#x27;s MMU memory cache helpers to common KVM code&quot;). Lorenzo&#x27;s
+&gt; commit d27acc152c62 (&quot;KVM: arm64: Size the stage-2 memcache from the
+&gt; fault MMU&quot;) takes min from s2fd-&gt;mmu instead of vcpu-&gt;arch.hw_mmu. For a
+&gt; guest abort that is the same MMU, so nothing changes here.
+&gt; 
+&gt; With 64 KiB pages, min is kvm_mmu_cache_min_pages(), which is at most 2.
+&gt; 
+&gt; &gt; 
+&gt; &gt; Although I can see that when it&#x27;s below that minimum it fills the whole 
+&gt; &gt; capacity (40) of the cache.
+&gt; &gt; 
+&gt; 
+&gt; Right, and that is the problem. Skipping the top-up avoids refilling
+&gt; the cache, but nothing ever drains it. A vCPU&#x27;s first fault fills its
+&gt; cache to 40. Each last-level table covers 512 MiB, so a guest needs very
+&gt; few table pages, and most vCPUs never drop below min. The remaining
+&gt; pages stay allocated until the vCPU is destroyed, which is why the
+&gt; production caches were still 86% full.
+&gt; 
+&gt; The patch keeps the early return and only lowers how far a refill goes.
+
+Right,
+
+I took a look in the cache workings, and it does not seem to receive freed 
+pages back in. It gets filled by topup and used by map, so IIUC it is used 
+only to avoid failing an allocation during the mapping walk.
+
+Maybe it could be the case to simplify this cache to have the capacity 
+about the same as the minimum (since it always topup before mapping) and 
+avoid the waste altogether.
+
+Maymbe having something like this should be enough?
+ 
+#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE (KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)
+
+Thanks!
+Leo
+
+---
+
+On Thu, Nov 26, 2026 at 08:06:41AM +0000, Wei-Lin Chang wrote:
+&gt; On Wed, Nov 25, 2026 at 09:42:33PM +0000, Usama Arif wrote:
+&gt; &gt; 
+&gt; &gt; 
+&gt; &gt; On 25/11/2026 10:25, Leonardo Bras wrote:
+&gt; &gt; &gt; On Wed, Nov 25, 2026 at 05:55:29PM +0000, Usama Arif wrote:
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; On 25/11/2026 09:14, Leonardo Bras wrote:
+&gt; &gt; &gt;&gt;&gt; On Tue, Nov 24, 2026 at 07:28:42AM -0800, Usama Arif wrote:
+&gt; &gt; &gt;&gt;&gt;&gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt; &gt; &gt;&gt;&gt;&gt; vCPU&#x27;s page cache: if it holds fewer pages than the fault might need, it
+&gt; &gt; &gt;&gt;&gt;&gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt; &gt; &gt;&gt;&gt;&gt; 40. Unused pages stay in the cache until the vCPU is destroyed.
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; With 64 KiB pages, that is 2.5 MiB per vCPU, and most of it is never
+&gt; &gt; &gt;&gt;&gt;&gt; used. Stage-2 has at most three levels and the root is preallocated, so
+&gt; &gt; &gt;&gt;&gt;&gt; a fault needs at most two new table pages (kvm_mmu_cache_min_pages()).
+&gt; &gt; &gt;&gt;&gt;&gt; As every last-level table covers 512 MiB, an 8 GiB guest needs just 17
+&gt; &gt; &gt;&gt;&gt;&gt; table pages to map all of its memory, while its four vCPU caches get
+&gt; &gt; &gt;&gt;&gt;&gt; filled with 160.
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; On a production host with 64 KiB pages running 101 VMs with four vCPUs
+&gt; &gt; &gt;&gt;&gt;&gt; each, the caches were still 86% full. The memory used:
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt;                         before      after
+&gt; &gt; &gt;&gt;&gt;&gt;   per-vCPU capacity     2.5 MB     512 KB
+&gt; &gt; &gt;&gt;&gt;&gt;   all 404 vCPUs         869 MB     &lt;= 202 MB
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; Let&#x27;s lower the capacity to 8 with 64 KiB pages, In the production
+&gt; &gt; &gt;&gt;&gt;&gt; usecase above, it frees at least 667 MB. That still covers the two-page
+&gt; &gt; &gt;&gt;&gt;&gt; minimum and leaves room for several table allocations per refill. 4 KB
+&gt; &gt; &gt;&gt;&gt;&gt; and 16 KB pages keep 40.
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt; &gt; &gt;&gt;&gt;&gt; but it is topped up before every page it maps, so 8 is sufficient there
+&gt; &gt; &gt;&gt;&gt;&gt; as well. The pKVM hypervisor memcache and the eager split cache don&#x27;t
+&gt; &gt; &gt;&gt;&gt;&gt; use this capacity.
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; ---
+&gt; &gt; &gt;&gt;&gt;&gt;  arch/arm64/include/asm/kvm_types.h | 5 +++++
+&gt; &gt; &gt;&gt;&gt;&gt;  1 file changed, 5 insertions(+)
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;&gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt; &gt; &gt;&gt;&gt;&gt; index 9a126b9e2d7c99..28568da9ea4a7b 100644
+&gt; &gt; &gt;&gt;&gt;&gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt; &gt; &gt;&gt;&gt;&gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt; &gt; &gt;&gt;&gt;&gt; @@ -2,7 +2,12 @@
+&gt; &gt; &gt;&gt;&gt;&gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt; &gt; &gt;&gt;&gt;&gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt; &gt; &gt;&gt;&gt;&gt;  
+&gt; &gt; &gt;&gt;&gt;&gt; +/* Must cover kvm_mmu_cache_min_pages(), at most 2 with 64 KiB pages. */
+&gt; &gt; &gt;&gt;&gt;&gt; +#ifdef CONFIG_ARM64_64K_PAGES
+&gt; &gt; &gt;&gt;&gt;&gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 8
+&gt; &gt; &gt;&gt;&gt;&gt; +#else
+&gt; &gt; &gt;&gt;&gt;&gt;  #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt; &gt; &gt;&gt;&gt;&gt; +#endif
+&gt; &gt; &gt;&gt;&gt;&gt;  
+&gt; &gt; &gt;&gt;&gt;&gt;  #endif /* _ASM_ARM64_KVM_TYPES_H */
+&gt; &gt; &gt;&gt;&gt;&gt;  
+&gt; &gt; &gt;&gt;&gt;&gt; -- 
+&gt; &gt; &gt;&gt;&gt;&gt; 2.53.1-Meta
+&gt; &gt; &gt;&gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt; Hi Usama,
+&gt; &gt; &gt;&gt;&gt;
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; Hello Leonardo,
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt;&gt; Have you tried to reproduce this issue in v7.4-rc1 or newer?
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; Yes. The patch is against kvmarm/next (v7.4-rc3), which includes
+&gt; &gt; &gt;&gt; Lorenzo&#x27;s pre-fault series, and I A/B tested it there.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; On unpatched v7.4-rc3 with 64 KiB pages, a VM whose 16 vCPUs each fault
+&gt; &gt; &gt;&gt; in one page needs a single stage-2 table page, yet the vCPU caches hold
+&gt; &gt; &gt;&gt; 640 pages (40 MiB). With the patch they hold 127 pages.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt; IIUC Lorenzo Stoakes introduced a change that would cause the memcache to 
+&gt; &gt; &gt;&gt;&gt; skip topup if the cache contains a minimum of ~4 pages, so it can possibly 
+&gt; &gt; &gt;&gt;&gt; improve that issue.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; I don&#x27;t think that part is new. __kvm_mmu_topup_memory_cache() has
+&gt; &gt; &gt;&gt; returned early when mc-&gt;nobjs &gt;= min since commit 6926f95accee (&quot;KVM:
+&gt; &gt; &gt;&gt; Move x86&#x27;s MMU memory cache helpers to common KVM code&quot;). Lorenzo&#x27;s
+&gt; &gt; &gt;&gt; commit d27acc152c62 (&quot;KVM: arm64: Size the stage-2 memcache from the
+&gt; &gt; &gt;&gt; fault MMU&quot;) takes min from s2fd-&gt;mmu instead of vcpu-&gt;arch.hw_mmu. For a
+&gt; &gt; &gt;&gt; guest abort that is the same MMU, so nothing changes here.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; With 64 KiB pages, min is kvm_mmu_cache_min_pages(), which is at most 2.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt;&gt;
+&gt; &gt; &gt;&gt;&gt; Although I can see that when it&#x27;s below that minimum it fills the whole 
+&gt; &gt; &gt;&gt;&gt; capacity (40) of the cache.
+&gt; &gt; &gt;&gt;&gt;
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; Right, and that is the problem. Skipping the top-up avoids refilling
+&gt; &gt; &gt;&gt; the cache, but nothing ever drains it. A vCPU&#x27;s first fault fills its
+&gt; &gt; &gt;&gt; cache to 40. Each last-level table covers 512 MiB, so a guest needs very
+&gt; &gt; &gt;&gt; few table pages, and most vCPUs never drop below min. The remaining
+&gt; &gt; &gt;&gt; pages stay allocated until the vCPU is destroyed, which is why the
+&gt; &gt; &gt;&gt; production caches were still 86% full.
+&gt; &gt; &gt;&gt;
+&gt; &gt; &gt;&gt; The patch keeps the early return and only lowers how far a refill goes.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Right,
+&gt; &gt; &gt; 
+&gt; &gt; &gt; I took a look in the cache workings, and it does not seem to receive freed 
+&gt; &gt; &gt; pages back in. It gets filled by topup and used by map, so IIUC it is used 
+&gt; &gt; &gt; only to avoid failing an allocation during the mapping walk.
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Maybe it could be the case to simplify this cache to have the capacity 
+&gt; &gt; &gt; about the same as the minimum (since it always topup before mapping) and 
+&gt; &gt; &gt; avoid the waste altogether.
+&gt; 
+&gt; Well the more you reserve the less frequent you&#x27;d need to actually allocate at
+&gt; topup, which saves time, so there&#x27;s this trade-off to consider.
+&gt; 
+&gt; Thanks,
+&gt; Wei-Lin Chang
+&gt; 
+
+Hi Wei-Lin,
+
+IIUC, every time we topup, we call a mmu_memory_cache_alloc_obj() for every 
+one of the objects in the array. So as it is today it runs it 40 times, and 
+waits until it runs down to allocate up to 40 again.
+
+With the change, it will run 4, then up to 4 how many times are needed.
+
+So having a smaller cache can potentially save both cputime and memory if 
+the cache is not that oftenly used. That being said, allocating 40 in 
+sequence would be faster than 4 * 10 because the instruction / data cache 
+is hot.
+
+I think the only way to evaluate the performance impact is by running some 
+benchmarks.
+
+&gt; &gt; &gt; 
+&gt; &gt; &gt; Maymbe having something like this should be enough?
+&gt; &gt; &gt;  
+&gt; &gt; &gt; #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE (KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)
+&gt; &gt; &gt; 
+&gt; &gt; 
+&gt; &gt; That sounds good to me. I tested and it works (and releases even more memory :))
+
+Out of curiosity, have you tested it in all pagesize scenarios (4k, 16k, 
+64k) in both host and guest?
+
+
+&gt; &gt; 
+&gt; &gt; I had to move #defines around to make it work, the current patch sits
+&gt; &gt; like below. If this seems acceptable, I can send it as v2 for review.
+&gt; &gt; 
+&gt; &gt; 
+&gt; &gt; &gt;From 9b044379f470625adb031a0ee7529e054d9ec219 Mon Sep 17 00:00:00 2001
+&gt; &gt; From: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; &gt; Date: Wed, 25 Nov 2026 12:55:15 -0800
+&gt; &gt; Subject: [PATCH] KVM: arm64: Shrink the stage-2 memcache to the page-table
+&gt; &gt;  depth
+&gt; &gt; 
+&gt; &gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt; &gt; vCPU&#x27;s memcache: if it holds fewer pages than the fault might need, it
+&gt; &gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt; &gt; 40. Pages never return to the cache, and unused ones stay there until
+&gt; &gt; the vCPU is destroyed.
+&gt; &gt; 
+&gt; &gt; The cache only has to cover a single map: every fault that can allocate
+&gt; &gt; tables tops it up first, and a map allocates at most one table per
+&gt; &gt; level below the preallocated root (kvm_mmu_cache_min_pages()). That is
+&gt; &gt; at most three pages with 4 KiB and 16 KiB pages, and two with 64 KiB
+&gt; &gt; pages.
+&gt; &gt; 
+&gt; &gt; With 64 KiB pages, the 40-page cache is 2.5 MiB per vCPU. As every
+&gt; &gt; last-level table covers 512 MiB, an 8 GiB guest needs just 17 table
+&gt; &gt; pages to map all of its memory, while its four vCPU caches get filled
+&gt; &gt; with 160. On a production host with 64 KiB pages running 101 VMs with
+&gt; &gt; four vCPUs each, the caches were still 86% full. The memory used:
+&gt; &gt; 
+&gt; &gt;                         before      after
+&gt; &gt;   per-vCPU capacity     2.5 MiB     256 KiB
+&gt; &gt;   all 404 vCPUs         869 MiB     &lt;= 101 MiB
+&gt; &gt; 
+&gt; &gt; Let&#x27;s size the cache to KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL,
+&gt; &gt; which is 4 pages and covers the deepest walk with one page to spare. On
+&gt; &gt; the host above, it frees at least 768 MiB. Refills get more frequent,
+&gt; &gt; but no more than four pages per vCPU ever sit unused. With 4 KiB pages,
+&gt; &gt; the cache shrinks from 160 KiB to 16 KiB per vCPU.
+&gt; &gt; 
+&gt; &gt; Move the two level definitions to asm/kvm_types.h, so that the generic
+&gt; &gt; top-up code in kvm_main.c can see them. kvm_pgtable.h still gets them
+&gt; &gt; through linux/kvm_types.h.
+
+It looks odd to have the PGTABLE level defines moved to kvm_types.h, but on 
+first glance I could not see a better place to put it.
+
+Thanks!
+Leo
+
+&gt; &gt; 
+&gt; &gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt; &gt; but it is topped up before every page it maps. The pKVM hypervisor
+&gt; &gt; memcache and the eager split cache don&#x27;t use this capacity.
+&gt; &gt; 
+&gt; &gt; Suggested-by: Leonardo Bras &lt;leo.bras@arm.com&gt;
+&gt; &gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt; &gt; ---
+&gt; &gt;  arch/arm64/include/asm/kvm_pgtable.h | 3 ---
+&gt; &gt;  arch/arm64/include/asm/kvm_types.h   | 7 ++++++-
+&gt; &gt;  2 files changed, 6 insertions(+), 4 deletions(-)
+&gt; &gt; 
+&gt; &gt; diff --git a/arch/arm64/include/asm/kvm_pgtable.h b/arch/arm64/include/asm/kvm_pgtable.h
+&gt; &gt; index eda440354a55ec..691e2eb63939f5 100644
+&gt; &gt; --- a/arch/arm64/include/asm/kvm_pgtable.h
+&gt; &gt; +++ b/arch/arm64/include/asm/kvm_pgtable.h
+&gt; &gt; @@ -19,9 +19,6 @@
+&gt; &gt;  
+&gt; &gt;  struct kvm_s2_mmu;
+&gt; &gt;  
+&gt; &gt; -#define KVM_PGTABLE_FIRST_LEVEL		-1
+&gt; &gt; -#define KVM_PGTABLE_LAST_LEVEL		3
+&gt; &gt; -
+&gt; &gt;  /*
+&gt; &gt;   * The largest supported block sizes for KVM (no 52-bit PA support):
+&gt; &gt;   *  - 4K (level 1):	1GB
+&gt; &gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt; &gt; index 9a126b9e2d7c99..5b61285d317e28 100644
+&gt; &gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt; &gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt; &gt; @@ -2,7 +2,12 @@
+&gt; &gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt; &gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt; &gt;  
+&gt; &gt; -#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt; &gt; +#define KVM_PGTABLE_FIRST_LEVEL		-1
+&gt; &gt; +#define KVM_PGTABLE_LAST_LEVEL		3
+&gt; &gt; +
+&gt; &gt; +/* One page per level below the root covers kvm_mmu_cache_min_pages(). */
+&gt; &gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE	\
+&gt; &gt; +	(KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)
+&gt; &gt;  
+&gt; &gt;  #endif /* _ASM_ARM64_KVM_TYPES_H */
+&gt; &gt;  
+&gt; &gt; -- 
+&gt; &gt; 2.53.1-Meta
+&gt; &gt;</pre>
+</details>
+<a href="https://lore.kernel.org/r/awcXhk885lqDRAHy@LeoBrasDK" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: inquiry, request for information</div>
+</div>
+</div>
 <div class="thread-node depth-0">
 <div class="review-comment">
 <div class="review-comment-header">
 <span class="review-author">Usama Arif (author)</span>
 <a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
-<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
+<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Author agrees that the revised patch works and releases more memory, plans to send a new version (v2) for review
-
-The author is addressing Leonardo&#x27;s concern that the patch does not fix the issue of unused pages staying in the cache until a vCPU is destroyed, which leads to high memory usage. The author explains that they are shrinking the stage-2 memcache to the page-table depth, which will reduce the number of pages allocated and thus decrease memory usage. They also move the level definitions to asm/kvm_types.h so that the generic top-up code can see them.</div>
+<div class="review-comment-text">Author addressed Leonardo&#x27;s concern about the memcache not draining due to early return in __kvm_mmu_topup_memory_cache(). Usama explained that this is a known issue and the patch only lowers how far a refill goes, but does not change the early return. He confirmed that he A/B tested the patch on v7.4-rc3 with 64 KiB pages and observed improved results.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">That sounds good to me. I tested and it works (and releases even more memory :))
+<pre class="raw-body-text">On 25/11/2026 09:14, Leonardo Bras wrote:
+&gt; On Tue, Nov 24, 2026 at 07:28:42AM -0800, Usama Arif wrote:
+&gt;&gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt;&gt; vCPU&#x27;s page cache: if it holds fewer pages than the fault might need, it
+&gt;&gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt;&gt; 40. Unused pages stay in the cache until the vCPU is destroyed.
+&gt;&gt;
+&gt;&gt; With 64 KiB pages, that is 2.5 MiB per vCPU, and most of it is never
+&gt;&gt; used. Stage-2 has at most three levels and the root is preallocated, so
+&gt;&gt; a fault needs at most two new table pages (kvm_mmu_cache_min_pages()).
+&gt;&gt; As every last-level table covers 512 MiB, an 8 GiB guest needs just 17
+&gt;&gt; table pages to map all of its memory, while its four vCPU caches get
+&gt;&gt; filled with 160.
+&gt;&gt;
+&gt;&gt; On a production host with 64 KiB pages running 101 VMs with four vCPUs
+&gt;&gt; each, the caches were still 86% full. The memory used:
+&gt;&gt;
+&gt;&gt;                         before      after
+&gt;&gt;   per-vCPU capacity     2.5 MB     512 KB
+&gt;&gt;   all 404 vCPUs         869 MB     &lt;= 202 MB
+&gt;&gt;
+&gt;&gt; Let&#x27;s lower the capacity to 8 with 64 KiB pages, In the production
+&gt;&gt; usecase above, it frees at least 667 MB. That still covers the two-page
+&gt;&gt; minimum and leaves room for several table allocations per refill. 4 KB
+&gt;&gt; and 16 KB pages keep 40.
+&gt;&gt;
+&gt;&gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt;&gt; but it is topped up before every page it maps, so 8 is sufficient there
+&gt;&gt; as well. The pKVM hypervisor memcache and the eager split cache don&#x27;t
+&gt;&gt; use this capacity.
+&gt;&gt;
+&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt;&gt; ---
+&gt;&gt;  arch/arm64/include/asm/kvm_types.h | 5 +++++
+&gt;&gt;  1 file changed, 5 insertions(+)
+&gt;&gt;
+&gt;&gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt;&gt; index 9a126b9e2d7c99..28568da9ea4a7b 100644
+&gt;&gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt;&gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt;&gt; @@ -2,7 +2,12 @@
+&gt;&gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt;&gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt;&gt;  
+&gt;&gt; +/* Must cover kvm_mmu_cache_min_pages(), at most 2 with 64 KiB pages. */
+&gt;&gt; +#ifdef CONFIG_ARM64_64K_PAGES
+&gt;&gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 8
+&gt;&gt; +#else
+&gt;&gt;  #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt;&gt; +#endif
+&gt;&gt;  
+&gt;&gt;  #endif /* _ASM_ARM64_KVM_TYPES_H */
+&gt;&gt;  
+&gt;&gt; -- 
+&gt;&gt; 2.53.1-Meta
+&gt;&gt;
+&gt; 
+&gt; Hi Usama,
+&gt; 
+
+Hello Leonardo,
+
+&gt; Have you tried to reproduce this issue in v7.4-rc1 or newer?
+
+Yes. The patch is against kvmarm/next (v7.4-rc3), which includes
+Lorenzo&#x27;s pre-fault series, and I A/B tested it there.
+
+On unpatched v7.4-rc3 with 64 KiB pages, a VM whose 16 vCPUs each fault
+in one page needs a single stage-2 table page, yet the vCPU caches hold
+640 pages (40 MiB). With the patch they hold 127 pages.
+
+&gt; 
+&gt; IIUC Lorenzo Stoakes introduced a change that would cause the memcache to 
+&gt; skip topup if the cache contains a minimum of ~4 pages, so it can possibly 
+&gt; improve that issue.
+
+I don&#x27;t think that part is new. __kvm_mmu_topup_memory_cache() has
+returned early when mc-&gt;nobjs &gt;= min since commit 6926f95accee (&quot;KVM:
+Move x86&#x27;s MMU memory cache helpers to common KVM code&quot;). Lorenzo&#x27;s
+commit d27acc152c62 (&quot;KVM: arm64: Size the stage-2 memcache from the
+fault MMU&quot;) takes min from s2fd-&gt;mmu instead of vcpu-&gt;arch.hw_mmu. For a
+guest abort that is the same MMU, so nothing changes here.
+
+With 64 KiB pages, min is kvm_mmu_cache_min_pages(), which is at most 2.
+
+&gt; 
+&gt; Although I can see that when it&#x27;s below that minimum it fills the whole 
+&gt; capacity (40) of the cache.
+&gt; 
+
+Right, and that is the problem. Skipping the top-up avoids refilling
+the cache, but nothing ever drains it. A vCPU&#x27;s first fault fills its
+cache to 40. Each last-level table covers 512 MiB, so a guest needs very
+few table pages, and most vCPUs never drop below min. The remaining
+pages stay allocated until the vCPU is destroyed, which is why the
+production caches were still 86% full.
+
+The patch keeps the early return and only lowers how far a refill goes.
+
+Thanks,
+Usama
+
+&gt; In any case, Lorenzo, could you advise?
+&gt; 
+&gt; CC:Lorenzo Stoakes (ARM) (ljs@kernel.org) 
+&gt; 
+&gt; Thanks,
+&gt; Leo
+
+---
+
+On 25/11/2026 10:25, Leonardo Bras wrote:
+&gt; On Wed, Nov 25, 2026 at 05:55:29PM +0000, Usama Arif wrote:
+&gt;&gt;
+&gt;&gt;
+&gt;&gt; On 25/11/2026 09:14, Leonardo Bras wrote:
+&gt;&gt;&gt; On Tue, Nov 24, 2026 at 07:28:42AM -0800, Usama Arif wrote:
+&gt;&gt;&gt;&gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt;&gt;&gt;&gt; vCPU&#x27;s page cache: if it holds fewer pages than the fault might need, it
+&gt;&gt;&gt;&gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt;&gt;&gt;&gt; 40. Unused pages stay in the cache until the vCPU is destroyed.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; With 64 KiB pages, that is 2.5 MiB per vCPU, and most of it is never
+&gt;&gt;&gt;&gt; used. Stage-2 has at most three levels and the root is preallocated, so
+&gt;&gt;&gt;&gt; a fault needs at most two new table pages (kvm_mmu_cache_min_pages()).
+&gt;&gt;&gt;&gt; As every last-level table covers 512 MiB, an 8 GiB guest needs just 17
+&gt;&gt;&gt;&gt; table pages to map all of its memory, while its four vCPU caches get
+&gt;&gt;&gt;&gt; filled with 160.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; On a production host with 64 KiB pages running 101 VMs with four vCPUs
+&gt;&gt;&gt;&gt; each, the caches were still 86% full. The memory used:
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt;                         before      after
+&gt;&gt;&gt;&gt;   per-vCPU capacity     2.5 MB     512 KB
+&gt;&gt;&gt;&gt;   all 404 vCPUs         869 MB     &lt;= 202 MB
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; Let&#x27;s lower the capacity to 8 with 64 KiB pages, In the production
+&gt;&gt;&gt;&gt; usecase above, it frees at least 667 MB. That still covers the two-page
+&gt;&gt;&gt;&gt; minimum and leaves room for several table allocations per refill. 4 KB
+&gt;&gt;&gt;&gt; and 16 KB pages keep 40.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt;&gt;&gt;&gt; but it is topped up before every page it maps, so 8 is sufficient there
+&gt;&gt;&gt;&gt; as well. The pKVM hypervisor memcache and the eager split cache don&#x27;t
+&gt;&gt;&gt;&gt; use this capacity.
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt;&gt;&gt;&gt; ---
+&gt;&gt;&gt;&gt;  arch/arm64/include/asm/kvm_types.h | 5 +++++
+&gt;&gt;&gt;&gt;  1 file changed, 5 insertions(+)
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;&gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt;&gt;&gt;&gt; index 9a126b9e2d7c99..28568da9ea4a7b 100644
+&gt;&gt;&gt;&gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt;&gt;&gt;&gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt;&gt;&gt;&gt; @@ -2,7 +2,12 @@
+&gt;&gt;&gt;&gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt;&gt;&gt;&gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt;&gt;&gt;&gt;  
+&gt;&gt;&gt;&gt; +/* Must cover kvm_mmu_cache_min_pages(), at most 2 with 64 KiB pages. */
+&gt;&gt;&gt;&gt; +#ifdef CONFIG_ARM64_64K_PAGES
+&gt;&gt;&gt;&gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 8
+&gt;&gt;&gt;&gt; +#else
+&gt;&gt;&gt;&gt;  #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt;&gt;&gt;&gt; +#endif
+&gt;&gt;&gt;&gt;  
+&gt;&gt;&gt;&gt;  #endif /* _ASM_ARM64_KVM_TYPES_H */
+&gt;&gt;&gt;&gt;  
+&gt;&gt;&gt;&gt; -- 
+&gt;&gt;&gt;&gt; 2.53.1-Meta
+&gt;&gt;&gt;&gt;
+&gt;&gt;&gt;
+&gt;&gt;&gt; Hi Usama,
+&gt;&gt;&gt;
+&gt;&gt;
+&gt;&gt; Hello Leonardo,
+&gt;&gt;
+&gt;&gt;&gt; Have you tried to reproduce this issue in v7.4-rc1 or newer?
+&gt;&gt;
+&gt;&gt; Yes. The patch is against kvmarm/next (v7.4-rc3), which includes
+&gt;&gt; Lorenzo&#x27;s pre-fault series, and I A/B tested it there.
+&gt;&gt;
+&gt;&gt; On unpatched v7.4-rc3 with 64 KiB pages, a VM whose 16 vCPUs each fault
+&gt;&gt; in one page needs a single stage-2 table page, yet the vCPU caches hold
+&gt;&gt; 640 pages (40 MiB). With the patch they hold 127 pages.
+&gt;&gt;
+&gt;&gt;&gt;
+&gt;&gt;&gt; IIUC Lorenzo Stoakes introduced a change that would cause the memcache to 
+&gt;&gt;&gt; skip topup if the cache contains a minimum of ~4 pages, so it can possibly 
+&gt;&gt;&gt; improve that issue.
+&gt;&gt;
+&gt;&gt; I don&#x27;t think that part is new. __kvm_mmu_topup_memory_cache() has
+&gt;&gt; returned early when mc-&gt;nobjs &gt;= min since commit 6926f95accee (&quot;KVM:
+&gt;&gt; Move x86&#x27;s MMU memory cache helpers to common KVM code&quot;). Lorenzo&#x27;s
+&gt;&gt; commit d27acc152c62 (&quot;KVM: arm64: Size the stage-2 memcache from the
+&gt;&gt; fault MMU&quot;) takes min from s2fd-&gt;mmu instead of vcpu-&gt;arch.hw_mmu. For a
+&gt;&gt; guest abort that is the same MMU, so nothing changes here.
+&gt;&gt;
+&gt;&gt; With 64 KiB pages, min is kvm_mmu_cache_min_pages(), which is at most 2.
+&gt;&gt;
+&gt;&gt;&gt;
+&gt;&gt;&gt; Although I can see that when it&#x27;s below that minimum it fills the whole 
+&gt;&gt;&gt; capacity (40) of the cache.
+&gt;&gt;&gt;
+&gt;&gt;
+&gt;&gt; Right, and that is the problem. Skipping the top-up avoids refilling
+&gt;&gt; the cache, but nothing ever drains it. A vCPU&#x27;s first fault fills its
+&gt;&gt; cache to 40. Each last-level table covers 512 MiB, so a guest needs very
+&gt;&gt; few table pages, and most vCPUs never drop below min. The remaining
+&gt;&gt; pages stay allocated until the vCPU is destroyed, which is why the
+&gt;&gt; production caches were still 86% full.
+&gt;&gt;
+&gt;&gt; The patch keeps the early return and only lowers how far a refill goes.
+&gt; 
+&gt; Right,
+&gt; 
+&gt; I took a look in the cache workings, and it does not seem to receive freed 
+&gt; pages back in. It gets filled by topup and used by map, so IIUC it is used 
+&gt; only to avoid failing an allocation during the mapping walk.
+&gt; 
+&gt; Maybe it could be the case to simplify this cache to have the capacity 
+&gt; about the same as the minimum (since it always topup before mapping) and 
+&gt; avoid the waste altogether.
+&gt; 
+&gt; Maymbe having something like this should be enough?
+&gt;  
+&gt; #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE (KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)
+&gt; 
+
+That sounds good to me. I tested and it works (and releases even more memory :))
 
 I had to move #defines around to make it work, the current patch sits
 like below. If this seems acceptable, I can send it as v2 for review.
 
----
 
+&gt;From 9b044379f470625adb031a0ee7529e054d9ec219 Mon Sep 17 00:00:00 2001
 From: Usama Arif &lt;usama.arif@linux.dev&gt;
 Date: Wed, 25 Nov 2026 12:55:15 -0800
 Subject: [PATCH] KVM: arm64: Shrink the stage-2 memcache to the page-table
@@ -342,68 +1030,222 @@ index 9a126b9e2d7c99..5b61285d317e28 100644
  #endif /* _ASM_ARM64_KVM_TYPES_H */
  
 -- 
-2.53.1-Meta</pre>
+2.53.1-Meta
+
+
+
+&gt; Thanks!
+&gt; Leo
+
+---
+
+On 26/11/2026 04:56, Marc Zyngier wrote:
+&gt; On Tue, 24 Nov 2026 15:28:42 +0000,
+&gt; Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
+&gt;&gt;
+&gt;&gt; When a stage-2 fault may need new page tables, KVM first tops up the
+&gt;&gt; vCPU&#x27;s page cache: if it holds fewer pages than the fault might need, it
+&gt;&gt; is refilled to KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE, which arm64 sets to
+&gt;&gt; 40. Unused pages stay in the cache until the vCPU is destroyed.
+&gt;&gt;
+&gt;&gt; With 64 KiB pages, that is 2.5 MiB per vCPU, and most of it is never
+&gt;&gt; used. Stage-2 has at most three levels and the root is preallocated, so
+&gt;&gt; a fault needs at most two new table pages (kvm_mmu_cache_min_pages()).
+&gt;&gt; As every last-level table covers 512 MiB, an 8 GiB guest needs just 17
+&gt;&gt; table pages to map all of its memory, while its four vCPU caches get
+&gt;&gt; filled with 160.
+&gt;&gt;
+&gt;&gt; On a production host with 64 KiB pages running 101 VMs with four vCPUs
+&gt;&gt; each, the caches were still 86% full. The memory used:
+&gt;&gt;
+&gt;&gt;                         before      after
+&gt;&gt;   per-vCPU capacity     2.5 MB     512 KB
+&gt;&gt;   all 404 vCPUs         869 MB     &lt;= 202 MB
+&gt;&gt;
+&gt;&gt; Let&#x27;s lower the capacity to 8 with 64 KiB pages, In the production
+&gt;&gt; usecase above, it frees at least 667 MB. That still covers the two-page
+&gt;&gt; minimum and leaves room for several table allocations per refill. 4 KB
+&gt;&gt; and 16 KB pages keep 40.
+&gt; 
+&gt; I&#x27;ll glance over the use of 64kB pages, because that&#x27;s definitely a
+&gt; niche configuration that hardly anyone uses. But the scale of the
+&gt; numbers strike me a bit: 808GB worth of guest memory, and you&#x27;re
+&gt; complaining about 869MB? That&#x27;s roughly 0.1% of the total, and the
+&gt; savings you&#x27;re gaining are even less... I know memory is expensive,
+&gt; but you&#x27;d save a lot more than that by using a realistic page size.
+&gt; Just saying...
+&gt; 
+
+Hello Marc,
+
+Thanks for the review!
+
+The 808 GB is what the guests were sized to, not what the host had.
+Guest memory there is overcommitted (with ballooning): the host has
+254 GB of RAM. v2 from [1] gives back at least 768 MB. The usecase
+is very memory intensive, so saving more than 0.5G is a very good win.
+
+The cost also scales with vCPUs, not with guest memory: up to 2.5 MB
+per vCPU, whatever the guest size. On a test host of the same type
+running 101 VMs with 4 vCPUs and 1 GB each, the caches held 986 MB,
+while the stage-2 page tables they exist to feed took 25 MB. That is
+39 times more memory held in reserve for page tables than used for
+them, and 89% of all kernel memory charged to the VMs&#x27; cgroup
+(1106 MB). With v2, the caches take 84 MB and the total is 204 MB.
+
+As for the page size, 64K is the default NVIDIA recommends for Grace,
+and both RHEL and Ubuntu ship 64K arm64 kernels. We use 64K base
+page size for all ARM hosts in the meta fleet and see regression in
+workload performance for 4K. I do know of other hyperscalers that
+use it as well, so this is not a niche in server world IMO.
+
+&gt; I also question the assumption you are making that the guest is
+&gt; strictly using IPA contiguous memory, and that therefore a very small
+&gt; set of pages are all you need to map a guest. Guests with multiple,
+&gt; disjoint memslots are (sadly) extremely common, specially in these
+&gt; days of tiered memory and other random horrors.
+&gt; 
+
+The patch doesn&#x27;t rely on that. The 8 GB guest needing 17 table pages
+was only an example of the scale. The capacity bounds how many pages
+are allocated ahead of time, not how many tables a guest can have:
+every translation fault tops the cache up to kvm_mmu_cache_min_pages()
+before taking mmu_lock, and a single map never needs more than that.
+
+Disjoint memslots mean more refills, not more allocations. The top-up
+allocates one page per iteration either way, so a 40-page refill is
+40 calls to __get_free_page(), with nothing amortised. With 4, the
+total is the same or lower, and the most a single fault allocates
+drops from 40 pages to 4. That also answers Wei-Lin&#x27;s point.
+
+&gt;&gt;
+&gt;&gt; The temporary cache in kvm_phys_addr_ioremap() uses the same capacity,
+&gt;&gt; but it is topped up before every page it maps, so 8 is sufficient there
+&gt;&gt; as well. The pKVM hypervisor memcache and the eager split cache don&#x27;t
+&gt;&gt; use this capacity.
+&gt;&gt;
+&gt;&gt; Signed-off-by: Usama Arif &lt;usama.arif@linux.dev&gt;
+&gt;&gt; ---
+&gt;&gt;  arch/arm64/include/asm/kvm_types.h | 5 +++++
+&gt;&gt;  1 file changed, 5 insertions(+)
+&gt;&gt;
+&gt;&gt; diff --git a/arch/arm64/include/asm/kvm_types.h b/arch/arm64/include/asm/kvm_types.h
+&gt;&gt; index 9a126b9e2d7c99..28568da9ea4a7b 100644
+&gt;&gt; --- a/arch/arm64/include/asm/kvm_types.h
+&gt;&gt; +++ b/arch/arm64/include/asm/kvm_types.h
+&gt;&gt; @@ -2,7 +2,12 @@
+&gt;&gt;  #ifndef _ASM_ARM64_KVM_TYPES_H
+&gt;&gt;  #define _ASM_ARM64_KVM_TYPES_H
+&gt;&gt;  
+&gt;&gt; +/* Must cover kvm_mmu_cache_min_pages(), at most 2 with 64 KiB pages. */
+&gt;&gt; +#ifdef CONFIG_ARM64_64K_PAGES
+&gt;&gt; +#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 8
+&gt;&gt; +#else
+&gt;&gt;  #define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE 40
+&gt;&gt; +#endif
+&gt; 
+&gt; Now, to the patch itself: I see no reason to special-case this. If
+&gt; kvm_mmu_cache_min_pages() is an indication of what is needed, then
+&gt; this macro should be driven by it, or the whole allocator take it into
+&gt; account. And then you adjust it by whatever fudge factor seems
+&gt; appropriate.
+&gt; 
+
+Completely agree! [1] does that: no page-size special case, and
+a capacity of KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL for every
+page size.  It can&#x27;t track kvm_mmu_cache_min_pages()
+at runtime: the vCPU&#x27;s cache is shared by the canonical and NV shadow
+MMUs, and its capacity must stay fixed. So it has to cover the largest
+minimum, which stage-2 caps at 3, and 4 is that plus one page of fudge.
+
+For what it&#x27;s worth, my understanding is that 40 currently used here was
+never derived from stage-2, it was copied from x86&#x27;s KVM_NR_MEM_OBJS by the
+initial port.
+
+Thanks!
+Usama
+
+&gt; Thanks,
+&gt; 
+&gt; 	M.
+
+[1] https://lore.kernel.org/all/e7bdcfa9-bbd8-4649-8318-2f6dc236db15@linux.dev/</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Leonardo Bras</div>
-<a href="https://lore.kernel.org/r/e7bdcfa9-bbd8-4649-8318-2f6dc236db15@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: agreement, commitment_to_revision, acknowledges a fix is needed</div>
+<a href="https://lore.kernel.org/r/06a69a4f-59bb-49b8-9ed0-f4cfe0ecad37@linux.dev" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: clarification, explanation</div>
 </div>
 <div class="thread-children">
-<div class="thread-node depth-1" id="2026-11-25">
+<div class="thread-node depth-1" id="2026-11-26">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Leonardo Bras</span>
-<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-25">2026-11-25</a>
+<span class="review-author">Marc Zyngier</span>
+<a class="date-chip" href="../2026-11-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-26">2026-11-26</a>
 <span class="inline-review-badge">Inline Review</span>
 <span class="review-tag-badge">Reviewed-by</span>
 <span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer Leonardo Bras noted that the stage-2 page cache does not receive freed pages back in, and suggested simplifying it to have a capacity about the same as the minimum, which is always topped up before mapping.</div>
+<div class="review-comment-text">Reviewer Marc Zyngier noted that the patch&#x27;s use of a fixed capacity for stage-2 page cache is not derived from the actual requirements, but rather copied from x86&#x27;s KVM_NR_MEM_OBJS, and requested that this be corrected to accurately reflect the arm64 architecture.
+
+Reviewer Marc Zyngier suggested adding a capacity calculation to cover more than one mapping per top-up, which would improve performance by reducing the ripple effect on splitting large blocks.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Right,
+<pre class="raw-body-text">On Thu, 26 Nov 2026 14:32:04 +0000,
+Usama Arif &lt;usama.arif@linux.dev&gt; wrote:
 
-I took a look in the cache workings, and it does not seem to receive freed 
-pages back in. It gets filled by topup and used by map, so IIUC it is used 
-only to avoid failing an allocation during the mapping walk.
+[nonsense deleted]
 
-Maybe it could be the case to simplify this cache to have the capacity 
-about the same as the minimum (since it always topup before mapping) and 
-avoid the waste altogether.
+---
 
-Maymbe having something like this should be enough?
- 
-#define KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE (KVM_PGTABLE_LAST_LEVEL - KVM_PGTABLE_FIRST_LEVEL)
+Of course it can. That&#x27;s not exactly rock science to add, rather than
+relying on another set of bad heuristics. And this must cover more
+than a single mapping per top-up, because that has a ripple effect on
+the speed at which we can split large blocks (funnily enough, people
+care about that stuff).
 
-Thanks!
-Leo</pre>
+	M.
+
+-- 
+Without deviation from the norm, progress is not possible.</pre>
 </details>
 <div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/awcoCklLOKeuXPhh@LeoBrasDK" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: requested changes, suggested improvement</div>
+<a href="https://lore.kernel.org/r/86v75jy48c.wl-maz@kernel.org" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested correction, accurate representation, requested changes</div>
 </div>
-</div>
-<div class="thread-node depth-1" id="2026-11-26">
+<div class="thread-children">
+<div class="thread-node depth-2">
 <div class="review-comment">
 <div class="review-comment-header">
-<span class="review-author">Wei-Lin Chang</span>
-<a class="date-chip" href="../2026-11-25_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-26">2026-11-26</a>
-<span class="badge" style="color:#383d41;background:#e2e3e5">Neutral</span>
+<span class="review-author">Lorenzo (ARM)</span>
+<a class="date-chip" href="../2026-11-26_ollama_llama3.1-8b.html" title="First appeared in report for 2026-11-26">2026-11-26</a>
+<span class="inline-review-badge">Inline Review</span>
+<span class="review-tag-badge">Reviewed-by</span>
+<span class="badge" style="color:#856404;background:#fff3cd">Needs Work</span>
 <span class="analysis-source-badge" style="color:#004085;background:#cce5ff" title="Analysis source: LLM">LLM</span>
 </div>
-<div class="review-comment-text">Reviewer noted that reducing the stage-2 page cache size can lead to less frequent top-up allocations, which may save time, but also introduces a trade-off between memory usage and allocation frequency.</div>
+<div class="review-comment-text">The reviewer questioned whether splitting the cache is necessary and noted that it may not improve performance due to the refill mechanism, which tops up the cache to its maximum size on each fault.</div>
 <details class="raw-body-toggle">
 <summary>Show original comment</summary>
-<pre class="raw-body-text">Well the more you reserve the less frequent you&#x27;d need to actually allocate at
-topup, which saves time, so there&#x27;s this trade-off to consider.
+<pre class="raw-body-text">Hmm is splitting a factor here re: the cache?
 
-Thanks,
-Wei-Lin Chang</pre>
+In kvm_mmu_split_huge_pages() it is using kvm-&gt;arch.mmu.split_page_cache which
+is a separate cache altogether right?
+
+And splitting on fault is via e.g. kvm_vm_mem_abort() -&gt; user_mem_abort() which
+tops up anyway? (Minus an NV case which is a bug I think, I can send that as a
+patch separately? I mention in another reply.)
+
+Maybe I missed a case?
+
+Re: the speed, having bigger cache size doesn&#x27;t speed anything up as the refill
+refills to the max each time, so you&#x27;re doing the same # of allocations, just
+maybe with a much bigger latency on one fault (seems bad to me)?</pre>
 </details>
-<div class="reply-to-label">&#8627; replying to Usama Arif</div>
-<a href="https://lore.kernel.org/r/4jxdf2pkuu2f7dftvf6ltpv27jctfuvvrfcrbfxudsgnp3hdfk@taur55wftexq" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
-<div class="review-comment-signals">Signals: trade-off, consider</div>
+<div class="reply-to-label">&#8627; replying to Marc Zyngier</div>
+<a href="https://lore.kernel.org/r/awhij_-9OARRRi9D@gremlin" target="_blank" rel="noopener" class="lore-link">View on lore &#8599;</a>
+<div class="review-comment-signals">Signals: requested changes</div>
+</div>
+</div>
 </div>
 </div>
 </div>
